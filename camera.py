@@ -113,6 +113,11 @@ def probe_device(ip, user, password, timeout=1.0):
         # 401 proves nothing either way. None is falsy, so the merge keeps SADP's answer.
         return {**base, "mac": "", "model": "", "activated": None,
                 "note": "credentials rejected"}
+    if r.status_code == 403 and "xml" in r.headers.get("Content-Type", ""):
+        # An inactive Hikvision refuses deviceInfo with an XML 403 (activated ones
+        # use 401 for bad creds) — this IS the factory-fresh camera we're hunting.
+        return {**base, "mac": "", "model": "", "activated": False,
+                "note": "not activated"}
     if r.status_code != 200 or "DeviceInfo" not in r.text:
         return None
     return {**base, "activated": True, "mac": norm_mac(_tag(r.text, "macAddress")),
