@@ -66,6 +66,16 @@ class Recorder:
                              "next_spawn": 0.0, "backoff": 2.0, "tail": deque(maxlen=20),
                              "last_bytes": 0, "last_progress": 0.0}
 
+    def remove_camera(self, name):
+        """Forget a camera. Refuses while its session is active; files on disk stay."""
+        with self.lock:
+            s = self.st.get(name)
+            if s and s["desired"]:
+                return False
+            self.cams.pop(name, None)
+            self.st.pop(name, None)
+            return True
+
     def cam_dir(self, name):
         return self.out_root / self.site / name
 

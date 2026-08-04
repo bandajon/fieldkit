@@ -73,6 +73,9 @@
   .cam .name { flex:1 1 100px; font-size:16px; font-weight:600; }
   .num { color:var(--dim); font-size:14px; }
   .cam .btn { margin-left:auto; }
+  .cam .btn.quiet { border-color:transparent; color:var(--dim); }
+  .cam .btn.quiet:hover { border-color:var(--line); color:var(--fg); }
+  .cam .btn.quiet + .btn { margin-left:0; }   /* Remove takes the push; Start sits beside it */
   .dev .head { display:flex; flex-wrap:wrap; align-items:center; gap:10px 16px; margin-bottom:14px; }
   .dev .ip { font-size:17px; font-weight:600; }
   .dev .meta { color:var(--dim); font-size:13px; }
@@ -251,9 +254,16 @@ async function rec(act, cam) {
 }
 document.getElementById('start-all').onclick = () => rec('start');
 document.getElementById('stop-all').onclick = () => rec('stop');
-document.getElementById('reclist').onclick = e => {
+document.getElementById('reclist').onclick = async e => {
   const b = e.target.closest('button[data-cam]');
-  if (b) rec(b.dataset.act, b.dataset.cam);
+  if (!b) return;
+  if (b.dataset.act !== 'remove') return rec(b.dataset.act, b.dataset.cam);
+  const cam = b.dataset.cam;
+  if (!confirm(`Remove ${cam} from config? Recordings on disk are kept.`)) return;
+  const r = await post('/api/config/remove_camera', {name: cam});
+  if (!r.ok) alert(r.detail || 'remove failed');
+  monCams = null;               // Monitor refetches the shrunken list
+  recPoll();
 };
 
 async function recPoll() {
@@ -275,6 +285,8 @@ async function recPoll() {
           <span class="num">${c.minutes} min</span>
           <span class="num">${(c.bytes / 1e6).toFixed(1)} MB</span>
           ${c.restarts ? `<span class="num">${c.restarts} restarts</span>` : ''}
+          ${act === 'start' ? `<button class="btn quiet" data-cam="${esc(n)}"
+                  data-act="remove">Remove</button>` : ''}
           <button class="btn${act === 'stop' ? ' halt' : ''}"
                   data-cam="${esc(n)}" data-act="${act}">${act === 'start' ? 'Start' : 'Stop'}</button>
         </div>`;

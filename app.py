@@ -442,5 +442,19 @@ def config_add_camera(body: dict = Body(default={})):
     return {"ok": True, "added": True, "name": name}
 
 
+@app.post("/api/config/remove_camera")
+def config_remove_camera(body: dict = Body(default={})):
+    name = body.get("name") or ""
+    if not any(c["name"] == name for c in CONFIG["cameras"]):
+        raise HTTPException(404, f"no camera named {name!r} in config")
+    if not REC.remove_camera(name):
+        raise HTTPException(400, f"{name} is recording — stop it first")
+    CONFIG["cameras"] = [c for c in CONFIG["cameras"] if c["name"] != name]
+    CONFIG_PATH.write_text(yaml.safe_dump(CONFIG, sort_keys=False))
+    LIVE.set_cameras(CONFIG["cameras"])
+    # Recordings under <record_dir>/<site>/<name>/ are deliberately left on disk.
+    return {"ok": True}
+
+
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
