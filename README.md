@@ -129,8 +129,10 @@ Per row:
   Snapshots are proxied through the server because a browser cannot do digest
   auth against the camera. **Full-res shot** opens a single full-size frame in
   a new tab for a framing check.
-- **Test RTSP** — a 3-second server-side ffprobe of the main stream. Reports
-  the codec and resolution, or the exact error.
+- **Test RTSP** — a server-side ffprobe of the main stream. Give it up to about
+  8 seconds: a camera that is slow to hand over a keyframe is common, and
+  waiting beats a false failure. Reports the codec and resolution, or the exact
+  error.
 
 ### Record
 
@@ -189,9 +191,11 @@ laptop, single column on a phone.
   server-side proxy the preview uses. Polling pauses when the tab is hidden or
   you switch to another tab, so it does not burn battery or bandwidth in your
   pocket.
-- **Live** (needs go2rtc, see below) embeds the go2rtc player per camera. If a
-  single stream fails, that one tile falls back to snapshots and the rest keep
-  playing.
+- **Live** (needs go2rtc, see below) embeds the go2rtc player per camera. If the
+  sidecar itself stops, the whole grid drops back to snapshots automatically.
+  A single camera whose stream fails shows a **black tile** — the browser gives
+  the page no usable error for an embedded player, so switch back to Snapshots
+  to confirm whether that camera is reachable at all.
 
 ---
 

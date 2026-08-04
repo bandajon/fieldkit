@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """FieldKit — on-site capture & extraction console. Run: python app.py"""
 
+import atexit
 import ipaddress
 import json
 import os
 import queue
 import shutil
 import socket
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -31,26 +33,37 @@ CONFIG = {}
 
 def load_config():
     """Re-read config.yaml into the module-level CONFIG dict."""
+    cfg = yaml.safe_load(CONFIG_PATH.read_text()) or {}   # parse first: a bad file must
+    for k in ("cameras", "nvrs"):                         # not leave CONFIG empty, and an
+        cfg[k] = cfg.get(k) or []                         # empty `cameras:` key is None
     CONFIG.clear()
-    CONFIG.update(yaml.safe_load(CONFIG_PATH.read_text()) or {})
+    CONFIG.update(cfg)
     return CONFIG
 
 
 def local_ips():
     """Non-loopback IPv4s of this host, stdlib only."""
     ips = set()
-    for _, _, _, _, addr in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
-        ips.add(addr[0])
+    try:
+        for *_, addr in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ips.add(addr[0])
+    except OSError:
+        pass          # unresolvable hostname is common on a field LAN; not fatal
     # getaddrinfo alone misses the LAN address on macOS/Jetson; ask the routing table too.
+    primary = ""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         s.connect(("8.8.8.8", 80))  # no packets sent, just picks the default route
-        ips.add(s.getsockname()[0])
+        primary = s.getsockname()[0]
+        ips.add(primary)
     except OSError:
         pass
     finally:
         s.close()
-    return sorted(ip for ip in ips if not ip.startswith("127."))
+    rest = sorted(ip for ip in ips if not ip.startswith("127.") and ip != primary)
+    # Default route first: the UI derives the Set-IP /24 from ips[0], and a sorted list
+    # would put a Tailscale 100.x address ahead of the site's 192.168.x.
+    return ([primary] if primary else []) + rest
 
 
 def record_dir():
@@ -63,6 +76,14 @@ load_config()
 REC = recorder.Recorder(CONFIG.get("cameras", []), record_dir(), CONFIG.get("site", "site1"))
 LIVE = live.Live(CONFIG.get("cameras", []), CONFIG.get("go2rtc_binary", ""), ROOT / "go2rtc.yaml")
 LIVE.start()   # no-op unless a binary is configured and present
+
+
+@atexit.register
+def _shutdown():
+    """Children spawned in their own process group survive Ctrl-C; an orphaned ffmpeg
+    would then fight the restarted app for the same segment paths."""
+    REC.stop()
+    LIVE.stop()
 
 app = FastAPI(title="FieldKit")
 app.mount("/static", StaticFiles(directory=ROOT / "static"), name="static")
@@ -119,8 +140,15 @@ def record_stop(body: dict = Body(default={})):
     return record_status()
 
 
+# Credentials set by an activation this process performed. In-memory only: a restart
+# forgets them, which is correct — config.yaml is the durable home for camera creds.
+ACTIVATED = {}
+
+
 def cam_creds(ip):
-    """Configured credentials for this IP, else the discovery defaults."""
+    """Credentials just set by us, else configured for this IP, else the defaults."""
+    if ip in ACTIVATED:
+        return ACTIVATED[ip]
     for c in CONFIG.get("cameras", []):
         if c.get("ip") == ip:
             return c.get("user", ""), c.get("password", "")
@@ -140,6 +168,13 @@ def valid_ip(ip):
 @app.post("/api/camera/scan")
 def camera_scan(body: dict = Body(default={})):
     cidrs = body.get("cidrs") or [f"{ip}/24" for ip in local_ips()]
+    for c in cidrs:
+        try:
+            net = ipaddress.ip_network(c, strict=False)
+        except (ValueError, TypeError):
+            raise HTTPException(400, f"not a network: {c!r}")
+        if net.prefixlen < 22:               # a /8 sweep is 16M hosts, not a field scan
+            raise HTTPException(400, f"{c} is too large to sweep — use /22 or smaller")
     return {"cameras": camera.scan(cidrs, cam_creds), "cidrs": cidrs}
 
 
@@ -147,7 +182,13 @@ def camera_scan(body: dict = Body(default={})):
 def camera_activate(body: dict = Body(default={})):
     if not body.get("password"):
         raise HTTPException(400, "password required")
-    return camera.activate(valid_ip(body.get("ip")), body["password"])
+    ip = valid_ip(body.get("ip"))
+    r = camera.activate(ip, body["password"])
+    if r.get("ok"):
+        # Preview/Set IP/Test RTSP must work straight after activation, before the
+        # operator has added this camera to config.yaml.
+        ACTIVATED[ip] = ("admin", body["password"])
+    return r
 
 
 @app.post("/api/camera/set_ip")
@@ -165,10 +206,10 @@ def camera_set_ip(body: dict = Body(default={})):
 
 
 @app.get("/api/camera/snapshot")
-def camera_snapshot(ip: str, user: str = "", password: str = ""):
+def camera_snapshot(ip: str):
+    # credentials resolve server-side only — query-string creds would land in access logs
     valid_ip(ip)
-    if not user:
-        user, password = cam_creds(ip)
+    user, password = cam_creds(ip)
     data, err = camera.snapshot(ip, user, password)
     if err:
         raise HTTPException(502, err)
@@ -184,7 +225,9 @@ def camera_test_rtsp(body: dict = Body(default={})):
 
 # --- NVR pull, wrapped around the existing nvr_pull.py ---
 
-NVR_POOL = ThreadPoolExecutor(max_workers=4)
+# Daemon threads, not a pool: a non-daemon worker mid multi-GB pull would block
+# interpreter exit. The semaphore keeps the same 4-at-a-time limit.
+NVR_SLOTS = threading.Semaphore(4)
 JOBS = {}            # site -> {"state": RUNNING|VERIFIED|ATTENTION, "started": ts}
 SUBSCRIBERS = []     # one queue.Queue per open SSE client
 
@@ -254,12 +297,13 @@ def nvr_list(date: str = ""):
 
 def run_pull(nvr, date, start, end, dry):
     site = nvr["name"]
-    try:
-        ok = nvr_pull.pull_site(nvr, date, start, end, out_root(),
-                                bool(CONFIG.get("remux_mkv", True)), dry)
-    except Exception as e:
-        nvr_log(site, f"PULL FAILED: {e}")
-        ok = False
+    with NVR_SLOTS:
+        try:
+            ok = nvr_pull.pull_site(nvr, date, start, end, out_root(),
+                                    bool(CONFIG.get("remux_mkv", True)), dry)
+        except Exception as e:
+            nvr_log(site, f"PULL FAILED: {e}")
+            ok = False
     JOBS[site] = {"state": "VERIFIED" if ok else "ATTENTION",
                   "started": JOBS.get(site, {}).get("started", time.time())}
     nvr_log(site, "VERIFIED" if ok else "ATTENTION NEEDED")
@@ -280,7 +324,8 @@ def nvr_pull_start(body: dict = Body(default={})):
         if JOBS.get(s, {}).get("state") == "RUNNING":
             continue
         JOBS[s] = {"state": "RUNNING", "started": time.time()}
-        NVR_POOL.submit(run_pull, by_name[s], date, start, end, bool(body.get("dry")))
+        threading.Thread(target=run_pull, daemon=True,
+                         args=(by_name[s], date, start, end, bool(body.get("dry")))).start()
         started.append(s)
     return {"started": started, "date": date, "start": start, "end": end}
 
@@ -326,8 +371,11 @@ def config_post(body: dict = Body(default={})):
         cfg = yaml.safe_load(text)
     except yaml.YAMLError as e:
         raise HTTPException(400, f"YAML parse error: {e}")
-    if not isinstance(cfg, dict) or not isinstance(cfg.get("nvrs"), list):
-        raise HTTPException(400, "config must be a mapping containing an 'nvrs' list")
+    if not isinstance(cfg, dict):
+        raise HTTPException(400, "config must be a mapping of keys")
+    for k in ("nvrs", "cameras"):     # absent is fine — a recording-only node has no nvrs
+        if cfg.get(k) is not None and not isinstance(cfg[k], list):
+            raise HTTPException(400, f"'{k}' must be a list if present")
     # Write the operator's text verbatim: a safe_dump round-trip would strip every comment.
     CONFIG_PATH.write_text(text)
     load_config()

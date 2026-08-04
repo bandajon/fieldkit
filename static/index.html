@@ -357,7 +357,8 @@ document.getElementById('prev-full').onclick = () => {
 
 // --- NVR Pull tab ---
 const sel = new Set();   // checked sites, kept across the 5 s re-render
-document.getElementById('nvr-date').value = new Date().toISOString().slice(0, 10);
+// en-CA gives YYYY-MM-DD in LOCAL time; toISOString() would be the UTC day.
+document.getElementById('nvr-date').value = new Date().toLocaleDateString('en-CA');
 const nvrDate = () => document.getElementById('nvr-date').value;
 
 async function nvrPoll() {
@@ -365,6 +366,8 @@ async function nvrPoll() {
   try { r = await (await fetch('/api/nvr/list?date=' + encodeURIComponent(nvrDate()))).json(); }
   catch (e) { return; }
   const list = r.nvrs || [];
+  const names = new Set(list.map(n => n.name));      // drop ghosts after a config rename
+  [...sel].forEach(s => names.has(s) || sel.delete(s));
   document.getElementById('nvrinfo').textContent =
     list.length ? `${list.length} NVR(s) configured` : 'No NVRs in config.yaml.';
   document.getElementById('nvrlist').innerHTML = list.map(n => `<div class="dev">
@@ -396,9 +399,17 @@ async function pull(sites, dry) {
     : `started: ${(r.started || []).join(', ') || 'nothing (already running?)'}`;
   nvrPoll();
 }
-document.getElementById('pull-sel').onclick = () => pull([...sel], false);
+// An empty sites list means ALL to the server, so only Pull All may send one.
+function pullSelected(dry) {
+  if (sel.size === 0) {
+    document.getElementById('nvrinfo').textContent = 'select at least one NVR';
+    return;
+  }
+  pull([...sel], dry);
+}
+document.getElementById('pull-sel').onclick = () => pullSelected(false);
 document.getElementById('pull-all').onclick = () => pull([], false);
-document.getElementById('pull-dry').onclick = () => pull([...sel], true);
+document.getElementById('pull-dry').onclick = () => pullSelected(true);
 
 // Live log over SSE; the server replaces nvr_pull.log to feed this.
 const logPane = document.getElementById('nvrlog');
@@ -455,18 +466,10 @@ async function monRender() {
         <div class="cap">${esc(c.name)} · ${esc(c.ip)}</div>
         ${monMode === 'live'
           ? `<iframe src="http://${esc(host)}:1984/stream.html?src=${encodeURIComponent(c.name)}"
-                     allow="autoplay; fullscreen" onerror="tileFallback('${esc(c.name)}')"></iframe>`
+                     allow="autoplay; fullscreen"></iframe>`
           : '<img alt="">'}
       </div>`).join('');
   if (monMode === 'snapshots') monTick();
-}
-
-// A stream that will not play drops that tile back to snapshots; the rest keep running.
-function tileFallback(name) {
-  const t = document.querySelector(`.tile[data-name="${CSS.escape(name)}"]`);
-  if (!t || !t.querySelector('iframe')) return;
-  t.querySelector('iframe').outerHTML = '<img alt="">';
-  t.querySelector('img').src = snapUrl(t.dataset.ip);
 }
 
 function monTick() {

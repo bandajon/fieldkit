@@ -9,6 +9,7 @@ import subprocess
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import quote
 from xml.sax.saxutils import escape
 
 import requests
@@ -79,7 +80,10 @@ def sadp_scan(timeout=3.0):
     s = _sadp_socket()
     out = {}
     try:
-        s.sendto(PROBE.format(uuid=uuid.uuid4()).encode(), (SADP_GROUP, SADP_PORT))
+        try:
+            s.sendto(PROBE.format(uuid=uuid.uuid4()).encode(), (SADP_GROUP, SADP_PORT))
+        except OSError:
+            return out       # no multicast route: let the TCP sweep carry the scan
         end = time.time() + timeout
         while time.time() < end:
             try:
@@ -171,7 +175,8 @@ def activate(ip, password, timeout=10):
         except requests.RequestException:
             caps = ""
         return {"ok": False, "status": r.status_code, "capabilities": caps,
-                "error": "needs encrypted activation — activate this unit via SADP tool"}
+                "error": "activation rejected — password too weak (need 8+ chars, mixed) "
+                         "or device needs encrypted activation (use SADP tool)"}
     return {"ok": r.status_code == 200, "status": r.status_code, "response": r.text[:300]}
 
 
@@ -200,7 +205,8 @@ def set_static_ip(ip, user, password, address, mask="255.255.255.0", gateway="",
 
 def test_rtsp(ip, user, password, timeout=8):
     """Server-side ffprobe of the main stream. Never probes /102."""
-    url = f"rtsp://{user}:{password}@{ip}:554/Streaming/Channels/101"
+    url = (f"rtsp://{quote(user, safe='')}:{quote(password, safe='')}"
+           f"@{ip}:554/Streaming/Channels/101")
     try:
         p = subprocess.run(["ffprobe", "-rtsp_transport", "tcp", "-print_format", "json",
                             "-show_streams", "-v", "error", url],

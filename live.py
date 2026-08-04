@@ -8,6 +8,7 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+from urllib.parse import quote
 
 import yaml
 
@@ -21,7 +22,8 @@ MAX_BACKOFF = 30.0
 
 def sub_url(cam):
     """SUB stream only. Hard rule: /101 is for recording, never for live view."""
-    return f"rtsp://{cam['user']}:{cam['password']}@{cam['ip']}:554/Streaming/Channels/102"
+    return (f"rtsp://{quote(cam['user'], safe='')}:{quote(cam['password'], safe='')}"
+            f"@{cam['ip']}:554/Streaming/Channels/102")
 
 
 def write_config(cameras, path):
@@ -89,9 +91,11 @@ class Live:
                 stderr=subprocess.DEVNULL, **kw)
             self.started_at = time.time()
             self.error = ""
-        except OSError as e:
+        except OSError as e:      # back off instead of retrying exec every second
             self.proc = None
             self.error = str(e)
+            self.backoff = min(self.backoff * 2, MAX_BACKOFF)
+            self.next_spawn = time.time() + self.backoff
 
     def _supervise(self):
         while True:
@@ -133,6 +137,11 @@ if __name__ == "__main__":
     assert "/Streaming/Channels/102" in text, text
     assert "/101" not in text, text          # sub-stream discipline
     assert yaml.safe_load(text)["streams"]["cam1"].startswith("rtsp://admin:pw@")
+
+    # Field passwords contain @ : / — unquoted they break the URL go2rtc parses.
+    quoted = write_config([{"name": "c", "ip": "10.0.0.1", "user": "ad@min",
+                            "password": "p@ss:w/rd"}], p).read_text()
+    assert "p%40ss%3Aw%2Frd" in quoted and "ad%40min" in quoted, quoted
 
     off = Live(cams, "", p)
     assert off.state() == "absent", off.state()
