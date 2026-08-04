@@ -231,6 +231,9 @@ def camera_login(body: dict = Body(default={})):
 def camera_set_ip(body: dict = Body(default={})):
     ip = valid_ip(body.get("ip"))
     address = valid_ip(body.get("address"))
+    if address != ip and hostnet._in_use(address):
+        # Two cameras on one address answer ARP and nothing else — refuse to create that.
+        raise HTTPException(400, f"{address} is already in use by another device — pick a different slot")
     user, password = cam_creds(ip)
     user, password = body.get("user") or user, body.get("password") or password
     try:
