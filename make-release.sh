@@ -33,8 +33,17 @@ FieldKit offline install
 Connecting the laptop to the field switch
 -----------------------------------------
 Field switches have no DHCP server. Plug in and the laptop self-assigns a
-169.254.x.x address, sees nothing, and Scan LAN finds no cameras. Give the
-Ethernet port a manual address on the camera network:
+169.254.x.x address; cameras may still show up in the scan, but every action
+against them fails because this machine is not on their network.
+
+FieldKit fixes this for you: a scan row on a network you are not on shows a
+"Join camera network" button. Grant the privilege once so it works silently:
+
+  macOS:   echo "$USER ALL=(root) NOPASSWD: /usr/sbin/ipconfig" | sudo tee /etc/sudoers.d/fieldkit
+  Ubuntu:  echo "$USER ALL=(root) NOPASSWD: $(command -v ip)" | sudo tee /etc/sudoers.d/fieldkit
+  Windows: start FieldKit from a terminal opened with "Run as administrator"
+
+Without it the button prints the exact command to run. To do it by hand:
 
   macOS:   sudo ipconfig set en7 MANUAL 192.168.1.2 255.255.255.0
            (en7 = the adapter; `networksetup -listallhardwareports` names it.

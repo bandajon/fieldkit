@@ -64,8 +64,24 @@ reference — read that one to learn the schema.
 ### Connecting the laptop to the field switch
 
 Field switches have no DHCP server. Plug in and the laptop self-assigns a
-`169.254.x.x` address, sees nothing, and **Scan LAN finds no cameras**. Give the
-Ethernet port a manual address on the camera network:
+`169.254.x.x` address; the scan may still find cameras over SADP, but every HTTP
+action against them fails because this machine has no address on their network.
+
+**FieldKit offers to fix this for you.** Any scan row on a network you are not
+on shows a warning and a **Join camera network** button; tapping it adds a free
+address (`.2`, `.3` or `.4`) to the Ethernet interface. It never touches the
+interface carrying your default route, so internet over WiFi keeps working.
+
+The button needs privileges. Grant them once and it works silently from then on:
+
+```
+macOS     echo "$USER ALL=(root) NOPASSWD: /usr/sbin/ipconfig" | sudo tee /etc/sudoers.d/fieldkit
+Ubuntu    echo "$USER ALL=(root) NOPASSWD: $(command -v ip)" | sudo tee /etc/sudoers.d/fieldkit
+Windows   start FieldKit from a terminal opened with "Run as administrator"
+```
+
+Without the grant the button still tells you exactly what to run — it prints the
+one-time line above and the manual command below. Doing it by hand:
 
 ```
 macOS     sudo ipconfig set en7 MANUAL 192.168.1.2 255.255.255.0
@@ -78,8 +94,9 @@ On macOS, `networksetup -listallhardwareports` tells you which `enN` the
 adapter is; the GUI path is System Settings > Network > the adapter > Details >
 TCP/IP > Configure IPv4: Manually.
 
-**Leave the gateway empty.** With no gateway on the Ethernet port your internet
-keeps working over WiFi and only camera traffic uses the cable — which is also
+**Leave the gateway empty** when doing it by hand. With no gateway on the
+Ethernet port your internet keeps working over WiFi and only camera traffic uses
+the cable — which is also
 the case FieldKit's SADP probe handles by sending out every interface rather
 than just the default route.
 

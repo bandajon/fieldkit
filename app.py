@@ -22,6 +22,7 @@ from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 import camera
+import hostnet
 import live
 import nvr_pull
 import recorder
@@ -185,6 +186,14 @@ def camera_scan(body: dict = Body(default={})):
             raise HTTPException(400, f"{c} is too large to sweep — use /22 or smaller")
     # ifaces: probe every interface, not just the default route (hotspot + switch case)
     return {"cameras": camera.scan(cidrs, cam_creds, ifaces=ips), "cidrs": cidrs}
+
+
+@app.post("/api/host/join_network")
+def host_join_network(body: dict = Body(default={})):
+    """Field switches have no DHCP; give this host an address on the camera's /24."""
+    ip = valid_ip(body.get("camera_ip"))
+    ips = local_ips()
+    return hostnet.join(f"{ip}/24", exclude_ip=ips[0] if ips else "")
 
 
 @app.post("/api/camera/activate")

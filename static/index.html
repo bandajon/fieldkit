@@ -98,8 +98,10 @@
   input { flex:1 1 140px; min-width:0; }
   input[type=checkbox] { width:22px; height:22px; min-height:0; flex:none; accent-color:var(--fg); }
 
-  .res { margin-top:8px; font-size:14px; color:var(--dim); word-break:break-word; }
+  .res { margin-top:8px; font-size:14px; color:var(--dim); word-break:break-word;
+         white-space:pre-line; }   /* failure text carries copy-paste commands on their own lines */
   .res.bad { color:var(--bad); }
+  .res.warn { color:var(--warn); }
   .res.good { color:var(--ok); }
 
   #nvrlog { height:260px; overflow:auto; margin:14px 0; padding:12px; background:#0b0e10;
@@ -199,6 +201,9 @@
 
 <script>
 let tab = 'cameras';
+let hostIps = [];          // this host's IPv4s; a row off all of them is unreachable
+const net24 = ip => ip.split('.').slice(0, 3).join('.');
+const onOurNet = ip => hostIps.some(h => net24(h) === net24(ip));
 let myNet = '192.168.1';   // /24 the Set IP suggestions live in; refreshed from /api/status
 let go2rtc = 'absent';
 document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
@@ -215,6 +220,7 @@ async function refreshStatus() {
     const s = await (await fetch('/api/status')).json();
     document.getElementById('s-host').textContent = s.hostname;
     document.getElementById('s-ips').textContent = s.ips.join(' ') || 'none';
+    hostIps = s.ips;
     if (s.ips[0]) myNet = s.ips[0].split('.').slice(0, 3).join('.');
     document.getElementById('s-disk').textContent = s.disk_free_gb + ' GB';
     document.getElementById('s-time').textContent = s.time.replace('T', ' ');
@@ -342,6 +348,10 @@ function renderDevs() {
           <span class="meta">${esc(d.model || 'unknown model')} · ${esc(d.mac || 'mac ?')} · ${esc(d.source)}${
             d.note ? ' · ' + esc(d.note) : ''}</span>
         </div>
+        ${onOurNet(d.ip) ? '' : `<div class="acts">
+          <span class="res warn">this machine has no address on ${esc(net24(d.ip))}.0/24 — actions will fail</span>
+          <button class="btn" data-act="join">Join camera network</button>
+        </div>`}
         ${d.activated === false ? `<div class="acts">
           <a class="btn" href="http://${esc(d.ip)}" target="_blank" rel="noopener">Open camera page to activate</a>
         </div>` : ''}
@@ -429,6 +439,17 @@ document.getElementById('camlist').addEventListener('click', async e => {
       const a = await addCamera(slot ? 'cam' + slot : nextCamName(), ip);
       show(a.ok ? `added to config as ${a.name}` : (a.detail || 'failed'), a.ok ? 'good' : 'bad');
       if (a.ok) b.remove();   // configured now; re-rendering here would wipe the message
+    } else if (b.dataset.act === 'join') {
+      const r = await post('/api/host/join_network', {camera_ip: ip});
+      if (r.ok) {
+        await refreshStatus();
+        renderDevs();          // clears the warning on every row on this net
+        const fresh = document.querySelector(`.dev[data-ip="${CSS.escape(ip)}"] [data-role="res"]`);
+        if (fresh) { fresh.textContent = `joined as ${r.ip} on ${r.iface}`; fresh.className = 'res good'; }
+      } else {
+        show(`${r.error || r.detail || 'failed'}\n\nrun this once, then the button works:\n${
+          r.grant || ''}\n\nor do it by hand now:\n${r.cmd || ''}`, 'bad');
+      }
     } else if (b.dataset.act === 'rtsp') {
       const r = await post('/api/camera/test_rtsp', {ip});
       show(r.ok ? `${r.codec} ${r.width}x${r.height} @ ${r.fps}`

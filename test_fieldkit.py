@@ -76,6 +76,35 @@ def readme_documents_config():
     assert not missing, f"undocumented config keys: {missing}"
 
 
+def hostnet_pick_iface():
+    """Mocked interface lists only — never touches this machine's networking."""
+    import hostnet
+    HOTSPOT = {"name": "en0", "ips": ["172.20.10.8"], "up": True, "link_local": False}
+    SWITCH = {"name": "en8", "ips": ["169.254.31.7"], "up": True, "link_local": True}
+    WIRED = {"name": "en8", "ips": [], "up": True, "link_local": False}
+    DOWN = {"name": "en5", "ips": [], "up": False, "link_local": False}
+    WIFI = {"name": "awdl0", "ips": [], "up": True, "link_local": False}
+
+    # The self-assigned interface is the field-switch signature and wins outright.
+    assert hostnet.pick_iface("172.20.10.8", [HOTSPOT, WIRED, SWITCH])["name"] == "en8"
+    # No 169.254: fall back to a wired interface that is not the default route.
+    assert hostnet.pick_iface("172.20.10.8", [HOTSPOT, DOWN, WIFI, WIRED])["name"] == "en8"
+    # Never hand back the interface carrying the default route.
+    assert hostnet.pick_iface("172.20.10.8", [HOTSPOT]) is None
+    assert hostnet.pick_iface("172.20.10.8", [DOWN, WIFI]) is None
+
+
+def hostnet_addressing():
+    import ipaddress, hostnet
+    net = ipaddress.ip_network("192.168.1.0/24")
+    assert hostnet.free_addr(net, in_use=lambda ip: False) == "192.168.1.2"
+    assert hostnet.free_addr(net, in_use=lambda ip: ip.endswith(".2")) == "192.168.1.3"
+    assert hostnet.free_addr(net, in_use=lambda ip: True) is None      # .2-.4 all taken
+    # Refuses public space before running any command.
+    r = hostnet.join("8.8.8.0/24")
+    assert r["ok"] is False and "not a private network" in r["error"], r
+
+
 def sadp_probes_every_interface():
     """Fake socket — never touches the wire. One dead interface must not stop the rest."""
     import socket as sk
@@ -152,6 +181,8 @@ check("live.py self-check", self_check("live.py"))
 check("sadp reports inactive camera", sadp_inactive)
 check("mac normalisation", macs)
 check("go2rtc absent without a binary", live_absent)
+check("hostnet pick_iface", hostnet_pick_iface)
+check("hostnet addressing", hostnet_addressing)
 check("sadp probes every interface", sadp_probes_every_interface)
 check("probe_device status codes", probe_status_codes)
 check("camera name validation", camera_names)
