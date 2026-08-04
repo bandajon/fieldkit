@@ -6,6 +6,7 @@ import ipaddress
 import json
 import os
 import queue
+import re
 import shutil
 import socket
 import threading
@@ -27,8 +28,10 @@ import recorder
 
 ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = ROOT / "config.yaml"
+EXAMPLE_PATH = ROOT / "config.example.yaml"
 
 CONFIG = {}
+CAM_NAME = re.compile(r"^[A-Za-z0-9_-]{1,32}$")   # becomes a directory name
 
 
 def load_config():
@@ -71,6 +74,10 @@ def record_dir():
     d.mkdir(parents=True, exist_ok=True)
     return d
 
+
+if not CONFIG_PATH.exists():      # first boot (and cloud deploys, where it is untracked)
+    shutil.copyfile(EXAMPLE_PATH, CONFIG_PATH)
+    print(f"created {CONFIG_PATH.name} from {EXAMPLE_PATH.name}", flush=True)
 
 load_config()
 REC = recorder.Recorder(CONFIG.get("cameras", []), record_dir(), CONFIG.get("site", "site1"))
@@ -194,15 +201,20 @@ def camera_activate(body: dict = Body(default={})):
 @app.post("/api/camera/set_ip")
 def camera_set_ip(body: dict = Body(default={})):
     ip = valid_ip(body.get("ip"))
+    address = valid_ip(body.get("address"))
     user, password = cam_creds(ip)
+    user, password = body.get("user") or user, body.get("password") or password
     try:
-        return camera.set_static_ip(ip, body.get("user") or user,
-                                    body.get("password") or password,
-                                    valid_ip(body.get("address")),
-                                    body.get("mask") or "255.255.255.0",
-                                    body.get("gateway") or "")
+        r = camera.set_static_ip(ip, user, password, address,
+                                 body.get("mask") or "255.255.255.0",
+                                 body.get("gateway") or "")
     except ValueError as e:
         raise HTTPException(400, str(e))
+    if r.get("ok"):
+        # The camera moves to `address`; the auto-add that follows looks creds up
+        # by the NEW ip, so the working pair must be reachable there too.
+        ACTIVATED[address] = (user, password)
+    return r
 
 
 @app.get("/api/camera/snapshot")
@@ -379,7 +391,35 @@ def config_post(body: dict = Body(default={})):
     # Write the operator's text verbatim: a safe_dump round-trip would strip every comment.
     CONFIG_PATH.write_text(text)
     load_config()
+    apply_cameras()
     return {"ok": True}
+
+
+def apply_cameras():
+    """Push CONFIG's camera list into the running recorder and sidecar."""
+    for c in CONFIG["cameras"]:
+        REC.add_camera(c)
+    LIVE.set_cameras(CONFIG["cameras"])
+
+
+@app.post("/api/config/add_camera")
+def config_add_camera(body: dict = Body(default={})):
+    name, ip = body.get("name") or "", valid_ip(body.get("ip"))
+    if not CAM_NAME.match(name):
+        raise HTTPException(400, "name must be 1-32 chars of letters, digits, - or _")
+    existing = next((c for c in CONFIG["cameras"] if c["name"] == name), None)
+    if existing and existing["ip"] != ip:
+        raise HTTPException(400, f"{name} already points at {existing['ip']}")
+    if existing:
+        return {"ok": True, "added": False, "name": name}   # idempotent re-add
+    # The ACTIVATED cache wins here: a camera activated a moment ago is usable at once.
+    user, password = cam_creds(ip)
+    cam = {"name": name, "ip": ip, "user": body.get("user") or user,
+           "password": body.get("password") or password}
+    CONFIG["cameras"].append(cam)
+    CONFIG_PATH.write_text(yaml.safe_dump(CONFIG, sort_keys=False))
+    apply_cameras()
+    return {"ok": True, "added": True, "name": name}
 
 
 if __name__ == "__main__":

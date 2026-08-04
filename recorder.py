@@ -53,6 +53,19 @@ class Recorder:
         self.lock = threading.Lock()
         threading.Thread(target=self._supervise, daemon=True).start()
 
+    def add_camera(self, cam):
+        """Make a newly configured camera recordable without a restart.
+        ponytail: no remove API — dropping a camera stays an edit + restart."""
+        with self.lock:
+            name = cam["name"]
+            self.cams[name] = cam
+            if self.st.get(name, {}).get("desired"):
+                return          # already recording: leave the running session alone
+            self.st[name] = {"desired": False, "proc": None, "state": "STOPPED",
+                             "started": None, "restarts": 0, "alive_since": 0.0,
+                             "next_spawn": 0.0, "backoff": 2.0, "tail": deque(maxlen=20),
+                             "last_bytes": 0, "last_progress": 0.0}
+
     def cam_dir(self, name):
         return self.out_root / self.site / name
 

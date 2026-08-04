@@ -33,6 +33,34 @@ what to type on a phone.
 `ffmpeg` and `ffprobe` must be on `PATH` — recording, the RTSP test, and the
 NVR pull's verification step all shell out to them.
 
+On first run FieldKit copies `config.example.yaml` to `config.yaml` for you.
+There is nothing to edit before you start.
+
+### Setting up cameras without touching YAML
+
+The normal field flow needs no text editor and no restart:
+
+1. **Scan LAN** on the Cameras tab.
+2. **Activate** any row showing INACTIVE — type a password, press it. FieldKit
+   remembers that password for the rest of the session, so the next two steps
+   just work.
+3. Pick a **cam slot** (`cam1` = `.111`, `cam2` = `.112`, …) and press
+   **Set IP**. The camera reboots onto its new address and is written into
+   `config.yaml` automatically; the result line reads
+   `now 192.168.1.113 · added to config as cam3`.
+
+That camera is now recordable on the Record tab and visible on Monitor
+immediately — no restart. For a camera that already has the address you want,
+**Add to config** on its row does the same thing without changing its IP; the
+button only appears for cameras that are not in the config yet.
+
+Removing a camera is the one thing that still needs the editor: delete it from
+`config.yaml` (NVR Pull tab → Edit config.yaml) and restart the app.
+
+`config.yaml` is **not** tracked in git, so the passwords you type in the field
+never land in a commit. `config.example.yaml` is the tracked, commented
+reference — read that one to learn the schema.
+
 ### Ubuntu / Debian (including a mini-PC at the node)
 
 ```
@@ -68,7 +96,8 @@ the phone on the field WiFi cannot reach port 8080.
 
 ## Configuration reference (`config.yaml`)
 
-One file. It is shared with `nvr_pull.py`, which reads the first three keys.
+One file, created from `config.example.yaml` on first boot and untracked
+thereafter. It is shared with `nvr_pull.py`, which reads the first three keys.
 
 | Key | Read by | Meaning |
 | --- | --- | --- |
@@ -94,9 +123,10 @@ Relative paths resolve against the app directory, not the shell's working
 directory, so `python app.py` behaves the same from anywhere.
 
 You can edit this file from the **NVR Pull** tab (Edit config.yaml). It is
-validated before it is written and your comments are preserved. Changes to the
-`cameras` and `nvrs` lists need an app restart to take effect — the recorder
-and the go2rtc sidecar are built at startup.
+validated before it is written and your comments are preserved. Cameras you
+add — by hand or via Set IP / Add to config — take effect immediately.
+Removing a camera, or changing `site`, `record_dir` or `go2rtc_binary`, needs a
+restart.
 
 ---
 
@@ -123,8 +153,12 @@ Per row:
   one unit with the vendor SADP tool, then come back.
 - **Set IP** — pick a `cam1…cam8` slot and the field fills in the site plan
   address (`cam1` = `.111`, `cam2` = `.112`, … in this server's `/24`), or type
-  one. FieldKit writes the static address and reboots the camera if it asks to
-  be rebooted.
+  one. FieldKit writes the static address, reboots the camera if it asks to be
+  rebooted, and — when a slot is chosen — adds the camera to `config.yaml`
+  under that name so it is recordable at once.
+- **Add to config** — appears only for cameras not yet configured. Adds the row
+  at its current address, using the slot name if one is picked, else the next
+  free `camN`.
 - **Preview** — a snapshot panel that refreshes about 1.5×/second for aiming.
   Snapshots are proxied through the server because a browser cannot do digest
   auth against the camera. **Full-res shot** opens a single full-size frame in
@@ -281,7 +315,7 @@ python3 test_fieldkit.py
 Runs each module's built-in self-check plus direct assertions: SADP parsing of
 an inactive camera (spec acceptance #2), MAC normalisation across the formats
 SADP and ISAPI use, go2rtc reporting `absent` with no binary configured, and a
-cross-check that every key in `config.yaml` is documented in this README.
+cross-check that every key in `config.example.yaml` is documented in this README.
 
 Each module is independently runnable and asserts its own risky logic:
 
@@ -306,6 +340,7 @@ recorder.py        ffmpeg process supervisor
 live.py            go2rtc sidecar manager
 nvr_pull.py        existing ISAPI extraction tool, used as a library
 test_fieldkit.py   stdlib test runner
-config.yaml        sites, NVRs, cameras, tool settings
+config.example.yaml  tracked, commented reference schema
+config.yaml        live config (untracked; auto-created on first boot)
 static/index.html  the entire UI, one file, vanilla JS
 ```

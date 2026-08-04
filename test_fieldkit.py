@@ -63,7 +63,8 @@ def live_absent():
 def readme_documents_config():
     """Every config key must appear in the README reference — no eyeballing."""
     readme = (ROOT / "README.md").read_text()
-    cfg = yaml.safe_load((ROOT / "config.yaml").read_text())
+    # config.example.yaml, not config.yaml: the latter is untracked and field-edited.
+    cfg = yaml.safe_load((ROOT / "config.example.yaml").read_text())
     keys = set(cfg)
     for section in ("nvrs", "cameras"):
         for entry in cfg.get(section) or []:
@@ -75,12 +76,33 @@ def readme_documents_config():
     assert not missing, f"undocumented config keys: {missing}"
 
 
+def camera_names():
+    """The name becomes a directory under record_dir, so it must stay a plain word."""
+    import app
+    for bad in ("../evil", "a/b", "", "x" * 33, "cam 1", ".", "café"):
+        assert not app.CAM_NAME.match(bad), bad
+    for good in ("cam1", "gate-north", "CAM_9", "x" * 32):
+        assert app.CAM_NAME.match(good), good
+
+
+def recorder_add_camera():
+    import tempfile, recorder
+    r = recorder.Recorder([], tempfile.mkdtemp(), "selftest")
+    r.add_camera({"name": "cam9", "ip": "10.0.0.9", "user": "u", "password": "p"})
+    assert r.status()["cam9"]["state"] == "STOPPED", r.status()
+    r.st["cam9"]["desired"] = True                      # pretend it is recording
+    r.add_camera({"name": "cam9", "ip": "10.0.0.9", "user": "u", "password": "p"})
+    assert r.st["cam9"]["desired"], "re-add wiped a live session"
+
+
 check("camera.py self-check", self_check("camera.py"))
 check("recorder.py self-check", self_check("recorder.py"))
 check("live.py self-check", self_check("live.py"))
 check("sadp reports inactive camera", sadp_inactive)
 check("mac normalisation", macs)
 check("go2rtc absent without a binary", live_absent)
+check("camera name validation", camera_names)
+check("recorder.add_camera", recorder_add_camera)
 check("README documents every config key", readme_documents_config)
 
 print(f"\n{'FAILED: ' + ', '.join(FAILS) if FAILS else 'all passed'}")

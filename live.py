@@ -112,6 +112,16 @@ class Live:
                         self._spawn()
             time.sleep(1)
 
+    def set_cameras(self, cams):
+        """go2rtc.yaml is regenerated in _spawn, so a graceful kill is the reload."""
+        with self.lock:
+            self.cameras = cams
+            p = self.proc if self.desired else None
+            self.proc = None
+        if p:
+            graceful_stop(p)     # supervisor respawns with the new stream list
+        return self.state()
+
     def start(self):
         if self.available():
             with self.lock:

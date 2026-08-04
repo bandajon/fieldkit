@@ -179,7 +179,7 @@
       <summary>Edit config.yaml</summary>
       <textarea id="cfgtext" spellcheck="false"></textarea>
       <div class="rowbtns"><button class="btn" id="cfgsave">Save config</button></div>
-      <div id="cfgres" class="res">Camera and NVR list changes need an app restart to take effect.</div>
+      <div id="cfgres" class="res">Added cameras take effect at once; removing one needs a restart.</div>
     </details>
   </section>
   <section id="monitor">
@@ -300,6 +300,21 @@ document.getElementById('scan').onclick = async () => {
   b.disabled = false; b.textContent = 'Scan LAN';
 };
 
+let configured = [];   // [{name, ip}] already in config.yaml
+const loadConfigured = async () => {
+  try { configured = await (await fetch('/api/cameras')).json(); } catch (e) {}
+};
+loadConfigured();
+const nextCamName = () => {
+  const used = new Set(configured.map(c => c.name));
+  for (let n = 1; ; n++) if (!used.has('cam' + n)) return 'cam' + n;
+};
+async function addCamera(name, ip) {
+  const r = await post('/api/config/add_camera', {name, ip});
+  if (r.ok) { await loadConfigured(); monCams = null; }   // Monitor refetches the new list
+  return r;
+}
+
 // null/undefined = the sweep 401'd, which proves nothing about activation.
 const actBadge = a => chip(a == null ? 'ACT ?' : a ? 'ACTIVE' : 'INACTIVE');
 
@@ -327,6 +342,8 @@ function renderDevs() {
         <div class="acts">
           <button class="btn" data-act="preview">Preview</button>
           <button class="btn" data-act="rtsp">Test RTSP</button>
+          ${configured.some(c => c.ip === d.ip) ? ''
+            : '<button class="btn" data-act="add">Add to config</button>'}
         </div>
         <div class="res" data-role="res"></div>
       </div>`).join('');
@@ -357,13 +374,24 @@ document.getElementById('camlist').addEventListener('click', async e => {
         show(r.ok ? 'activated' : (r.error || r.detail || 'failed'), r.ok ? 'good' : 'bad');
       }
     } else if (b.dataset.act === 'setip') {
+      const slot = card.querySelector('[data-role="plan"]').value;
       const address = card.querySelector('[data-role="addr"]').value.trim();
       if (!address) show('pick a cam slot or type an IP first', 'bad');
       else {
         const r = await post('/api/camera/set_ip', {ip, address});
-        show(r.ok ? `now ${address}${r.rebooted ? ' — rebooting' : ''}`
-                  : (r.error || r.detail || 'failed'), r.ok ? 'good' : 'bad');
+        let msg = r.ok ? `now ${address}${r.rebooted ? ' — rebooting' : ''}`
+                       : (r.error || r.detail || 'failed');
+        if (r.ok && slot) {
+          const a = await addCamera('cam' + slot, address);   // it reboots onto this one
+          msg += a.ok ? ` · added to config as ${a.name}` : ` · not added: ${a.detail || ''}`;
+        }
+        show(msg, r.ok ? 'good' : 'bad');
       }
+    } else if (b.dataset.act === 'add') {
+      const slot = card.querySelector('[data-role="plan"]').value;
+      const a = await addCamera(slot ? 'cam' + slot : nextCamName(), ip);
+      show(a.ok ? `added to config as ${a.name}` : (a.detail || 'failed'), a.ok ? 'good' : 'bad');
+      if (a.ok) b.remove();   // configured now; re-rendering here would wipe the message
     } else if (b.dataset.act === 'rtsp') {
       const r = await post('/api/camera/test_rtsp', {ip});
       show(r.ok ? `${r.codec} ${r.width}x${r.height} @ ${r.fps}`
@@ -484,7 +512,7 @@ cfgbox.addEventListener('toggle', async () => {
 document.getElementById('cfgsave').onclick = async () => {
   const res = document.getElementById('cfgres');
   const r = await post('/api/config', {text: document.getElementById('cfgtext').value});
-  res.textContent = r.ok ? 'saved — camera/NVR list changes need an app restart'
+  res.textContent = r.ok ? 'saved — added cameras are live; removals need a restart'
                          : 'not saved: ' + (r.detail || 'unknown error');
   res.className = 'res ' + (r.ok ? 'good' : 'bad');
   if (r.ok) nvrPoll();
