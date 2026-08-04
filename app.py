@@ -405,6 +405,19 @@ def config_get():
     return {"text": CONFIG_PATH.read_text()}
 
 
+@app.post("/api/config/reset")
+def config_reset():
+    """Restore config.yaml from config.example.yaml and apply it live."""
+    if any(c["state"] != "STOPPED" for c in REC.status().values()):
+        raise HTTPException(400, "stop all recording first — reset replaces the camera list")
+    for name in list(REC.cams):           # all stopped, so every removal succeeds
+        REC.remove_camera(name)
+    shutil.copyfile(EXAMPLE_PATH, CONFIG_PATH)
+    load_config()
+    apply_cameras()                        # example cameras become live in recorder+monitor
+    return {"ok": True, "text": CONFIG_PATH.read_text()}
+
+
 @app.post("/api/config")
 def config_post(body: dict = Body(default={})):
     text = body.get("text") or ""

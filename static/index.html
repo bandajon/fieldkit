@@ -184,7 +184,10 @@
     <details id="cfgbox">
       <summary>Edit config.yaml</summary>
       <textarea id="cfgtext" spellcheck="false"></textarea>
-      <div class="rowbtns"><button class="btn" id="cfgsave">Save config</button></div>
+      <div class="rowbtns">
+        <button class="btn" id="cfgsave">Save config</button>
+        <button class="btn halt" id="cfgreset">Reset to defaults</button>
+      </div>
       <div id="cfgres" class="res">Added cameras take effect at once; removing one needs a restart.</div>
     </details>
   </section>
@@ -574,6 +577,21 @@ document.getElementById('cfgsave').onclick = async () => {
                          : 'not saved: ' + (r.detail || 'unknown error');
   res.className = 'res ' + (r.ok ? 'good' : 'bad');
   if (r.ok) nvrPoll();
+};
+document.getElementById('cfgreset').onclick = async () => {
+  if (!confirm('Replace config.yaml with the shipped defaults? Cameras and NVRs you ' +
+               'added are forgotten (recordings on disk are kept).')) return;
+  const res = document.getElementById('cfgres');
+  const r = await post('/api/config/reset', {});
+  if (r.ok) {
+    document.getElementById('cfgtext').value = r.text;
+    res.textContent = 'reset to defaults — applied to recorder and monitor';
+    res.className = 'res good';
+    monCams = null; nvrPoll();
+  } else {
+    res.textContent = 'not reset: ' + (r.detail || 'unknown error');
+    res.className = 'res bad';
+  }
 };
 
 setInterval(() => { if (tab === 'nvr' && !document.hidden) nvrPoll(); }, 5000);
