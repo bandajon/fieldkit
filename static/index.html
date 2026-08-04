@@ -48,6 +48,7 @@
        text-transform:uppercase; color:var(--dim); }
   h2:empty { display:none; }
 
+  a.btn { display:inline-flex; align-items:center; justify-content:center; text-decoration:none; }
   .btn { min-height:48px; padding:0 18px; font-size:15px; font-weight:600; color:var(--fg);
          background:none; border:1px solid var(--line); border-radius:4px; cursor:pointer;
          transition:background 150ms, border-color 150ms; }
@@ -329,6 +330,9 @@ function renderDevs() {
           <span class="meta">${esc(d.model || 'unknown model')} · ${esc(d.mac || 'mac ?')} · ${esc(d.source)}${
             d.note ? ' · ' + esc(d.note) : ''}</span>
         </div>
+        ${d.activated === false ? `<div class="acts">
+          <a class="btn" href="http://${esc(d.ip)}" target="_blank" rel="noopener">Open camera page to activate</a>
+        </div>` : ''}
         <div class="acts">
           <input type="password" data-role="pw" placeholder="new password" autocomplete="new-password">
           <button class="btn" data-act="activate">Activate</button>
