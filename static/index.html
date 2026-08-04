@@ -55,6 +55,17 @@
   .YES { background:#3ddc7f; }
   .NO { background:#ff6b6b; }
   .UNK { background:#6b7683; color:var(--fg); }
+  .VERIFIED { background:#3ddc7f; }
+  .ATTENTION { background:#ff6b6b; }
+  .RUNNING { background:var(--accent); }
+  #nvrlog { height:260px; overflow:auto; margin:12px 0; padding:10px; background:#000;
+            border:2px solid var(--line); border-radius:8px; white-space:pre-wrap;
+            font:14px/1.35 ui-monospace, Menlo, Consolas, monospace; color:#c8f7c8; }
+  #cfgtext { width:100%; min-height:320px; padding:10px; background:#000; color:var(--fg);
+             border:2px solid var(--line); border-radius:8px;
+             font:14px/1.4 ui-monospace, Menlo, Consolas, monospace; }
+  summary { cursor:pointer; padding:14px 0; font-size:18px; font-weight:600; }
+  input[type=checkbox] { width:26px; height:26px; }
   #preview img { width:100%; max-width:640px; border:2px solid var(--line); border-radius:8px;
                  background:#000; display:block; margin-top:10px; }
 </style>
@@ -100,7 +111,28 @@
     <div id="diskinfo" class="num">…</div>
     <div id="reclist"></div>
   </section>
-  <section id="nvr"><h2>NVR Pull</h2></section>
+  <section id="nvr">
+    <h2>NVR Pull</h2>
+    <div class="acts">
+      <input type="date" id="nvr-date">
+      <input type="time" id="nvr-start" value="05:00">
+      <input type="time" id="nvr-end" value="21:30">
+    </div>
+    <div class="rowbtns">
+      <button class="btn go" id="pull-sel">Pull Selected</button>
+      <button class="btn go" id="pull-all">Pull All</button>
+      <button class="btn" id="pull-dry">Dry Run</button>
+    </div>
+    <div id="nvrinfo" class="res"></div>
+    <div id="nvrlist"></div>
+    <div id="nvrlog"></div>
+    <details id="cfgbox">
+      <summary>Edit config.yaml</summary>
+      <textarea id="cfgtext" spellcheck="false"></textarea>
+      <div class="rowbtns"><button class="btn" id="cfgsave">Save config</button></div>
+      <div id="cfgres" class="res">Camera and NVR list changes need an app restart to take effect.</div>
+    </details>
+  </section>
   <section id="monitor"><h2>Monitor</h2></section>
 </main>
 
@@ -112,6 +144,7 @@ document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
   document.querySelectorAll('nav button').forEach(x => x.classList.toggle('on', x === b));
   document.querySelectorAll('section').forEach(s => s.classList.toggle('on', s.id === tab));
   if (tab === 'record') recPoll();
+  if (tab === 'nvr') nvrPoll();
 });
 
 async function refreshStatus() {
@@ -302,6 +335,79 @@ document.getElementById('prev-close').onclick = () => {
 document.getElementById('prev-full').onclick = () => {
   if (prevIp) window.open(snapUrl(prevIp), '_blank');
 };
+
+// --- NVR Pull tab ---
+const sel = new Set();   // checked sites, kept across the 5 s re-render
+document.getElementById('nvr-date').value = new Date().toISOString().slice(0, 10);
+const nvrDate = () => document.getElementById('nvr-date').value;
+
+async function nvrPoll() {
+  let r;
+  try { r = await (await fetch('/api/nvr/list?date=' + encodeURIComponent(nvrDate()))).json(); }
+  catch (e) { return; }
+  const list = r.nvrs || [];
+  document.getElementById('nvrinfo').textContent =
+    list.length ? `${list.length} NVR(s) configured` : 'No NVRs in config.yaml.';
+  document.getElementById('nvrlist').innerHTML = list.map(n => `<div class="dev">
+      <div class="head">
+        <label class="ip"><input type="checkbox" data-site="${esc(n.name)}"${
+          sel.has(n.name) ? ' checked' : ''}> ${esc(n.name)}</label>
+        <span class="badge ${n.reachable ? 'YES' : 'NO'}">${n.reachable ? 'UP' : 'DOWN'}</span>
+        ${n.state ? `<span class="badge ${n.state}">${n.state}</span>` : ''}
+        <span class="meta">${esc(n.host)} · ${n.channels} ch${n.verified ? ' · .verified' : ''}</span>
+        ${n.manifest ? `<a class="meta" target="_blank" href="/api/nvr/manifest?site=${
+          encodeURIComponent(n.name)}&date=${encodeURIComponent(r.date)}">manifest.json</a>` : ''}
+      </div></div>`).join('');
+}
+
+document.getElementById('nvrlist').addEventListener('change', e => {
+  const c = e.target.closest('input[type=checkbox][data-site]');
+  if (c) c.checked ? sel.add(c.dataset.site) : sel.delete(c.dataset.site);
+});
+document.getElementById('nvr-date').addEventListener('change', nvrPoll);
+
+async function pull(sites, dry) {
+  const r = await post('/api/nvr/pull', {
+    sites, dry, date: nvrDate(),
+    start: document.getElementById('nvr-start').value,
+    end: document.getElementById('nvr-end').value
+  });
+  document.getElementById('nvrinfo').textContent = r.detail
+    ? 'error: ' + r.detail
+    : `started: ${(r.started || []).join(', ') || 'nothing (already running?)'}`;
+  nvrPoll();
+}
+document.getElementById('pull-sel').onclick = () => pull([...sel], false);
+document.getElementById('pull-all').onclick = () => pull([], false);
+document.getElementById('pull-dry').onclick = () => pull([...sel], true);
+
+// Live log over SSE; the server replaces nvr_pull.log to feed this.
+const logPane = document.getElementById('nvrlog');
+const logLines = [];
+new EventSource('/api/nvr/logstream').onmessage = e => {
+  const d = JSON.parse(e.data);
+  logLines.push(`[${d.t}] [${d.site}] ${d.msg}`);
+  if (logLines.length > 500) logLines.shift();
+  const atBottom = logPane.scrollTop + logPane.clientHeight >= logPane.scrollHeight - 40;
+  logPane.textContent = logLines.join('\n');
+  if (atBottom) logPane.scrollTop = logPane.scrollHeight;
+};
+
+const cfgbox = document.getElementById('cfgbox');
+cfgbox.addEventListener('toggle', async () => {
+  if (cfgbox.open) document.getElementById('cfgtext').value =
+    (await (await fetch('/api/config')).json()).text;
+});
+document.getElementById('cfgsave').onclick = async () => {
+  const res = document.getElementById('cfgres');
+  const r = await post('/api/config', {text: document.getElementById('cfgtext').value});
+  res.textContent = r.ok ? 'saved — camera/NVR list changes need an app restart'
+                         : 'not saved: ' + (r.detail || 'unknown error');
+  res.className = 'res ' + (r.ok ? 'good' : 'bad');
+  if (r.ok) nvrPoll();
+};
+
+setInterval(() => { if (tab === 'nvr' && !document.hidden) nvrPoll(); }, 5000);
 </script>
 </body>
 </html>
