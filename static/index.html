@@ -333,9 +333,12 @@ function renderDevs() {
         ${d.activated === false ? `<div class="acts">
           <a class="btn" href="http://${esc(d.ip)}" target="_blank" rel="noopener">Open camera page to activate</a>
         </div>` : ''}
-        <div class="acts">
-          <input type="password" data-role="pw" placeholder="new password" autocomplete="new-password">
-          <button class="btn" data-act="activate">Activate</button>
+        <div class="acts">${d.activated
+          ? `<input data-role="user" placeholder="user" value="admin" autocomplete="username">
+             <input type="password" data-role="pw" placeholder="password" autocomplete="current-password">
+             <button class="btn" data-act="login">Log in</button>`
+          : `<input type="password" data-role="pw" placeholder="new password" autocomplete="new-password">
+             <button class="btn" data-act="activate">Activate</button>`}
         </div>
         <div class="acts">
           <select data-role="plan"><option value="">cam…</option>${
@@ -376,6 +379,21 @@ document.getElementById('camlist').addEventListener('click', async e => {
       else {
         const r = await post('/api/camera/activate', {ip, password: pw});
         show(r.ok ? 'activated' : (r.error || r.detail || 'failed'), r.ok ? 'good' : 'bad');
+      }
+    } else if (b.dataset.act === 'login') {
+      const pw = card.querySelector('[data-role="pw"]').value;
+      const user = card.querySelector('[data-role="user"]').value || 'admin';
+      if (!pw) show('enter the password first', 'bad');
+      else {
+        const r = await post('/api/camera/login', {ip, user, password: pw});
+        if (r.ok) {
+          const d = devs.find(x => x.ip === ip);      // fill in what auth unlocked
+          if (d) Object.assign(d, {model: r.model || d.model, mac: r.mac || d.mac,
+                                   note: 'logged in'});
+          show('logged in — credentials remembered for this camera', 'good');
+          card.querySelector('.meta').textContent =
+            `${r.model || 'unknown model'} · ${r.mac || 'mac ?'} · logged in`;
+        } else show(r.detail || 'log in failed', 'bad');
       }
     } else if (b.dataset.act === 'setip') {
       const slot = card.querySelector('[data-role="plan"]').value;

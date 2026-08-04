@@ -200,6 +200,24 @@ def camera_activate(body: dict = Body(default={})):
     return r
 
 
+@app.post("/api/camera/login")
+def camera_login(body: dict = Body(default={})):
+    """Verify credentials for an already-activated camera (e.g. set up on its own
+    web page) and remember them for every later action on this ip."""
+    ip = valid_ip(body.get("ip"))
+    user = body.get("user") or "admin"
+    if not body.get("password"):
+        raise HTTPException(400, "password required")
+    d = camera.probe_device(ip, user, body["password"], timeout=3)
+    if not d:
+        raise HTTPException(502, "no ISAPI response from that address")
+    if d.get("note"):                      # credentials rejected / not activated
+        raise HTTPException(401, d["note"])
+    ACTIVATED[ip] = (user, body["password"])
+    return {"ok": True, "model": d.get("model", ""), "mac": d.get("mac", ""),
+            "serial": d.get("serial", "")}
+
+
 @app.post("/api/camera/set_ip")
 def camera_set_ip(body: dict = Body(default={})):
     ip = valid_ip(body.get("ip"))
