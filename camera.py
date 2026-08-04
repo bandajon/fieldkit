@@ -115,10 +115,16 @@ def sadp_scan(timeout=3.0, ifaces=()):
 
 
 def probe_device(ip, user, password, timeout=1.0):
-    """GET /ISAPI/System/deviceInfo on one host. → dict or None."""
+    """GET /ISAPI/System/deviceInfo on one host. → dict or None.
+
+    Only presents credentials when it actually has a password: an empty-password
+    digest attempt still counts toward Hikvision's failed-login lockout, and the
+    sweep runs against every camera on every scan.
+    """
+    auth = HTTPDigestAuth(user, password) if password else None
     try:
         r = requests.get(f"http://{ip}/ISAPI/System/deviceInfo",
-                         auth=HTTPDigestAuth(user, password), timeout=(1.0, timeout))
+                         auth=auth, timeout=(1.0, timeout))
     except requests.RequestException:
         return None
     base = {"ip": ip, "reachable": True, "source": "sweep"}
