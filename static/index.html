@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>FieldKit</title>
+<style>
+  :root { --bg:#0b0d10; --panel:#161a1f; --line:#2c333c; --fg:#f2f5f8; --dim:#9fb0c0; --accent:#ffb000; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:17px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  #status { position:sticky; top:0; z-index:2; display:flex; flex-wrap:wrap; gap:6px 18px;
+            padding:10px 12px; background:#000; border-bottom:2px solid var(--accent); font-size:15px; }
+  #status b { color:var(--accent); font-weight:600; }
+  nav { display:flex; flex-wrap:wrap; gap:8px; padding:10px 12px; }
+  nav button { flex:1 1 140px; min-height:52px; padding:0 14px; font-size:17px; font-weight:600;
+               color:var(--fg); background:var(--panel); border:2px solid var(--line);
+               border-radius:8px; cursor:pointer; }
+  nav button.on { background:var(--accent); border-color:var(--accent); color:#000; }
+  main { padding:0 12px 40px; }
+  section { display:none; }
+  section.on { display:block; }
+  h2 { margin:8px 0 12px; font-size:22px; }
+  .btn { min-height:52px; padding:0 18px; font-size:17px; font-weight:600; color:var(--fg);
+         background:var(--panel); border:2px solid var(--line); border-radius:8px; cursor:pointer; }
+  .btn.go { background:#1d7a3c; border-color:#1d7a3c; }
+  .btn.halt { background:#8c2b2b; border-color:#8c2b2b; }
+  .bar { height:26px; background:var(--panel); border:2px solid var(--line); border-radius:6px;
+         overflow:hidden; margin:12px 0; }
+  .bar > div { height:100%; background:var(--accent); }
+  .cam { display:flex; flex-wrap:wrap; align-items:center; gap:10px; padding:12px;
+         margin-bottom:10px; background:var(--panel); border:2px solid var(--line); border-radius:8px; }
+  .cam .name { flex:1 1 100px; font-weight:600; font-size:19px; }
+  .cam .num { color:var(--dim); font-variant-numeric:tabular-nums; }
+  .cam .btn { margin-left:auto; }
+  .badge { padding:4px 10px; border-radius:6px; font-size:14px; font-weight:700; color:#000; }
+  .RECORDING { background:#3ddc7f; }
+  .RECONNECTING { background:var(--accent); }
+  .STOPPED { background:#6b7683; color:var(--fg); }
+  .rowbtns { display:flex; gap:10px; }
+  .rowbtns .btn { flex:1; }
+</style>
+</head>
+<body>
+
+<div id="status">
+  <span>host <b id="s-host">…</b></span>
+  <span>ip <b id="s-ips">…</b></span>
+  <span>free <b id="s-disk">…</b></span>
+  <span><b id="s-time">…</b></span>
+</div>
+
+<nav>
+  <button data-tab="cameras" class="on">Cameras</button>
+  <button data-tab="record">Record</button>
+  <button data-tab="nvr">NVR Pull</button>
+  <button data-tab="monitor">Monitor</button>
+</nav>
+
+<main>
+  <section id="cameras" class="on"><h2>Cameras</h2></section>
+  <section id="record">
+    <h2>Record</h2>
+    <div class="rowbtns">
+      <button class="btn go" id="start-all">Start All</button>
+      <button class="btn halt" id="stop-all">Stop All</button>
+    </div>
+    <div class="bar"><div id="diskbar"></div></div>
+    <div id="diskinfo" class="num">…</div>
+    <div id="reclist"></div>
+  </section>
+  <section id="nvr"><h2>NVR Pull</h2></section>
+  <section id="monitor"><h2>Monitor</h2></section>
+</main>
+
+<script>
+let tab = 'cameras';
+document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
+  tab = b.dataset.tab;
+  document.querySelectorAll('nav button').forEach(x => x.classList.toggle('on', x === b));
+  document.querySelectorAll('section').forEach(s => s.classList.toggle('on', s.id === tab));
+  if (tab === 'record') recPoll();
+});
+
+async function refreshStatus() {
+  try {
+    const s = await (await fetch('/api/status')).json();
+    document.getElementById('s-host').textContent = s.hostname;
+    document.getElementById('s-ips').textContent = s.ips.join(' ') || 'none';
+    document.getElementById('s-disk').textContent = s.disk_free_gb + ' GB';
+    document.getElementById('s-time').textContent = s.time.replace('T', ' ');
+  } catch (e) {
+    document.getElementById('s-time').textContent = 'server unreachable';
+  }
+}
+refreshStatus();
+setInterval(refreshStatus, 5000);
+
+// --- Record tab ---
+const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+async function rec(act, cam) {
+  await fetch('/api/record/' + act, {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({cams: cam ? [cam] : []})
+  });
+  recPoll();
+}
+document.getElementById('start-all').onclick = () => rec('start');
+document.getElementById('stop-all').onclick = () => rec('stop');
+document.getElementById('reclist').onclick = e => {
+  const b = e.target.closest('button[data-cam]');
+  if (b) rec(b.dataset.act, b.dataset.cam);
+};
+
+async function recPoll() {
+  let s;
+  try { s = await (await fetch('/api/record/status')).json(); } catch (e) { return; }
+  const used = s.disk_total_gb ? (s.disk_total_gb - s.disk_free_gb) / s.disk_total_gb : 0;
+  document.getElementById('diskbar').style.width = (used * 100).toFixed(0) + '%';
+  document.getElementById('diskinfo').textContent =
+    `${s.disk_free_gb} GB free of ${s.disk_total_gb} GB`;
+  const cams = Object.entries(s.cameras);
+  document.getElementById('reclist').innerHTML = cams.length === 0
+    ? '<p class="num">No cameras in config.yaml.</p>'
+    : cams.map(([n, c]) => {
+        const act = c.state === 'STOPPED' ? 'start' : 'stop';
+        return `<div class="cam">
+          <span class="name">${esc(n)}</span>
+          <span class="badge ${c.state}">${c.state}</span>
+          <span class="num">${c.minutes} min</span>
+          <span class="num">${(c.bytes / 1e6).toFixed(1)} MB</span>
+          ${c.restarts ? `<span class="num">${c.restarts} restarts</span>` : ''}
+          <button class="btn ${act === 'start' ? 'go' : 'halt'}"
+                  data-cam="${esc(n)}" data-act="${act}">${act === 'start' ? 'Start' : 'Stop'}</button>
+        </div>`;
+      }).join('');
+}
+setInterval(() => { if (tab === 'record' && !document.hidden) recPoll(); }, 2000);
+</script>
+</body>
+</html>
