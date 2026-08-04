@@ -61,6 +61,31 @@ Removing a camera is the one thing that still needs the editor: delete it from
 never land in a commit. `config.example.yaml` is the tracked, commented
 reference — read that one to learn the schema.
 
+### Connecting the laptop to the field switch
+
+Field switches have no DHCP server. Plug in and the laptop self-assigns a
+`169.254.x.x` address, sees nothing, and **Scan LAN finds no cameras**. Give the
+Ethernet port a manual address on the camera network:
+
+```
+macOS     sudo ipconfig set en7 MANUAL 192.168.1.2 255.255.255.0
+Windows   adapter Properties > Internet Protocol Version 4 > Use the following
+          IP address: 192.168.1.2 / 255.255.255.0
+Ubuntu    sudo ip addr add 192.168.1.2/24 dev eth0
+```
+
+On macOS, `networksetup -listallhardwareports` tells you which `enN` the
+adapter is; the GUI path is System Settings > Network > the adapter > Details >
+TCP/IP > Configure IPv4: Manually.
+
+**Leave the gateway empty.** With no gateway on the Ethernet port your internet
+keeps working over WiFi and only camera traffic uses the cable — which is also
+the case FieldKit's SADP probe handles by sending out every interface rather
+than just the default route.
+
+Factory-fresh Hikvision cameras sit at `192.168.1.64`, so `192.168.1.x/24` is
+the right network to join for first contact.
+
 ### Ubuntu / Debian (including a mini-PC at the node)
 
 ```

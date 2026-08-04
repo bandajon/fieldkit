@@ -75,15 +75,29 @@ def _sadp_socket():
     return s
 
 
-def sadp_scan(timeout=3.0):
-    """Broadcast a SADP inquiry, collect replies for `timeout` seconds. → {mac: dict}"""
+def sadp_scan(timeout=3.0, ifaces=()):
+    """Broadcast a SADP inquiry, collect replies for `timeout` seconds. → {mac: dict}
+
+    The probe egresses EVERY interface in `ifaces`, not just the default route: a
+    laptop on hotspot WiFi with Ethernet to the camera switch would otherwise send
+    the probe out the hotspot and never hear a camera.
+    """
     s = _sadp_socket()
     out = {}
     try:
-        try:
-            s.sendto(PROBE.format(uuid=uuid.uuid4()).encode(), (SADP_GROUP, SADP_PORT))
-        except OSError:
-            return out       # no multicast route: let the TCP sweep carry the scan
+        probe = PROBE.format(uuid=uuid.uuid4()).encode()
+        sent = 0
+        for ip in ifaces or [""]:            # "" = whatever the routing table picks
+            try:
+                if ip:
+                    s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF,
+                                 socket.inet_aton(ip))
+                s.sendto(probe, (SADP_GROUP, SADP_PORT))
+                sent += 1
+            except OSError:
+                continue     # this interface refuses multicast; the others may not
+        if not sent:
+            return out       # no multicast route at all: the TCP sweep carries the scan
         end = time.time() + timeout
         while time.time() < end:
             try:
@@ -137,10 +151,10 @@ def tcp_sweep(cidrs, cred_lookup, workers=64):
     return out
 
 
-def scan(cidrs, cred_lookup, sadp_timeout=3.0):
+def scan(cidrs, cred_lookup, sadp_timeout=3.0, ifaces=()):
     """SADP and sweep in parallel, merged on normalised MAC, falling back to IP."""
     with ThreadPoolExecutor(max_workers=2) as ex:
-        f_sadp = ex.submit(sadp_scan, sadp_timeout)
+        f_sadp = ex.submit(sadp_scan, sadp_timeout, ifaces)
         f_sweep = ex.submit(tcp_sweep, cidrs, cred_lookup)
         found, swept = f_sadp.result(), f_sweep.result()
     # A 401 row carries no MAC, so match it to the SADP row by address or the same
@@ -275,7 +289,7 @@ if __name__ == "__main__":
     assert row401["activated"] is None, row401
 
     def merge_with(sweep_row):
-        globals()["sadp_scan"] = lambda t=0: {"c4:2f:90:aa:bb:cc": parse_sadp_reply(SAMPLE)}
+        globals()["sadp_scan"] = lambda t=0, i=(): {"c4:2f:90:aa:bb:cc": parse_sadp_reply(SAMPLE)}
         globals()["tcp_sweep"] = lambda c, f, workers=64: {
             sweep_row["mac"] or sweep_row["ip"]: sweep_row}
         return scan(["192.168.1.0/24"], lambda ip: ("admin", ""))

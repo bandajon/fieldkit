@@ -76,6 +76,57 @@ def readme_documents_config():
     assert not missing, f"undocumented config keys: {missing}"
 
 
+def sadp_probes_every_interface():
+    """Fake socket — never touches the wire. One dead interface must not stop the rest."""
+    import socket as sk
+    from unittest.mock import patch
+    sent, current = [], [""]
+
+    class FakeSock:
+        def setsockopt(self, level, opt, val):
+            if opt == sk.IP_MULTICAST_IF:
+                current[0] = sk.inet_ntoa(val)
+
+        def sendto(self, data, addr):
+            assert addr == (camera.SADP_GROUP, camera.SADP_PORT), addr
+            if current[0] == "10.0.0.9":
+                raise OSError("no route to host")
+            sent.append(current[0])
+
+        def recvfrom(self, n):
+            raise sk.timeout
+
+        def close(self):
+            pass
+
+    with patch.object(camera, "_sadp_socket", FakeSock):
+        camera.sadp_scan(timeout=0, ifaces=["192.168.1.2", "10.0.0.9", "172.16.0.5"])
+    assert sent == ["192.168.1.2", "172.16.0.5"], sent
+
+    with patch.object(camera, "_sadp_socket", FakeSock):   # no ifaces = default route
+        sent.clear(); current[0] = ""
+        camera.sadp_scan(timeout=0)
+    assert sent == [""], sent
+
+
+def probe_status_codes():
+    """A factory-fresh camera answers deviceInfo with an XML 403; junk on :80 is not a camera."""
+    from unittest.mock import patch
+    import requests as rq
+
+    def fake(status, ctype="application/xml", text=""):
+        return type("R", (), {"status_code": status, "text": text,
+                              "headers": {"Content-Type": ctype}})()
+
+    with patch.object(rq, "get", return_value=fake(403, text="<ResponseStatus/>")):
+        d = camera.probe_device("10.0.0.5", "admin", "")
+        assert d["activated"] is False and d["note"] == "not activated", d
+    with patch.object(rq, "get", return_value=fake(404, "text/html", "<html>nope</html>")):
+        assert camera.probe_device("10.0.0.5", "admin", "") is None
+    with patch.object(rq, "get", return_value=fake(403, "text/html", "<html>nginx</html>")):
+        assert camera.probe_device("10.0.0.5", "admin", "") is None   # 403 but not XML
+
+
 def camera_names():
     """The name becomes a directory under record_dir, so it must stay a plain word."""
     import app
@@ -101,6 +152,8 @@ check("live.py self-check", self_check("live.py"))
 check("sadp reports inactive camera", sadp_inactive)
 check("mac normalisation", macs)
 check("go2rtc absent without a binary", live_absent)
+check("sadp probes every interface", sadp_probes_every_interface)
+check("probe_device status codes", probe_status_codes)
 check("camera name validation", camera_names)
 check("recorder.add_camera", recorder_add_camera)
 check("README documents every config key", readme_documents_config)

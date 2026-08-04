@@ -174,7 +174,8 @@ def valid_ip(ip):
 
 @app.post("/api/camera/scan")
 def camera_scan(body: dict = Body(default={})):
-    cidrs = body.get("cidrs") or [f"{ip}/24" for ip in local_ips()]
+    ips = local_ips()
+    cidrs = body.get("cidrs") or [f"{ip}/24" for ip in ips]
     for c in cidrs:
         try:
             net = ipaddress.ip_network(c, strict=False)
@@ -182,7 +183,8 @@ def camera_scan(body: dict = Body(default={})):
             raise HTTPException(400, f"not a network: {c!r}")
         if net.prefixlen < 22:               # a /8 sweep is 16M hosts, not a field scan
             raise HTTPException(400, f"{c} is too large to sweep — use /22 or smaller")
-    return {"cameras": camera.scan(cidrs, cam_creds), "cidrs": cidrs}
+    # ifaces: probe every interface, not just the default route (hotspot + switch case)
+    return {"cameras": camera.scan(cidrs, cam_creds, ifaces=ips), "cidrs": cidrs}
 
 
 @app.post("/api/camera/activate")

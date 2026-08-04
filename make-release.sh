@@ -30,6 +30,27 @@ FieldKit offline install
 5. On a phone on the same WiFi, open http://<this machine's IP>:8080
    (the IP is shown in the strip at the top of the screen).
 
+Connecting the laptop to the field switch
+-----------------------------------------
+Field switches have no DHCP server. Plug in and the laptop self-assigns a
+169.254.x.x address, sees nothing, and Scan LAN finds no cameras. Give the
+Ethernet port a manual address on the camera network:
+
+  macOS:   sudo ipconfig set en7 MANUAL 192.168.1.2 255.255.255.0
+           (en7 = the adapter; `networksetup -listallhardwareports` names it.
+           Or System Settings > Network > the adapter > Details > TCP/IP >
+           Configure IPv4: Manually)
+  Windows: Settings > Network > Change adapter options > adapter > Properties
+           > Internet Protocol Version 4 > Use the following IP address:
+           192.168.1.2 / 255.255.255.0
+  Ubuntu:  sudo ip addr add 192.168.1.2/24 dev eth0
+
+LEAVE THE GATEWAY EMPTY. With no gateway on the Ethernet port the internet
+keeps working over WiFi and only camera traffic uses the cable.
+
+Factory-fresh Hikvision cameras sit at 192.168.1.64, so 192.168.1.x/24 is the
+right network to join for first contact.
+
 First boot creates config.yaml automatically. Then: Scan LAN -> Activate ->
 Set IP with a cam slot -> the camera configures itself. See README.md.
 EOF
