@@ -378,7 +378,10 @@ document.getElementById('camlist').addEventListener('click', async e => {
       const address = card.querySelector('[data-role="addr"]').value.trim();
       if (!address) show('pick a cam slot or type an IP first', 'bad');
       else {
-        const r = await post('/api/camera/set_ip', {ip, address});
+        // If the operator typed a password (e.g. after activating on the camera's own
+        // web page), send it — the server then remembers it for the camera's new IP.
+        const pw = card.querySelector('[data-role="pw"]').value;
+        const r = await post('/api/camera/set_ip', pw ? {ip, address, password: pw} : {ip, address});
         let msg = r.ok ? `now ${address}${r.rebooted ? ' — rebooting' : ''}`
                        : (r.error || r.detail || 'failed');
         if (r.ok && slot) {

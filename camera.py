@@ -194,8 +194,10 @@ def activate(ip, password, timeout=10):
         except requests.RequestException:
             caps = ""
         return {"ok": False, "status": r.status_code, "capabilities": caps,
-                "error": "activation rejected — password too weak (need 8+ chars, mixed) "
-                         "or device needs encrypted activation (use SADP tool)"}
+                "error": "activation rejected — password too weak (need 8+ chars, mixed) or "
+                         f"this firmware only activates from its own page: open http://{ip} "
+                         "in a browser, set the password there, rescan, then type that "
+                         "password here and Set IP"}
     return {"ok": r.status_code == 200, "status": r.status_code, "response": r.text[:300]}
 
 
