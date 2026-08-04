@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """FieldKit — on-site capture & extraction console. Run: python app.py"""
 
+import ipaddress
 import shutil
 import socket
 from datetime import datetime
@@ -8,10 +9,11 @@ from pathlib import Path
 
 import uvicorn
 import yaml
-from fastapi import Body, FastAPI
-from fastapi.responses import FileResponse
+from fastapi import Body, FastAPI, HTTPException
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
+import camera
 import recorder
 
 ROOT = Path(__file__).resolve().parent
@@ -98,6 +100,69 @@ def record_start(body: dict = Body(default={})):
 def record_stop(body: dict = Body(default={})):
     REC.stop(body.get("cams") or None)
     return record_status()
+
+
+def cam_creds(ip):
+    """Configured credentials for this IP, else the discovery defaults."""
+    for c in CONFIG.get("cameras", []):
+        if c.get("ip") == ip:
+            return c.get("user", ""), c.get("password", "")
+    d = CONFIG.get("camera_defaults") or {}
+    return d.get("user", "admin"), d.get("password", "")
+
+
+def valid_ip(ip):
+    """These land in URLs and device config — never trust the caller."""
+    try:
+        ipaddress.ip_address(ip)
+    except (ValueError, TypeError):
+        raise HTTPException(400, f"not an IP address: {ip!r}")
+    return ip
+
+
+@app.post("/api/camera/scan")
+def camera_scan(body: dict = Body(default={})):
+    cidrs = body.get("cidrs") or [f"{ip}/24" for ip in local_ips()]
+    return {"cameras": camera.scan(cidrs, cam_creds), "cidrs": cidrs}
+
+
+@app.post("/api/camera/activate")
+def camera_activate(body: dict = Body(default={})):
+    if not body.get("password"):
+        raise HTTPException(400, "password required")
+    return camera.activate(valid_ip(body.get("ip")), body["password"])
+
+
+@app.post("/api/camera/set_ip")
+def camera_set_ip(body: dict = Body(default={})):
+    ip = valid_ip(body.get("ip"))
+    user, password = cam_creds(ip)
+    try:
+        return camera.set_static_ip(ip, body.get("user") or user,
+                                    body.get("password") or password,
+                                    valid_ip(body.get("address")),
+                                    body.get("mask") or "255.255.255.0",
+                                    body.get("gateway") or "")
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.get("/api/camera/snapshot")
+def camera_snapshot(ip: str, user: str = "", password: str = ""):
+    valid_ip(ip)
+    if not user:
+        user, password = cam_creds(ip)
+    data, err = camera.snapshot(ip, user, password)
+    if err:
+        raise HTTPException(502, err)
+    return Response(content=data, media_type="image/jpeg")
+
+
+@app.post("/api/camera/test_rtsp")
+def camera_test_rtsp(body: dict = Body(default={})):
+    ip = valid_ip(body.get("ip"))
+    user, password = cam_creds(ip)
+    return camera.test_rtsp(ip, body.get("user") or user, body.get("password") or password)
 
 
 if __name__ == "__main__":

@@ -37,8 +37,26 @@
   .RECORDING { background:#3ddc7f; }
   .RECONNECTING { background:var(--accent); }
   .STOPPED { background:#6b7683; color:var(--fg); }
-  .rowbtns { display:flex; gap:10px; }
+  .rowbtns { display:flex; gap:10px; flex-wrap:wrap; }
   .rowbtns .btn { flex:1; }
+  input, select { min-height:48px; padding:0 10px; font-size:17px; color:var(--fg);
+                  background:#0b0d10; border:2px solid var(--line); border-radius:8px; }
+  input { flex:1 1 140px; min-width:0; }
+  .dev { padding:12px; margin-bottom:10px; background:var(--panel);
+         border:2px solid var(--line); border-radius:8px; }
+  .dev .head { display:flex; flex-wrap:wrap; align-items:center; gap:8px 14px; margin-bottom:10px; }
+  .dev .ip { font-size:20px; font-weight:700; }
+  .dev .meta { color:var(--dim); font-size:15px; }
+  .acts { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+  .acts .btn { min-height:48px; flex:1 1 120px; }
+  .res { margin-top:8px; font-size:15px; color:var(--dim); word-break:break-word; }
+  .res.bad { color:#ff8a8a; }
+  .res.good { color:#3ddc7f; }
+  .YES { background:#3ddc7f; }
+  .NO { background:#ff6b6b; }
+  .UNK { background:#6b7683; color:var(--fg); }
+  #preview img { width:100%; max-width:640px; border:2px solid var(--line); border-radius:8px;
+                 background:#000; display:block; margin-top:10px; }
 </style>
 </head>
 <body>
@@ -58,7 +76,20 @@
 </nav>
 
 <main>
-  <section id="cameras" class="on"><h2>Cameras</h2></section>
+  <section id="cameras" class="on">
+    <h2>Cameras</h2>
+    <div class="rowbtns"><button class="btn go" id="scan">Scan LAN</button></div>
+    <div id="scaninfo" class="res"></div>
+    <div id="preview" hidden>
+      <div class="rowbtns">
+        <button class="btn" id="prev-full">Full-res shot</button>
+        <button class="btn halt" id="prev-close">Close preview</button>
+      </div>
+      <div id="prev-label" class="res"></div>
+      <img id="prev-img" alt="camera preview">
+    </div>
+    <div id="camlist"></div>
+  </section>
   <section id="record">
     <h2>Record</h2>
     <div class="rowbtns">
@@ -75,6 +106,7 @@
 
 <script>
 let tab = 'cameras';
+let myNet = '192.168.1';   // /24 the Set IP suggestions live in; refreshed from /api/status
 document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
   tab = b.dataset.tab;
   document.querySelectorAll('nav button').forEach(x => x.classList.toggle('on', x === b));
@@ -87,6 +119,7 @@ async function refreshStatus() {
     const s = await (await fetch('/api/status')).json();
     document.getElementById('s-host').textContent = s.hostname;
     document.getElementById('s-ips').textContent = s.ips.join(' ') || 'none';
+    if (s.ips[0]) myNet = s.ips[0].split('.').slice(0, 3).join('.');
     document.getElementById('s-disk').textContent = s.disk_free_gb + ' GB';
     document.getElementById('s-time').textContent = s.time.replace('T', ' ');
   } catch (e) {
@@ -99,11 +132,14 @@ setInterval(refreshStatus, 5000);
 // --- Record tab ---
 const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 
+async function post(url, body) {
+  const r = await fetch(url, {method: 'POST', headers: {'Content-Type': 'application/json'},
+                              body: JSON.stringify(body)});
+  return r.json();
+}
+
 async function rec(act, cam) {
-  await fetch('/api/record/' + act, {
-    method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({cams: cam ? [cam] : []})
-  });
+  await post('/api/record/' + act, {cams: cam ? [cam] : []});
   recPoll();
 }
 document.getElementById('start-all').onclick = () => rec('start');
@@ -137,6 +173,135 @@ async function recPoll() {
       }).join('');
 }
 setInterval(() => { if (tab === 'record' && !document.hidden) recPoll(); }, 2000);
+
+// --- Cameras tab ---
+let devs = [];
+
+document.getElementById('scan').onclick = async () => {
+  const b = document.getElementById('scan'), info = document.getElementById('scaninfo');
+  b.disabled = true; b.textContent = 'Scanning…';
+  info.className = 'res'; info.textContent = 'SADP probe + /24 sweep, ~5 s';
+  try {
+    const r = await post('/api/camera/scan', {});
+    devs = r.cameras || [];
+    info.textContent = `${devs.length} device(s) on ${(r.cidrs || []).join(', ')}`;
+    renderDevs();
+  } catch (err) {
+    info.textContent = 'scan failed: ' + err; info.className = 'res bad';
+  }
+  b.disabled = false; b.textContent = 'Scan LAN';
+};
+
+// null/undefined = the sweep 401'd, which proves nothing about activation.
+function actBadge(a) {
+  if (a == null) return '<span class="badge UNK">ACT ?</span>';
+  return a ? '<span class="badge YES">ACTIVE</span>' : '<span class="badge NO">INACTIVE</span>';
+}
+
+function renderDevs() {
+  document.getElementById('camlist').innerHTML = devs.length === 0
+    ? '<p class="res">Nothing found. Cameras must be on this LAN and powered.</p>'
+    : devs.map(d => `<div class="dev" data-ip="${esc(d.ip)}">
+        <div class="head">
+          <span class="ip">${esc(d.ip)}</span>
+          ${actBadge(d.activated)}
+          <span class="badge ${d.reachable ? 'YES' : 'NO'}">${d.reachable ? 'ISAPI OK' : 'NO ISAPI'}</span>
+          <span class="meta">${esc(d.model || 'unknown model')} · ${esc(d.mac || 'mac ?')} · ${esc(d.source)}${
+            d.note ? ' · ' + esc(d.note) : ''}</span>
+        </div>
+        <div class="acts">
+          <input type="password" data-role="pw" placeholder="new password" autocomplete="new-password">
+          <button class="btn" data-act="activate">Activate</button>
+        </div>
+        <div class="acts">
+          <select data-role="plan"><option value="">cam…</option>${
+            [1,2,3,4,5,6,7,8].map(n => `<option value="${n}">cam${n}</option>`).join('')}</select>
+          <input data-role="addr" placeholder="new IP" inputmode="decimal">
+          <button class="btn" data-act="setip">Set IP</button>
+        </div>
+        <div class="acts">
+          <button class="btn" data-act="preview">Preview</button>
+          <button class="btn" data-act="rtsp">Test RTSP</button>
+        </div>
+        <div class="res" data-role="res"></div>
+      </div>`).join('');
+}
+
+// cam1 = .111, cam2 = .112 … in whichever /24 this server sits on.
+document.getElementById('camlist').addEventListener('change', e => {
+  const sel = e.target.closest('select[data-role="plan"]');
+  if (!sel || !sel.value) return;
+  sel.closest('.dev').querySelector('[data-role="addr"]').value = `${myNet}.${110 + Number(sel.value)}`;
+});
+
+document.getElementById('camlist').addEventListener('click', async e => {
+  const b = e.target.closest('button[data-act]');
+  if (!b) return;
+  const card = b.closest('.dev'), ip = card.dataset.ip;
+  const res = card.querySelector('[data-role="res"]');
+  const show = (msg, cls) => { res.textContent = msg; res.className = 'res ' + (cls || ''); };
+  if (b.dataset.act === 'preview') return openPreview(ip);
+  const was = b.textContent;
+  b.disabled = true; b.textContent = '…';
+  try {
+    if (b.dataset.act === 'activate') {
+      const pw = card.querySelector('[data-role="pw"]').value;
+      if (!pw) show('enter a password first', 'bad');
+      else {
+        const r = await post('/api/camera/activate', {ip, password: pw});
+        show(r.ok ? 'activated' : (r.error || r.detail || 'failed'), r.ok ? 'good' : 'bad');
+      }
+    } else if (b.dataset.act === 'setip') {
+      const address = card.querySelector('[data-role="addr"]').value.trim();
+      if (!address) show('pick a cam slot or type an IP first', 'bad');
+      else {
+        const r = await post('/api/camera/set_ip', {ip, address});
+        show(r.ok ? `now ${address}${r.rebooted ? ' — rebooting' : ''}`
+                  : (r.error || r.detail || 'failed'), r.ok ? 'good' : 'bad');
+      }
+    } else if (b.dataset.act === 'rtsp') {
+      const r = await post('/api/camera/test_rtsp', {ip});
+      show(r.ok ? `${r.codec} ${r.width}x${r.height} @ ${r.fps}`
+                : (r.error || r.detail || 'failed'), r.ok ? 'good' : 'bad');
+    }
+  } catch (err) {
+    show(String(err), 'bad');
+  }
+  b.disabled = false; b.textContent = was;
+});
+
+// Preview: poll the server-side snapshot proxy into an <img> (browser can't do digest auth).
+let prevIp = null, prevTimer = null;
+const prevImg = document.getElementById('prev-img');
+
+function snapUrl(ip) {
+  return `/api/camera/snapshot?ip=${encodeURIComponent(ip)}&_=${Date.now()}`;
+}
+function tickPreview() {
+  if (prevIp && !document.hidden && tab === 'cameras') prevImg.src = snapUrl(prevIp);
+}
+function openPreview(ip) {
+  prevIp = ip;
+  document.getElementById('preview').hidden = false;
+  document.getElementById('prev-label').textContent = 'preview ' + ip;
+  if (!prevTimer) prevTimer = setInterval(tickPreview, 700);
+  tickPreview();
+}
+prevImg.onerror = () => {
+  document.getElementById('prev-label').textContent = `preview ${prevIp} — no image (unreachable or wrong credentials)`;
+};
+prevImg.onload = () => {
+  document.getElementById('prev-label').textContent = 'preview ' + prevIp;
+};
+document.getElementById('prev-close').onclick = () => {
+  prevIp = null;
+  clearInterval(prevTimer); prevTimer = null;
+  document.getElementById('preview').hidden = true;
+  prevImg.removeAttribute('src');
+};
+document.getElementById('prev-full').onclick = () => {
+  if (prevIp) window.open(snapUrl(prevIp), '_blank');
+};
 </script>
 </body>
 </html>
