@@ -8,7 +8,11 @@ V=$(date +%Y%m%d)
 OUT="dist/fieldkit-$V"
 rm -rf dist && mkdir -p "$OUT/wheels"
 
-git archive HEAD | tar -x -C "$OUT"          # tracked files only — never config.yaml
+git archive HEAD | tar -x -C "$OUT"          # tracked files only — never the WORKING config.yaml
+# Pre-seed config.yaml FROM THE EXAMPLE (placeholder creds only) so a novice
+# never sees a missing-config moment. The real config.yaml is untracked and
+# can never reach the zip via git archive.
+cp "$OUT/config.example.yaml" "$OUT/config.yaml"
 
 for P in win_amd64 manylinux2014_x86_64 manylinux2014_aarch64; do
   pip download -r requirements.txt -d "$OUT/wheels/$P" \
