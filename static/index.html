@@ -4,85 +4,128 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>FieldKit</title>
+<link rel="icon" href="data:,"><!-- silence the /favicon.ico request -->
+
 <style>
-  :root { --bg:#0b0d10; --panel:#161a1f; --line:#2c333c; --fg:#f2f5f8; --dim:#9fb0c0; --accent:#ffb000; }
+  :root {
+    --bg:#111417; --panel:#191d21; --line:rgba(255,255,255,.14);
+    --fg:#e8eaec; --dim:#8a939b;
+    /* State only — never decoration. Used for 8px dots and text tints. */
+    --ok:#4a9e6f; --bad:#c25454; --warn:#c29a4a;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    color-scheme: dark;   /* native checkboxes, date/time pickers and scrollbars follow */
+  }
   * { box-sizing: border-box; }
-  body { margin:0; background:var(--bg); color:var(--fg);
-         font:17px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
-  #status { position:sticky; top:0; z-index:2; display:flex; flex-wrap:wrap; gap:6px 18px;
-            padding:10px 12px; background:#000; border-bottom:2px solid var(--accent); font-size:15px; }
-  #status b { color:var(--accent); font-weight:600; }
-  nav { display:flex; flex-wrap:wrap; gap:8px; padding:10px 12px; }
-  nav button { flex:1 1 140px; min-height:52px; padding:0 14px; font-size:17px; font-weight:600;
-               color:var(--fg); background:var(--panel); border:2px solid var(--line);
-               border-radius:8px; cursor:pointer; }
-  nav button.on { background:var(--accent); border-color:var(--accent); color:#000; }
-  main { padding:0 12px 40px; }
+  body { margin:0; background:var(--bg); color:var(--fg); -webkit-font-smoothing:antialiased;
+         font:16px/1.45 "Avenir Next", Inter, system-ui, -apple-system, sans-serif; }
+  /* Machine data is always mono + tabular so columns of numbers line up. */
+  .mono, .num, .cam .name, .dev .ip, .dev .meta, .tile .cap, #diskinfo,
+  input, select, textarea { font-family:var(--mono); font-variant-numeric:tabular-nums; }
+
+  #status { position:sticky; top:0; z-index:2; display:flex; flex-wrap:wrap;
+            padding:8px 8px; background:var(--bg); border-bottom:1px solid var(--line); }
+  #status .cell { display:flex; flex-direction:column; gap:2px; padding:2px 14px;
+                  border-left:1px solid var(--line); }
+  #status .cell:first-child { border-left:0; }
+  /* Once the rail wraps, a cell starting a new row would hang a divider off the
+     left edge — CSS can't see "first in row", so drop them below the wrap point. */
+  @media (max-width:700px) { #status .cell { border-left:0; padding-left:0; padding-right:20px; } }
+  #status i { font-style:normal; font-size:10px; letter-spacing:.14em;
+              text-transform:uppercase; color:var(--dim); }
+  #status b { font:400 14px/1.3 var(--mono); font-variant-numeric:tabular-nums; }
+
+  nav { display:flex; flex-wrap:wrap; padding:0 12px; border-bottom:1px solid var(--line); }
+  nav button { flex:1 1 140px; min-height:52px;   /* 2x2 on a phone, one row on a laptop */ padding:0 16px; font-size:14px; font-weight:600;
+               letter-spacing:.08em; text-transform:uppercase; color:var(--dim);
+               background:none; border:0; border-bottom:2px solid transparent;
+               cursor:pointer; transition:color 150ms; }
+  nav button.on { color:var(--fg); border-bottom-color:var(--fg); }
+
+  main { padding:22px 12px 48px; }
   section { display:none; }
   section.on { display:block; }
-  h2 { margin:8px 0 12px; font-size:22px; }
-  .btn { min-height:52px; padding:0 18px; font-size:17px; font-weight:600; color:var(--fg);
-         background:var(--panel); border:2px solid var(--line); border-radius:8px; cursor:pointer; }
-  .btn.go { background:#1d7a3c; border-color:#1d7a3c; }
-  .btn.halt { background:#8c2b2b; border-color:#8c2b2b; }
-  .bar { height:26px; background:var(--panel); border:2px solid var(--line); border-radius:6px;
-         overflow:hidden; margin:12px 0; }
-  .bar > div { height:100%; background:var(--accent); }
-  .cam { display:flex; flex-wrap:wrap; align-items:center; gap:10px; padding:12px;
-         margin-bottom:10px; background:var(--panel); border:2px solid var(--line); border-radius:8px; }
-  .cam .name { flex:1 1 100px; font-weight:600; font-size:19px; }
-  .cam .num { color:var(--dim); font-variant-numeric:tabular-nums; }
-  .cam .btn { margin-left:auto; }
-  .badge { padding:4px 10px; border-radius:6px; font-size:14px; font-weight:700; color:#000; }
-  .RECORDING { background:#3ddc7f; }
-  .RECONNECTING { background:var(--accent); }
-  .STOPPED { background:#6b7683; color:var(--fg); }
-  .rowbtns { display:flex; gap:10px; flex-wrap:wrap; }
+  h2 { margin:0 0 16px; font:600 11px/1 var(--mono); letter-spacing:.18em;
+       text-transform:uppercase; color:var(--dim); }
+  h2:empty { display:none; }
+
+  .btn { min-height:48px; padding:0 18px; font-size:15px; font-weight:600; color:var(--fg);
+         background:none; border:1px solid var(--line); border-radius:4px; cursor:pointer;
+         transition:background 150ms, border-color 150ms; }
+  .btn:hover:not(:disabled) { background:rgba(255,255,255,.06); }
+  .btn:disabled { opacity:.4; cursor:not-allowed; }
+  .btn.go { background:var(--fg); border-color:var(--fg); color:var(--bg); }
+  .btn.go:hover:not(:disabled) { background:#fff; }
+  .btn.halt { border-color:var(--bad); color:var(--bad); }
+  .btn.halt:hover:not(:disabled) { background:rgba(194,84,84,.12); }
+  .btn:focus-visible, nav button:focus-visible, summary:focus-visible {
+    outline:2px solid var(--fg); outline-offset:2px; }
+  .rowbtns { display:flex; gap:10px; flex-wrap:wrap; margin-bottom:10px; }
   .rowbtns .btn { flex:1; }
-  input, select { min-height:48px; padding:0 10px; font-size:17px; color:var(--fg);
-                  background:#0b0d10; border:2px solid var(--line); border-radius:8px; }
+
+  .bar { height:4px; background:rgba(255,255,255,.10); border-radius:2px;
+         overflow:hidden; margin:14px 0 6px; }
+  .bar > div { height:100%; background:var(--fg); }
+
+  .cam, .dev { background:var(--panel); border:1px solid var(--line); border-radius:4px;
+               padding:16px; margin-bottom:10px; }
+  .cam { display:flex; flex-wrap:wrap; align-items:center; gap:12px; }
+  .cam .name { flex:1 1 100px; font-size:16px; font-weight:600; }
+  .num { color:var(--dim); font-size:14px; }
+  .cam .btn { margin-left:auto; }
+  .dev .head { display:flex; flex-wrap:wrap; align-items:center; gap:10px 16px; margin-bottom:14px; }
+  .dev .ip { font-size:17px; font-weight:600; }
+  .dev .meta { color:var(--dim); font-size:13px; }
+
+  /* State = a coloured dot beside neutral text. No filled pills anywhere. */
+  .state { display:inline-flex; align-items:center; gap:7px; color:var(--fg);
+           font:600 12px/1 var(--mono); letter-spacing:.06em; text-transform:uppercase; }
+  .state::before { content:''; width:8px; height:8px; border-radius:50%;
+                   background:var(--dot); flex:none; }
+  .s-ok { --dot:var(--ok); }
+  .s-bad { --dot:var(--bad); }
+  .s-warn { --dot:var(--warn); }
+  .s-idle { --dot:var(--dim); }
+
+  .acts { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-bottom:8px; }
+  .acts .btn { flex:1 1 120px; }
+  input, select, textarea { min-height:48px; padding:0 12px; font-size:15px; color:var(--fg);
+                            background:transparent; border:1px solid var(--line); border-radius:4px; }
+  input:focus, select:focus, textarea:focus { outline:none; border-color:var(--fg); }
   input { flex:1 1 140px; min-width:0; }
-  .dev { padding:12px; margin-bottom:10px; background:var(--panel);
-         border:2px solid var(--line); border-radius:8px; }
-  .dev .head { display:flex; flex-wrap:wrap; align-items:center; gap:8px 14px; margin-bottom:10px; }
-  .dev .ip { font-size:20px; font-weight:700; }
-  .dev .meta { color:var(--dim); font-size:15px; }
-  .acts { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
-  .acts .btn { min-height:48px; flex:1 1 120px; }
-  .res { margin-top:8px; font-size:15px; color:var(--dim); word-break:break-word; }
-  .res.bad { color:#ff8a8a; }
-  .res.good { color:#3ddc7f; }
-  .YES { background:#3ddc7f; }
-  .NO { background:#ff6b6b; }
-  .UNK { background:#6b7683; color:var(--fg); }
-  .VERIFIED { background:#3ddc7f; }
-  .ATTENTION { background:#ff6b6b; }
-  .RUNNING { background:var(--accent); }
-  #nvrlog { height:260px; overflow:auto; margin:12px 0; padding:10px; background:#000;
-            border:2px solid var(--line); border-radius:8px; white-space:pre-wrap;
-            font:14px/1.35 ui-monospace, Menlo, Consolas, monospace; color:#c8f7c8; }
-  #cfgtext { width:100%; min-height:320px; padding:10px; background:#000; color:var(--fg);
-             border:2px solid var(--line); border-radius:8px;
-             font:14px/1.4 ui-monospace, Menlo, Consolas, monospace; }
-  summary { cursor:pointer; padding:14px 0; font-size:18px; font-weight:600; }
-  input[type=checkbox] { width:26px; height:26px; }
+  input[type=checkbox] { width:22px; height:22px; min-height:0; flex:none; accent-color:var(--fg); }
+
+  .res { margin-top:8px; font-size:14px; color:var(--dim); word-break:break-word; }
+  .res.bad { color:var(--bad); }
+  .res.good { color:var(--ok); }
+
+  #nvrlog { height:260px; overflow:auto; margin:14px 0; padding:12px; background:#0b0e10;
+            border:1px solid var(--line); border-radius:4px; white-space:pre-wrap;
+            font:13px/1.5 var(--mono); color:var(--dim); }
+  #cfgtext { width:100%; min-height:320px; padding:12px; background:#0b0e10; color:var(--fg);
+             border:1px solid var(--line); border-radius:4px; font:13px/1.5 var(--mono); }
+  summary { cursor:pointer; padding:16px 0; font:600 11px/1 var(--mono); letter-spacing:.18em;
+            text-transform:uppercase; color:var(--dim); }
+  summary:hover { color:var(--fg); }
+
   #grid { display:grid; gap:10px; grid-template-columns:repeat(auto-fit, minmax(300px, 1fr)); }
-  .tile { background:var(--panel); border:2px solid var(--line); border-radius:8px; overflow:hidden; }
-  .tile .cap { padding:8px 10px; font-weight:600; }
+  .tile { background:var(--panel); border:1px solid var(--line); border-radius:4px; overflow:hidden; }
+  .tile .cap { padding:10px 12px; font-size:13px; color:var(--dim); }
   .tile img, .tile iframe { display:block; width:100%; aspect-ratio:16/9; border:0; background:#000; }
-  .toggle .btn.on { background:var(--accent); border-color:var(--accent); color:#000; }
-  #preview img { width:100%; max-width:640px; border:2px solid var(--line); border-radius:8px;
+  .toggle .btn.on { background:rgba(255,255,255,.10); border-color:var(--fg); }
+  #preview img { width:100%; max-width:640px; border:1px solid var(--line); border-radius:4px;
                  background:#000; display:block; margin-top:10px; }
+
+  @media (prefers-reduced-motion: reduce) { * { transition:none !important; } }
 </style>
 </head>
 <body>
 
 <div id="status">
-  <span>host <b id="s-host">…</b></span>
-  <span>ip <b id="s-ips">…</b></span>
-  <span>free <b id="s-disk">…</b></span>
-  <span>live <b id="s-live">…</b></span>
-  <span><b id="s-time">…</b></span>
+  <span class="cell"><i>host</i><b id="s-host">…</b></span>
+  <span class="cell"><i>bound ip</i><b id="s-ips">…</b></span>
+  <span class="cell"><i>disk free</i><b id="s-disk">…</b></span>
+  <span class="cell"><i>go2rtc</i><b id="s-live">…</b></span>
+  <span class="cell"><i>clock</i><b id="s-time">…</b></span>
 </div>
 
 <nav>
@@ -94,7 +137,7 @@
 
 <main>
   <section id="cameras" class="on">
-    <h2>Cameras</h2>
+    <h2 id="cnt-cameras"></h2>
     <div class="rowbtns"><button class="btn go" id="scan">Scan LAN</button></div>
     <div id="scaninfo" class="res"></div>
     <div id="preview" hidden>
@@ -108,7 +151,7 @@
     <div id="camlist"></div>
   </section>
   <section id="record">
-    <h2>Record</h2>
+    <h2 id="cnt-record"></h2>
     <div class="rowbtns">
       <button class="btn go" id="start-all">Start All</button>
       <button class="btn halt" id="stop-all">Stop All</button>
@@ -118,7 +161,7 @@
     <div id="reclist"></div>
   </section>
   <section id="nvr">
-    <h2>NVR Pull</h2>
+    <h2 id="cnt-nvr"></h2>
     <div class="acts">
       <input type="date" id="nvr-date">
       <input type="time" id="nvr-start" value="05:00">
@@ -126,7 +169,7 @@
     </div>
     <div class="rowbtns">
       <button class="btn go" id="pull-sel">Pull Selected</button>
-      <button class="btn go" id="pull-all">Pull All</button>
+      <button class="btn" id="pull-all">Pull All</button>
       <button class="btn" id="pull-dry">Dry Run</button>
     </div>
     <div id="nvrinfo" class="res"></div>
@@ -140,7 +183,7 @@
     </details>
   </section>
   <section id="monitor">
-    <h2>Monitor</h2>
+    <h2 id="cnt-monitor"></h2>
     <div class="rowbtns toggle">
       <button class="btn on" id="m-snap">Snapshots</button>
       <button class="btn" id="m-live">Live</button>
@@ -184,6 +227,17 @@ setInterval(refreshStatus, 5000);
 // --- Record tab ---
 const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 
+// Colour is state, never decoration: each label maps to one dot colour.
+const STATE_KIND = {
+  RECORDING:'ok', VERIFIED:'ok', ACTIVE:'ok', UP:'ok', 'ISAPI OK':'ok',
+  RECONNECTING:'warn', RUNNING:'warn',
+  ATTENTION:'bad', INACTIVE:'bad', DOWN:'bad', 'NO ISAPI':'bad',
+};
+const chip = label => `<span class="state s-${STATE_KIND[label] || 'idle'}">${esc(label)}</span>`;
+// The tab bar already names the section, so the eyebrow carries only the count.
+const setCount = (id, n, word) =>
+  document.getElementById('cnt-' + id).textContent = n ? `${n} ${word}` : '';
+
 async function post(url, body) {
   const r = await fetch(url, {method: 'POST', headers: {'Content-Type': 'application/json'},
                               body: JSON.stringify(body)});
@@ -209,17 +263,18 @@ async function recPoll() {
   document.getElementById('diskinfo').textContent =
     `${s.disk_free_gb} GB free of ${s.disk_total_gb} GB`;
   const cams = Object.entries(s.cameras);
+  setCount('record', cams.length, 'configured');
   document.getElementById('reclist').innerHTML = cams.length === 0
-    ? '<p class="num">No cameras in config.yaml.</p>'
+    ? '<p class="res">No cameras in config.yaml.</p>'
     : cams.map(([n, c]) => {
         const act = c.state === 'STOPPED' ? 'start' : 'stop';
         return `<div class="cam">
           <span class="name">${esc(n)}</span>
-          <span class="badge ${c.state}">${c.state}</span>
+          ${chip(c.state)}
           <span class="num">${c.minutes} min</span>
           <span class="num">${(c.bytes / 1e6).toFixed(1)} MB</span>
           ${c.restarts ? `<span class="num">${c.restarts} restarts</span>` : ''}
-          <button class="btn ${act === 'start' ? 'go' : 'halt'}"
+          <button class="btn${act === 'stop' ? ' halt' : ''}"
                   data-cam="${esc(n)}" data-act="${act}">${act === 'start' ? 'Start' : 'Stop'}</button>
         </div>`;
       }).join('');
@@ -236,6 +291,7 @@ document.getElementById('scan').onclick = async () => {
   try {
     const r = await post('/api/camera/scan', {});
     devs = r.cameras || [];
+    setCount('cameras', devs.length, 'found');
     info.textContent = `${devs.length} device(s) on ${(r.cidrs || []).join(', ')}`;
     renderDevs();
   } catch (err) {
@@ -245,10 +301,7 @@ document.getElementById('scan').onclick = async () => {
 };
 
 // null/undefined = the sweep 401'd, which proves nothing about activation.
-function actBadge(a) {
-  if (a == null) return '<span class="badge UNK">ACT ?</span>';
-  return a ? '<span class="badge YES">ACTIVE</span>' : '<span class="badge NO">INACTIVE</span>';
-}
+const actBadge = a => chip(a == null ? 'ACT ?' : a ? 'ACTIVE' : 'INACTIVE');
 
 function renderDevs() {
   document.getElementById('camlist').innerHTML = devs.length === 0
@@ -257,7 +310,7 @@ function renderDevs() {
         <div class="head">
           <span class="ip">${esc(d.ip)}</span>
           ${actBadge(d.activated)}
-          <span class="badge ${d.reachable ? 'YES' : 'NO'}">${d.reachable ? 'ISAPI OK' : 'NO ISAPI'}</span>
+          ${chip(d.reachable ? 'ISAPI OK' : 'NO ISAPI')}
           <span class="meta">${esc(d.model || 'unknown model')} · ${esc(d.mac || 'mac ?')} · ${esc(d.source)}${
             d.note ? ' · ' + esc(d.note) : ''}</span>
         </div>
@@ -368,14 +421,14 @@ async function nvrPoll() {
   const list = r.nvrs || [];
   const names = new Set(list.map(n => n.name));      // drop ghosts after a config rename
   [...sel].forEach(s => names.has(s) || sel.delete(s));
-  document.getElementById('nvrinfo').textContent =
-    list.length ? `${list.length} NVR(s) configured` : 'No NVRs in config.yaml.';
+  setCount('nvr', list.length, 'configured');
+  if (!list.length) document.getElementById('nvrinfo').textContent = 'No NVRs in config.yaml.';
   document.getElementById('nvrlist').innerHTML = list.map(n => `<div class="dev">
       <div class="head">
         <label class="ip"><input type="checkbox" data-site="${esc(n.name)}"${
           sel.has(n.name) ? ' checked' : ''}> ${esc(n.name)}</label>
-        <span class="badge ${n.reachable ? 'YES' : 'NO'}">${n.reachable ? 'UP' : 'DOWN'}</span>
-        ${n.state ? `<span class="badge ${n.state}">${n.state}</span>` : ''}
+        ${chip(n.reachable ? 'UP' : 'DOWN')}
+        ${n.state ? chip(n.state) : ''}
         <span class="meta">${esc(n.host)} · ${n.channels} ch${n.verified ? ' · .verified' : ''}</span>
         ${n.manifest ? `<a class="meta" target="_blank" href="/api/nvr/manifest?site=${
           encodeURIComponent(n.name)}&date=${encodeURIComponent(r.date)}">manifest.json</a>` : ''}
@@ -459,6 +512,7 @@ function syncLiveToggle() {
 
 async function monRender() {
   if (!monCams) monCams = await (await fetch('/api/cameras')).json();
+  setCount('monitor', monCams.length, 'configured');
   const host = location.hostname;
   document.getElementById('grid').innerHTML = monCams.length === 0
     ? '<p class="res">No cameras in config.yaml.</p>'
