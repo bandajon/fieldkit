@@ -2,3 +2,5 @@ __pycache__/
 *.pyc
 recordings/
 ingest/
+# generated from config.yaml; contains camera passwords
+go2rtc.yaml

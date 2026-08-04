@@ -66,6 +66,11 @@
              font:14px/1.4 ui-monospace, Menlo, Consolas, monospace; }
   summary { cursor:pointer; padding:14px 0; font-size:18px; font-weight:600; }
   input[type=checkbox] { width:26px; height:26px; }
+  #grid { display:grid; gap:10px; grid-template-columns:repeat(auto-fit, minmax(300px, 1fr)); }
+  .tile { background:var(--panel); border:2px solid var(--line); border-radius:8px; overflow:hidden; }
+  .tile .cap { padding:8px 10px; font-weight:600; }
+  .tile img, .tile iframe { display:block; width:100%; aspect-ratio:16/9; border:0; background:#000; }
+  .toggle .btn.on { background:var(--accent); border-color:var(--accent); color:#000; }
   #preview img { width:100%; max-width:640px; border:2px solid var(--line); border-radius:8px;
                  background:#000; display:block; margin-top:10px; }
 </style>
@@ -76,6 +81,7 @@
   <span>host <b id="s-host">…</b></span>
   <span>ip <b id="s-ips">…</b></span>
   <span>free <b id="s-disk">…</b></span>
+  <span>live <b id="s-live">…</b></span>
   <span><b id="s-time">…</b></span>
 </div>
 
@@ -133,18 +139,28 @@
       <div id="cfgres" class="res">Camera and NVR list changes need an app restart to take effect.</div>
     </details>
   </section>
-  <section id="monitor"><h2>Monitor</h2></section>
+  <section id="monitor">
+    <h2>Monitor</h2>
+    <div class="rowbtns toggle">
+      <button class="btn on" id="m-snap">Snapshots</button>
+      <button class="btn" id="m-live">Live</button>
+    </div>
+    <div id="m-note" class="res"></div>
+    <div id="grid"></div>
+  </section>
 </main>
 
 <script>
 let tab = 'cameras';
 let myNet = '192.168.1';   // /24 the Set IP suggestions live in; refreshed from /api/status
+let go2rtc = 'absent';
 document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
   tab = b.dataset.tab;
   document.querySelectorAll('nav button').forEach(x => x.classList.toggle('on', x === b));
   document.querySelectorAll('section').forEach(s => s.classList.toggle('on', s.id === tab));
   if (tab === 'record') recPoll();
   if (tab === 'nvr') nvrPoll();
+  if (tab === 'monitor') monRender();
 });
 
 async function refreshStatus() {
@@ -155,6 +171,9 @@ async function refreshStatus() {
     if (s.ips[0]) myNet = s.ips[0].split('.').slice(0, 3).join('.');
     document.getElementById('s-disk').textContent = s.disk_free_gb + ' GB';
     document.getElementById('s-time').textContent = s.time.replace('T', ' ');
+    go2rtc = (s.go2rtc || {}).state || 'absent';
+    document.getElementById('s-live').textContent = go2rtc;
+    syncLiveToggle();
   } catch (e) {
     document.getElementById('s-time').textContent = 'server unreachable';
   }
@@ -408,6 +427,67 @@ document.getElementById('cfgsave').onclick = async () => {
 };
 
 setInterval(() => { if (tab === 'nvr' && !document.hidden) nvrPoll(); }, 5000);
+
+// --- Monitor tab ---
+let monCams = null, monMode = 'snapshots';
+const LIVE_NOTE = 'Live is the 640×360 sub-stream for aiming, not evidence quality. ' +
+                  'Recording quality is unaffected.';
+
+function syncLiveToggle() {
+  const b = document.getElementById('m-live');
+  if (!b) return;
+  b.disabled = go2rtc !== 'running';
+  if (monMode === 'live' && go2rtc !== 'running') setMode('snapshots');   // sidecar died
+  const note = document.getElementById('m-note');
+  if (monMode === 'live') note.textContent = LIVE_NOTE;
+  else if (go2rtc === 'running') note.textContent = 'Live video available.';
+  else if (go2rtc === 'absent') note.textContent =
+    'Live needs go2rtc: download the binary for this platform and set go2rtc_binary in config.yaml.';
+  else note.textContent = `go2rtc is ${go2rtc} — snapshots only until it is running.`;
+}
+
+async function monRender() {
+  if (!monCams) monCams = await (await fetch('/api/cameras')).json();
+  const host = location.hostname;
+  document.getElementById('grid').innerHTML = monCams.length === 0
+    ? '<p class="res">No cameras in config.yaml.</p>'
+    : monCams.map(c => `<div class="tile" data-name="${esc(c.name)}" data-ip="${esc(c.ip)}">
+        <div class="cap">${esc(c.name)} · ${esc(c.ip)}</div>
+        ${monMode === 'live'
+          ? `<iframe src="http://${esc(host)}:1984/stream.html?src=${encodeURIComponent(c.name)}"
+                     allow="autoplay; fullscreen" onerror="tileFallback('${esc(c.name)}')"></iframe>`
+          : '<img alt="">'}
+      </div>`).join('');
+  if (monMode === 'snapshots') monTick();
+}
+
+// A stream that will not play drops that tile back to snapshots; the rest keep running.
+function tileFallback(name) {
+  const t = document.querySelector(`.tile[data-name="${CSS.escape(name)}"]`);
+  if (!t || !t.querySelector('iframe')) return;
+  t.querySelector('iframe').outerHTML = '<img alt="">';
+  t.querySelector('img').src = snapUrl(t.dataset.ip);
+}
+
+function monTick() {
+  if (tab !== 'monitor' || document.hidden || monMode !== 'snapshots') return;
+  document.querySelectorAll('#grid .tile').forEach(t => {
+    const img = t.querySelector('img');
+    if (img) img.src = snapUrl(t.dataset.ip);
+  });
+}
+
+function setMode(mode) {
+  monMode = mode;
+  document.getElementById('m-snap').classList.toggle('on', mode === 'snapshots');
+  document.getElementById('m-live').classList.toggle('on', mode === 'live');
+  monRender();
+  syncLiveToggle();
+}
+document.getElementById('m-snap').onclick = () => setMode('snapshots');
+document.getElementById('m-live').onclick = () => setMode('live');
+
+setInterval(monTick, 1000);   // 1 fps, and monTick no-ops when the tab is hidden
 </script>
 </body>
 </html>

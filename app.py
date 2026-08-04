@@ -3,6 +3,7 @@
 
 import ipaddress
 import json
+import os
 import queue
 import shutil
 import socket
@@ -18,6 +19,7 @@ from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 import camera
+import live
 import nvr_pull
 import recorder
 
@@ -59,6 +61,8 @@ def record_dir():
 
 load_config()
 REC = recorder.Recorder(CONFIG.get("cameras", []), record_dir(), CONFIG.get("site", "site1"))
+LIVE = live.Live(CONFIG.get("cameras", []), CONFIG.get("go2rtc_binary", ""), ROOT / "go2rtc.yaml")
+LIVE.start()   # no-op unless a binary is configured and present
 
 app = FastAPI(title="FieldKit")
 app.mount("/static", StaticFiles(directory=ROOT / "static"), name="static")
@@ -76,7 +80,23 @@ def status():
         "ips": local_ips(),
         "disk_free_gb": round(shutil.disk_usage(record_dir()).free / 1e9, 1),
         "time": datetime.now().isoformat(timespec="seconds"),
+        "go2rtc": LIVE.info(),
     }
+
+
+@app.get("/api/cameras")
+def cameras_list():
+    return [{"name": c["name"], "ip": c["ip"]} for c in CONFIG.get("cameras", [])]
+
+
+@app.post("/api/live/start")
+def live_start():
+    return {"state": LIVE.start()}
+
+
+@app.post("/api/live/stop")
+def live_stop():
+    return {"state": LIVE.stop()}
 
 
 @app.get("/api/record/status")
@@ -315,4 +335,4 @@ def config_post(body: dict = Body(default={})):
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
