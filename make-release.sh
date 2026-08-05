@@ -27,9 +27,10 @@ FieldKit offline install
    - Ubuntu/Jetson: sudo apt install python3 python3-pip ffmpeg
 2. Unzip this folder anywhere.
 3. Install dependencies from the bundled wheels (pick your platform):
-   - Windows laptop:   EASIEST: powershell -ExecutionPolicy Bypass -File setup-windows.ps1
-                       (installs deps, opens firewall ports, joins the camera network,
-                       starts the app - all in one). Manual alternative:
+   - Windows laptop:   EASIEST: double-click setup-windows.bat (accept the admin
+                       prompt). It unblocks the files, installs deps, opens the
+                       firewall, joins the camera network, and starts the app.
+                       Manual alternative:
                        pip install --no-index --find-links wheels/win_amd64 -r requirements.txt
    - Ubuntu mini-PC:   pip3 install --no-index --find-links wheels/manylinux2014_x86_64 -r requirements.txt
    - Jetson Orin Nano: pip3 install --no-index --find-links wheels/manylinux2014_aarch64 -r requirements.txt
