@@ -9,6 +9,7 @@ import subprocess
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from urllib.parse import quote
 from xml.sax.saxutils import escape
 
@@ -33,6 +34,10 @@ IFACE_BODY = """<?xml version="1.0" encoding="UTF-8"?>
     <DefaultGateway><ipAddress>{gateway}</ipAddress></DefaultGateway>
   </IPAddress>
 </NetworkInterface>"""
+
+TIME_BODY = ('<Time xmlns="http://www.hikvision.com/ver20/XMLSchema">'
+             '<timeMode>manual</timeMode><localTime>{local}</localTime>'
+             '<timeZone>{tz}</timeZone></Time>')
 
 
 def _tag(xml, name):
@@ -230,6 +235,33 @@ def set_static_ip(ip, user, password, address, mask="255.255.255.0", gateway="",
     return out
 
 
+def hik_tz(offset_minutes):
+    """UTC offset → Hikvision tz string. The sign is INVERTED: UTC+2 is CST-2:00:00."""
+    h, m = divmod(abs(offset_minutes), 60)
+    return f"CST{'-' if offset_minutes >= 0 else '+'}{h}:{m:02d}:00"
+
+
+def set_time(ip, user, password, timeout=10):
+    """Put the camera on this host's local time. Factory units ship on China time."""
+    now = datetime.now().astimezone()
+    tz = hik_tz(round(now.utcoffset().total_seconds() / 60))
+    url = f"http://{ip}/ISAPI/System/time"
+    auth = HTTPDigestAuth(user, password)
+    try:
+        r = requests.put(url, data=TIME_BODY.format(local=now.isoformat(timespec="seconds"), tz=tz),
+                         auth=auth, headers={"Content-Type": "application/xml"}, timeout=timeout)
+    except requests.RequestException as e:
+        return {"ok": False, "error": str(e)}
+    if r.status_code != 200:
+        return {"ok": False, "status": r.status_code, "response": r.text[:300]}
+    try:
+        # Read back rather than trust the 200 — firmware that ignores a field still says OK.
+        got = _tag(requests.get(url, auth=auth, timeout=timeout).text, "localTime")
+    except requests.RequestException:
+        got = ""
+    return {"ok": True, "camera_time": got, "tz": tz}
+
+
 def test_rtsp(ip, user, password, timeout=8):
     """Server-side ffprobe of the main stream. Never probes /102."""
     url = (f"rtsp://{quote(user, safe='')}:{quote(password, safe='')}"
@@ -316,4 +348,26 @@ if __name__ == "__main__":
                        "model": "DS-2CD2143G0-I", "reachable": True, "source": "sweep"})
     assert len(rows) == 1 and rows[0]["activated"] is True, rows
     print("merge, sweep 200 :", {k: rows[0][k] for k in ("ip", "mac", "model", "activated")})
+
+    assert hik_tz(120) == "CST-2:00:00"      # Zambia/CAT
+    assert hik_tz(-300) == "CST+5:00:00"
+    assert hik_tz(330) == "CST-5:30:00"
+    assert hik_tz(0) == "CST-0:00:00"
+
+    sent = {}
+    fake_time = type("R", (), {"status_code": 200,
+                               "text": "<localTime>2026-08-05T14:26:20+02:00</localTime>"})()
+
+    def fake_put(url, data=None, **kw):
+        sent.update(url=url, data=data)
+        return fake_time
+
+    with patch.object(requests, "put", fake_put), patch.object(requests, "get", return_value=fake_time):
+        t = set_time("192.168.1.64", "admin", "pw")
+    assert t["ok"] and t["camera_time"].startswith("2026-08-05"), t
+    assert sent["url"].endswith("/ISAPI/System/time"), sent
+    assert "<timeMode>manual</timeMode>" in sent["data"], sent
+    host_tz = hik_tz(round(datetime.now().astimezone().utcoffset().total_seconds() / 60))
+    assert f"<timeZone>{host_tz}</timeZone>" in sent["data"], sent
+    print("set_time         :", t)
     print("camera self-check ok:", d)
