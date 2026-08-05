@@ -350,6 +350,9 @@ async function addCamera(name, ip) {
 // null/undefined = the sweep 401'd, which proves nothing about activation.
 const actBadge = a => chip(a == null ? 'ACT ?' : a ? 'ACTIVE' : 'INACTIVE');
 
+// A failed auto clock-sync must be said out loud, or the camera stays on China time.
+const tsNote = ts => !ts ? '' : ts.ok ? ` · clock set (${ts.tz})` : ' · clock NOT set — use Sync time';
+
 function renderDevs() {
   document.getElementById('camlist').innerHTML = devs.length === 0
     ? '<p class="res">Nothing found. Cameras must be on this LAN and powered.</p>'
@@ -418,7 +421,8 @@ document.getElementById('camlist').addEventListener('click', async e => {
       if (!pw) show('enter a password first', 'bad');
       else {
         const r = await post('/api/camera/activate', {ip, password: pw});
-        show(r.ok ? 'activated' : (r.error || r.detail || 'failed'), r.ok ? 'good' : 'bad');
+        show(r.ok ? 'activated' + tsNote(r.time_sync) : (r.error || r.detail || 'failed'),
+             r.ok ? 'good' : 'bad');
       }
     } else if (b.dataset.act === 'login') {
       const pw = card.querySelector('[data-role="pw"]').value;
@@ -430,7 +434,7 @@ document.getElementById('camlist').addEventListener('click', async e => {
           const d = devs.find(x => x.ip === ip);      // fill in what auth unlocked
           if (d) Object.assign(d, {model: r.model || d.model, mac: r.mac || d.mac,
                                    note: 'logged in'});
-          show('logged in — credentials remembered for this camera', 'good');
+          show('logged in — credentials remembered for this camera' + tsNote(r.time_sync), 'good');
           card.querySelector('.meta').textContent =
             `${r.model || 'unknown model'} · ${r.mac || 'mac ?'} · logged in`;
         } else show(r.detail || 'log in failed', 'bad');
