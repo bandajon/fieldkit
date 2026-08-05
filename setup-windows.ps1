@@ -28,10 +28,19 @@ Write-Host "[ok] firewall rules for ports 8080/tcp and 37020/udp"
 
 # 3) Camera-network address: field switches have no DHCP, so the wired adapter
 #    self-assigns 169.254.x — that adapter gets 192.168.1.2 added.
-$have = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-        Where-Object { $_.IPAddress -like "192.168.1.*" }
+# "Already done" means a camera address on a WIRED adapter. An earlier run of this
+# script could have parked one on Wi-Fi; that reaches no cameras, so clean it up.
+$cam = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+       Where-Object { $_.IPAddress -like "192.168.1.*" }
+$onWifi = $cam | Where-Object { (Get-NetAdapter -InterfaceIndex $_.InterfaceIndex
+                                 -ErrorAction SilentlyContinue).InterfaceDescription -match "Wireless|Wi-?Fi|802\.11" }
+foreach ($bad in $onWifi) {
+  Remove-NetIPAddress -IPAddress $bad.IPAddress -InterfaceIndex $bad.InterfaceIndex -Confirm:$false -ErrorAction SilentlyContinue
+  Write-Host "[--] removed $($bad.IPAddress) from wireless '$($bad.InterfaceAlias)' - cameras are on the cable"
+}
+$have = $cam | Where-Object { $_.InterfaceIndex -notin ($onWifi | ForEach-Object InterfaceIndex) }
 if ($have) {
-  Write-Host "[ok] already on the camera network as $($have[0].IPAddress)"
+  Write-Host "[ok] already on the camera network as $($have[0].IPAddress) on '$($have[0].InterfaceAlias)'"
 } else {
   # WIRED adapters only: an idle Wi-Fi radio also self-assigns 169.254, and putting
   # the camera address on a radio that isn't on the switch reaches nothing.
