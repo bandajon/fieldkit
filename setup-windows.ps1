@@ -32,8 +32,7 @@ Write-Host "[ok] firewall rules for ports 8080/tcp and 37020/udp"
 # script could have parked one on Wi-Fi; that reaches no cameras, so clean it up.
 $cam = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
        Where-Object { $_.IPAddress -like "192.168.1.*" }
-$onWifi = $cam | Where-Object { (Get-NetAdapter -InterfaceIndex $_.InterfaceIndex
-                                 -ErrorAction SilentlyContinue).InterfaceDescription -match "Wireless|Wi-?Fi|802\.11" }
+$onWifi = $cam | Where-Object { (Get-NetAdapter -InterfaceIndex $_.InterfaceIndex -ErrorAction SilentlyContinue).InterfaceDescription -match "Wireless|Wi-?Fi|802\.11" }
 foreach ($bad in $onWifi) {
   Remove-NetIPAddress -IPAddress $bad.IPAddress -InterfaceIndex $bad.InterfaceIndex -Confirm:$false -ErrorAction SilentlyContinue
   Write-Host "[--] removed $($bad.IPAddress) from wireless '$($bad.InterfaceAlias)' - cameras are on the cable"
