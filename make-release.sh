@@ -27,6 +27,13 @@ wheelset win_amd64            3.12 3.13 3.14
 wheelset manylinux2014_x86_64 3.10 3.11 3.12
 wheelset manylinux2014_aarch64 3.10 3.12
 
+# pip evaluates environment markers on THIS machine (macOS), so deps guarded by
+# platform_system == "Windows" never download for the win target. Add them by hand.
+# Known: click -> colorama. Re-check when requirements change:
+#   pip download --dry-run on a real Windows box, or grep Requires-Dist metadata.
+pip download colorama -d "$OUT/wheels/win_amd64" \
+  --platform win_amd64 --only-binary=:all: --python-version 3.12 -q
+
 cat > "$OUT/INSTALL.txt" <<'EOF'
 FieldKit offline install
 ========================
