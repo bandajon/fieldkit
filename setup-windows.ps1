@@ -33,8 +33,15 @@ $have = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
 if ($have) {
   Write-Host "[ok] already on the camera network as $($have[0].IPAddress)"
 } else {
-  $ll = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+  # WIRED adapters only: an idle Wi-Fi radio also self-assigns 169.254, and putting
+  # the camera address on a radio that isn't on the switch reaches nothing.
+  $wired = Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Object {
+    $_.Status -eq "Up" -and $_.InterfaceDescription -notmatch "Wireless|Wi-?Fi|802\.11" }
+  $ll = $wired | ForEach-Object {
+          Get-NetIPAddress -AddressFamily IPv4 -InterfaceIndex $_.ifIndex -ErrorAction SilentlyContinue } |
         Where-Object { $_.IPAddress -like "169.254.*" } | Select-Object -First 1
+  # No self-assigned wired address? Still prefer a connected wired adapter over Wi-Fi.
+  if (-not $ll -and $wired) { $ll = [pscustomobject]@{ InterfaceAlias = $wired[0].Name } }
   if ($ll) {
     try {
       New-NetIPAddress -InterfaceAlias $ll.InterfaceAlias -IPAddress 192.168.1.2 -PrefixLength 24 -ErrorAction Stop | Out-Null
@@ -44,7 +51,8 @@ if ($have) {
       Write-Host "[ok] added 192.168.1.2 on '$($ll.InterfaceAlias)' (netsh)"
     }
   } else {
-    Write-Host "[!!] no adapter has a 169.254.x address - is the Ethernet cable plugged into the camera switch?" -ForegroundColor Yellow
+    Write-Host "[!!] no connected wired adapter found - is the Ethernet cable (or USB dongle)" -ForegroundColor Yellow
+    Write-Host "     plugged into the camera switch? Check with: Get-NetAdapter" -ForegroundColor Yellow
     Write-Host "     Plug it in, wait 30 seconds, and rerun this script." -ForegroundColor Yellow
   }
 }
