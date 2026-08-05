@@ -58,8 +58,8 @@ if (-not $pyExe) {
         "'Add python.exe to PATH' and 'Install for all users' - then rerun setup. (user: $env:USERNAME)")
 }
 $pyVer = & $pyExe -c "import sys;print('%d.%d' % sys.version_info[:2])"
-if ($pyVer -ne '3.12') {
-  Fail "Python $pyVer found, but the offline bundle's wheels need Python 3.12. Install 3.12 from python.org, then rerun setup."
+if ($pyVer -notin '3.12', '3.13', '3.14') {
+  Fail "Python $pyVer found, but the offline bundle carries wheels for Python 3.12-3.14 only. Install one of those from python.org, then rerun setup."
 }
 
 # venv: immune to user-site/admin-account mixups, works for whichever account runs the app.

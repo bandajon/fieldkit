@@ -1,7 +1,9 @@
 #!/bin/sh
 # Build a self-contained installer zip: source + offline wheels for every
-# target platform. Share the zip; field machines need no GitHub, no internet.
-# Targets assume Python 3.12 on the field machine (see INSTALL.txt).
+# target platform AND every Python a field machine plausibly has (only
+# pydantic-core/PyYAML are version-locked; the rest are shared pure wheels).
+# Windows: 3.12-3.14 (python.org installers). Ubuntu 22.04/Jetson: 3.10;
+# 24.04: 3.12.
 set -e
 cd "$(dirname "$0")"
 V=$(date +%Y%m%d)
@@ -14,19 +16,25 @@ git archive HEAD | tar -x -C "$OUT"          # tracked files only — never the 
 # can never reach the zip via git archive.
 cp "$OUT/config.example.yaml" "$OUT/config.yaml"
 
-for P in win_amd64 manylinux2014_x86_64 manylinux2014_aarch64; do
-  pip download -r requirements.txt -d "$OUT/wheels/$P" \
-    --platform "$P" --only-binary=:all: --python-version 3.12 -q
-done
+wheelset() {  # platform, python versions...
+  P=$1; shift
+  for PYV in "$@"; do
+    pip download -r requirements.txt -d "$OUT/wheels/$P" \
+      --platform "$P" --only-binary=:all: --python-version "$PYV" -q
+  done
+}
+wheelset win_amd64            3.12 3.13 3.14
+wheelset manylinux2014_x86_64 3.10 3.11 3.12
+wheelset manylinux2014_aarch64 3.10 3.12
 
 cat > "$OUT/INSTALL.txt" <<'EOF'
 FieldKit offline install
 ========================
 
 WINDOWS - the whole install, in order (each prompt named):
-  1. Install Python 3.12 from python.org. Tick BOTH boxes:
-     "Add python.exe to PATH" AND "Install for all users" (Customize install).
-     Python 3.11 or 3.13 will NOT work - the offline bundle is built for 3.12.
+  1. Install Python from python.org if the machine has none (3.12, 3.13 and
+     3.14 all work). Tick BOTH boxes: "Add python.exe to PATH" AND
+     "Install for all users" (Customize install).
   2. Right-click the downloaded ZIP -> Properties -> tick "Unblock" -> OK.
      (Skipping this makes Windows silently distrust every extracted file.)
   3. Right-click the ZIP -> "Extract All..." - do NOT run anything from the
