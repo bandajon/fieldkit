@@ -9,6 +9,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import time
 from itertools import islice
 
 DARWIN = sys.platform == "darwin"
@@ -151,9 +152,14 @@ def join(cidr, exclude_ip=""):
         return {**fail, "error": str(e)}
     if p.returncode != 0:
         return {**fail, "error": (p.stderr or p.stdout or "command failed").strip()[:300]}
-    if addr not in [x for i in list_ifaces() for x in i["ips"]]:
-        return {**fail, "error": f"command reported success but {addr} is not up"}
-    return {"ok": True, "iface": iface["name"], "ip": addr, "cmd": _manual(argv)}
+    # macOS ipconfig set is asynchronous (configd applies it after the command
+    # returns) — poll instead of checking once and losing the race.
+    deadline = time.time() + 6
+    while time.time() < deadline:
+        if addr in [x for i in list_ifaces() for x in i["ips"]]:
+            return {"ok": True, "iface": iface["name"], "ip": addr, "cmd": _manual(argv)}
+        time.sleep(0.5)
+    return {**fail, "error": f"command reported success but {addr} did not come up within 6s"}
 
 
 if __name__ == "__main__":
