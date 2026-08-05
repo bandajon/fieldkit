@@ -136,8 +136,20 @@ def record_status():
             "disk_total_gb": round(du.total / 1e9, 1)}
 
 
+def sync_clocks(names):
+    """Cameras drift between site visits, and a wrong clock ruins the footage timeline."""
+    for c in CONFIG["cameras"]:
+        if c["name"] in names:
+            r = camera.set_time(c.get("ip", ""), c.get("user", ""), c.get("password", ""))
+            how = r.get("camera_time") or "ok" if r.get("ok") else r.get("error") or r.get("status")
+            print(f"time sync {c['name']} {c.get('ip', '')}: {how}", flush=True)
+
+
 @app.post("/api/record/start")
 def record_start(body: dict = Body(default={})):
+    names = set(body.get("cams") or [c["name"] for c in CONFIG["cameras"]])
+    # Off-thread and best-effort: an unreachable camera must never delay a record start.
+    threading.Thread(target=sync_clocks, args=(names,), daemon=True).start()
     REC.start(body.get("cams") or None)   # empty/missing = every configured camera
     return record_status()
 
@@ -206,6 +218,8 @@ def camera_activate(body: dict = Body(default={})):
         # Preview/Set IP/Test RTSP must work straight after activation, before the
         # operator has added this camera to config.yaml.
         ACTIVATED[ip] = ("admin", body["password"])
+        # Factory cameras run on China time; activation is the moment to fix that.
+        r["time_sync"] = camera.set_time(ip, "admin", body["password"])
     return r
 
 
@@ -224,7 +238,8 @@ def camera_login(body: dict = Body(default={})):
         raise HTTPException(401, d["note"])
     ACTIVATED[ip] = (user, body["password"])
     return {"ok": True, "model": d.get("model", ""), "mac": d.get("mac", ""),
-            "serial": d.get("serial", "")}
+            "serial": d.get("serial", ""),
+            "time_sync": camera.set_time(ip, user, body["password"])}
 
 
 @app.post("/api/camera/set_ip")
@@ -247,6 +262,13 @@ def camera_set_ip(body: dict = Body(default={})):
         # by the NEW ip, so the working pair must be reachable there too.
         ACTIVATED[address] = (user, password)
     return r
+
+
+@app.post("/api/camera/set_time")
+def camera_set_time(body: dict = Body(default={})):
+    ip = valid_ip(body.get("ip"))
+    user, password = cam_creds(ip)
+    return camera.set_time(ip, body.get("user") or user, body.get("password") or password)
 
 
 @app.get("/api/camera/snapshot")
@@ -465,6 +487,26 @@ def config_add_camera(body: dict = Body(default={})):
     CONFIG_PATH.write_text(yaml.safe_dump(CONFIG, sort_keys=False))
     apply_cameras()
     return {"ok": True, "added": True, "name": name}
+
+
+@app.post("/api/config/rename_camera")
+def config_rename_camera(body: dict = Body(default={})):
+    old, new = body.get("old") or "", body.get("new") or ""
+    if not CAM_NAME.match(new):
+        raise HTTPException(400, "name must be 1-32 chars of letters, digits, - or _")
+    cam = next((c for c in CONFIG["cameras"] if c["name"] == old), None)
+    if not cam:
+        raise HTTPException(404, f"no camera named {old!r} in config")
+    if any(c["name"] == new for c in CONFIG["cameras"]):
+        raise HTTPException(400, f"{new} already exists")
+    if not REC.remove_camera(old):
+        raise HTTPException(400, f"{old} is recording — stop it first")
+    cam["name"] = new
+    CONFIG_PATH.write_text(yaml.safe_dump(CONFIG, sort_keys=False))
+    REC.add_camera(cam)
+    LIVE.set_cameras(CONFIG["cameras"])
+    # Already-written segments stay under <record_dir>/<site>/<old>/ — only new ones move.
+    return {"ok": True}
 
 
 @app.post("/api/config/remove_camera")

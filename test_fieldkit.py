@@ -156,6 +156,33 @@ def probe_status_codes():
         assert camera.probe_device("10.0.0.5", "admin", "") is None   # 403 but not XML
 
 
+def camera_tz_strings():
+    """Hikvision's tz string inverts the sign: Zambia (UTC+2) is CST-2:00:00."""
+    assert camera.hik_tz(120) == "CST-2:00:00"
+    assert camera.hik_tz(-300) == "CST+5:00:00"
+    assert camera.hik_tz(330) == "CST-5:30:00"
+    assert camera.hik_tz(0) == "CST-0:00:00"
+
+
+def camera_set_time():
+    """Mocked ISAPI — never touches a real camera."""
+    from unittest.mock import patch
+    import requests as rq
+    sent = {}
+    fake = type("R", (), {"status_code": 200,
+                          "text": "<localTime>2026-08-05T14:26:20+02:00</localTime>"})()
+
+    def fake_put(url, data=None, **kw):
+        sent.update(url=url, data=data)
+        return fake
+
+    with patch.object(rq, "put", fake_put), patch.object(rq, "get", return_value=fake):
+        r = camera.set_time("10.0.0.5", "admin", "pw")
+    assert r["ok"] and r["camera_time"].startswith("2026-08-05"), r
+    assert sent["url"].endswith("/ISAPI/System/time"), sent
+    assert "<timeMode>manual</timeMode>" in sent["data"], sent
+
+
 def camera_names():
     """The name becomes a directory under record_dir, so it must stay a plain word."""
     import app
@@ -185,6 +212,8 @@ check("hostnet pick_iface", hostnet_pick_iface)
 check("hostnet addressing", hostnet_addressing)
 check("sadp probes every interface", sadp_probes_every_interface)
 check("probe_device status codes", probe_status_codes)
+check("hikvision tz strings", camera_tz_strings)
+check("camera.set_time", camera_set_time)
 check("camera name validation", camera_names)
 check("recorder.add_camera", recorder_add_camera)
 check("README documents every config key", readme_documents_config)

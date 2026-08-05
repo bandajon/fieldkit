@@ -266,8 +266,16 @@ document.getElementById('stop-all').onclick = () => rec('stop');
 document.getElementById('reclist').onclick = async e => {
   const b = e.target.closest('button[data-cam]');
   if (!b) return;
-  if (b.dataset.act !== 'remove') return rec(b.dataset.act, b.dataset.cam);
   const cam = b.dataset.cam;
+  if (b.dataset.act === 'rename') {
+    const nn = (prompt(`Rename ${cam} to:\n(recordings already on disk keep the old folder name)`, cam) || '').trim();
+    if (!nn || nn === cam) return;
+    const r = await post('/api/config/rename_camera', {old: cam, new: nn});
+    if (!r.ok) return alert(r.detail || 'rename failed');
+    monCams = null;
+    return recPoll();
+  }
+  if (b.dataset.act !== 'remove') return rec(b.dataset.act, cam);
   if (!confirm(`Remove ${cam} from config? Recordings on disk are kept.`)) return;
   const r = await post('/api/config/remove_camera', {name: cam});
   if (!r.ok) alert(r.detail || 'remove failed');
@@ -295,6 +303,8 @@ async function recPoll() {
           <span class="num">${(c.bytes / 1e6).toFixed(1)} MB</span>
           ${c.restarts ? `<span class="num">${c.restarts} restarts</span>` : ''}
           ${act === 'start' ? `<button class="btn quiet" data-cam="${esc(n)}"
+                  data-act="rename">Rename</button>
+          <button class="btn quiet" data-cam="${esc(n)}"
                   data-act="remove">Remove</button>` : ''}
           <button class="btn${act === 'stop' ? ' halt' : ''}"
                   data-cam="${esc(n)}" data-act="${act}">${act === 'start' ? 'Start' : 'Stop'}</button>
@@ -374,6 +384,8 @@ function renderDevs() {
         <div class="acts">
           <button class="btn" data-act="preview">Preview</button>
           <button class="btn" data-act="rtsp">Test RTSP</button>
+          <button class="btn" data-act="synctime">Sync time</button>
+          <input data-role="camname" placeholder="name (e.g. gate)">
           ${configured.some(c => c.ip === d.ip) ? ''
             : '<button class="btn" data-act="add">Add to config</button>'}
         </div>
@@ -434,15 +446,17 @@ document.getElementById('camlist').addEventListener('click', async e => {
         const r = await post('/api/camera/set_ip', pw ? {ip, address, password: pw} : {ip, address});
         let msg = r.ok ? `now ${address}${r.rebooted ? ' — rebooting' : ''}`
                        : (r.error || r.detail || 'failed');
+        const nm = card.querySelector('[data-role="camname"]').value.trim();
         if (r.ok && slot) {
-          const a = await addCamera('cam' + slot, address);   // it reboots onto this one
+          const a = await addCamera(nm || 'cam' + slot, address);   // it reboots onto this one
           msg += a.ok ? ` · added to config as ${a.name}` : ` · not added: ${a.detail || ''}`;
         }
         show(msg, r.ok ? 'good' : 'bad');
       }
     } else if (b.dataset.act === 'add') {
       const slot = card.querySelector('[data-role="plan"]').value;
-      const a = await addCamera(slot ? 'cam' + slot : nextCamName(), ip);
+      const nm = card.querySelector('[data-role="camname"]').value.trim();
+      const a = await addCamera(nm || (slot ? 'cam' + slot : nextCamName()), ip);
       show(a.ok ? `added to config as ${a.name}` : (a.detail || 'failed'), a.ok ? 'good' : 'bad');
       if (a.ok) b.remove();   // configured now; re-rendering here would wipe the message
     } else if (b.dataset.act === 'join') {
@@ -459,6 +473,10 @@ document.getElementById('camlist').addEventListener('click', async e => {
     } else if (b.dataset.act === 'rtsp') {
       const r = await post('/api/camera/test_rtsp', {ip});
       show(r.ok ? `${r.codec} ${r.width}x${r.height} @ ${r.fps}`
+                : (r.error || r.detail || 'failed'), r.ok ? 'good' : 'bad');
+    } else if (b.dataset.act === 'synctime') {
+      const r = await post('/api/camera/set_time', {ip});
+      show(r.ok ? `camera clock set — device says ${r.camera_time || 'ok'} (${r.tz})`
                 : (r.error || r.detail || 'failed'), r.ok ? 'good' : 'bad');
     }
   } catch (err) {
