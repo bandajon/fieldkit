@@ -6,7 +6,7 @@
 # 24.04: 3.12.
 set -e
 cd "$(dirname "$0")"
-V=$(date +%Y%m%d)
+V=$(date +%Y%m%d-%H%M)   # minutes matter: same-day rebuilds must not look identical
 OUT="dist/fieldkit-$V"
 rm -rf dist && mkdir -p "$OUT/wheels"
 
