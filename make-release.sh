@@ -22,16 +22,29 @@ done
 cat > "$OUT/INSTALL.txt" <<'EOF'
 FieldKit offline install
 ========================
-1. Install Python 3.12 and ffmpeg on this machine:
-   - Windows:      python.org installer (tick "Add to PATH"), ffmpeg from ffmpeg.org, add to PATH
+
+WINDOWS - the whole install, in order (each prompt named):
+  1. Install Python 3.12 from python.org. Tick BOTH boxes:
+     "Add python.exe to PATH" AND "Install for all users" (Customize install).
+     Python 3.11 or 3.13 will NOT work - the offline bundle is built for 3.12.
+  2. Right-click the downloaded ZIP -> Properties -> tick "Unblock" -> OK.
+     (Skipping this makes Windows silently distrust every extracted file.)
+  3. Right-click the ZIP -> "Extract All..." - do NOT run anything from the
+     zip preview window.
+  4. In the extracted folder, double-click  setup-windows.bat
+     -> click "Run" on the security warning (if shown)
+     -> click "Yes" on the blue Administrator prompt.
+     A second window opens and does everything: dependencies, firewall,
+     camera network, and starts the app. Keep that window open.
+  5. ffmpeg (needed for RECORDING): download from ffmpeg.org, add to PATH.
+     Setup warns you if it is missing; the UI works without it.
+  Re-running setup-windows.bat any time is safe - it fixes itself.
+
+OTHER PLATFORMS:
+1. Install Python 3.12 and ffmpeg:
    - Ubuntu/Jetson: sudo apt install python3 python3-pip ffmpeg
 2. Unzip this folder anywhere.
 3. Install dependencies from the bundled wheels (pick your platform):
-   - Windows laptop:   EASIEST: double-click setup-windows.bat (accept the admin
-                       prompt). It unblocks the files, installs deps, opens the
-                       firewall, joins the camera network, and starts the app.
-                       Manual alternative:
-                       pip install --no-index --find-links wheels/win_amd64 -r requirements.txt
    - Ubuntu mini-PC:   pip3 install --no-index --find-links wheels/manylinux2014_x86_64 -r requirements.txt
    - Jetson Orin Nano: pip3 install --no-index --find-links wheels/manylinux2014_aarch64 -r requirements.txt
 4. Run it:            python3 app.py     (Windows: python app.py)
