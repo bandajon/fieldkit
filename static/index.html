@@ -381,11 +381,14 @@ function renderDevs() {
       </div>`).join('');
 }
 
-// cam1 = .111, cam2 = .112 … in whichever /24 this server sits on.
+// cam1 = .111, cam2 = .112 … in the CAMERA's own /24 — the host's first IP can be
+// a VPN/Tailscale address, which would suggest slots in a network the camera isn't on.
 document.getElementById('camlist').addEventListener('change', e => {
   const sel = e.target.closest('select[data-role="plan"]');
   if (!sel || !sel.value) return;
-  sel.closest('.dev').querySelector('[data-role="addr"]').value = `${myNet}.${110 + Number(sel.value)}`;
+  const card = sel.closest('.dev');
+  card.querySelector('[data-role="addr"]').value =
+    `${net24(card.dataset.ip)}.${110 + Number(sel.value)}`;
 });
 
 document.getElementById('camlist').addEventListener('click', async e => {
