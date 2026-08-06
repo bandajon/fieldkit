@@ -64,6 +64,10 @@ def local_ips():
         pass
     finally:
         s.close()
+    # getaddrinfo also misses secondary addresses on Linux (/etc/hosts pins the
+    # hostname to 127.0.1.1) — a joined camera-net or link-local address must count.
+    for i in hostnet.list_ifaces():
+        ips.update(i["ips"])
     rest = sorted(ip for ip in ips if not ip.startswith("127.") and ip != primary)
     # Default route first: the UI derives the Set-IP /24 from ips[0], and a sorted list
     # would put a Tailscale 100.x address ahead of the site's 192.168.x.
@@ -185,10 +189,18 @@ def valid_ip(ip):
     return ip
 
 
+def scan_cidrs(ips):
+    """Default sweep targets. Never our own link-local /24: cameras don't live in the
+    slice we parked on, and SADP is what finds a self-assigned camera anyway."""
+    return [f"{ip}/24" for ip in ips if not ip.startswith("169.254.")]
+
+
 @app.post("/api/camera/scan")
 def camera_scan(body: dict = Body(default={})):
+    # Linux/Jetson: a bare wired port can't even egress the SADP probe — fix that first.
+    boot = hostnet.bootstrap(exclude_ip=(local_ips() or [""])[0])
     ips = local_ips()
-    cidrs = body.get("cidrs") or [f"{ip}/24" for ip in ips]
+    cidrs = body.get("cidrs") or scan_cidrs(ips)
     for c in cidrs:
         try:
             net = ipaddress.ip_network(c, strict=False)
@@ -199,6 +211,9 @@ def camera_scan(body: dict = Body(default={})):
     # ifaces: probe every interface, not just the default route (hotspot + switch case)
     rows = camera.scan(cidrs, cam_creds, ifaces=ips)
     out = {"cameras": rows, "cidrs": cidrs}
+    if boot and not boot.get("ok"):
+        # Usually the missing sudoers grant — the UI shows the one-time command.
+        out["join_error"] = {k: boot.get(k) for k in ("error", "cmd", "grant")}
 
     # Novices don't read the amber warning, so join the camera's network for them.
     # One join per scan: one switch at a time is the field reality.
@@ -213,7 +228,7 @@ def camera_scan(body: dict = Body(default={})):
             # ponytail: full re-scan (~5 s) instead of merging a partial sweep — it
             # happens once per site and the merge lives in camera.scan, not here.
             ips = local_ips()
-            out["cameras"] = camera.scan(body.get("cidrs") or [f"{i}/24" for i in ips],
+            out["cameras"] = camera.scan(body.get("cidrs") or scan_cidrs(ips),
                                          cam_creds, ifaces=ips)
         else:
             out["join_error"] = {k: j.get(k) for k in ("error", "cmd", "grant")}

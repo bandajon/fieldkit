@@ -13,7 +13,7 @@ from itertools import islice
 
 DARWIN = sys.platform == "darwin"
 WINDOWS = sys.platform == "win32"
-WIRED = re.compile(r"^(en|eth|enp|ens|eno)\d")
+WIRED = re.compile(r"^(en|eth|enp|ens|eno)\d", re.I)   # Jetson Orin: enP8p1s0
 LOOPBACK = ("lo", "lo0")
 
 
@@ -42,8 +42,10 @@ def _iproute():
     for line in _run(["ip", "-o", "link"]).splitlines():
         m = re.match(r"\d+:\s+([^:@]+)[:@].*?<([^>]*)>", line)
         if m:
+            flags = m.group(2).split(",")
+            # NO-CARRIER = admin-up but no cable; offering it would just fail later.
             ifaces[m.group(1)] = {"name": m.group(1), "ips": [],
-                                  "up": "UP" in m.group(2).split(",")}
+                                  "up": "UP" in flags and "NO-CARRIER" not in flags}
     for line in _run(["ip", "-o", "-4", "addr"]).splitlines():
         p = line.split()
         if len(p) > 3 and p[1] in ifaces:
@@ -83,8 +85,11 @@ def pick_iface(exclude_ip="", ifaces=None):
     carrying the default route (taking that over would kill the operator's internet)."""
     ifs = [i for i in (list_ifaces() if ifaces is None else ifaces)
            if i["up"] and exclude_ip not in i["ips"]]
+    # A wired port with no address at all is the Linux field-switch signature
+    # (macOS/Windows self-assign 169.254.x there; Linux leaves the port bare).
     return next((i for i in ifs if i["link_local"]),
-                next((i for i in ifs if WIRED.match(i["name"])), None))
+                next((i for i in ifs if WIRED.match(i["name"]) and not i["ips"]),
+                     next((i for i in ifs if WIRED.match(i["name"])), None)))
 
 
 MAC = re.compile(r"\b([0-9a-fA-F]{1,2}[:-]){5}[0-9a-fA-F]{1,2}\b")
@@ -180,6 +185,22 @@ def join(cidr, exclude_ip=""):
             return {"ok": True, "iface": iface["name"], "ip": addr, "cmd": _manual(argv)}
         time.sleep(0.5)
     return {**fail, "error": f"command reported success but {addr} did not come up within 6s"}
+
+
+LINK_LOCAL = "169.254.100.0/24"   # mid-range: RFC 3927 reserves the .0.x and .255.x ends
+
+
+def bootstrap(exclude_ip=""):
+    """Linux never self-assigns on a DHCP-less switch the way macOS/Windows do: an up
+    wired port with no IPv4 can't even egress the SADP probe, so discovery finds
+    nothing and auto-join never triggers. Park a link-local address on such a port.
+    → join() result, or None when there is nothing to do."""
+    if DARWIN or WINDOWS:
+        return None
+    i = pick_iface(exclude_ip)
+    if i is None or i["ips"]:
+        return None
+    return join(LINK_LOCAL, exclude_ip)
 
 
 if __name__ == "__main__":

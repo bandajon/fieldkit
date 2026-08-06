@@ -330,6 +330,11 @@ document.getElementById('scan').onclick = async () => {
       info.textContent = `joined camera network as ${r.joined.ip} on ${
         r.joined.iface} · ` + info.textContent;
       info.className = 'res good';
+    } else if (r.join_error) {
+      // .res is pre-line, so the copy-paste commands land on their own lines.
+      info.textContent += `\ncouldn't join the camera network: ${r.join_error.error || 'failed'}`
+        + (r.join_error.grant ? `\nrun this once, then Scan again:\n${r.join_error.grant}` : '');
+      info.className = 'res warn';
     }
     renderDevs();
   } catch (err) {

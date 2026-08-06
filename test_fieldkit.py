@@ -130,6 +130,7 @@ def scan_auto_joins_once():
 
     with patch.object(app, "local_ips", lambda: ["172.20.10.8"]), \
          patch.object(app.camera, "scan", lambda *a, **k: rows), \
+         patch.object(app.hostnet, "bootstrap", lambda **k: None), \
          patch.object(app.hostnet, "join", fake_join):
         out = app.camera_scan({})
     assert out["joined"] == {"ip": "192.168.1.3", "iface": "en8"}, out
@@ -138,6 +139,7 @@ def scan_auto_joins_once():
     # A failed join surfaces the operator's escape hatch instead of a joined key.
     with patch.object(app, "local_ips", lambda: ["172.20.10.8"]), \
          patch.object(app.camera, "scan", lambda *a, **k: rows), \
+         patch.object(app.hostnet, "bootstrap", lambda **k: None), \
          patch.object(app.hostnet, "join",
                       lambda c, exclude_ip="": {"ok": False, "error": "nope",
                                                 "cmd": "sudo ...", "grant": "echo ..."}):
@@ -147,10 +149,65 @@ def scan_auto_joins_once():
     # Nothing off-net: no join attempted at all.
     with patch.object(app, "local_ips", lambda: ["192.168.1.2"]), \
          patch.object(app.camera, "scan", lambda *a, **k: [{"ip": "192.168.1.80"}]), \
+         patch.object(app.hostnet, "bootstrap", lambda **k: None), \
          patch.object(app.hostnet, "join", fake_join):
         out = app.camera_scan({})
     assert "joined" not in out and "join_error" not in out, out
     assert calls == ["192.168.1.80/24"], calls
+
+
+def hostnet_jetson():
+    """Jetson Orin realities: enP8p1s0 naming, bare ports, NO-CARRIER, bootstrap."""
+    from unittest.mock import patch
+    import hostnet
+
+    assert hostnet.WIRED.match("enP8p1s0"), "Jetson Orin port name"
+    assert hostnet.WIRED.match("eth0") and not hostnet.WIRED.match("wlan0")
+
+    # A bare wired port (Linux on a DHCP-less switch) beats one that has an address.
+    BUSY = {"name": "eth1", "ips": ["10.0.0.5"], "up": True, "link_local": False}
+    BARE = {"name": "enP8p1s0", "ips": [], "up": True, "link_local": False}
+    assert hostnet.pick_iface("", [BUSY, BARE])["name"] == "enP8p1s0"
+
+    # ip-link parsing: admin-UP with NO-CARRIER means the cable is out.
+    LINK = ("1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536\n"
+            "2: enP8p1s0: <NO-CARRIER,BROADCAST,MULTICAST,UP> mtu 1500\n"
+            "3: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500\n")
+    ADDR = "3: eth0    inet 10.0.0.5/24 brd 10.0.0.255 scope global eth0\n"
+    with patch.object(hostnet, "_run",
+                      lambda argv: LINK if argv[:3] == ["ip", "-o", "link"] else ADDR):
+        ifs = {i["name"]: i for i in hostnet._iproute()}
+    assert ifs["eth0"]["up"] and ifs["eth0"]["ips"] == ["10.0.0.5"], ifs
+    assert not ifs["enP8p1s0"]["up"], ifs
+
+    # bootstrap: only on Linux, only for a bare port, parks the link-local slice.
+    calls = []
+    with patch.object(hostnet, "DARWIN", False), patch.object(hostnet, "WINDOWS", False), \
+         patch.object(hostnet, "pick_iface", lambda e="": BARE), \
+         patch.object(hostnet, "join", lambda c, e="": calls.append(c) or {"ok": True}):
+        assert hostnet.bootstrap()["ok"]
+    assert calls == [hostnet.LINK_LOCAL], calls
+    with patch.object(hostnet, "DARWIN", False), patch.object(hostnet, "WINDOWS", False), \
+         patch.object(hostnet, "pick_iface", lambda e="": BUSY):
+        assert hostnet.bootstrap() is None      # port already has an address
+    with patch.object(hostnet, "DARWIN", True):
+        assert hostnet.bootstrap() is None      # macOS self-assigns by itself
+
+
+def scan_skips_own_link_local():
+    """The parked 169.254 slice is never swept — SADP finds self-assigned cameras."""
+    import app
+    assert app.scan_cidrs(["192.168.1.2", "169.254.100.2"]) == ["192.168.1.2/24"]
+
+
+def local_ips_sees_all_ifaces():
+    """A joined or link-local address must reach the SADP egress list on Linux."""
+    from unittest.mock import patch
+    import app
+    with patch.object(app.hostnet, "list_ifaces",
+                      lambda: [{"name": "eth0", "ips": ["169.254.100.2"], "up": True,
+                                "link_local": True}]):
+        assert "169.254.100.2" in app.local_ips()
 
 
 def hostnet_addressing():
@@ -272,6 +329,9 @@ check("hostnet pick_iface", hostnet_pick_iface)
 check("hostnet addressing", hostnet_addressing)
 check("hostnet arp parser", hostnet_arp_parser)
 check("scan auto-joins once", scan_auto_joins_once)
+check("hostnet jetson (naming, no-carrier, bootstrap)", hostnet_jetson)
+check("scan skips own link-local /24", scan_skips_own_link_local)
+check("local_ips sees every interface", local_ips_sees_all_ifaces)
 check("sadp probes every interface", sadp_probes_every_interface)
 check("probe_device status codes", probe_status_codes)
 check("hikvision tz strings", camera_tz_strings)

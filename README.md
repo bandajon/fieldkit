@@ -84,7 +84,11 @@ Learned the hard way. Check these before blaming the software:
   a network that works.
 - **FieldKit joins the camera network for you.** Scan LAN notices when a camera
   is on a network this machine has no address on, and adds one automatically.
-  The manual commands below remain as the fallback.
+  On Linux/Jetson it first parks a link-local address on a bare wired port
+  (Linux does not self-assign the way macOS/Windows do), so a fresh switch
+  works from the first scan. If the scan reports it could not join, run the
+  one-time sudoers command it shows, then scan again. The manual commands
+  below remain as the fallback.
 
 ### Connecting the laptop to the field switch
 
