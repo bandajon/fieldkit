@@ -3,7 +3,8 @@
 # target platform AND every Python a field machine plausibly has (only
 # pydantic-core/PyYAML are version-locked; the rest are shared pure wheels).
 # Windows: 3.12-3.14 (python.org installers). Ubuntu 22.04/Jetson: 3.10;
-# 24.04: 3.12.
+# 24.04: 3.12. Raspberry Pi OS Bookworm: 3.11; Trixie: 3.13 (64-bit images only —
+# nobody publishes armv7l wheels for pydantic-core).
 set -e
 cd "$(dirname "$0")"
 V=$(date +%Y%m%d-%H%M)   # minutes matter: same-day rebuilds must not look identical
@@ -25,7 +26,7 @@ wheelset() {  # platform, python versions...
 }
 wheelset win_amd64            3.12 3.13 3.14
 wheelset manylinux2014_x86_64 3.10 3.11 3.12
-wheelset manylinux2014_aarch64 3.10 3.12
+wheelset manylinux2014_aarch64 3.10 3.11 3.12 3.13
 
 # pip evaluates environment markers on THIS machine (macOS), so deps guarded by
 # platform_system == "Windows" never download for the win target. Add them by hand.
@@ -55,16 +56,23 @@ WINDOWS - the whole install, in order (each prompt named):
      Setup warns you if it is missing; the UI works without it.
   Re-running setup-windows.bat any time is safe - it fixes itself.
 
-OTHER PLATFORMS:
-1. Install Python 3.12 and ffmpeg:
-   - Ubuntu/Jetson: sudo apt install python3 python3-pip ffmpeg
-2. Unzip this folder anywhere.
-3. Install dependencies from the bundled wheels (pick your platform):
-   - Ubuntu mini-PC:   pip3 install --no-index --find-links wheels/manylinux2014_x86_64 -r requirements.txt
-   - Jetson Orin Nano: pip3 install --no-index --find-links wheels/manylinux2014_aarch64 -r requirements.txt
-4. Run it:            python3 app.py     (Windows: python app.py)
-5. On a phone on the same WiFi, open http://<this machine's IP>:8080
-   (the IP is shown in the strip at the top of the screen).
+RASPBERRY PI / JETSON / UBUNTU - the whole install:
+1. Unzip this folder anywhere.
+2. In the folder, run:   ./setup-linux.sh
+   It installs ffmpeg, the Python dependencies (offline, from the bundled
+   wheels), grants the camera-network privilege, and starts FieldKit now
+   AND on every boot. Re-running it any time is safe - it fixes itself.
+   Raspberry Pi: use a 64-bit OS image (Pi 4/5); recording is stream-copy,
+   so the Pi never re-encodes video.
+3. On a phone on the same WiFi, open http://<this machine's IP>:8080
+   (the setup script prints the address; it is also in the strip at the
+   top of the screen).
+
+Manual fallback (any Linux without systemd):
+   pip3 install --no-index --find-links wheels/manylinux2014_$(uname -m) -r requirements.txt
+   python3 app.py
+   (Debian Bookworm+ refuses system pip installs - create a venv first:
+    python3 -m venv .venv && .venv/bin/pip install ... && .venv/bin/python app.py)
 
 Connecting the laptop to the field switch
 -----------------------------------------

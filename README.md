@@ -132,19 +132,35 @@ than just the default route.
 Factory-fresh Hikvision cameras sit at `192.168.1.64`, so `192.168.1.x/24` is
 the right network to join for first contact.
 
-### Ubuntu / Debian (including a mini-PC at the node)
+### Raspberry Pi / Jetson / Ubuntu — one command
 
 ```
-sudo apt update && sudo apt install -y python3-pip ffmpeg
-pip3 install -r requirements.txt
-python3 app.py
+./setup-linux.sh
 ```
+
+The whole install: ffmpeg, a venv with the dependencies (Debian Bookworm+ and
+Ubuntu 24.04+ refuse bare `pip3 install` into the system Python), the sudoers
+grant so Scan LAN joins camera networks silently, and a systemd service so
+FieldKit starts now **and on every boot** — power-cycle the box and it comes
+back recording-ready. Re-running the script any time is safe; run it again
+after a `git pull` to pick up new code. Logs: `journalctl -u fieldkit -f`.
+
+Manual install (any Linux): `sudo apt install ffmpeg && python3 -m venv .venv
+&& .venv/bin/pip install -r requirements.txt && .venv/bin/python app.py`.
+
+### Raspberry Pi notes (4/5)
+
+Use a **64-bit** Raspberry Pi OS image — nobody publishes 32-bit armv7l wheels
+for the dependency chain. Recording is ffmpeg stream-copy (no re-encode), so a
+Pi 4 handles several cameras; the bottleneck is the SD card, so prefer an SSD
+or a high-endurance card for `record_dir`. USB Ethernet dongles get Debian's
+`enx<mac>` interface names and are detected for camera networks. For live
+video, take the **linux_arm64** go2rtc build.
 
 ### Jetson Orin Nano (ARM64)
 
-Identical to Ubuntu — the app is pure Python and ships no compiled extensions.
-JetPack already includes Python 3. Install `ffmpeg` from apt as above. If you
-want live video, take the **linux_arm64** go2rtc build, not amd64.
+Same `./setup-linux.sh`. JetPack already includes Python 3. For live video,
+take the **linux_arm64** go2rtc build, not amd64.
 
 ### Windows laptop
 
@@ -311,7 +327,7 @@ https://github.com/AlexxIT/go2rtc) — a single static binary with no
 dependencies — and embeds its player.
 
 1. Download the build for your platform from the go2rtc releases page:
-   `go2rtc_linux_amd64`, `go2rtc_linux_arm64` (Jetson), or
+   `go2rtc_linux_amd64`, `go2rtc_linux_arm64` (Jetson, Raspberry Pi 64-bit), or
    `go2rtc_win64.exe`. **Do this before you go to site.** FieldKit will never
    download anything in the field.
 2. Make it executable (`chmod +x`) and put it somewhere stable.

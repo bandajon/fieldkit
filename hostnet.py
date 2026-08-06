@@ -13,7 +13,8 @@ from itertools import islice
 
 DARWIN = sys.platform == "darwin"
 WINDOWS = sys.platform == "win32"
-WIRED = re.compile(r"^(en|eth|enp|ens|eno)\d", re.I)   # Jetson Orin: enP8p1s0
+# Jetson Orin: enP8p1s0 (capital P). Debian/Pi USB dongles: enx<mac>, no digit after en.
+WIRED = re.compile(r"^((en|eth|enp|ens|eno)\d|enx[0-9a-f])", re.I)
 LOOPBACK = ("lo", "lo0")
 
 

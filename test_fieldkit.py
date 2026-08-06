@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Plain stdlib test runner: python3 test_fieldkit.py — exits non-zero on failure."""
 
+import os
 import re
 import subprocess
 import sys
@@ -163,6 +164,8 @@ def hostnet_jetson():
 
     assert hostnet.WIRED.match("enP8p1s0"), "Jetson Orin port name"
     assert hostnet.WIRED.match("eth0") and not hostnet.WIRED.match("wlan0")
+    assert hostnet.WIRED.match("enxb827eb123456"), "Debian/Pi USB dongle name"
+    assert not hostnet.WIRED.match("enx"), "bare prefix is not an interface"
 
     # A bare wired port (Linux on a DHCP-less switch) beats one that has an address.
     BUSY = {"name": "eth1", "ips": ["10.0.0.5"], "up": True, "link_local": False}
@@ -192,6 +195,21 @@ def hostnet_jetson():
         assert hostnet.bootstrap() is None      # port already has an address
     with patch.object(hostnet, "DARWIN", True):
         assert hostnet.bootstrap() is None      # macOS self-assigns by itself
+
+
+def setup_linux_script():
+    """The Pi/Jetson installer must parse and keep its load-bearing steps."""
+    p = ROOT / "setup-linux.sh"
+    r = subprocess.run(["sh", "-n", str(p)], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    text = p.read_text()
+    for needle in ("python3 -m venv",              # Bookworm+ blocks bare pip (PEP 668)
+                   "sudoers.d/fieldkit",           # silent Scan-LAN join
+                   "systemctl enable --now",       # survives a power cycle
+                   "KillSignal=SIGINT",            # ffmpeg finalises the last segment
+                   "--no-index --find-links"):     # offline install from the release zip
+        assert needle in text, f"setup-linux.sh lost: {needle}"
+    assert os.access(p, os.X_OK), "setup-linux.sh must be executable"
 
 
 def scan_skips_own_link_local():
@@ -331,6 +349,7 @@ check("hostnet arp parser", hostnet_arp_parser)
 check("scan auto-joins once", scan_auto_joins_once)
 check("hostnet jetson (naming, no-carrier, bootstrap)", hostnet_jetson)
 check("scan skips own link-local /24", scan_skips_own_link_local)
+check("setup-linux.sh (pi/jetson installer)", setup_linux_script)
 check("local_ips sees every interface", local_ips_sees_all_ifaces)
 check("sadp probes every interface", sadp_probes_every_interface)
 check("probe_device status codes", probe_status_codes)

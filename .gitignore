@@ -8,3 +8,4 @@ go2rtc.yaml
 # operator config: copied from config.example.yaml on first boot, holds field passwords
 config.yaml
 dist/
+.venv/
