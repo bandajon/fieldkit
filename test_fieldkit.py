@@ -197,6 +197,36 @@ def hostnet_jetson():
         assert hostnet.bootstrap() is None      # macOS self-assigns by itself
 
 
+def hostnet_windows():
+    """Captured Get-NetAdapter CSV: dongles report PhysicalMediaType Unspecified,
+    so wired = physical + Up + not-wireless — never require 802.3."""
+    from unittest.mock import patch
+    import hostnet
+    CSV = ('"Name","Status","PhysicalMediaType","InterfaceDescription"\n'
+           '"Ethernet","Disconnected","802.3","Realtek PCIe GbE Family Controller"\n'
+           '"Ethernet 2","Up","Unspecified","Realtek USB GbE Family Controller"\n'
+           '"Wi-Fi","Up","Native 802.11","Intel(R) Wi-Fi 6 AX201 160MHz"\n'
+           '"Bluetooth Network Connection","Disconnected","BlueTooth","Bluetooth Device (PAN)"\n'
+           '"Ethernet 3","Up","802.3","TAP-Windows Adapter V9"\n')
+    assert hostnet.parse_win_adapters(CSV) == ["Ethernet 2"], hostnet.parse_win_adapters(CSV)
+    assert hostnet.parse_win_adapters("") == []
+
+    # pick_iface falls back to the adapter layer on Windows: no 169.254 yet
+    # (APIPA takes ~30 s), name never matches the WIRED regex — dongle still found.
+    with patch.object(hostnet, "WINDOWS", True), \
+         patch.object(hostnet, "list_ifaces", lambda: [
+             {"name": "Wi-Fi", "ips": ["192.168.8.10"], "up": True, "link_local": False}]), \
+         patch.object(hostnet, "_win_wired", lambda: ["Ethernet 2"]):
+        assert hostnet.pick_iface("192.168.8.10")["name"] == "Ethernet 2"
+        # But an APIPA adapter (already self-assigned on the switch) still wins
+        # without any powershell call.
+    with patch.object(hostnet, "WINDOWS", True), \
+         patch.object(hostnet, "list_ifaces", lambda: [
+             {"name": "Ethernet 2", "ips": ["169.254.7.9"], "up": True, "link_local": True}]), \
+         patch.object(hostnet, "_win_wired", lambda: (_ for _ in ()).throw(AssertionError("not needed"))):
+        assert hostnet.pick_iface("")["name"] == "Ethernet 2"
+
+
 def setup_linux_script():
     """The Pi/Jetson installer must parse and keep its load-bearing steps."""
     p = ROOT / "setup-linux.sh"
@@ -205,11 +235,26 @@ def setup_linux_script():
     text = p.read_text()
     for needle in ("python3 -m venv",              # Bookworm+ blocks bare pip (PEP 668)
                    "sudoers.d/fieldkit",           # silent Scan-LAN join
+                   "ip) addr add *",               # scoped: bare ip grants a root shell (netns)
+                   "visudo -cf",                   # bad sudoers.d disables sudo machine-wide
                    "systemctl enable --now",       # survives a power cycle
                    "KillSignal=SIGINT",            # ffmpeg finalises the last segment
                    "--no-index --find-links"):     # offline install from the release zip
         assert needle in text, f"setup-linux.sh lost: {needle}"
     assert os.access(p, os.X_OK), "setup-linux.sh must be executable"
+
+
+def setup_windows_script():
+    """The Windows installer must keep its load-bearing steps."""
+    text = (ROOT / "setup-windows.ps1").read_text()
+    for needle in ("Register-ScheduledTask",       # boot-on-power, like systemd on the Pi
+                   "-UserId 'SYSTEM'",             # elevation for runtime netsh joins
+                   "-AtStartup",
+                   "ExecutionTimeLimit (New-TimeSpan)",  # default kills the app after 72 h
+                   "Unblock-File",                 # Mark-of-the-Web breaks extracted zips
+                   "localport=8080",               # phone UI through the firewall
+                   "localport=37020"):             # SADP replies through the firewall
+        assert needle in text, f"setup-windows.ps1 lost: {needle}"
 
 
 def scan_skips_own_link_local():
@@ -350,6 +395,8 @@ check("scan auto-joins once", scan_auto_joins_once)
 check("hostnet jetson (naming, no-carrier, bootstrap)", hostnet_jetson)
 check("scan skips own link-local /24", scan_skips_own_link_local)
 check("setup-linux.sh (pi/jetson installer)", setup_linux_script)
+check("setup-windows.ps1 (always-on task)", setup_windows_script)
+check("hostnet windows (dongle detection)", hostnet_windows)
 check("local_ips sees every interface", local_ips_sees_all_ifaces)
 check("sadp probes every interface", sadp_probes_every_interface)
 check("probe_device status codes", probe_status_codes)

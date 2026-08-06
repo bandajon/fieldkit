@@ -51,7 +51,9 @@ WINDOWS - the whole install, in order (each prompt named):
      -> click "Run" on the security warning (if shown)
      -> click "Yes" on the blue Administrator prompt.
      A second window opens and does everything: dependencies, firewall,
-     camera network, and starts the app. Keep that window open.
+     camera network (built-in port or USB dongle), and installs FieldKit
+     as an always-on task - it is running when setup finishes and comes
+     back by itself after every reboot. The window can then be closed.
   5. ffmpeg (needed for RECORDING): download from ffmpeg.org, add to PATH.
      Setup warns you if it is missing; the UI works without it.
   Re-running setup-windows.bat any time is safe - it fixes itself.
@@ -83,9 +85,10 @@ against them fails because this machine is not on their network.
 FieldKit fixes this for you: a scan row on a network you are not on shows a
 "Join camera network" button. Grant the privilege once so it works silently:
 
-  macOS:   echo "$USER ALL=(root) NOPASSWD: /usr/sbin/ipconfig" | sudo tee /etc/sudoers.d/fieldkit
-  Ubuntu:  echo "$USER ALL=(root) NOPASSWD: $(command -v ip)" | sudo tee /etc/sudoers.d/fieldkit
-  Windows: start FieldKit from a terminal opened with "Run as administrator"
+  macOS:   echo "$USER ALL=(root) NOPASSWD: /usr/sbin/ipconfig set *" | sudo tee /etc/sudoers.d/fieldkit
+  Ubuntu:  echo "$USER ALL=(root) NOPASSWD: $(command -v ip) addr add *" | sudo tee /etc/sudoers.d/fieldkit
+  Windows: already granted - setup-windows.bat installs FieldKit with the
+           needed rights (rerun it if networking actions say access denied)
 
 Without it the button prints the exact command to run. To do it by hand:
 

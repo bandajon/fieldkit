@@ -147,9 +147,33 @@ if ($onWired) {
   }
 }
 
+# --- always-on task -------------------------------------------------------------
+# SYSTEM at boot = FieldKit survives a power cycle AND has the elevation netsh
+# needs, so Scan LAN joins camera networks silently at runtime - the app itself
+# is field-LAN only and binds 8080 regardless of who is logged in.
+Stop-ScheduledTask -TaskName 'FieldKit' -ErrorAction SilentlyContinue
+$action    = New-ScheduledTaskAction -Execute $venvPy `
+               -Argument ('"{0}"' -f (Join-Path $PSScriptRoot 'app.py')) `
+               -WorkingDirectory $PSScriptRoot
+$trigger   = New-ScheduledTaskTrigger -AtStartup
+$principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+# ExecutionTimeLimit zero-TimeSpan = "no limit" (the default kills the app after 72h).
+$settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+               -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) `
+               -ExecutionTimeLimit (New-TimeSpan)
+Register-ScheduledTask -TaskName 'FieldKit' -Action $action -Trigger $trigger `
+  -Principal $principal -Settings $settings -Force | Out-Null
+Start-ScheduledTask -TaskName 'FieldKit'
+Write-Host "[ok] FieldKit installed as an always-on task: running now and on every boot"
+
 # --- go ------------------------------------------------------------------------
+Start-Sleep -Seconds 3   # give uvicorn a moment so the URL below works immediately
+$ip = (Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+  Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' } |
+  Select-Object -First 1 -ExpandProperty IPAddress)
+if (-not $ip) { $ip = 'localhost' }
 Write-Host ""
-Write-Host "Setup complete. Starting FieldKit - open http://localhost:8080 (Ctrl+C stops it)." -ForegroundColor Cyan
-& $venvPy (Join-Path $PSScriptRoot 'app.py')
-Write-Host "FieldKit stopped (exit code $LASTEXITCODE)."
+Write-Host "Setup complete. FieldKit is running - open http://${ip}:8080" -ForegroundColor Cyan
+Write-Host "It comes back by itself after every reboot. Stop it: schtasks /End /TN FieldKit"
+Write-Host "See its output (for support): schtasks /End /TN FieldKit, then run .venv\Scripts\python.exe app.py"
 Read-Host "Press Enter to close"

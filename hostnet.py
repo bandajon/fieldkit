@@ -81,6 +81,35 @@ def list_ifaces():
     return [i for i in ifaces if i["name"] not in LOOPBACK]
 
 
+WIRELESS = re.compile(r"Wireless|Wi-?Fi|WLAN|802\.11|Bluetooth", re.I)
+VIRTUAL = re.compile(r"TAP|VPN|Loopback|VirtualBox|VMware|Hyper-V", re.I)
+
+
+def parse_win_adapters(csv_text):
+    """Pure: Get-NetAdapter CSV → names of connected wired physical adapters.
+    Wired = Up + not wireless + not virtual; never require 802.3 — USB dongles
+    report PhysicalMediaType 'Unspecified' (same logic as setup-windows.ps1)."""
+    import csv
+    import io
+    out = []
+    for row in csv.DictReader(io.StringIO(csv_text)):
+        blob = f"{row.get('PhysicalMediaType', '')} {row.get('InterfaceDescription', '')}"
+        if (row.get("Status") == "Up" and not WIRELESS.search(blob)
+                and not VIRTUAL.search(row.get("InterfaceDescription", ""))):
+            out.append(row["Name"])
+    return out
+
+
+def _win_wired():
+    try:
+        return parse_win_adapters(_run(
+            ["powershell", "-NoProfile", "-Command",
+             "Get-NetAdapter -Physical | Select-Object Name,Status,"
+             "PhysicalMediaType,InterfaceDescription | ConvertTo-Csv -NoTypeInformation"]))
+    except (OSError, subprocess.SubprocessError):
+        return []
+
+
 def pick_iface(exclude_ip="", ifaces=None):
     """The self-assigned interface if there is one, else a wired one that is not
     carrying the default route (taking that over would kill the operator's internet)."""
@@ -88,9 +117,18 @@ def pick_iface(exclude_ip="", ifaces=None):
            if i["up"] and exclude_ip not in i["ips"]]
     # A wired port with no address at all is the Linux field-switch signature
     # (macOS/Windows self-assign 169.254.x there; Linux leaves the port bare).
-    return next((i for i in ifs if i["link_local"]),
+    pick = next((i for i in ifs if i["link_local"]),
                 next((i for i in ifs if WIRED.match(i["name"]) and not i["ips"]),
                      next((i for i in ifs if WIRED.match(i["name"])), None)))
+    if pick is None and WINDOWS and ifaces is None:
+        # Windows names ("Ethernet 2", "USB Ethernet") never hit the WIRED regex,
+        # and before APIPA kicks in (~30 s after plugging a dead switch) there is
+        # no 169.254 either — ask the adapter layer which ports are wired + up.
+        byname = {i["name"]: i for i in ifs}
+        pick = next((byname.get(n, {"name": n, "ips": [], "up": True, "link_local": False})
+                     for n in _win_wired() if exclude_ip not in byname.get(n, {}).get("ips", [])),
+                    None)
+    return pick
 
 
 MAC = re.compile(r"\b([0-9a-fA-F]{1,2}[:-]){5}[0-9a-fA-F]{1,2}\b")
@@ -145,10 +183,13 @@ def _manual(argv):
 
 def _grant():
     if WINDOWS:
-        return "Start FieldKit from a terminal opened with 'Run as administrator'."
-    tool = "ipconfig" if DARWIN else "ip"
+        return ("Double-click setup-windows.bat once — it installs FieldKit as an "
+                "always-on task with the rights to do this silently.")
+    # Scoped to the exact invocation join() makes; NOPASSWD on the bare tool
+    # would also grant `ip netns exec` (a root shell).
+    tool, args = ("ipconfig", "set *") if DARWIN else ("ip", "addr add *")
     path = shutil.which(tool) or f"/usr/sbin/{tool}"
-    return f'echo "$USER ALL=(root) NOPASSWD: {path}" | sudo tee /etc/sudoers.d/fieldkit'
+    return f'echo "$USER ALL=(root) NOPASSWD: {path} {args}" | sudo tee /etc/sudoers.d/fieldkit'
 
 
 def _elevated(argv):
