@@ -27,8 +27,12 @@ else
 fi
 
 echo "[3/4] network privilege (lets Scan LAN join camera networks silently)"
-echo "$USER ALL=(root) NOPASSWD: $(command -v ip)" | sudo tee /etc/sudoers.d/fieldkit >/dev/null
+# Scoped to the one invocation hostnet.py makes — a bare NOPASSWD ip would also
+# grant `ip netns exec`, which is a root shell.
+echo "$USER ALL=(root) NOPASSWD: $(command -v ip) addr add *" | sudo tee /etc/sudoers.d/fieldkit >/dev/null
 sudo chmod 440 /etc/sudoers.d/fieldkit
+# A syntax error in sudoers.d disables sudo machine-wide — validate or remove.
+sudo visudo -cf /etc/sudoers.d/fieldkit >/dev/null || sudo rm -f /etc/sudoers.d/fieldkit
 
 echo "[4/4] start now and on every boot"
 sudo tee /etc/systemd/system/fieldkit.service >/dev/null <<UNIT

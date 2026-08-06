@@ -104,10 +104,14 @@ interface carrying your default route, so internet over WiFi keeps working.
 The button needs privileges. Grant them once and it works silently from then on:
 
 ```
-macOS     echo "$USER ALL=(root) NOPASSWD: /usr/sbin/ipconfig" | sudo tee /etc/sudoers.d/fieldkit
-Ubuntu    echo "$USER ALL=(root) NOPASSWD: $(command -v ip)" | sudo tee /etc/sudoers.d/fieldkit
-Windows   start FieldKit from a terminal opened with "Run as administrator"
+macOS     echo "$USER ALL=(root) NOPASSWD: /usr/sbin/ipconfig set *" | sudo tee /etc/sudoers.d/fieldkit
+Ubuntu    echo "$USER ALL=(root) NOPASSWD: $(command -v ip) addr add *" | sudo tee /etc/sudoers.d/fieldkit
+Windows   already granted — setup-windows.bat installs FieldKit as an
+          always-on task with the needed rights
 ```
+
+(`setup-linux.sh` writes the scoped Ubuntu grant for you. The scope matters:
+`NOPASSWD` on the bare tool would also allow `ip netns exec`, a root shell.)
 
 Without the grant the button still tells you exactly what to run — it prints the
 one-time line above and the manual command below. Doing it by hand:
@@ -196,19 +200,31 @@ without systemd: `sudo apt install ffmpeg && python3 -m venv .venv &&
 3. In the extracted folder, double-click **`setup-windows.bat`** → "Run" on
    the security warning → "Yes" on the blue Administrator prompt. It does
    everything: dependencies (offline from the bundled wheels), the firewall
-   rule so a phone can reach port 8080, the camera-network address, and
-   starts the app. Keep that window open.
+   rule so a phone can reach port 8080, the camera-network address — on the
+   built-in Ethernet port or a USB dongle, whichever is connected — and
+   installs FieldKit as an **always-on task**: it is running when setup
+   finishes and comes back by itself after every reboot, with the rights to
+   join camera networks silently. The setup window can then be closed.
 4. ffmpeg (needed for recording): `winget install Gyan.FFmpeg` or download
    from ffmpeg.org and add to PATH. Setup warns if it is missing; the UI
    works without it.
 5. Open `http://<the laptop's IP>:8080` — the IP is in the strip at the top
    of the screen.
 
+Windows dongle realities: most new laptops have no Ethernet port, so a USB
+dongle **is** the camera port. Test the dongle before you travel (Windows
+often needs its driver, shipped as a fake USB drive that appears when you
+plug it in), always use the same USB port (the parked address follows the
+adapter), and plug the dongle in *before* running setup or scanning. Runtime
+scans detect wired adapters the same way setup does — physical, connected,
+not wireless — so a dongle and a built-in port behave identically.
+
 Recording works the same on NTFS. Stopping a recording sends
 `CTRL_BREAK_EVENT` instead of `SIGINT` (the process is spawned with
 `CREATE_NEW_PROCESS_GROUP` so the signal can be delivered at all); either way
 ffmpeg finalises the segment it is writing before exiting. Nothing is ever
-force-killed first.
+force-killed first. To stop the always-on task itself:
+`schtasks /End /TN FieldKit` (stop recordings from the UI first).
 
 ---
 
