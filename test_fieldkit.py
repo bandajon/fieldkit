@@ -94,12 +94,72 @@ def hostnet_pick_iface():
     assert hostnet.pick_iface("172.20.10.8", [DOWN, WIFI]) is None
 
 
+def hostnet_arp_parser():
+    """Captured real output. A MAC means the address is taken."""
+    import hostnet
+    taken = [
+        "? (192.168.1.2) at 0:e0:4c:61:1:9a on en8 ifscope [ethernet]",       # darwin
+        "192.168.1.2 dev eth0 lladdr 04:ee:cd:5e:73:17 REACHABLE",            # linux
+        "  Internet Address      Physical Address      Type\n"
+        "  192.168.1.2          04-ee-cd-5e-73-17     dynamic",              # windows
+    ]
+    free = [
+        "? (192.168.1.2) at (incomplete) on en8 ifscope [ethernet]",          # darwin
+        "192.168.1.2 (192.168.1.2) -- no entry",                              # darwin
+        "192.168.1.2 dev eth0 FAILED",                                        # linux
+        "192.168.1.2 dev eth0  INCOMPLETE",                                   # linux
+        "No ARP Entries Found.",                                              # windows
+        "",
+    ]
+    for t in taken:
+        assert hostnet.parse_arp(t) is True, t
+    for t in free:
+        assert hostnet.parse_arp(t) is False, t
+
+
+def scan_auto_joins_once():
+    """Two off-net cameras must still trigger exactly one join."""
+    from unittest.mock import patch
+    import app
+    rows = [{"ip": "192.168.1.80"}, {"ip": "10.9.9.9"}]
+    calls = []
+
+    def fake_join(cidr, exclude_ip=""):
+        calls.append(cidr)
+        return {"ok": True, "ip": "192.168.1.3", "iface": "en8"}
+
+    with patch.object(app, "local_ips", lambda: ["172.20.10.8"]), \
+         patch.object(app.camera, "scan", lambda *a, **k: rows), \
+         patch.object(app.hostnet, "join", fake_join):
+        out = app.camera_scan({})
+    assert out["joined"] == {"ip": "192.168.1.3", "iface": "en8"}, out
+    assert calls == ["192.168.1.80/24"], calls          # exactly one, the first orphan
+
+    # A failed join surfaces the operator's escape hatch instead of a joined key.
+    with patch.object(app, "local_ips", lambda: ["172.20.10.8"]), \
+         patch.object(app.camera, "scan", lambda *a, **k: rows), \
+         patch.object(app.hostnet, "join",
+                      lambda c, exclude_ip="": {"ok": False, "error": "nope",
+                                                "cmd": "sudo ...", "grant": "echo ..."}):
+        out = app.camera_scan({})
+    assert "joined" not in out and out["join_error"]["error"] == "nope", out
+
+    # Nothing off-net: no join attempted at all.
+    with patch.object(app, "local_ips", lambda: ["192.168.1.2"]), \
+         patch.object(app.camera, "scan", lambda *a, **k: [{"ip": "192.168.1.80"}]), \
+         patch.object(app.hostnet, "join", fake_join):
+        out = app.camera_scan({})
+    assert "joined" not in out and "join_error" not in out, out
+    assert calls == ["192.168.1.80/24"], calls
+
+
 def hostnet_addressing():
     import ipaddress, hostnet
     net = ipaddress.ip_network("192.168.1.0/24")
     assert hostnet.free_addr(net, in_use=lambda ip: False) == "192.168.1.2"
     assert hostnet.free_addr(net, in_use=lambda ip: ip.endswith(".2")) == "192.168.1.3"
-    assert hostnet.free_addr(net, in_use=lambda ip: True) is None      # .2-.4 all taken
+    assert hostnet.free_addr(net, in_use=lambda ip: True) is None      # .2-.10 all taken
+    assert hostnet.free_addr(net, in_use=lambda ip: not ip.endswith('.10')) == '192.168.1.10'
     # Refuses public space before running any command.
     r = hostnet.join("8.8.8.0/24")
     assert r["ok"] is False and "not a private network" in r["error"], r
@@ -210,6 +270,8 @@ check("mac normalisation", macs)
 check("go2rtc absent without a binary", live_absent)
 check("hostnet pick_iface", hostnet_pick_iface)
 check("hostnet addressing", hostnet_addressing)
+check("hostnet arp parser", hostnet_arp_parser)
+check("scan auto-joins once", scan_auto_joins_once)
 check("sadp probes every interface", sadp_probes_every_interface)
 check("probe_device status codes", probe_status_codes)
 check("hikvision tz strings", camera_tz_strings)

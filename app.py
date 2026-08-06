@@ -197,7 +197,27 @@ def camera_scan(body: dict = Body(default={})):
         if net.prefixlen < 22:               # a /8 sweep is 16M hosts, not a field scan
             raise HTTPException(400, f"{c} is too large to sweep — use /22 or smaller")
     # ifaces: probe every interface, not just the default route (hotspot + switch case)
-    return {"cameras": camera.scan(cidrs, cam_creds, ifaces=ips), "cidrs": cidrs}
+    rows = camera.scan(cidrs, cam_creds, ifaces=ips)
+    out = {"cameras": rows, "cidrs": cidrs}
+
+    # Novices don't read the amber warning, so join the camera's network for them.
+    # One join per scan: one switch at a time is the field reality.
+    mine = {ipaddress.ip_network(f"{i}/24", strict=False) for i in ips}
+    orphan = next((r["ip"] for r in rows
+                   if ipaddress.ip_network(f"{r['ip']}/24", strict=False) not in mine), None)
+    if orphan:
+        j = hostnet.join(f"{orphan}/24", exclude_ip=ips[0] if ips else "")
+        if j.get("ok"):
+            out["joined"] = {"ip": j["ip"], "iface": j["iface"]}
+            # Re-scan with the new address so those rows come back with ISAPI data.
+            # ponytail: full re-scan (~5 s) instead of merging a partial sweep — it
+            # happens once per site and the merge lives in camera.scan, not here.
+            ips = local_ips()
+            out["cameras"] = camera.scan(body.get("cidrs") or [f"{i}/24" for i in ips],
+                                         cam_creds, ifaces=ips)
+        else:
+            out["join_error"] = {k: j.get(k) for k in ("error", "cmd", "grant")}
+    return out
 
 
 @app.post("/api/host/join_network")

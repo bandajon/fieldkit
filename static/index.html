@@ -325,6 +325,12 @@ document.getElementById('scan').onclick = async () => {
     devs = r.cameras || [];
     setCount('cameras', devs.length, 'found');
     info.textContent = `${devs.length} device(s) on ${(r.cidrs || []).join(', ')}`;
+    if (r.joined) {
+      await refreshStatus();     // hostIps now has the joined address; warnings clear
+      info.textContent = `joined camera network as ${r.joined.ip} on ${
+        r.joined.iface} · ` + info.textContent;
+      info.className = 'res good';
+    }
     renderDevs();
   } catch (err) {
     info.textContent = 'scan failed: ' + err; info.className = 'res bad';
@@ -371,7 +377,9 @@ function renderDevs() {
         ${d.activated === false ? `<div class="acts">
           <a class="btn" href="http://${esc(d.ip)}" target="_blank" rel="noopener">Open camera page to activate</a>
         </div>` : ''}
-        <div class="acts">${d.activated
+        <div class="acts">${d.activated !== false
+          /* null = unknown (401 sweep): the camera is almost certainly activated and
+             rejecting default creds, so offer Log in — Activate would just fail. */
           ? `<input data-role="user" placeholder="user" value="admin" autocomplete="username">
              <input type="password" data-role="pw" placeholder="password" autocomplete="current-password">
              <button class="btn" data-act="login">Log in</button>`

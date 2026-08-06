@@ -61,6 +61,31 @@ Removing a camera is the one thing that still needs the editor: delete it from
 never land in a commit. `config.example.yaml` is the tracked, commented
 reference — read that one to learn the schema.
 
+### Field networking checklist
+
+Learned the hard way. Check these before blaming the software:
+
+- **One USB-Ethernet adapter per laptop.** Never share one between machines.
+  Test each adapter on its own laptop before you travel — Windows often needs
+  the dongle's driver, and the installer usually ships as a fake USB drive that
+  appears in File Explorer when you plug the adapter in.
+- **Two laptops on one switch must not both claim the same address.** FieldKit
+  picks a free one by ARP, so it will not collide with a machine that is already
+  there. If you set addresses by hand, give each laptop a different one —
+  Windows disables a conflicting adapter and then every command fails with
+  "transmit failed. General failure".
+- **Budget the PoE.** A ColorVu camera can draw ~15 W at boot. Small unmanaged
+  switches brown out at two or three cameras: the symptom is cameras that answer
+  ARP and SADP but flap or boot-loop the moment you load a page or a stream. If
+  cameras keep restarting, count the watts before you debug anything else.
+- **Cameras must have static IPs.** A camera left on DHCP strands itself on a
+  field switch with no DHCP server — it will come up on a self-assigned address
+  nobody can predict. Set the static address while you still have the camera on
+  a network that works.
+- **FieldKit joins the camera network for you.** Scan LAN notices when a camera
+  is on a network this machine has no address on, and adds one automatically.
+  The manual commands below remain as the fallback.
+
 ### Connecting the laptop to the field switch
 
 Field switches have no DHCP server. Plug in and the laptop self-assigns a

@@ -6,7 +6,6 @@ import os
 import re
 import shlex
 import shutil
-import socket
 import subprocess
 import sys
 import time
@@ -88,18 +87,39 @@ def pick_iface(exclude_ip="", ifaces=None):
                 next((i for i in ifs if WIRED.match(i["name"])), None))
 
 
+MAC = re.compile(r"\b([0-9a-fA-F]{1,2}[:-]){5}[0-9a-fA-F]{1,2}\b")
+
+
+def parse_arp(text):
+    """Pure: arp / ip-neigh output → True when a real MAC is present (address taken).
+    ponytail: one regex for all three platforms — each either prints a MAC or doesn't."""
+    low = text.lower()
+    if "incomplete" in low or "no entry" in low or "no arp entries" in low:
+        return False
+    if re.search(r"\b(failed|permanent_failed)\b", low):
+        return False
+    return bool(MAC.search(text))
+
+
 def _in_use(ip, timeout=0.5):
-    """ponytail: TCP:80 only — a host that answers nothing looks free. Fine for
-    .2/.3/.4 on a camera switch; move to ARP if collisions ever turn up."""
+    """ponytail: ARP, not TCP:80 — a laptop with its firewall up answers nothing on
+    :80 but cannot hide from layer 2. Two laptops grabbing .2 on one switch is the
+    conflict this prevents."""
+    ms = max(int(timeout * 1000), 1)
+    ping = (["ping", "-n", "1", "-w", str(ms), ip] if WINDOWS else
+            ["ping", "-c", "1", "-W", str(ms if DARWIN else max(int(timeout), 1)), ip])
+    show = (["arp", "-a", ip] if WINDOWS else
+            ["arp", "-n", ip] if DARWIN else ["ip", "neigh", "show", ip])
     try:
-        socket.create_connection((ip, 80), timeout).close()
-        return True
-    except OSError:
+        subprocess.run(ping, capture_output=True, timeout=3)   # populate the neighbour table
+        return parse_arp(subprocess.run(show, capture_output=True, text=True,
+                                        timeout=3).stdout)
+    except (OSError, subprocess.SubprocessError):
         return False
 
 
 def free_addr(net, in_use=_in_use):
-    return next((str(h) for h in islice(net.hosts(), 1, 4) if not in_use(str(h))), None)
+    return next((str(h) for h in islice(net.hosts(), 1, 10) if not in_use(str(h))), None)
 
 
 def _argv(iface, addr, net):
@@ -142,7 +162,7 @@ def join(cidr, exclude_ip=""):
         return {"ok": False, "error": "no spare wired interface — is the Ethernet cable in?"}
     addr = free_addr(net)
     if addr is None:
-        return {"ok": False, "error": f"no free address in {net} (tried .2 through .4)"}
+        return {"ok": False, "error": f"no free address in {net} (tried .2 through .9)"}
 
     argv = _argv(iface["name"], addr, net)
     fail = {"ok": False, "cmd": _manual(argv), "grant": _grant()}
