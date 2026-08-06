@@ -132,52 +132,83 @@ than just the default route.
 Factory-fresh Hikvision cameras sit at `192.168.1.64`, so `192.168.1.x/24` is
 the right network to join for first contact.
 
-### Raspberry Pi / Jetson / Ubuntu — one command
+## Installing on your device
 
-```
-./setup-linux.sh
-```
+Get the code onto the machine first — either unzip a release
+(`./make-release.sh` builds one, with offline wheels for every platform) or
+`git clone` when the machine has internet. Then follow your device's section.
+When you update later (`git pull` or a new zip), just run the same setup
+script again — all of them are idempotent and fix themselves.
 
-The whole install: ffmpeg, a venv with the dependencies (Debian Bookworm+ and
-Ubuntu 24.04+ refuse bare `pip3 install` into the system Python), the sudoers
-grant so Scan LAN joins camera networks silently, and a systemd service so
-FieldKit starts now **and on every boot** — power-cycle the box and it comes
-back recording-ready. Re-running the script any time is safe; run it again
-after a `git pull` to pick up new code. Logs: `journalctl -u fieldkit -f`.
+### Raspberry Pi (4/5)
 
-Manual install (any Linux): `sudo apt install ffmpeg && python3 -m venv .venv
-&& .venv/bin/pip install -r requirements.txt && .venv/bin/python app.py`.
+1. Flash a **64-bit** Raspberry Pi OS image (Raspberry Pi Imager: "Raspberry
+   Pi OS (64-bit)"). 32-bit images cannot work — nobody publishes armv7l
+   wheels for the dependency chain.
+2. In the FieldKit folder, run:
 
-### Raspberry Pi notes (4/5)
+   ```
+   ./setup-linux.sh
+   ```
 
-Use a **64-bit** Raspberry Pi OS image — nobody publishes 32-bit armv7l wheels
-for the dependency chain. Recording is ffmpeg stream-copy (no re-encode), so a
-Pi 4 handles several cameras; the bottleneck is the SD card, so prefer an SSD
-or a high-endurance card for `record_dir`. USB Ethernet dongles get Debian's
+   That is the whole install: ffmpeg, a venv with the dependencies (offline
+   from the bundled wheels when run out of a release zip; Bookworm+ refuses
+   bare `pip3 install` into the system Python), the sudoers grant so Scan LAN
+   joins camera networks silently, and a systemd service so FieldKit starts
+   now **and on every boot** — power-cycle the Pi and it comes back
+   recording-ready, headless.
+3. Open `http://<the pi's IP>:8080` from a phone on the same network (the
+   script prints the address). Logs: `journalctl -u fieldkit -f`.
+
+Pi realities: recording is ffmpeg stream-copy (no re-encode), so a Pi 4
+handles several cameras — the bottleneck is the SD card; prefer an SSD or a
+high-endurance card for `record_dir`. USB Ethernet dongles get Debian's
 `enx<mac>` interface names and are detected for camera networks. For live
 video, take the **linux_arm64** go2rtc build.
 
-### Jetson Orin Nano (ARM64)
+### Jetson Orin Nano
 
-Same `./setup-linux.sh`. JetPack already includes Python 3. For live video,
-take the **linux_arm64** go2rtc build, not amd64.
+1. JetPack already includes Python 3 — nothing to flash or add.
+2. In the FieldKit folder, run:
+
+   ```
+   ./setup-linux.sh
+   ```
+
+   Same script and same result as the Pi: ffmpeg, venv, network privilege,
+   and start-on-boot via systemd.
+3. Open `http://<the jetson's IP>:8080`. Logs: `journalctl -u fieldkit -f`.
+
+For live video, take the **linux_arm64** go2rtc build, not amd64.
+
+The same script covers an Ubuntu/Debian mini-PC. Manual install on any Linux
+without systemd: `sudo apt install ffmpeg && python3 -m venv .venv &&
+.venv/bin/pip install -r requirements.txt && .venv/bin/python app.py`.
 
 ### Windows laptop
 
-```
-winget install Gyan.FFmpeg        # or: choco install ffmpeg
-pip install -r requirements.txt
-python app.py
-```
+1. Install Python from python.org if the machine has none (3.12–3.14 all
+   work). Tick **both** boxes: "Add python.exe to PATH" and "Install for all
+   users" (under Customize install).
+2. If you downloaded a release ZIP: right-click it → Properties → tick
+   **Unblock** → OK (skipping this makes Windows silently distrust every
+   extracted file), then right-click → **Extract All…**.
+3. In the extracted folder, double-click **`setup-windows.bat`** → "Run" on
+   the security warning → "Yes" on the blue Administrator prompt. It does
+   everything: dependencies (offline from the bundled wheels), the firewall
+   rule so a phone can reach port 8080, the camera-network address, and
+   starts the app. Keep that window open.
+4. ffmpeg (needed for recording): `winget install Gyan.FFmpeg` or download
+   from ffmpeg.org and add to PATH. Setup warns if it is missing; the UI
+   works without it.
+5. Open `http://<the laptop's IP>:8080` — the IP is in the strip at the top
+   of the screen.
 
 Recording works the same on NTFS. Stopping a recording sends
 `CTRL_BREAK_EVENT` instead of `SIGINT` (the process is spawned with
 `CREATE_NEW_PROCESS_GROUP` so the signal can be delivered at all); either way
 ffmpeg finalises the segment it is writing before exiting. Nothing is ever
 force-killed first.
-
-If Windows Firewall prompts on first run, allow private networks — otherwise
-the phone on the field WiFi cannot reach port 8080.
 
 ---
 
