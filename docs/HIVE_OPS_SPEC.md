@@ -8,8 +8,8 @@
 > the console is `ops.py` (the node agent is `hive.py`), WS path is
 > `/ingest`, heartbeats are 30 s, the UI uses real History-API paths under
 > `static/ops/` (not hash routes), rejected connections surface as audit
-> rows rather than a dedicated ledger panel, and fonts load via CSS import
-> with system-font fallback instead of vendored woff2.
+> rows rather than a dedicated ledger panel, and Barlow woff2 is vendored
+> under `static/ops/fonts/` so the console renders with no internet.
 
 ## What this is
 Two halves, one repo, one wire protocol:
