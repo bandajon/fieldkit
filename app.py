@@ -22,6 +22,7 @@ from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 import camera
+import hive
 import hostnet
 import live
 import nvr_pull
@@ -97,6 +98,10 @@ if resumed:
     print(f"resumed recording after restart: {', '.join(resumed)}", flush=True)
 OFFLOAD = offload.Offload(CONFIG, record_dir())   # holds CONFIG: config edits land live
 OFFLOAD.start()   # no-op unless offload.enabled is set
+# lambda: record_status is a route defined further down, and the heartbeat sends its
+# body verbatim — the console sees exactly what the local Record tab does.
+HIVE = hive.Hive(CONFIG, REC, lambda: record_status(), camera.snapshot, local_ips)
+HIVE.start()   # no-op unless config.yaml has an ops: block
 
 
 @atexit.register
@@ -123,6 +128,7 @@ def status():
         "disk_free_gb": round(shutil.disk_usage(record_dir()).free / 1e9, 1),
         "time": datetime.now().isoformat(timespec="seconds"),
         "go2rtc": LIVE.info(),
+        "hive": HIVE.info(),
     }
 
 

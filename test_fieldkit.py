@@ -426,11 +426,29 @@ def offload_off_by_default():
     assert not o.last_error and o.uploaded == 0, o.info()
 
 
+def hive_off_by_default():
+    """Every self-hosting node runs this path — it must not open a socket or a thread."""
+    import tempfile, threading, hive, recorder
+    rec = recorder.Recorder([], tempfile.mkdtemp(), "selftest")
+    h = hive.Hive({}, rec, dict, lambda *a: (None, "x"), list)
+    before = threading.active_count()
+    h.start()
+    assert h.info() == {"configured": False, "state": "OFF", "last_beat": 0.0, "seq": 0}
+    assert threading.active_count() == before, "phoned home without an ops block"
+    # A partly-filled block is not enrolment either.
+    for half in ({"url": "ws://c/ingest"}, {"url": "ws://c/ingest", "token": "t"},
+                 {"token": "t", "hive": "kalambo"}):
+        assert not hive.Hive({"ops": half}, rec, dict, lambda *a: (None, "x"),
+                             list).configured(), half
+
+
 check("camera.py self-check", self_check("camera.py"))
+check("hive.py self-check", self_check("hive.py"))
 check("recorder.py self-check", self_check("recorder.py"))
 check("live.py self-check", self_check("live.py"))
 check("offload.py self-check", self_check("offload.py"))
 check("offload off without a config block", offload_off_by_default)
+check("hive off without a config block", hive_off_by_default)
 check("sadp reports inactive camera", sadp_inactive)
 check("mac normalisation", macs)
 check("go2rtc absent without a binary", live_absent)

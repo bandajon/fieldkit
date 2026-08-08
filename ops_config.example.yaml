@@ -1,0 +1,6 @@
+# FIELDKIT HIVE OPS console — copied to ops_config.yaml on first boot.
+# The console never dials a node; nodes dial in with an enrollment token.
+
+port: 8090            # PORT env var wins if set
+webhook_url: ""       # optional; alert fire/clear POSTs {"text": "..."} here
+disk_amber_hours: 6   # a drive with less than this many hours of headroom goes amber
