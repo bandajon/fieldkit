@@ -454,6 +454,29 @@ Leave `ops` out (the default) and none of that runs: no thread, no socket, no
 traffic. The protocol is `docs/HIVE_PROTOCOL.md`; the node's own status is on
 `/api/status` under `hive`.
 
+### Running the ops console
+
+```
+python ops.py        # FIELDKIT HIVE OPS on 0.0.0.0:8090
+```
+
+One instance per organization, on a machine your team's tailnet can reach —
+there is no auth on the console itself, the tailnet is the boundary, and the
+enrolment tokens are what keep strangers' nodes out. First boot copies
+`ops_config.example.yaml` to `ops_config.yaml` (port, optional alert
+`webhook_url`, `disk_amber_hours`) and creates `ops_state/` for tokens,
+desired commands, the audit trail and 24 h of replayable heartbeats — plain
+JSON/JSONL, no database.
+
+Flow: open `/enroll`, create a token for a hive, paste it into each node's
+`ops` block. The fleet ledger at `/` sorts worst-first and folds all-green
+hives; click a hive for its nodes and cameras, a camera for full focus (live
+video is your browser talking straight to that node's go2rtc over the
+tailnet — the console never touches video). Start/stop commands ride tickets
+that show commanded-vs-acked per node; nodes offline at command time apply
+the stored command when they reconnect. `python3 test_e2e.py` smoke-tests
+the whole loop against a real node client.
+
 ---
 
 ## Remote access via Tailscale
