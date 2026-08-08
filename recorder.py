@@ -46,7 +46,7 @@ class Recorder:
         self.out_root = Path(out_root)
         self.site = site
         self.st = {n: {"desired": False, "proc": None, "state": "STOPPED",
-                       "started": None, "restarts": 0, "alive_since": 0.0,
+                       "started": None, "until": None, "restarts": 0, "alive_since": 0.0,
                        "next_spawn": 0.0, "backoff": 2.0, "tail": deque(maxlen=20),
                        "last_bytes": 0, "last_progress": 0.0}
                    for n in self.cams}
@@ -62,7 +62,7 @@ class Recorder:
             if self.st.get(name, {}).get("desired"):
                 return          # already recording: leave the running session alone
             self.st[name] = {"desired": False, "proc": None, "state": "STOPPED",
-                             "started": None, "restarts": 0, "alive_since": 0.0,
+                             "started": None, "until": None, "restarts": 0, "alive_since": 0.0,
                              "next_spawn": 0.0, "backoff": 2.0, "tail": deque(maxlen=20),
                              "last_bytes": 0, "last_progress": 0.0}
 
@@ -119,9 +119,13 @@ class Recorder:
     def _supervise(self):
         while True:
             now = time.time()
+            expired = []
             with self.lock:
                 for name, s in self.st.items():
                     if not s["desired"]:
+                        continue
+                    if s["until"] and now >= s["until"]:
+                        expired.append(name)
                         continue
                     p = s["proc"]
                     if p is not None and p.poll() is None:
@@ -155,16 +159,27 @@ class Recorder:
                         s["proc"] = None
                     elif now >= s["next_spawn"]:
                         self._spawn(name)
+            # Outside the lock: stop() takes it, and _graceful blocks up to 15 s per
+            # process — supervision of the others pauses meanwhile, same as an operator Stop.
+            if expired:
+                self.stop(expired)
             time.sleep(1)
 
-    def start(self, names=None):
+    def start(self, names=None, hours=None):
+        # A run length is optional: no hours (or a non-positive/garbage one) records
+        # until someone presses Stop.
+        try:
+            hours = float(hours)
+        except (TypeError, ValueError):
+            hours = 0.0
+        until = time.time() + hours * 3600 if hours > 0 else None
         with self.lock:
             for n in names or self.cams:
                 s = self.st.get(n)
                 if s is None or s["desired"]:
                     continue
                 s.update(desired=True, state="RECONNECTING", started=time.time(),
-                         restarts=0, backoff=2.0, next_spawn=0.0, last_bytes=0)
+                         until=until, restarts=0, backoff=2.0, next_spawn=0.0, last_bytes=0)
 
     def stop(self, names=None):
         names = list(names or self.cams)
@@ -184,7 +199,7 @@ class Recorder:
                 s = self.st.get(n)
                 # A start() that landed mid-stop owns the state now; don't clobber it.
                 if s and not s["desired"]:
-                    s.update(proc=None, state="STOPPED", started=None)
+                    s.update(proc=None, state="STOPPED", started=None, until=None)
 
     def status(self):
         now = time.time()
@@ -198,6 +213,7 @@ class Recorder:
                     # ponytail: wallclock since Start, not decoded duration — close enough
                     # for an operator; ffprobe the segments if exact footage time matters.
                     "minutes": round((now - start) / 60, 1) if start else 0,
+                    "until": s["until"],
                     "restarts": s["restarts"],
                     "log": list(s["tail"])[-5:],
                 }
@@ -220,6 +236,22 @@ if __name__ == "__main__":
     st = r.status()["fake"]
     assert st["state"] == "STOPPED", st
     assert r.st["fake"]["proc"] is None
+
+    # Timed run: hours= must end the session on its own — nobody calls stop() here.
+    t = Recorder([{"name": "timed", "ip": "127.0.0.1", "user": "u", "password": "p"}],
+                 tempfile.mkdtemp(), "selftest")
+    t.start(["timed"], hours=0.001)          # 3.6 s
+    assert t.status()["timed"]["until"], t.status()["timed"]
+    for _ in range(20):
+        if t.status()["timed"]["state"] == "STOPPED":
+            break
+        time.sleep(0.5)
+    assert t.status()["timed"]["state"] == "STOPPED", t.status()["timed"]
+    assert t.st["timed"]["desired"] is False, t.st["timed"]
+    assert t.st["timed"]["until"] is None, t.st["timed"]
+    t.start(["timed"], hours=0)              # non-positive = record until Stop
+    assert t.st["timed"]["until"] is None
+    t.stop(["timed"])
 
     assert "p%40ss%3Aw%2Frd" in rtsp_url(
         {"user": "admin", "password": "p@ss:w/rd", "ip": "10.0.0.1"})

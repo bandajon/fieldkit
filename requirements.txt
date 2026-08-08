@@ -2,3 +2,4 @@ fastapi
 uvicorn
 requests
 pyyaml
+# boto3  # optional — only for Cloudflare R2 offload

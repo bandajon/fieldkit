@@ -382,9 +382,55 @@ def recorder_add_camera():
     assert r.st["cam9"]["desired"], "re-add wiped a live session"
 
 
+def recorder_timed_stop():
+    """A timed run must finalise itself: the crew starts it and drives away."""
+    import tempfile, time, recorder
+    r = recorder.Recorder([{"name": "t", "ip": "127.0.0.1", "user": "u", "password": "p"}],
+                          tempfile.mkdtemp(), "selftest")
+    r.start(["t"], hours=0.001)                    # 3.6 s
+    assert r.status()["t"]["until"], r.status()["t"]
+    for _ in range(24):
+        if r.status()["t"]["state"] == "STOPPED":
+            break
+        time.sleep(0.5)
+    assert r.status()["t"]["state"] == "STOPPED", r.status()["t"]
+    assert r.st["t"]["desired"] is False and r.st["t"]["until"] is None, r.st["t"]
+    r.start(["t"], hours=0)                        # non-positive = until Stop
+    assert r.st["t"]["until"] is None
+    r.stop(["t"])
+
+
+def record_start_hours():
+    """Bad hours must be refused at the boundary, not silently ignored."""
+    import app
+    from fastapi import HTTPException
+    for bad in ("nope", "", 0, -1, 721, [2]):
+        try:
+            app.record_start({"cams": ["__nosuch__"], "hours": bad})
+        except HTTPException as e:
+            assert e.status_code == 400, (bad, e.status_code)
+        else:
+            raise AssertionError(f"accepted hours={bad!r}")
+    # Valid: no camera by that name, so nothing spawns — we only want the route's shape.
+    r = app.record_start({"cams": ["__nosuch__"], "hours": 2})
+    assert "cameras" in r and r["disks"], r
+    assert r["disks"][0]["free_gb"] > 0, r["disks"]
+
+
+def offload_off_by_default():
+    """Every node without an offload block runs this code path — it must be inert."""
+    import tempfile, offload
+    o = offload.Offload({}, tempfile.mkdtemp())
+    assert not o.info()["enabled"], o.info()
+    o.sweep()                                  # no block, no client, no crash
+    assert not o.last_error and o.uploaded == 0, o.info()
+
+
 check("camera.py self-check", self_check("camera.py"))
 check("recorder.py self-check", self_check("recorder.py"))
 check("live.py self-check", self_check("live.py"))
+check("offload.py self-check", self_check("offload.py"))
+check("offload off without a config block", offload_off_by_default)
 check("sadp reports inactive camera", sadp_inactive)
 check("mac normalisation", macs)
 check("go2rtc absent without a binary", live_absent)
@@ -404,6 +450,8 @@ check("hikvision tz strings", camera_tz_strings)
 check("camera.set_time", camera_set_time)
 check("camera name validation", camera_names)
 check("recorder.add_camera", recorder_add_camera)
+check("recorder timed stop", recorder_timed_stop)
+check("record start validates hours", record_start_hours)
 check("README documents every config key", readme_documents_config)
 
 print(f"\n{'FAILED: ' + ', '.join(FAILS) if FAILS else 'all passed'}")

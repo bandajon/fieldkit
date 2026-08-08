@@ -252,6 +252,7 @@ thereafter. It is shared with `nvr_pull.py`, which reads the first three keys.
 | `record_dir` | FieldKit | Root for ffmpeg segment recordings. Created on demand. |
 | `go2rtc_binary` | FieldKit | Absolute path to the go2rtc binary. Empty means the Monitor tab stays on snapshots. FieldKit never downloads it. |
 | `camera_defaults` | FieldKit | Credentials the discovery sweep tries against cameras that are not yet in `cameras`. |
+| `offload` | FieldKit | Optional Cloudflare R2 upload when the recording drive runs low. Off unless `offload.enabled` is true — see [Cloud offload](#cloud-offload-optional). |
 
 Relative paths resolve against the app directory, not the shell's working
 directory, so `python app.py` behaves the same from anywhere.
@@ -394,6 +395,41 @@ evidence. Recording quality is completely unaffected by any of this.
 
 `go2rtc.yaml` is generated, contains your camera passwords, and is gitignored.
 Do not commit it.
+
+---
+
+## Cloud offload (optional)
+
+A node that records for days can fill its drive. With `offload.enabled: true`
+FieldKit watches free space on the recording drive and, once it drops below
+`min_free_gb`, uploads the **oldest finished segments** to a Cloudflare R2
+bucket and deletes each local copy — stopping the moment the drive is back
+above the floor. It frees space, it does not drain the disk.
+
+Three rules make it safe to leave on:
+
+- Only **finished** segments move. The segment ffmpeg is currently writing is
+  never touched.
+- Every upload carries a sha256 that **R2 verifies server-side**. A corrupt or
+  truncated upload is rejected by Cloudflare, not by us.
+- The local file is deleted **only after** that upload succeeds. Any failure —
+  network, credentials, checksum — keeps the footage and stops the pass.
+
+Setup:
+
+1. Create the bucket: `npx wrangler r2 bucket create fieldkit-recordings`.
+2. In the Cloudflare dashboard, **R2 → Manage R2 API Tokens**, mint an **Object
+   Read & Write** token scoped to that bucket. Note the account ID, access key
+   ID and secret.
+3. Fill the `offload` block in `config.yaml` and set `enabled: true`.
+4. `pip install boto3` — it is not in `requirements.txt`. Enabled without it,
+   FieldKit logs `offload enabled but boto3 missing` and stays idle.
+
+State (`enabled`, files uploaded this session, last file, last error) is
+reported by `/api/record/status`.
+
+**Self-hosting?** Leave `enabled: false`, the default. Nothing ever leaves the
+node, no credentials are needed, and the uploader thread does nothing at all.
 
 ---
 
