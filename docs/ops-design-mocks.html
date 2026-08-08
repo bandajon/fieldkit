@@ -1,0 +1,746 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet data-dc-atomics><meta name="design_doc_mode" content="canvas"><link rel="stylesheet" href="ds/industry.css"><style>body{margin:0;background:#f0eee9;font-family:"Barlow",system-ui,sans-serif}a{color:#416180}a:hover{color:#1d2d3d}.dv-turn{padding:40px 44px 32px;border-bottom:1px solid rgba(0,0,0,.08);scroll-margin-top:16px}.dv-thd{display:flex;align-items:baseline;gap:10px;margin:0 0 20px}.dv-tid{font:600 10px ui-monospace,Menlo,monospace;padding:3px 7px;background:#1a1a1a;color:#fff;border-radius:4px;text-decoration:none}.dv-tname{font:600 13px/1.2 system-ui,sans-serif;color:#1a1a1a}.dv-opts{display:flex;flex-wrap:wrap;gap:28px;align-items:flex-start}.dv-opt{flex:none;display:flex;flex-direction:column;gap:9px;scroll-margin-top:16px}.dv-oid{font:600 10.5px ui-monospace,Menlo,monospace;padding:3px 7px;background:rgba(0,0,0,.08);color:#1a1a1a;border-radius:5px;text-decoration:none}.dv-olabel{display:flex;align-items:baseline;gap:8px;font:400 11px/1.3 system-ui,sans-serif;color:rgba(0,0,0,.55)}.dv-card{max-width:100%;background:#f2f2f3;border:1px solid rgba(0,0,0,.1);border-radius:8px;box-shadow:0 1px 3px rgba(0,0,0,.06);overflow:hidden}.dv-opt:target .dv-oid{background:#2a78d6;color:#fff}.dv-next{margin:22px 0 0;font:12px/1.5 system-ui,sans-serif;color:rgba(0,0,0,.5)}.dv-group{flex-basis:100%;margin:26px 0 -14px;font:600 11px/1 ui-monospace,Menlo,monospace;letter-spacing:.16em;text-transform:uppercase;color:rgba(0,0,0,.45)}.dv-group:first-of-type{margin-top:0}</style></helmet>
+<section class="dv-turn" id="t4" data-screen-label="Turn 4 — timed recording, per-drive disk, cloud offload">
+<div class="dv-thd"><a class="dv-tid" href="#t4">4</a><span class="dv-tname">Node-API additions — timed recording, per-drive disk, R2 offload. Reworks <a class="dv-oid" href="#1h">1h</a>, <a class="dv-oid" href="#3a">3a</a> rows, <a class="dv-oid" href="#1f">1f</a>, <a class="dv-oid" href="#1i">1i</a>.</span></div>
+<div class="dv-opts">
+
+<div class="dv-opt" id="4a"><div class="dv-olabel"><a class="dv-oid" href="#4a">4a</a>Start confirm with duration — preset chips, until-stopped default</div>
+<div class="dv-card" style="width:560px;background:#c9ccd0;padding:28px" data-screen-label="4a Start confirm with duration">
+<div class="blueprint" style="background:#f2f2f3;box-shadow:0 12px 32px rgba(43,43,45,.22)"><i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+<div style="padding:20px 22px">
+<h4 style="margin:0 0 14px">START RECORDING</h4>
+<div style="display:flex;border:1px solid #b7b7ba;margin-bottom:16px">
+<span style="flex:1;text-align:center;padding:12px;font:600 13px ui-monospace,Menlo,monospace;background:#1d2d3d;color:#f2f2f3">HIVE · KALAMBO</span>
+<span style="flex:1;text-align:center;padding:12px;font:600 13px ui-monospace,Menlo,monospace;color:#5d5d60">ENTIRE FLEET</span></div>
+<div style="font:600 10px/1 ui-monospace,Menlo,monospace;letter-spacing:.14em;color:#5d5d60;margin-bottom:8px">DURATION</div>
+<div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:10px">
+<span style="padding:12px 16px;font:600 13px ui-monospace,Menlo,monospace;background:#1d2d3d;color:#f2f2f3;min-height:48px;display:inline-flex;align-items:center">UNTIL STOPPED</span>
+<span style="padding:12px 16px;font:600 13px ui-monospace,Menlo,monospace;border:1px solid #b7b7ba;color:#424244;min-height:48px;display:inline-flex;align-items:center">2 H</span>
+<span style="padding:12px 16px;font:600 13px ui-monospace,Menlo,monospace;border:1px solid #b7b7ba;color:#424244;min-height:48px;display:inline-flex;align-items:center">4 H</span>
+<span style="padding:12px 16px;font:600 13px ui-monospace,Menlo,monospace;border:1px solid #b7b7ba;color:#424244;min-height:48px;display:inline-flex;align-items:center">8 H</span>
+<span style="padding:12px 16px;font:600 13px ui-monospace,Menlo,monospace;border:1px dashed #b7b7ba;color:#5d5d60;min-height:48px;display:inline-flex;align-items:center">CUSTOM…</span></div>
+<div style="font:13px/1.7 ui-monospace,Menlo,monospace;color:#424244">3 nodes · 9 cameras · until stopped<br><span style="color:#2f7a52">2 nodes online — ack ≤ 60 s</span> · <span style="color:#9a6d1f">1 offline — applies on reconnect</span></div>
+<p style="font:12px/1.5 'Barlow',sans-serif;color:#5d5d60;margin:12px 0 0">A duration pick rewrites the line above: "9 cameras · 4 h — stops 18:07Z (timer runs on each node; survives console outage)". Offline-node caveat: its timer starts when IT starts, so its stop time may differ — shown per node in the ticket.</p></div>
+<div style="display:flex;gap:10px;padding:0 22px 20px">
+<button class="btn btn-primary" style="min-height:52px;flex:1;font-size:16px">Command start — 3 nodes</button>
+<button class="btn btn-ghost" style="min-height:52px">Cancel</button></div></div></div></div>
+
+<div class="dv-opt" id="4b"><div class="dv-olabel"><a class="dv-oid" href="#4b">4b</a>Node rows reworked — timers, per-drive hours, offload states (fleet tier)</div>
+<div class="dv-card" style="width:1180px" data-screen-label="4b Node rows with timers, drives, offload">
+<div style="padding:20px">
+<div class="blueprint"><i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+<div style="display:grid;grid-template-columns:150px 1fr 240px 240px 130px;gap:0 16px;align-items:center;padding:8px 18px 4px;font:600 10px/1 ui-monospace,Menlo,monospace;letter-spacing:.14em;color:#98989b"><span>NODE</span><span>CAMERAS</span><span>DRIVES · HOURS LEFT</span><span>OFFLOAD</span><span>LAST HB</span></div>
+<div style="display:grid;grid-template-columns:150px 1fr 240px 240px 130px;gap:0 16px;align-items:center;padding:13px 18px;border-top:1px solid #e7e7ea;min-height:60px">
+<span style="display:inline-flex;align-items:center;gap:8px;font:600 13px ui-monospace,Menlo,monospace"><span style="width:8px;height:8px;border-radius:50%;background:#2f7a52;display:inline-block"></span>fk-kal-01</span>
+<span style="display:flex;flex-direction:column;gap:4px;font:12px ui-monospace,Menlo,monospace"><span><span style="color:#2f7a52">●</span> 3 cams REC · <b style="background:#e9e9ea;padding:2px 6px">⏱ STOPS 18:07Z · 3:58 LEFT</b></span></span>
+<span style="display:flex;flex-direction:column;gap:3px;font:12px ui-monospace,Menlo,monospace"><span>recordings 61.4 h</span><span style="color:#5d5d60">nvr-staging 210 h</span></span>
+<span style="display:inline-flex;align-items:center;gap:7px;font:600 11px ui-monospace,Menlo,monospace;color:#416180;letter-spacing:.04em">▲ UPLOADING 20260808T1340_cam4.mkv</span>
+<span style="font:13px ui-monospace,Menlo,monospace;color:#5d5d60">31 s</span></div>
+<div style="display:grid;grid-template-columns:150px 1fr 240px 240px 130px;gap:0 16px;align-items:center;padding:13px 18px;border-top:1px solid #e7e7ea;min-height:60px">
+<span style="display:inline-flex;align-items:center;gap:8px;font:600 13px ui-monospace,Menlo,monospace"><span style="width:8px;height:8px;border-radius:50%;background:#2f7a52;display:inline-block"></span>fk-bb-02</span>
+<span style="display:flex;flex-direction:column;gap:4px;font:12px ui-monospace,Menlo,monospace"><span><span style="color:#2f7a52">●</span> cam7·cam8 REC · <b style="background:#e9e9ea;padding:2px 6px">⏱ 1:12 LEFT</b></span><span><span style="color:#2f7a52">●</span> cam9 REC · UNTIL STOPPED — <b style="color:#9a6d1f">MIXED</b></span></span>
+<span style="display:flex;flex-direction:column;gap:3px;font:12px ui-monospace,Menlo,monospace"><span>recordings 52.8 h</span></span>
+<span style="font:11px ui-monospace,Menlo,monospace;color:#98989b">—</span>
+<span style="font:13px ui-monospace,Menlo,monospace;color:#5d5d60">12 s</span></div>
+<div style="display:grid;grid-template-columns:150px 1fr 240px 240px 130px;gap:0 16px;align-items:center;padding:13px 18px;border-top:1px solid #e7e7ea;min-height:60px;background:#fdf3f2">
+<span style="display:inline-flex;align-items:center;gap:8px;font:600 13px ui-monospace,Menlo,monospace"><span style="width:8px;height:8px;border-radius:50%;background:#2f7a52;display:inline-block"></span>fk-bb-01</span>
+<span style="font:12px ui-monospace,Menlo,monospace"><span style="color:#2f7a52">●</span> 2 cams REC · UNTIL STOPPED</span>
+<span style="display:flex;flex-direction:column;gap:3px;font:12px ui-monospace,Menlo,monospace"><span style="color:#b04a3f;font-weight:600">recordings 4.2 h ⚠</span><span style="color:#5d5d60">nvr-staging 96 h</span></span>
+<span style="display:inline-flex;align-items:center;gap:7px;font:600 11px ui-monospace,Menlo,monospace;color:#b04a3f;background:#fff;border:1px solid #b04a3f;padding:5px 8px">▲ FAILED 3 H · R2 403 — DISK 4.2 H</span>
+<span style="font:13px ui-monospace,Menlo,monospace;color:#5d5d60">18 s</span></div>
+</div>
+<p style="font:12px/1.5 'Barlow',sans-serif;color:#5d5d60;margin:16px 0 0;max-width:820px">Row anatomy changes to <a href="#3a">3a</a>: DISK column becomes DRIVES — one hours-remaining line per filesystem, never merged, never percent; the <b>worst drive</b> is the sort key and takes the tint. Timers ride the camera line as a ⏱ chip (absolute Z time + countdown); a node with both timed and open-ended cams is flagged MIXED. OFFLOAD shows only where enabled: dim ✓ idle · steel ▲ uploading with current file · red FAILED with the reason — and failed-offload-plus-low-disk (bottom row) tints the whole row red even though every camera is green. Disabled = column empty, no cloud chrome.</p>
+</div></div></div>
+
+<div class="dv-opt" id="4c"><div class="dv-olabel"><a class="dv-oid" href="#4c">4c</a>Node focus reworked — timer per camera, drives + offload panels</div>
+<div class="dv-card" style="width:1180px" data-screen-label="4c Node focus with drives and offload">
+<div style="display:flex;align-items:center;gap:20px;background:#1d2d3d;color:#f2f2f3;padding:0 20px;min-height:56px">
+<div style="font-family:'Barlow Condensed',sans-serif;font-weight:600;font-size:21px;letter-spacing:.03em">FIELDKIT <span style="color:#94bce3">HIVE OPS</span></div>
+<span style="font:13px ui-monospace,Menlo,monospace;color:#9ebbd8">FLEET › KALAMBO › <b style="color:#f2f2f3">fk-kal-01</b></span></div>
+<div style="display:grid;grid-template-columns:1fr 300px;gap:0">
+<div style="padding:16px 18px">
+<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:14px">
+<div style="display:flex;flex-direction:column;gap:8px">
+<div style="aspect-ratio:16/9;background:repeating-linear-gradient(45deg,#e2e6ea 0 8px,#d9dee3 8px 16px);border:1px solid #d4d4d7;display:flex;align-items:end"><span style="font:10px ui-monospace,Menlo,monospace;color:#5d5d60;padding:5px 7px">snapshot · 12 s</span></div>
+<span style="display:flex;align-items:center;gap:8px;font:600 12px ui-monospace,Menlo,monospace"><span style="width:8px;height:8px;border-radius:50%;background:#2f7a52"></span>cam4 · REC</span>
+<span style="font:11px ui-monospace,Menlo,monospace;background:#e9e9ea;padding:4px 7px;width:fit-content">⏱ STOPS 18:07Z · 3:58 LEFT</span>
+<span style="height:8px;background:#2f7a52"></span></div>
+<div style="display:flex;flex-direction:column;gap:8px">
+<div style="aspect-ratio:16/9;background:repeating-linear-gradient(45deg,#e2e6ea 0 8px,#d9dee3 8px 16px);border:1px solid #d4d4d7;display:flex;align-items:end"><span style="font:10px ui-monospace,Menlo,monospace;color:#5d5d60;padding:5px 7px">snapshot · 8 s</span></div>
+<span style="display:flex;align-items:center;gap:8px;font:600 12px ui-monospace,Menlo,monospace"><span style="width:8px;height:8px;border-radius:50%;background:#2f7a52"></span>cam5 · REC</span>
+<span style="font:11px ui-monospace,Menlo,monospace;background:#e9e9ea;padding:4px 7px;width:fit-content">⏱ STOPS 18:07Z · 3:58 LEFT</span>
+<span style="height:8px;background:linear-gradient(90deg,#2f7a52 0 71%,#b04a3f 71% 84%,#2f7a52 84% 100%)"></span></div>
+<div style="display:flex;flex-direction:column;gap:8px">
+<div style="aspect-ratio:16/9;background:repeating-linear-gradient(45deg,#e2e6ea 0 8px,#d9dee3 8px 16px);border:1px solid #d4d4d7;display:flex;align-items:end"><span style="font:10px ui-monospace,Menlo,monospace;color:#5d5d60;padding:5px 7px">snapshot · 9 s</span></div>
+<span style="display:flex;align-items:center;gap:8px;font:600 12px ui-monospace,Menlo,monospace"><span style="width:8px;height:8px;border-radius:50%;background:#2f7a52"></span>cam6 · REC</span>
+<span style="font:11px ui-monospace,Menlo,monospace;color:#5d5d60;padding:4px 0;width:fit-content">UNTIL STOPPED</span>
+<span style="height:8px;background:#2f7a52"></span></div></div>
+<div style="display:flex;align-items:center;gap:10px;margin-top:14px;padding:10px 12px;border:1px solid #d4d4d7;background:#e9e9ea">
+<span style="font:600 10px ui-monospace,Menlo,monospace;letter-spacing:.14em;color:#9a6d1f">MIXED TIMERS</span>
+<span style="font:12px ui-monospace,Menlo,monospace;color:#424244">2 cams stop 18:07Z · 1 cam until stopped</span>
+<button class="btn btn-ghost" style="margin-left:auto;min-height:40px;font-size:12px">Extend all +2 h</button>
+<button class="btn btn-ghost" style="min-height:40px;font-size:12px">Clear timers</button></div></div>
+<div style="border-left:1px solid #d4d4d7;padding:16px;display:flex;flex-direction:column;gap:16px">
+<div><span style="font:600 10px/1 ui-monospace,Menlo,monospace;letter-spacing:.14em;color:#5d5d60">DRIVES</span>
+<div style="display:flex;justify-content:space-between;font:13px ui-monospace,Menlo,monospace;margin-top:8px"><span>recordings</span><b>61.4 h</b></div>
+<div style="height:6px;background:#d4d4d7;margin:5px 0 10px"><div style="height:100%;width:64%;background:#2f7a52"></div></div>
+<div style="display:flex;justify-content:space-between;font:13px ui-monospace,Menlo,monospace;color:#5d5d60"><span>nvr-staging</span><b>210 h</b></div>
+<div style="height:6px;background:#d4d4d7;margin-top:5px"><div style="height:100%;width:88%;background:#98989b"></div></div>
+<div style="font:11px ui-monospace,Menlo,monospace;color:#98989b;margin-top:6px">hours at each drive's own write rate · worst drive sorts the node</div></div>
+<div class="blueprint" style="padding:12px 14px"><i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+<span style="font:600 10px/1 ui-monospace,Menlo,monospace;letter-spacing:.14em;color:#5d5d60">OFFLOAD · R2</span>
+<div style="display:flex;align-items:center;gap:8px;font:600 12px ui-monospace,Menlo,monospace;color:#416180;margin-top:8px">▲ UPLOADING</div>
+<div style="font:11.5px/1.6 ui-monospace,Menlo,monospace;color:#424244;margin-top:4px">20260808T1340_cam4.mkv<br>uploaded 412 segments · verified then deleted locally<br>floor: starts under 24 h free</div></div>
+<div><span style="font:600 10px/1 ui-monospace,Menlo,monospace;letter-spacing:.14em;color:#5d5d60">COVERAGE — CAM5 · 24 H</span>
+<div style="height:12px;background:linear-gradient(90deg,#749dc4 0 30%,#2f7a52 30% 71%,#b04a3f 71% 84%,#2f7a52 84% 100%);margin:8px 0 5px"></div>
+<div style="font:11px ui-monospace,Menlo,monospace;color:#5d5d60"><span style="color:#416180">▲ blue = in cloud (118 seg)</span> · green = on node · <span style="color:#b04a3f">red = gap</span></div></div>
+</div></div></div></div>
+
+<div class="dv-opt" id="4d"><div class="dv-olabel"><a class="dv-oid" href="#4d">4d</a>New alert states — offload failing; disk critical despite offload</div>
+<div class="dv-card" style="width:760px;padding:20px;display:flex;flex-direction:column;gap:12px" data-screen-label="4d Offload alerts">
+<div class="blueprint" style="background:#fdf3f2;padding:14px 16px"><i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+<div style="display:flex;align-items:center;gap:10px;font:600 13px ui-monospace,Menlo,monospace"><span style="width:8px;height:8px;border-radius:50%;background:#b04a3f;flex:none"></span>FIRING · DISK CRITICAL DESPITE OFFLOAD<span style="margin-left:auto;color:#5d5d60;font-weight:400">3.1 h</span></div>
+<div style="font:13px ui-monospace,Menlo,monospace;margin:6px 0 2px">ben bella › fk-bb-01 — recordings 4.2 h left · offload FAILED (R2 403)</div>
+<div style="font:12px ui-monospace,Menlo,monospace;color:#5d5d60">the urgent combination: safety valve down while the drive fills — supersedes and absorbs the separate disk + offload alerts · webhook posted with both facts</div></div>
+<div class="blueprint" style="padding:14px 16px"><i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+<div style="display:flex;align-items:center;gap:10px;font:600 13px ui-monospace,Menlo,monospace;color:#9a6d1f"><span style="width:8px;height:8px;border-radius:50%;background:#9a6d1f;flex:none"></span>FIRING · OFFLOAD FAILING<span style="margin-left:auto;color:#5d5d60;font-weight:400">55 min</span></div>
+<div style="font:13px ui-monospace,Menlo,monospace;margin:6px 0 2px">chingola › fk-chi-03 — last_error: R2 timeout · disk 89 h left</div>
+<div style="font:12px ui-monospace,Menlo,monospace;color:#5d5d60">amber while disk is healthy (persisted 3 heartbeats) · escalates to the red combination if the worst drive drops under N h · clears after 2 clean uploads</div></div>
+<p style="font:12px/1.5 'Barlow',sans-serif;color:#5d5d60;margin:0">Severity is the pair, not the part: offload failure alone = amber; low disk alone = amber; both on one node = red and sorts to the very top. Nodes with offload disabled can never raise either.</p>
+</div></div>
+
+</div>
+<p class="dv-next">Try next: "phone treatment of the timer chips and drive lines" · "custom-duration picker for <a class="dv-oid" href="#4a">4a</a>" · "clickable prototype with all of turn 4 folded in"</p>
+</section>
+<section class="dv-turn" id="t3" data-screen-label="Turn 3 — consolidated fleet view, enrollment, stop scoping">
+<div class="dv-thd"><a class="dv-tid" href="#t3">3</a><span class="dv-tname">Consolidation per the updated brief — one global view (folds <a class="dv-oid" href="#1a">1a</a> into <a class="dv-oid" href="#2b">2b</a> as its fallback), enrollment, and the stop-scope rule</span></div>
+<div class="dv-opts">
+
+<div class="dv-opt" id="3a"><div class="dv-olabel"><a class="dv-oid" href="#3a">3a</a>THE global fleet view — micro-thumb ledger with degraded rows built in</div>
+<div class="dv-card" style="width:1180px" data-screen-label="3a Global fleet view (consolidated)">
+<div style="display:flex;align-items:center;gap:24px;background:#1d2d3d;color:#f2f2f3;padding:0 20px;min-height:56px">
+<div style="font-family:'Barlow Condensed',sans-serif;font-weight:600;font-size:21px;letter-spacing:.03em">FIELDKIT <span style="color:#94bce3">HIVE OPS</span></div>
+<div style="display:flex;gap:2px;margin-left:8px">
+<span style="font:600 12px/1 ui-monospace,Menlo,monospace;letter-spacing:.12em;padding:14px 14px;border-bottom:2px solid #94bce3">FLEET</span>
+<span style="font:600 12px/1 ui-monospace,Menlo,monospace;letter-spacing:.12em;padding:14px 14px;color:#9ebbd8">ALERTS <span style="background:#b04a3f;color:#fff;border-radius:8px;padding:1px 6px">4</span></span>
+<span style="font:600 12px/1 ui-monospace,Menlo,monospace;letter-spacing:.12em;padding:14px 14px;color:#9ebbd8">AUDIT</span>
+<span style="font:600 12px/1 ui-monospace,Menlo,monospace;letter-spacing:.12em;padding:14px 14px;color:#9ebbd8">ENROLL</span></div>
+<div style="margin-left:auto;display:flex;align-items:center;gap:18px">
+<span style="font:12px ui-monospace,Menlo,monospace;color:#9ebbd8">14:07:22Z</span>
+<span style="font:600 11px ui-monospace,Menlo,monospace;letter-spacing:.1em;border:1px solid #416180;padding:6px 10px;color:#d6ebff">SNAPSHOTS 10 S</span></div></div>
+<div style="display:flex;flex-wrap:wrap;align-items:center;border-bottom:1px solid #d4d4d7;background:#e9e9ea;padding:10px 20px">
+<div style="display:flex;flex-direction:column;gap:3px;padding-right:22px;border-right:1px solid #d4d4d7"><span style="font:600 10px/1 ui-monospace,Menlo,monospace;letter-spacing:.14em;color:#5d5d60">NODES</span><span style="font:14px ui-monospace,Menlo,monospace"><b style="color:#2f7a52">11</b> online · <b style="color:#9a6d1f">2</b> hb-only · <b style="color:#b04a3f">1</b> offline</span></div>
+<div style="display:flex;flex-direction:column;gap:3px;padding:0 22px;border-right:1px solid #d4d4d7"><span style="font:600 10px/1 ui-monospace,Menlo,monospace;letter-spacing:.14em;color:#5d5d60">CAMERAS</span><span style="font:14px ui-monospace,Menlo,monospace"><b style="color:#2f7a52">37</b> rec · <b style="color:#b04a3f">2</b> reconnecting · <b style="color:#98989b">2</b> stopped</span></div>
+<div style="display:flex;flex-direction:column;gap:3px;padding:0 22px"><span style="font:600 10px/1 ui-monospace,Menlo,monospace;letter-spacing:.14em;color:#5d5d60">COVERAGE 24H</span><span style="font:14px ui-monospace,Menlo,monospace">96.2%</span></div>
+<div style="margin-left:auto;display:flex;gap:10px"><button class="btn btn-secondary" style="min-height:44px">Start recording…</button><button class="btn btn-ghost" style="min-height:44px;color:#b04a3f;border-color:#b04a3f">Stop…</button></div></div>
+<div style="padding:20px">
+<div class="blueprint"><i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+<div style="display:flex;align-items:center;gap:16px;padding:12px 18px;border-bottom:1px solid #d4d4d7">
+<h4 style="margin:0">KALAMBO</h4><span style="font:12px ui-monospace,Menlo,monospace;color:#5d5d60">3 nodes · 9 cams · coverage 89.1%</span>
+<span style="display:inline-flex;align-items:center;gap:6px;font:600 11px/1 ui-monospace,Menlo,monospace;letter-spacing:.06em;color:#b04a3f"><span style="width:8px;height:8px;border-radius:50%;background:#b04a3f;display:inline-block"></span>2 PROBLEMS</span>
+<span style="margin-left:auto;font:600 13px ui-monospace,Menlo,monospace;color:#416180">OPEN HIVE ▸</span></div>
+<div style="display:grid;grid-template-columns:150px 330px 1fr 110px 96px;gap:0 16px;align-items:center;padding:8px 18px 4px;font:600 10px/1 ui-monospace,Menlo,monospace;letter-spacing:.14em;color:#98989b"><span>NODE</span><span>CAMERAS · THUMBS 10 S</span><span>COVERAGE 24H</span><span>DISK</span><span>LAST HB</span></div>
+<div style="display:grid;grid-template-columns:150px 330px 1fr 110px 96px;gap:0 16px;align-items:center;padding:11px 18px;border-top:1px solid #e7e7ea;background:#fdf3f2;min-height:56px">
+<span style="display:inline-flex;align-items:center;gap:8px;font:600 13px ui-monospace,Menlo,monospace"><span style="width:8px;height:8px;border-radius:50%;background:#b04a3f;display:inline-block"></span>fk-kal-02</span>
+<span style="font:600 12px ui-monospace,Menlo,monospace;color:#b04a3f;letter-spacing:.06em">OFFLINE 42 MIN — NO THUMBS · LAST STATE 3 CAMS REC</span>
+<span style="height:8px;background:linear-gradient(90deg,#2f7a52 0 88%,#b7b7ba 88% 100%)"></span>
+<span style="font:13px ui-monospace,Menlo,monospace;color:#98989b">—</span>
+<span style="font:13px ui-monospace,Menlo,monospace;color:#b04a3f">14:24Z</span></div>
+<div style="display:grid;grid-template-columns:150px 330px 1fr 110px 96px;gap:0 16px;align-items:center;padding:11px 18px;border-top:1px solid #e7e7ea">
+<span style="display:inline-flex;align-items:center;gap:8px;font:600 13px ui-monospace,Menlo,monospace"><span style="width:8px;height:8px;border-radius:50%;background:#2f7a52;display:inline-block"></span>fk-kal-01</span>
+<span style="display:flex;gap:6px"><span style="width:96px;aspect-ratio:16/9;background:repeating-linear-gradient(45deg,#e2e6ea 0 6px,#d9dee3 6px 12px);border:1px solid #d4d4d7;position:relative;display:block"><span style="position:absolute;top:3px;right:3px;background:rgba(29,45,61,.85);color:#d6ebff;font:600 9px ui-monospace,Menlo,monospace;padding:2px 4px">8S</span></span><span style="width:96px;aspect-ratio:16/9;background:#3a2a2a;border:1px solid #b04a3f;display:flex;align-items:center;justify-content:center;font:600 9px ui-monospace,Menlo,monospace;color:#e8b4ae;text-align:center">RECON<br>3.2H</span><span style="width:96px;aspect-ratio:16/9;background:repeating-linear-gradient(45deg,#e2e6ea 0 6px,#d9dee3 6px 12px);border:1px solid #d4d4d7;position:relative;display:block"><span style="position:absolute;top:3px;right:3px;background:rgba(29,45,61,.85);color:#d6ebff;font:600 9px ui-monospace,Menlo,monospace;padding:2px 4px">3S</span></span></span>
+<span style="height:8px;background:linear-gradient(90deg,#2f7a52 0 71%,#b04a3f 71% 84%,#2f7a52 84% 100%)"></span>
+<span style="font:13px ui-monospace,Menlo,monospace">61.4 h</span>
+<span style="font:13px ui-monospace,Menlo,monospace;color:#5d5d60">31 s</span></div>
+<div style="display:grid;grid-template-columns:150px 330px 1fr 110px 96px;gap:0 16px;align-items:center;padding:11px 18px;border-top:1px solid #e7e7ea">
+<span style="display:inline-flex;align-items:center;gap:8px;font:600 13px ui-monospace,Menlo,monospace"><span style="width:8px;height:8px;border-radius:50%;background:#9a6d1f;display:inline-block"></span>fk-kal-03</span>
+<span style="display:flex;gap:6px"><span style="width:96px;aspect-ratio:16/9;background:repeating-linear-gradient(45deg,#efe9db 0 6px,#e8e0cf 6px 12px);position:relative;display:block"><span style="position:absolute;top:3px;right:3px;background:#9a6d1f;color:#fff;font:600 9px ui-monospace,Menlo,monospace;padding:2px 4px">58S·HB</span></span><span style="width:96px;aspect-ratio:16/9;background:repeating-linear-gradient(45deg,#efe9db 0 6px,#e8e0cf 6px 12px);position:relative;display:block"><span style="position:absolute;top:3px;right:3px;background:#9a6d1f;color:#fff;font:600 9px ui-monospace,Menlo,monospace;padding:2px 4px">58S·HB</span></span><span style="width:96px;aspect-ratio:16/9;background:repeating-linear-gradient(45deg,#efe9db 0 6px,#e8e0cf 6px 12px);position:relative;display:block"><span style="position:absolute;top:3px;right:3px;background:#9a6d1f;color:#fff;font:600 9px ui-monospace,Menlo,monospace;padding:2px 4px">58S·HB</span></span></span>
+<span style="height:8px;background:#2f7a52"></span>
+<span style="font:13px ui-monospace,Menlo,monospace">38.0 h</span>
+<span style="font:13px ui-monospace,Menlo,monospace;color:#5d5d60">47 s</span></div>
+</div>
+<div class="blueprint" style="margin-top:18px"><i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+<div style="display:flex;align-items:center;gap:16px;padding:12px 18px">
+<h4 style="margin:0;color:#5d5d60">CHINGOLA</h4><span style="font:12px ui-monospace,Menlo,monospace;color:#5d5d60">9 nodes · 26 cams · coverage 99.7%</span>
+<span style="display:inline-flex;align-items:center;gap:6px;font:600 11px/1 ui-monospace,Menlo,monospace;letter-spacing:.06em;color:#2f7a52"><span style="width:8px;height:8px;border-radius:50%;background:#2f7a52;display:inline-block"></span>ALL HEALTHY</span>
+<span style="margin-left:auto;font:600 13px ui-monospace,Menlo,monospace;color:#416180">EXPAND ▾</span></div></div>
+<p style="font:12px/1.5 'Barlow',sans-serif;color:#5d5d60;margin:16px 0 0;max-width:760px">One view, three row modes: healthy = micro-thumbs with age chips (10 s, expanded hives only) · heartbeat-only = 60 s VIA-HB frames · offline = the text-only fallback row (was <a href="#1a">1a</a>), red-tinted, no thumbs fetched. Coverage bars show offline time as gray "unknown", distinct from red gaps. Thumbs are JPEG snapshots, never live.</p>
+</div></div></div>
+
+<div class="dv-opt" id="3b"><div class="dv-olabel"><a class="dv-oid" href="#3b">3b</a>Enrollment — per-hive tokens, generate/revoke, enrolled nodes</div>
+<div class="dv-card" style="width:1180px" data-screen-label="3b Enrollment">
+<div style="display:flex;align-items:center;gap:24px;background:#1d2d3d;color:#f2f2f3;padding:0 20px;min-height:56px">
+<div style="font-family:'Barlow Condensed',sans-serif;font-weight:600;font-size:21px;letter-spacing:.03em">FIELDKIT <span style="color:#94bce3">HIVE OPS</span></div>
+<span style="font:600 12px/1 ui-monospace,Menlo,monospace;letter-spacing:.12em;border-bottom:2px solid #94bce3;padding:14px 0">ENROLL</span></div>
+<div style="display:grid;grid-template-columns:420px 1fr;gap:0">
+<div style="border-right:1px solid #d4d4d7;padding:18px;display:flex;flex-direction:column;gap:14px">
+<h6 style="margin:0;color:#5d5d60">Hive tokens</h6>
+<div class="blueprint" style="padding:14px 16px"><i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+<div style="display:flex;align-items:center;gap:10px"><h5 style="margin:0">KALAMBO</h5><span style="font:12px ui-monospace,Menlo,monospace;color:#5d5d60">3 nodes enrolled</span></div>
+<div style="display:flex;align-items:center;gap:8px;margin:10px 0;font:13px ui-monospace,Menlo,monospace;background:#e9e9ea;padding:10px 12px"><span>fk1_kal_••••••••••••7q2f</span><span style="margin-left:auto;font:600 11px;color:#416180;letter-spacing:.08em">COPY</span></div>
+<div style="font:11px ui-monospace,Menlo,monospace;color:#98989b;margin-bottom:10px">created 2026-06-14 · shown once in full at creation</div>
+<div style="display:flex;gap:8px"><button class="btn btn-ghost" style="min-height:44px;font-size:13px;flex:1">Rotate token</button><button class="btn btn-ghost" style="min-height:44px;font-size:13px;color:#b04a3f;border-color:#b04a3f">Revoke</button></div></div>
+<div class="blueprint" style="padding:14px 16px"><i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+<div style="display:flex;align-items:center;gap:10px"><h5 style="margin:0">BEN BELLA</h5><span style="font:12px ui-monospace,Menlo,monospace;color:#5d5d60">2 nodes enrolled</span></div>
+<div style="display:flex;align-items:center;gap:8px;margin:10px 0;font:13px ui-monospace,Menlo,monospace;background:#e9e9ea;padding:10px 12px"><span>fk1_bb_••••••••••••x9dm</span><span style="margin-left:auto;font:600 11px;color:#416180;letter-spacing:.08em">COPY</span></div>
+<div style="display:flex;gap:8px"><button class="btn btn-ghost" style="min-height:44px;font-size:13px;flex:1">Rotate token</button><button class="btn btn-ghost" style="min-height:44px;font-size:13px;color:#b04a3f;border-color:#b04a3f">Revoke</button></div></div>
+<button class="btn btn-primary" style="min-height:48px">New hive token…</button>
+<p style="font:12px/1.5 'Barlow',sans-serif;color:#5d5d60;margin:0">A node enrolls by pasting the token into its <span style="font-family:ui-monospace,Menlo,monospace">config.yaml</span> — its next heartbeat carries the hive tag and it appears here. Rotate = old token stops enrolling <b>new</b> nodes; enrolled nodes keep working. Revoke = heartbeats rejected; the node shows as REVOKED (below), never as a silent disappearance.</p>
+</div>
+<div style="padding:18px">
+<h6 style="margin:0 0 12px;color:#5d5d60">Enrolled nodes — 14</h6>
+<table class="table" style="width:100%;font-family:ui-monospace,Menlo,monospace;font-size:13px">
+<thead><tr><th>NODE</th><th>HIVE</th><th>FIRST SEEN</th><th>VERSION</th><th>LAST HB</th><th></th></tr></thead>
+<tbody>
+<tr><td>fk-kal-01</td><td>kalambo</td><td>2026-06-14</td><td>7d03b1f</td><td style="color:#2f7a52">31 s</td><td style="color:#416180">REMOVE</td></tr>
+<tr><td>fk-kal-02</td><td>kalambo</td><td>2026-06-14</td><td>7d03b1f</td><td style="color:#b04a3f">42 min</td><td style="color:#416180">REMOVE</td></tr>
+<tr><td>fk-kal-03</td><td>kalambo</td><td>2026-06-15</td><td>7d03b1f</td><td style="color:#2f7a52">47 s</td><td style="color:#416180">REMOVE</td></tr>
+<tr><td>fk-bb-01</td><td>ben bella</td><td>2026-05-02</td><td style="color:#9a6d1f">a41c9e2 ≠</td><td style="color:#2f7a52">18 s</td><td style="color:#416180">REMOVE</td></tr>
+<tr><td style="color:#98989b">fk-old-07</td><td style="color:#98989b">—</td><td style="color:#98989b">2026-03-20</td><td style="color:#98989b">—</td><td style="color:#b04a3f">REVOKED 07-30</td><td style="color:#416180">FORGET</td></tr>
+</tbody></table>
+<p style="font:12px/1.5 'Barlow',sans-serif;color:#5d5d60;margin:14px 0 0">REMOVE de-lists a node (it can re-enroll with a valid token); FORGET erases a revoked node from the roster. Both are audit-log rows. Token create/rotate/revoke likewise.</p>
+</div></div></div></div>
+
+<div class="dv-opt" id="3c"><div class="dv-olabel"><a class="dv-oid" href="#3c">3c</a>Stop confirm — hive by default, fleet only behind typed intent</div>
+<div class="dv-card" style="width:560px;background:#c9ccd0;padding:28px" data-screen-label="3c Stop confirm">
+<div class="blueprint" style="background:#f2f2f3;box-shadow:0 12px 32px rgba(43,43,45,.22)"><i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+<div style="padding:20px 22px">
+<h4 style="margin:0 0 14px;color:#b04a3f">STOP RECORDING</h4>
+<div style="display:flex;border:1px solid #b7b7ba;margin-bottom:14px">
+<span style="flex:1;text-align:center;padding:12px;font:600 13px ui-monospace,Menlo,monospace;background:#1d2d3d;color:#f2f2f3">HIVE · KALAMBO</span>
+<span style="flex:1;text-align:center;padding:12px;font:600 13px ui-monospace,Menlo,monospace;color:#98989b">ENTIRE FLEET ⚠</span></div>
+<div style="font:13px/1.7 ui-monospace,Menlo,monospace;color:#424244">3 nodes · 9 cameras stop writing footage<br><span style="color:#9a6d1f">1 node offline — stops when it reconnects</span></div>
+<div style="border:1px solid #b7b7ba;background:#e9e9ea;padding:12px 14px;margin-top:12px">
+<div style="font:600 10px/1 ui-monospace,Menlo,monospace;letter-spacing:.14em;color:#5d5d60;margin-bottom:8px">FLEET SCOPE IS NEVER THE DEFAULT</div>
+<p style="font:12px/1.5 'Barlow',sans-serif;color:#5d5d60;margin:0">Selecting ENTIRE FLEET (14 nodes, 41 cams) additionally requires typing <b style="font-family:ui-monospace,Menlo,monospace">STOP ALL</b> before the button enables. Start commands don't carry this guard — a wrong start records extra footage; a wrong stop loses it.</p></div></div>
+<div style="display:flex;gap:10px;padding:0 22px 20px">
+<button class="btn" style="min-height:52px;flex:1;font-size:16px;background:#b04a3f;border:1px solid #b04a3f;color:#fff">Command stop — hive Kalambo</button>
+<button class="btn btn-ghost" style="min-height:52px">Cancel</button></div></div></div></div>
+
+</div>
+<p class="dv-next">Try next: "clickable prototype of <a class="dv-oid" href="#3a">3a</a> → <a class="dv-oid" href="#1f">1f</a> → <a class="dv-oid" href="#1g">1g</a> with the ticket tray <a class="dv-oid" href="#1e">1e</a>" · "phone version of <a class="dv-oid" href="#3a">3a</a> and <a class="dv-oid" href="#3b">3b</a>" · "riff on the enrollment token card"</p>
+</section>
+<section class="dv-turn" id="t2" data-screen-label="Turn 2 — snapshots on the global view">
+<div class="dv-thd"><a class="dv-tid" href="#t2">2</a><span class="dv-tname">Snapshots on the global view — riffs on <a class="dv-oid" href="#1a">1a</a>, thumbs refresh every 10 s with a visible age chip</span></div>
+<div class="dv-opts">
+
+<div class="dv-opt" id="2a"><div class="dv-olabel"><a class="dv-oid" href="#2a">2a</a>Ledger + snapshot strip — a thumb row under each node's signals</div>
+<div class="dv-card" style="width:1180px" data-screen-label="2a Ledger with snapshot strips">
+<div style="display:flex;align-items:center;gap:24px;background:#1d2d3d;color:#f2f2f3;padding:0 20px;min-height:56px">
+<div style="font-family:'Barlow Condensed',sans-serif;font-weight:600;font-size:21px;letter-spacing:.03em">FIELDKIT <span style="color:#94bce3">HIVE OPS</span></div>
+<div style="display:flex;gap:2px;margin-left:8px">
+<span style="font:600 12px/1 ui-monospace,Menlo,monospace;letter-spacing:.12em;padding:14px 14px;border-bottom:2px solid #94bce3">FLEET</span>
+<span style="font:600 12px/1 ui-monospace,Menlo,monospace;letter-spacing:.12em;padding:14px 14px;color:#9ebbd8">ALERTS <span style="background:#b04a3f;color:#fff;border-radius:8px;padding:1px 6px">4</span></span>
+<span style="font:600 12px/1 ui-monospace,Menlo,monospace;letter-spacing:.12em;padding:14px 14px;color:#9ebbd8">AUDIT</span></div>
+<div style="margin-left:auto;display:flex;align-items:center;gap:18px">
+<span style="font:12px ui-monospace,Menlo,monospace;color:#9ebbd8">console clock 14:07:22Z</span>
+<span style="font:600 11px ui-monospace,Menlo,monospace;letter-spacing:.1em;border:1px solid #416180;padding:6px 10px;color:#d6ebff">SNAPSHOTS 10 S</span></div></div>
+<div style="padding:20px">
+<div class="blueprint" style="margin-bottom:18px"><i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+<div style="display:flex;align-items:center;gap:16px;padding:12px 18px;border-bottom:1px solid #d4d4d7">
+<h4 style="margin:0">KALAMBO</h4><span style="font:12px ui-monospace,Menlo,monospace;color:#5d5d60">3 nodes · 9 cams</span>
+<span style="display:inline-flex;align-items:center;gap:6px;font:600 11px/1 ui-monospace,Menlo,monospace;letter-spacing:.06em;color:#b04a3f"><span style="width:8px;height:8px;border-radius:50%;background:#b04a3f;display:inline-block"></span>2 PROBLEMS</span>
+<div style="margin-left:auto;display:flex;gap:8px"><button class="btn btn-ghost" style="min-height:40px;font-size:13px">Start hive</button><button class="btn btn-ghost" style="min-height:40px;font-size:13px">Stop hive</button></div></div>
+<div style="padding:13px 18px;border-bottom:1px solid #e7e7ea;background:#fdf3f2">
+<div style="display:flex;align-items:center;gap:16px;margin-bottom:10px">
+<span style="display:inline-flex;align-items:center;gap:8px;font:600 13px ui-monospace,Menlo,monospace;width:134px"><span style="width:8px;height:8px;border-radius:50%;background:#b04a3f;display:inline-block"></span>fk-kal-02</span>
+<span style="font:600 12px ui-monospace,Menlo,monospace;color:#b04a3f;letter-spacing:.06em">OFFLINE 42 MIN</span>
+<span style="margin-left:auto;font:13px ui-monospace,Menlo,monospace;color:#b04a3f">last hb 14:24Z</span></div>
+<div style="display:flex;gap:10px">
+<div style="width:172px;aspect-ratio:16/9;background:repeating-linear-gradient(45deg,#e6dad9 0 8px,#ddd0cf 8px 16px);position:relative;opacity:.6"><span style="position:absolute;inset:auto 0 0 0;background:#b04a3f;color:#fff;font:600 10px ui-monospace,Menlo,monospace;padding:4px 7px;letter-spacing:.06em">LAST FRAME 14:24Z</span></div>
+<div style="width:172px;aspect-ratio:16/9;background:repeating-linear-gradient(45deg,#e6dad9 0 8px,#ddd0cf 8px 16px);position:relative;opacity:.6"><span style="position:absolute;inset:auto 0 0 0;background:#b04a3f;color:#fff;font:600 10px ui-monospace,Menlo,monospace;padding:4px 7px;letter-spacing:.06em">LAST FRAME 14:24Z</span></div>
+<div style="width:172px;aspect-ratio:16/9;background:repeating-linear-gradient(45deg,#e6dad9 0 8px,#ddd0cf 8px 16px);position:relative;opacity:.6"><span style="position:absolute;inset:auto 0 0 0;background:#b04a3f;color:#fff;font:600 10px ui-monospace,Menlo,monospace;padding:4px 7px;letter-spacing:.06em">LAST FRAME 14:24Z</span></div></div></div>
+<div style="padding:13px 18px;border-bottom:1px solid #e7e7ea">
+<div style="display:flex;align-items:center;gap:16px;margin-bottom:10px">
+<span style="display:inline-flex;align-items:center;gap:8px;font:600 13px ui-monospace,Menlo,monospace;width:134px"><span style="width:8px;height:8px;border-radius:50%;background:#2f7a52;display:inline-block"></span>fk-kal-01</span>
+<span style="height:8px;flex:0 0 200px;background:linear-gradient(90deg,#2f7a52 0 71%,#b04a3f 71% 84%,#2f7a52 84% 100%)"></span>
+<span style="font:13px ui-monospace,Menlo,monospace;color:#5d5d60">61.4 h · +0.3 s · 64 ms · hb 31 s</span></div>
+<div style="display:flex;gap:10px">
+<div style="display:flex;flex-direction:column;gap:5px"><div style="width:172px;aspect-ratio:16/9;background:repeating-linear-gradient(45deg,#e2e6ea 0 8px,#d9dee3 8px 16px);border:1px solid #d4d4d7;position:relative"><span style="position:absolute;top:5px;right:5px;background:rgba(29,45,61,.85);color:#d6ebff;font:600 10px ui-monospace,Menlo,monospace;padding:3px 6px">8 S</span></div><span style="display:flex;align-items:center;gap:7px;font:600 11px ui-monospace,Menlo,monospace"><span style="width:8px;height:8px;border-radius:50%;background:#2f7a52"></span>cam4 REC</span></div>
+<div style="display:flex;flex-direction:column;gap:5px"><div style="width:172px;aspect-ratio:16/9;background:#3a2a2a;border:1px solid #b04a3f;display:flex;align-items:center;justify-content:center"><span style="font:600 11px ui-monospace,Menlo,monospace;color:#e8b4ae;text-align:center">RECONNECTING<br>3.2 H</span></div><span style="display:flex;align-items:center;gap:7px;font:600 11px ui-monospace,Menlo,monospace;color:#b04a3f"><span style="width:8px;height:8px;border-radius:50%;background:#b04a3f"></span>cam5 RECONNECTING</span></div>
+<div style="display:flex;flex-direction:column;gap:5px"><div style="width:172px;aspect-ratio:16/9;background:repeating-linear-gradient(45deg,#e2e6ea 0 8px,#d9dee3 8px 16px);border:1px solid #d4d4d7;position:relative"><span style="position:absolute;top:5px;right:5px;background:rgba(29,45,61,.85);color:#d6ebff;font:600 10px ui-monospace,Menlo,monospace;padding:3px 6px">3 S</span></div><span style="display:flex;align-items:center;gap:7px;font:600 11px ui-monospace,Menlo,monospace"><span style="width:8px;height:8px;border-radius:50%;background:#2f7a52"></span>cam6 REC</span></div></div></div>
+<div style="padding:13px 18px">
+<div style="display:flex;align-items:center;gap:16px;margin-bottom:10px">
+<span style="display:inline-flex;align-items:center;gap:8px;font:600 13px ui-monospace,Menlo,monospace;width:134px"><span style="width:8px;height:8px;border-radius:50%;background:#9a6d1f;display:inline-block"></span>fk-kal-03</span>
+<span style="font:600 12px ui-monospace,Menlo,monospace;color:#9a6d1f;letter-spacing:.06em">HB ONLY — NO MEDIA PATH</span>
+<span style="margin-left:auto;font:13px ui-monospace,Menlo,monospace;color:#5d5d60">38.0 h · 890 ms · 8%</span></div>
+<div style="display:flex;gap:10px">
+<div style="width:172px;aspect-ratio:16/9;background:repeating-linear-gradient(45deg,#efe9db 0 8px,#e8e0cf 8px 16px);position:relative"><span style="position:absolute;top:5px;right:5px;background:#9a6d1f;color:#fff;font:600 10px ui-monospace,Menlo,monospace;padding:3px 6px">58 S · VIA HB</span></div>
+<div style="width:172px;aspect-ratio:16/9;background:repeating-linear-gradient(45deg,#efe9db 0 8px,#e8e0cf 8px 16px);position:relative"><span style="position:absolute;top:5px;right:5px;background:#9a6d1f;color:#fff;font:600 10px ui-monospace,Menlo,monospace;padding:3px 6px">58 S · VIA HB</span></div>
+<div style="width:172px;aspect-ratio:16/9;background:repeating-linear-gradient(45deg,#efe9db 0 8px,#e8e0cf 8px 16px);position:relative"><span style="position:absolute;top:5px;right:5px;background:#9a6d1f;color:#fff;font:600 10px ui-monospace,Menlo,monospace;padding:3px 6px">58 S · VIA HB</span></div></div></div>
+</div>
+<div class="blueprint"><i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+<div style="display:flex;align-items:center;gap:16px;padding:12px 18px">
+<h4 style="margin:0;color:#5d5d60">CHINGOLA</h4><span style="font:12px ui-monospace,Menlo,monospace;color:#5d5d60">9 nodes · 26 cams</span>
+<span style="display:inline-flex;align-items:center;gap:6px;font:600 11px/1 ui-monospace,Menlo,monospace;letter-spacing:.06em;color:#2f7a52"><span style="width:8px;height:8px;border-radius:50%;background:#2f7a52;display:inline-block"></span>ALL HEALTHY</span>
+<span style="font:12px ui-monospace,Menlo,monospace;color:#98989b">folded — no thumbs fetched for folded hives</span>
+<div style="margin-left:auto"><span style="font:600 13px ui-monospace,Menlo,monospace;color:#416180">EXPAND ▾</span></div></div></div>
+<p style="font:12px/1.5 'Barlow',sans-serif;color:#5d5d60;margin:16px 0 0;max-width:760px">Every thumb carries its age chip (top-right): steel ≤ 20 s, amber past it, red banner when the node is offline (dimmed last frame, never blank). 10 s refresh applies to <b>expanded</b> hives only — folded hives fetch nothing, and a thumb is always a JPEG snapshot, never a live stream. Heartbeat-only nodes fall back to the 60 s heartbeat frame, labeled VIA HB.</p>
+</div></div></div>
+
+<div class="dv-opt" id="2b"><div class="dv-olabel"><a class="dv-oid" href="#2b">2b</a>Micro-thumbs — snapshots inside the row, density preserved</div>
+<div class="dv-card" style="width:1180px" data-screen-label="2b Ledger with micro-thumbs">
+<div style="display:flex;align-items:center;gap:24px;background:#1d2d3d;color:#f2f2f3;padding:0 20px;min-height:56px">
+<div style="font-family:'Barlow Condensed',sans-serif;font-weight:600;font-size:21px;letter-spacing:.03em">FIELDKIT <span style="color:#94bce3">HIVE OPS</span></div>
+<span style="margin-left:auto;font:600 11px ui-monospace,Menlo,monospace;letter-spacing:.1em;border:1px solid #416180;padding:6px 10px;color:#d6ebff">SNAPSHOTS 10 S</span></div>
+<div style="padding:20px">
+<div class="blueprint"><i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+<div style="display:flex;align-items:center;gap:16px;padding:12px 18px;border-bottom:1px solid #d4d4d7">
+<h4 style="margin:0">KALAMBO</h4><span style="font:12px ui-monospace,Menlo,monospace;color:#5d5d60">3 nodes · 9 cams</span>
+<span style="display:inline-flex;align-items:center;gap:6px;font:600 11px/1 ui-monospace,Menlo,monospace;letter-spacing:.06em;color:#b04a3f"><span style="width:8px;height:8px;border-radius:50%;background:#b04a3f;display:inline-block"></span>2 PROBLEMS</span></div>
+<div style="display:grid;grid-template-columns:150px 330px 1fr 110px 96px;gap:0 16px;align-items:center;padding:8px 18px 4px;font:600 10px/1 ui-monospace,Menlo,monospace;letter-spacing:.14em;color:#98989b"><span>NODE</span><span>CAMERAS · 10 S</span><span>COVERAGE 24H</span><span>DISK</span><span>LAST HB</span></div>
+<div style="display:grid;grid-template-columns:150px 330px 1fr 110px 96px;gap:0 16px;align-items:center;padding:11px 18px;border-top:1px solid #e7e7ea;background:#fdf3f2">
+<span style="display:inline-flex;align-items:center;gap:8px;font:600 13px ui-monospace,Menlo,monospace"><span style="width:8px;height:8px;border-radius:50%;background:#b04a3f;display:inline-block"></span>fk-kal-02</span>
+<span style="display:flex;gap:6px"><span style="width:96px;aspect-ratio:16/9;background:repeating-linear-gradient(45deg,#e6dad9 0 6px,#ddd0cf 6px 12px);opacity:.55;display:block"></span><span style="width:96px;aspect-ratio:16/9;background:repeating-linear-gradient(45deg,#e6dad9 0 6px,#ddd0cf 6px 12px);opacity:.55;display:block"></span><span style="width:96px;aspect-ratio:16/9;background:repeating-linear-gradient(45deg,#e6dad9 0 6px,#ddd0cf 6px 12px);opacity:.55;display:block"></span></span>
+<span style="font:600 12px ui-monospace,Menlo,monospace;color:#b04a3f;letter-spacing:.06em">OFFLINE 42 MIN — LAST FRAMES 14:24Z</span>
+<span style="font:13px ui-monospace,Menlo,monospace;color:#98989b">—</span>
+<span style="font:13px ui-monospace,Menlo,monospace;color:#b04a3f">14:24Z</span></div>
+<div style="display:grid;grid-template-columns:150px 330px 1fr 110px 96px;gap:0 16px;align-items:center;padding:11px 18px;border-top:1px solid #e7e7ea">
+<span style="display:inline-flex;align-items:center;gap:8px;font:600 13px ui-monospace,Menlo,monospace"><span style="width:8px;height:8px;border-radius:50%;background:#2f7a52;display:inline-block"></span>fk-kal-01</span>
+<span style="display:flex;gap:6px"><span style="width:96px;aspect-ratio:16/9;background:repeating-linear-gradient(45deg,#e2e6ea 0 6px,#d9dee3 6px 12px);border:1px solid #d4d4d7;display:block"></span><span style="width:96px;aspect-ratio:16/9;background:#3a2a2a;border:1px solid #b04a3f;display:flex;align-items:center;justify-content:center;font:600 9px ui-monospace,Menlo,monospace;color:#e8b4ae">RECON 3.2H</span><span style="width:96px;aspect-ratio:16/9;background:repeating-linear-gradient(45deg,#e2e6ea 0 6px,#d9dee3 6px 12px);border:1px solid #d4d4d7;display:block"></span></span>
+<span style="height:8px;background:linear-gradient(90deg,#2f7a52 0 71%,#b04a3f 71% 84%,#2f7a52 84% 100%)"></span>
+<span style="font:13px ui-monospace,Menlo,monospace">61.4 h</span>
+<span style="font:13px ui-monospace,Menlo,monospace;color:#5d5d60">31 s</span></div>
+<div style="display:grid;grid-template-columns:150px 330px 1fr 110px 96px;gap:0 16px;align-items:center;padding:11px 18px;border-top:1px solid #e7e7ea">
+<span style="display:inline-flex;align-items:center;gap:8px;font:600 13px ui-monospace,Menlo,monospace"><span style="width:8px;height:8px;border-radius:50%;background:#9a6d1f;display:inline-block"></span>fk-kal-03</span>
+<span style="display:flex;gap:6px"><span style="width:96px;aspect-ratio:16/9;background:repeating-linear-gradient(45deg,#efe9db 0 6px,#e8e0cf 6px 12px);display:block"></span><span style="width:96px;aspect-ratio:16/9;background:repeating-linear-gradient(45deg,#efe9db 0 6px,#e8e0cf 6px 12px);display:block"></span><span style="width:96px;aspect-ratio:16/9;background:repeating-linear-gradient(45deg,#efe9db 0 6px,#e8e0cf 6px 12px);display:block"></span></span>
+<span style="height:8px;background:#2f7a52"></span>
+<span style="font:13px ui-monospace,Menlo,monospace">38.0 h</span>
+<span style="font:13px ui-monospace,Menlo,monospace;color:#5d5d60">47 s</span></div>
+</div>
+<p style="font:12px/1.5 'Barlow',sans-serif;color:#5d5d60;margin:16px 0 0;max-width:760px">96 px thumbs keep the ledger's ~12-nodes-per-screen density — enough pixels to see "camera pointing at grass vs black frame", not enough for detail (that's the hive tier, <a href="#1f">1f</a>). Hover/long-press zooms a thumb to 320 px; tap opens the camera. Clock/link columns move into the node detail line to make room.</p>
+</div></div></div>
+
+</div>
+<p class="dv-next">Try next: "go with <a class="dv-oid" href="#2a">2a</a> and update the phone view to match" · "make the thumbs clickable in a prototype" · "age chips on <a class="dv-oid" href="#1f">1f</a> too"</p>
+</section>
+<section class="dv-turn" id="t1" data-screen-label="Turn 1 — Ops console explorations">
+<div class="dv-thd"><a class="dv-tid" href="#t1">1</a><span class="dv-tname">FieldKit "Hive" Ops console — global-view directions, ack treatments, and a deep pass · <a href="Design Spec.dc.html">written spec →</a></span></div>
+<div class="dv-opts">
+
+<div class="dv-group">Context · system</div>
+<div class="dv-opt" id="1x"><div class="dv-olabel"><a class="dv-oid" href="#1x">1x</a>Assumptions &amp; visual system (read first)</div>
+<div class="dv-card" style="width:1180px;padding:24px 28px">
+<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:28px">
+<div><h6 style="color:#416180">Carried from the node console</h6><p style="font-size:13.5px;color:#424244;margin:0">Machine data always mono + tabular. State is an 8&nbsp;px dot beside neutral uppercase text — never a filled pill. Hit targets ≥&nbsp;48&nbsp;px. State color (<span style="color:#2f7a52;font-weight:600">ok</span> / <span style="color:#9a6d1f;font-weight:600">warn</span> / <span style="color:#b04a3f;font-weight:600">bad</span>) is signal only, never decoration.</p></div>
+<div><h6 style="color:#416180">Distinct on purpose</h6><p style="font-size:13.5px;color:#424244;margin:0">Node console = dark charcoal. Ops console = light Industry ground with a solid steel <span style="font:600 12px ui-monospace,Menlo,monospace;background:#1d2d3d;color:#f2f2f3;padding:2px 6px">HIVE OPS</span> header band. One glance tells you which console you're on. Blueprint corner-marks frame hives and dialogs.</p></div>
+<div><h6 style="color:#416180">Assumed from the brief</h6><p style="font-size:13.5px;color:#424244;margin:0">Worst-first sort everywhere. Hierarchy: hive › node hostname › camera (site in details). Three bandwidth rungs: grid = 30–60&nbsp;s snapshots · node focus = fast snapshots · camera focus = the single live sub-stream. Commands are desired state with per-node acks.</p></div>
+</div></div></div>
+
+<div class="dv-group">A · Global view — three directions</div>
+
+<div class="dv-opt" id="1a"><div class="dv-olabel"><a class="dv-oid" href="#1a">1a</a>Ledger — hive blocks, node rows, everything scannable (recommended)</div>
+<div class="dv-card" style="width:1180px" data-screen-label="1a Ledger global view">
+<div style="display:flex;align-items:center;gap:24px;background:#1d2d3d;color:#f2f2f3;padding:0 20px;min-height:56px">
+<div style="font-family:'Barlow Condensed',sans-serif;font-weight:600;font-size:21px;letter-spacing:.03em">FIELDKIT <span style="color:#94bce3">HIVE OPS</span></div>
+<div style="display:flex;gap:2px;margin-left:8px">
+<span style="font:600 12px/1 ui-monospace,Menlo,monospace;letter-spacing:.12em;padding:14px 14px;border-bottom:2px solid #94bce3">FLEET</span>
+<span style="font:600 12px/1 ui-monospace,Menlo,monospace;letter-spacing:.12em;padding:14px 14px;color:#9ebbd8">ALERTS <span style="background:#b04a3f;color:#fff;border-radius:8px;padding:1px 6px">4</span></span>
+<span style="font:600 12px/1 ui-monospace,Menlo,monospace;letter-spacing:.12em;padding:14px 14px;color:#9ebbd8">AUDIT</span>
+</div>
+<div style="margin-left:auto;display:flex;align-items:center;gap:18px">
+<span style="font:12px ui-monospace,Menlo,monospace;color:#9ebbd8">console clock 14:07:22Z</span>
+<span style="font:600 11px ui-monospace,Menlo,monospace;letter-spacing:.1em;border:1px solid #416180;padding:6px 10px;color:#d6ebff">TAILNET · DIRECT</span>
+</div></div>
+<div style="display:flex;flex-wrap:wrap;align-items:center;gap:0;border-bottom:1px solid #d4d4d7;background:#e9e9ea;padding:10px 20px">
+<div style="display:flex;flex-direction:column;gap:3px;padding-right:22px;border-right:1px solid #d4d4d7"><span style="font:600 10px/1 ui-monospace,Menlo,monospace;letter-spacing:.14em;color:#5d5d60">NODES</span><span style="font:14px ui-monospace,Menlo,monospace;font-variant-numeric:tabular-nums"><b style="color:#2f7a52">11</b> online · <b style="color:#9a6d1f">2</b> hb-only · <b style="color:#b04a3f">1</b> offline</span></div>
+<div style="display:flex;flex-direction:column;gap:3px;padding:0 22px;border-right:1px solid #d4d4d7"><span style="font:600 10px/1 ui-monospace,Menlo,monospace;letter-spacing:.14em;color:#5d5d60">CAMERAS</span><span style="font:14px ui-monospace,Menlo,monospace;font-variant-numeric:tabular-nums"><b style="color:#2f7a52">37</b> rec · <b style="color:#b04a3f">2</b> reconnecting · <b style="color:#98989b">2</b> stopped</span></div>
+<div style="display:flex;flex-direction:column;gap:3px;padding:0 22px;border-right:1px solid #d4d4d7"><span style="font:600 10px/1 ui-monospace,Menlo,monospace;letter-spacing:.14em;color:#5d5d60">COVERAGE 24H</span><span style="font:14px ui-monospace,Menlo,monospace;font-variant-numeric:tabular-nums">96.2%</span></div>
+<div style="display:flex;flex-direction:column;gap:3px;padding:0 22px"><span style="font:600 10px/1 ui-monospace,Menlo,monospace;letter-spacing:.14em;color:#5d5d60">SNAPSHOTS</span><span style="font:14px ui-monospace,Menlo,monospace">refresh 45&nbsp;s</span></div>
+<div style="margin-left:auto;display:flex;gap:10px"><button class="btn btn-secondary" style="min-height:44px">Start all recording</button><button class="btn btn-ghost" style="min-height:44px;color:#b04a3f;border-color:#b04a3f">Stop all</button></div>
+</div>
+<div style="padding:20px">
+<div class="blueprint" style="margin-bottom:18px"><i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+<div style="display:flex;align-items:center;gap:16px;padding:12px 18px;border-bottom:1px solid #d4d4d7">
+<h4 style="margin:0">KALAMBO</h4><span style="font:12px ui-monospace,Menlo,monospace;color:#5d5d60">3 nodes · 9 cams</span>
+<span style="display:inline-flex;align-items:center;gap:6px;font:600 11px/1 ui-monospace,Menlo,monospace;letter-spacing:.06em;color:#b04a3f"><span style="width:8px;height:8px;border-radius:50%;background:#b04a3f;display:inline-block"></span>2 PROBLEMS</span>
+<div style="margin-left:auto;display:flex;gap:8px"><button class="btn btn-ghost" style="min-height:40px;font-size:13px">Start hive</button><button class="btn btn-ghost" style="min-height:40px;font-size:13px">Stop hive</button></div></div>
+<div style="display:grid;grid-template-columns:150px 1fr 240px 110px 92px 130px 96px;gap:0 16px;align-items:center;padding:8px 18px 4px;font:600 10px/1 ui-monospace,Menlo,monospace;letter-spacing:.14em;color:#98989b"><span>NODE</span><span>CAMERAS</span><span>COVERAGE 24H</span><span>DISK</span><span>CLOCK</span><span>LINK</span><span>LAST HB</span></div>
+<div style="display:grid;grid-template-columns:150px 1fr 240px 110px 92px 130px 96px;gap:0 16px;align-items:center;padding:13px 18px;border-top:1px solid #e7e7ea;min-height:56px;background:#fdf3f2">
+<span style="display:inline-flex;align-items:center;gap:8px;font:600 13px ui-monospace,Menlo,monospace"><span style="width:8px;height:8px;border-radius:50%;background:#b04a3f;display:inline-block"></span>fk-kal-02</span>
+<span style="font:600 12px ui-monospace,Menlo,monospace;color:#b04a3f;letter-spacing:.06em">OFFLINE 42 MIN — LAST STATE: 3 CAMS RECORDING</span>
+<span style="height:8px;background:linear-gradient(90deg,#2f7a52 0 88%,#b04a3f 88% 100%);opacity:.55"></span>
+<span style="font:13px ui-monospace,Menlo,monospace;color:#98989b">— </span><span style="font:13px ui-monospace,Menlo,monospace;color:#98989b">—</span><span style="font:13px ui-monospace,Menlo,monospace;color:#98989b">—</span>
+<span style="font:13px ui-monospace,Menlo,monospace;color:#b04a3f">14:24Z</span></div>
+<div style="display:grid;grid-template-columns:150px 1fr 240px 110px 92px 130px 96px;gap:0 16px;align-items:center;padding:13px 18px;border-top:1px solid #e7e7ea;min-height:56px">
+<span style="display:inline-flex;align-items:center;gap:8px;font:600 13px ui-monospace,Menlo,monospace"><span style="width:8px;height:8px;border-radius:50%;background:#2f7a52;display:inline-block"></span>fk-kal-01</span>
+<span style="display:flex;gap:14px;flex-wrap:wrap"><span style="font:12px ui-monospace,Menlo,monospace"><span style="color:#2f7a52">●</span> cam4 REC</span><span style="font:600 12px ui-monospace,Menlo,monospace;color:#b04a3f;background:#fdf3f2;border:1px solid #b04a3f;padding:4px 8px">● cam5 RECONNECTING 3.2 H</span><span style="font:12px ui-monospace,Menlo,monospace"><span style="color:#2f7a52">●</span> cam6 REC</span></span>
+<span style="height:8px;background:linear-gradient(90deg,#2f7a52 0 71%,#b04a3f 71% 84%,#2f7a52 84% 100%)"></span>
+<span style="font:13px ui-monospace,Menlo,monospace">61.4 h left</span><span style="font:13px ui-monospace,Menlo,monospace;color:#5d5d60">+0.3 s</span><span style="font:13px ui-monospace,Menlo,monospace;color:#5d5d60">64 ms · 0%</span><span style="font:13px ui-monospace,Menlo,monospace;color:#5d5d60">31 s</span></div>
+<div style="display:grid;grid-template-columns:150px 1fr 240px 110px 92px 130px 96px;gap:0 16px;align-items:center;padding:13px 18px;border-top:1px solid #e7e7ea;min-height:56px">
+<span style="display:inline-flex;align-items:center;gap:8px;font:600 13px ui-monospace,Menlo,monospace"><span style="width:8px;height:8px;border-radius:50%;background:#9a6d1f;display:inline-block"></span>fk-kal-03</span>
+<span style="font:600 12px ui-monospace,Menlo,monospace;color:#9a6d1f;letter-spacing:.06em">HEARTBEAT ONLY — NO MEDIA PATH · 3 CAMS RECORDING</span>
+<span style="height:8px;background:#2f7a52"></span>
+<span style="font:13px ui-monospace,Menlo,monospace">38.0 h left</span><span style="font:13px ui-monospace,Menlo,monospace;color:#5d5d60">+1.1 s</span><span style="font:13px ui-monospace,Menlo,monospace;color:#9a6d1f">890 ms · 8%</span><span style="font:13px ui-monospace,Menlo,monospace;color:#5d5d60">47 s</span></div>
+</div>
+<div class="blueprint" style="margin-bottom:18px"><i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+<div style="display:flex;align-items:center;gap:16px;padding:12px 18px;border-bottom:1px solid #d4d4d7">
+<h4 style="margin:0">BEN BELLA</h4><span style="font:12px ui-monospace,Menlo,monospace;color:#5d5d60">2 nodes · 6 cams</span>
+<span style="display:inline-flex;align-items:center;gap:6px;font:600 11px/1 ui-monospace,Menlo,monospace;letter-spacing:.06em;color:#9a6d1f"><span style="width:8px;height:8px;border-radius:50%;background:#9a6d1f;display:inline-block"></span>DISK LOW</span>
+<div style="margin-left:auto;display:flex;gap:8px"><button class="btn btn-ghost" style="min-height:40px;font-size:13px">Start hive</button><button class="btn btn-ghost" style="min-height:40px;font-size:13px">Stop hive</button></div></div>
+<div style="display:grid;grid-template-columns:150px 1fr 240px 110px 92px 130px 96px;gap:0 16px;align-items:center;padding:13px 18px;min-height:56px">
+<span style="display:inline-flex;align-items:center;gap:8px;font:600 13px ui-monospace,Menlo,monospace"><span style="width:8px;height:8px;border-radius:50%;background:#2f7a52;display:inline-block"></span>fk-bb-01</span>
+<span style="display:flex;gap:14px;flex-wrap:wrap"><span style="font:12px ui-monospace,Menlo,monospace"><span style="color:#2f7a52">●</span> cam1 REC</span><span style="font:12px ui-monospace,Menlo,monospace"><span style="color:#2f7a52">●</span> cam2 REC</span><span style="font:12px ui-monospace,Menlo,monospace"><span style="color:#98989b">●</span> cam3 STOPPED</span></span>
+<span style="height:8px;background:#2f7a52"></span>
+<span style="font:600 13px ui-monospace,Menlo,monospace;color:#9a6d1f;background:#faf4e8;border:1px solid #9a6d1f;padding:4px 6px;justify-self:start">4.2 h left</span>
+<span style="font:600 13px ui-monospace,Menlo,monospace;color:#9a6d1f">+6.4 s</span><span style="font:13px ui-monospace,Menlo,monospace;color:#5d5d60">120 ms · 1%</span><span style="font:13px ui-monospace,Menlo,monospace;color:#5d5d60">18 s</span></div>
+<div style="display:grid;grid-template-columns:150px 1fr 240px 110px 92px 130px 96px;gap:0 16px;align-items:center;padding:13px 18px;border-top:1px solid #e7e7ea;min-height:56px">
+<span style="display:inline-flex;align-items:center;gap:8px;font:600 13px ui-monospace,Menlo,monospace"><span style="width:8px;height:8px;border-radius:50%;background:#2f7a52;display:inline-block"></span>fk-bb-02</span>
+<span style="display:flex;gap:14px;flex-wrap:wrap"><span style="font:12px ui-monospace,Menlo,monospace"><span style="color:#2f7a52">●</span> cam7 REC</span><span style="font:12px ui-monospace,Menlo,monospace"><span style="color:#2f7a52">●</span> cam8 REC</span><span style="font:12px ui-monospace,Menlo,monospace"><span style="color:#2f7a52">●</span> cam9 REC</span></span>
+<span style="height:8px;background:#2f7a52"></span>
+<span style="font:13px ui-monospace,Menlo,monospace">52.8 h left</span><span style="font:13px ui-monospace,Menlo,monospace;color:#5d5d60">-0.2 s</span><span style="font:13px ui-monospace,Menlo,monospace;color:#5d5d60">71 ms · 0%</span><span style="font:13px ui-monospace,Menlo,monospace;color:#5d5d60">12 s</span></div>
+</div>
+<div class="blueprint"><i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+<div style="display:flex;align-items:center;gap:16px;padding:12px 18px">
+<h4 style="margin:0;color:#5d5d60">CHINGOLA</h4><span style="font:12px ui-monospace,Menlo,monospace;color:#5d5d60">9 nodes · 26 cams</span>
+<span style="display:inline-flex;align-items:center;gap:6px;font:600 11px/1 ui-monospace,Menlo,monospace;letter-spacing:.06em;color:#2f7a52"><span style="width:8px;height:8px;border-radius:50%;background:#2f7a52;display:inline-block"></span>ALL HEALTHY</span>
+<span style="font:12px ui-monospace,Menlo,monospace;color:#98989b">collapsed — healthy hives fold; tap to expand</span>
+<div style="margin-left:auto"><span style="font:600 13px ui-monospace,Menlo,monospace;color:#416180">EXPAND ▾</span></div></div></div>
+</div></div></div>
+
+<div class="dv-opt" id="1b"><div class="dv-olabel"><a class="dv-oid" href="#1b">1b</a>Cellboard — snapshot-forward node cards on the modular grid</div>
+<div class="dv-card" style="width:1180px" data-screen-label="1b Cellboard global view">
+<div style="display:flex;align-items:center;gap:24px;background:#1d2d3d;color:#f2f2f3;padding:0 20px;min-height:56px">
+<div style="font-family:'Barlow Condensed',sans-serif;font-weight:600;font-size:21px;letter-spacing:.03em">FIELDKIT <span style="color:#94bce3">HIVE OPS</span></div>
+<span style="font:12px ui-monospace,Menlo,monospace;color:#9ebbd8;margin-left:auto">14:07:22Z · ALERTS 4</span></div>
+<div style="padding:20px">
+<div style="font:600 11px/1 ui-monospace,Menlo,monospace;letter-spacing:.16em;color:#b04a3f;margin-bottom:12px">KALAMBO — 2 PROBLEMS</div>
+<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:18px;margin-bottom:26px">
+<div class="blueprint" style="background:#fdf3f2"><i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+<div style="aspect-ratio:16/6.5;background:repeating-linear-gradient(45deg,#eddfde 0 8px,#e4d4d3 8px 16px);display:flex;align-items:center;justify-content:center"><span style="font:12px ui-monospace,Menlo,monospace;color:#b04a3f">no snapshot — node offline</span></div>
+<div style="padding:12px 14px;display:flex;flex-direction:column;gap:8px">
+<span style="display:inline-flex;align-items:center;gap:8px;font:600 13px ui-monospace,Menlo,monospace"><span style="width:8px;height:8px;border-radius:50%;background:#b04a3f;display:inline-block"></span>fk-kal-02 · OFFLINE 42 MIN</span>
+<span style="font:12px ui-monospace,Menlo,monospace;color:#5d5d60">last hb 14:24Z · last state 3 cams REC</span></div></div>
+<div class="blueprint"><i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:1px;background:#d4d4d7">
+<div style="aspect-ratio:16/10;background:repeating-linear-gradient(45deg,#e2e6ea 0 8px,#d9dee3 8px 16px);display:flex;align-items:end;justify-content:start"><span style="font:10px ui-monospace,Menlo,monospace;color:#5d5d60;padding:4px 6px">cam4 · 38s</span></div>
+<div style="aspect-ratio:16/10;background:#3a2a2a;display:flex;align-items:center;justify-content:center"><span style="font:600 10px ui-monospace,Menlo,monospace;color:#e8b4ae;text-align:center">RECONNECTING<br>3.2 H</span></div>
+<div style="aspect-ratio:16/10;background:repeating-linear-gradient(45deg,#e2e6ea 0 8px,#d9dee3 8px 16px);display:flex;align-items:end"><span style="font:10px ui-monospace,Menlo,monospace;color:#5d5d60;padding:4px 6px">cam6 · 41s</span></div></div>
+<div style="padding:12px 14px;display:flex;flex-direction:column;gap:8px">
+<span style="display:inline-flex;align-items:center;gap:8px;font:600 13px ui-monospace,Menlo,monospace"><span style="width:8px;height:8px;border-radius:50%;background:#2f7a52;display:inline-block"></span>fk-kal-01</span>
+<span style="height:8px;background:linear-gradient(90deg,#2f7a52 0 71%,#b04a3f 71% 84%,#2f7a52 84% 100%)"></span>
+<span style="font:12px ui-monospace,Menlo,monospace;color:#5d5d60">61.4 h disk · +0.3 s · 64 ms</span></div></div>
+<div class="blueprint"><i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+<div style="aspect-ratio:16/6.5;background:repeating-linear-gradient(45deg,#efe9db 0 8px,#e8e0cf 8px 16px);display:flex;align-items:center;justify-content:center"><span style="font:12px ui-monospace,Menlo,monospace;color:#9a6d1f;text-align:center">heartbeat only — no media path<br>snapshots via heartbeat, 60 s</span></div>
+<div style="padding:12px 14px;display:flex;flex-direction:column;gap:8px">
+<span style="display:inline-flex;align-items:center;gap:8px;font:600 13px ui-monospace,Menlo,monospace"><span style="width:8px;height:8px;border-radius:50%;background:#9a6d1f;display:inline-block"></span>fk-kal-03 · HB ONLY</span>
+<span style="height:8px;background:#2f7a52"></span>
+<span style="font:12px ui-monospace,Menlo,monospace;color:#5d5d60">38.0 h disk · 890 ms · 8% miss</span></div></div>
+</div>
+<div style="font:600 11px/1 ui-monospace,Menlo,monospace;letter-spacing:.16em;color:#9a6d1f;margin-bottom:12px">BEN BELLA — DISK LOW</div>
+<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:18px">
+<div class="blueprint"><i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:1px;background:#d4d4d7">
+<div style="aspect-ratio:16/10;background:repeating-linear-gradient(45deg,#e2e6ea 0 8px,#d9dee3 8px 16px)"></div>
+<div style="aspect-ratio:16/10;background:repeating-linear-gradient(45deg,#e2e6ea 0 8px,#d9dee3 8px 16px)"></div>
+<div style="aspect-ratio:16/10;background:#e9e9ea;display:flex;align-items:center;justify-content:center"><span style="font:600 10px ui-monospace,Menlo,monospace;color:#98989b">STOPPED</span></div></div>
+<div style="padding:12px 14px;display:flex;flex-direction:column;gap:8px">
+<span style="display:inline-flex;align-items:center;gap:8px;font:600 13px ui-monospace,Menlo,monospace"><span style="width:8px;height:8px;border-radius:50%;background:#2f7a52;display:inline-block"></span>fk-bb-01 · <b style="color:#9a6d1f">4.2 H DISK</b></span>
+<span style="height:8px;background:#2f7a52"></span>
+<span style="font:12px ui-monospace,Menlo,monospace;color:#9a6d1f">clock +6.4 s</span></div></div>
+<div class="blueprint"><i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:1px;background:#d4d4d7">
+<div style="aspect-ratio:16/10;background:repeating-linear-gradient(45deg,#e2e6ea 0 8px,#d9dee3 8px 16px)"></div>
+<div style="aspect-ratio:16/10;background:repeating-linear-gradient(45deg,#e2e6ea 0 8px,#d9dee3 8px 16px)"></div>
+<div style="aspect-ratio:16/10;background:repeating-linear-gradient(45deg,#e2e6ea 0 8px,#d9dee3 8px 16px)"></div></div>
+<div style="padding:12px 14px;display:flex;flex-direction:column;gap:8px">
+<span style="display:inline-flex;align-items:center;gap:8px;font:600 13px ui-monospace,Menlo,monospace"><span style="width:8px;height:8px;border-radius:50%;background:#2f7a52;display:inline-block"></span>fk-bb-02</span>
+<span style="height:8px;background:#2f7a52"></span>
+<span style="font:12px ui-monospace,Menlo,monospace;color:#5d5d60">52.8 h disk · 71 ms · 0%</span></div></div>
+<div style="border:1px dashed #b7b7ba;display:flex;align-items:center;justify-content:center;min-height:180px"><span style="font:12px ui-monospace,Menlo,monospace;color:#98989b;text-align:center">CHINGOLA · 9 nodes all healthy<br>folded — tap to expand</span></div>
+</div>
+<p style="font:12px/1.5 'Barlow',sans-serif;color:#5d5d60;margin:18px 0 0">Trade-off vs <a href="#1a">1a</a>: snapshots give instant scene truth but cost vertical space — ~6 nodes per screen vs ~14. Snapshot age is printed on every thumb; a thumb never plays live video at this tier.</p>
+</div></div></div>
+
+<div class="dv-opt" id="1c"><div class="dv-olabel"><a class="dv-oid" href="#1c">1c</a>Triage split — problem queue first, healthy fleet compressed to a dotboard (novel)</div>
+<div class="dv-card" style="width:1180px" data-screen-label="1c Triage global view">
+<div style="display:flex;align-items:center;gap:24px;background:#1d2d3d;color:#f2f2f3;padding:0 20px;min-height:56px">
+<div style="font-family:'Barlow Condensed',sans-serif;font-weight:600;font-size:21px;letter-spacing:.03em">FIELDKIT <span style="color:#94bce3">HIVE OPS</span></div>
+<span style="font:12px ui-monospace,Menlo,monospace;color:#9ebbd8;margin-left:auto">14:07:22Z</span></div>
+<div style="display:grid;grid-template-columns:420px 1fr;gap:0">
+<div style="border-right:1px solid #d4d4d7;padding:18px;display:flex;flex-direction:column;gap:12px">
+<h6 style="color:#b04a3f;margin:0">Triage — worst first · 4</h6>
+<div class="blueprint" style="background:#fdf3f2;padding:14px"><i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+<div style="display:flex;align-items:center;gap:8px;font:600 13px ui-monospace,Menlo,monospace"><span style="width:8px;height:8px;border-radius:50%;background:#b04a3f;display:inline-block"></span>NODE SILENT 42 MIN</div>
+<div style="font:13px ui-monospace,Menlo,monospace;margin:6px 0 10px">kalambo › fk-kal-02</div>
+<div style="display:flex;gap:8px"><button class="btn btn-secondary" style="min-height:44px;flex:1">Open node</button><button class="btn btn-ghost" style="min-height:44px">Log tail</button></div></div>
+<div class="blueprint" style="background:#fdf3f2;padding:14px"><i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+<div style="display:flex;align-items:center;gap:8px;font:600 13px ui-monospace,Menlo,monospace"><span style="width:8px;height:8px;border-radius:50%;background:#b04a3f;display:inline-block"></span>CAM NOT RECORDING 3.2 H</div>
+<div style="font:13px ui-monospace,Menlo,monospace;margin:6px 0 10px">kalambo › fk-kal-01 › cam5</div>
+<div style="display:flex;gap:8px"><button class="btn btn-secondary" style="min-height:44px;flex:1">Open camera</button><button class="btn btn-ghost" style="min-height:44px">Log tail</button></div></div>
+<div class="blueprint" style="padding:14px"><i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+<div style="display:flex;align-items:center;gap:8px;font:600 13px ui-monospace,Menlo,monospace"><span style="width:8px;height:8px;border-radius:50%;background:#9a6d1f;display:inline-block"></span>DISK UNDER 6 H — 4.2 H LEFT</div>
+<div style="font:13px ui-monospace,Menlo,monospace;margin:6px 0 0">ben bella › fk-bb-01</div></div>
+<div class="blueprint" style="padding:14px"><i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+<div style="display:flex;align-items:center;gap:8px;font:600 13px ui-monospace,Menlo,monospace"><span style="width:8px;height:8px;border-radius:50%;background:#9a6d1f;display:inline-block"></span>CLOCK DRIFT +6.4 S</div>
+<div style="font:13px ui-monospace,Menlo,monospace;margin:6px 0 0">ben bella › fk-bb-01</div></div>
+</div>
+<div style="padding:18px">
+<h6 style="color:#5d5d60;margin:0 0 14px">Fleet — 14 nodes · 41 cams</h6>
+<div style="display:flex;flex-direction:column;gap:14px">
+<div style="display:flex;align-items:center;gap:16px;min-height:48px"><span style="font:600 13px ui-monospace,Menlo,monospace;width:110px">KALAMBO</span>
+<span style="display:flex;gap:6px"><span style="width:22px;height:22px;background:#2f7a52"></span><span style="width:22px;height:22px;background:#b04a3f"></span><span style="width:22px;height:22px;background:#9a6d1f"></span></span>
+<span style="font:12px ui-monospace,Menlo,monospace;color:#5d5d60">7/9 cams rec · coverage 89.1%</span></div>
+<div style="display:flex;align-items:center;gap:16px;min-height:48px"><span style="font:600 13px ui-monospace,Menlo,monospace;width:110px">BEN BELLA</span>
+<span style="display:flex;gap:6px"><span style="width:22px;height:22px;background:#9a6d1f"></span><span style="width:22px;height:22px;background:#2f7a52"></span></span>
+<span style="font:12px ui-monospace,Menlo,monospace;color:#5d5d60">5/6 cams rec · coverage 98.4%</span></div>
+<div style="display:flex;align-items:center;gap:16px;min-height:48px"><span style="font:600 13px ui-monospace,Menlo,monospace;width:110px">CHINGOLA</span>
+<span style="display:flex;gap:6px"><span style="width:22px;height:22px;background:#2f7a52"></span><span style="width:22px;height:22px;background:#2f7a52"></span><span style="width:22px;height:22px;background:#2f7a52"></span><span style="width:22px;height:22px;background:#2f7a52"></span><span style="width:22px;height:22px;background:#2f7a52"></span><span style="width:22px;height:22px;background:#2f7a52"></span><span style="width:22px;height:22px;background:#2f7a52"></span><span style="width:22px;height:22px;background:#2f7a52"></span><span style="width:22px;height:22px;background:#2f7a52"></span></span>
+<span style="font:12px ui-monospace,Menlo,monospace;color:#5d5d60">26/26 cams rec · coverage 99.7%</span></div>
+</div>
+<p style="font:12px/1.5 'Barlow',sans-serif;color:#5d5d60;margin:20px 0 0;max-width:520px">Each square is a node (min 44&nbsp;px tap target with padding); tap opens the node inside its hive. Healthy fleet costs almost no space, so the queue is the page. Risk: less ambient awareness of per-node numbers — the ledger (<a href="#1a">1a</a>) keeps them visible.</p>
+</div></div></div></div>
+
+<div class="dv-group">B · Commanded vs acked — two treatments</div>
+
+<div class="dv-opt" id="1d"><div class="dv-olabel"><a class="dv-oid" href="#1d">1d</a>Roll-call dialog — modal reconciliation, blocks until backgrounded</div>
+<div class="dv-card" style="width:560px;background:#c9ccd0;padding:28px" data-screen-label="1d Roll-call ack dialog">
+<div class="blueprint" style="background:#f2f2f3;box-shadow:0 12px 32px rgba(43,43,45,.22)"><i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+<div style="padding:20px 22px 0">
+<h4 style="margin:0 0 4px">START RECORDING — KALAMBO</h4>
+<div style="font:13px ui-monospace,Menlo,monospace;color:#5d5d60">desired state: recording=on · 3 nodes · 9 cams</div>
+<div style="display:flex;align-items:baseline;gap:10px;margin:16px 0 8px">
+<span style="font:600 26px ui-monospace,Menlo,monospace;font-variant-numeric:tabular-nums">2<span style="color:#98989b">/3</span></span>
+<span style="font:600 11px ui-monospace,Menlo,monospace;letter-spacing:.12em;color:#5d5d60">ACKNOWLEDGED</span></div>
+<div style="height:8px;background:#d4d4d7;margin-bottom:16px"><div style="height:100%;width:67%;background:#2f7a52"></div></div>
+<div style="display:flex;align-items:center;gap:10px;min-height:48px;border-top:1px solid #e7e7ea;font:13px ui-monospace,Menlo,monospace"><span style="width:8px;height:8px;border-radius:50%;background:#2f7a52;flex:none"></span>fk-kal-01<span style="margin-left:auto;color:#2f7a52">ACKED 14:07:31Z · 3 cams recording</span></div>
+<div style="display:flex;align-items:center;gap:10px;min-height:48px;border-top:1px solid #e7e7ea;font:13px ui-monospace,Menlo,monospace"><span style="width:8px;height:8px;border-radius:50%;background:#2f7a52;flex:none"></span>fk-kal-03<span style="margin-left:auto;color:#2f7a52">ACKED 14:07:44Z · 3 cams recording</span></div>
+<div style="display:flex;align-items:center;gap:10px;min-height:48px;border-top:1px solid #e7e7ea;font:13px ui-monospace,Menlo,monospace"><span style="width:8px;height:8px;border-radius:50%;background:#b04a3f;flex:none"></span>fk-kal-02<span style="margin-left:auto;color:#9a6d1f;text-align:right">OFFLINE — TARGET STORED,<br>APPLIES ON RECONNECT</span></div>
+</div>
+<div style="display:flex;gap:10px;padding:18px 22px 20px">
+<button class="btn btn-primary" style="min-height:48px;flex:1">Keep watching</button>
+<button class="btn btn-ghost" style="min-height:48px">Background — track in command tray</button></div>
+</div></div></div>
+
+<div class="dv-opt" id="1e"><div class="dv-olabel"><a class="dv-oid" href="#1e">1e</a>Command ticket — non-blocking tray, built for late acks (novel)</div>
+<div class="dv-card" style="width:560px;padding:28px;display:flex;flex-direction:column;gap:16px" data-screen-label="1e Command ticket tray">
+<p style="font:12px/1.5 'Barlow',sans-serif;color:#5d5d60;margin:0">The command becomes a persistent ticket docked bottom-right over any screen. It never blocks; it survives navigation; a node acking 6 minutes late updates the same ticket. Unacked past 5&nbsp;min escalates to an alert. Every ticket is an audit-log row.</p>
+<div class="blueprint" style="background:#f2f2f3;box-shadow:0 12px 32px rgba(43,43,45,.22);align-self:flex-end;width:420px"><i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+<div style="display:flex;align-items:center;gap:10px;padding:12px 16px;background:#1d2d3d;color:#f2f2f3">
+<span style="font:600 11px ui-monospace,Menlo,monospace;letter-spacing:.12em">CMD 0142 · START REC · KALAMBO</span>
+<span style="margin-left:auto;font:600 13px ui-monospace,Menlo,monospace;color:#94bce3">2/3</span></div>
+<div style="height:6px;background:#d4d4d7"><div style="height:100%;width:67%;background:#2f7a52"></div></div>
+<div style="padding:8px 16px 4px">
+<div style="display:flex;align-items:center;gap:10px;min-height:44px;font:13px ui-monospace,Menlo,monospace"><span style="width:8px;height:8px;border-radius:50%;background:#2f7a52;flex:none"></span>fk-kal-01<span style="margin-left:auto;color:#2f7a52">ACKED +9 s</span></div>
+<div style="display:flex;align-items:center;gap:10px;min-height:44px;border-top:1px solid #e7e7ea;font:13px ui-monospace,Menlo,monospace"><span style="width:8px;height:8px;border-radius:50%;background:#2f7a52;flex:none"></span>fk-kal-03<span style="margin-left:auto;color:#2f7a52">ACKED +22 s</span></div>
+<div style="display:flex;align-items:center;gap:10px;min-height:44px;border-top:1px solid #e7e7ea;font:13px ui-monospace,Menlo,monospace"><span style="width:8px;height:8px;border-radius:50%;background:#9a6d1f;flex:none"></span>fk-kal-02<span style="margin-left:auto;color:#9a6d1f">WAITING · OFFLINE 42 MIN</span></div></div>
+<div style="display:flex;gap:8px;padding:10px 16px 14px">
+<button class="btn btn-ghost" style="min-height:44px;font-size:13px;flex:1">Details</button>
+<button class="btn btn-ghost" style="min-height:44px;font-size:13px">Dismiss when complete</button></div></div>
+<div class="blueprint" style="align-self:flex-end;width:420px;background:#e9e9ea"><i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+<div style="display:flex;align-items:center;gap:10px;padding:10px 16px;font:12px ui-monospace,Menlo,monospace;color:#5d5d60"><span style="color:#2f7a52">●</span> CMD 0141 · STOP REC · fk-chi-04 · 1/1 · complete 13:52Z<span style="margin-left:auto">✕</span></div></div>
+</div></div>
+
+<div class="dv-group">C · Deep pass on the ledger direction (<a class="dv-oid" href="#1a" style="letter-spacing:0">1a</a>)</div>
+
+<div class="dv-opt" id="1f"><div class="dv-olabel"><a class="dv-oid" href="#1f">1f</a>Hive drill-down — /kalambo · fast snapshots, still no live video</div>
+<div class="dv-card" style="width:1180px" data-screen-label="1f Hive drill-down">
+<div style="display:flex;align-items:center;gap:24px;background:#1d2d3d;color:#f2f2f3;padding:0 20px;min-height:56px">
+<div style="font-family:'Barlow Condensed',sans-serif;font-weight:600;font-size:21px;letter-spacing:.03em">FIELDKIT <span style="color:#94bce3">HIVE OPS</span></div>
+<span style="font:13px ui-monospace,Menlo,monospace;color:#9ebbd8"><a href="#1a" style="color:#9ebbd8;text-decoration:none">FLEET</a> › <b style="color:#f2f2f3">KALAMBO</b></span>
+<span style="font:12px ui-monospace,Menlo,monospace;color:#9ebbd8;margin-left:auto">14:07:22Z</span></div>
+<div style="display:flex;align-items:center;gap:22px;background:#e9e9ea;border-bottom:1px solid #d4d4d7;padding:10px 20px">
+<h3 style="margin:0">KALAMBO</h3>
+<span style="font:13px ui-monospace,Menlo,monospace;color:#5d5d60">3 nodes · 9 cams · coverage 89.1% · snapshots every 15 s at this tier</span>
+<div style="margin-left:auto;display:flex;gap:10px"><button class="btn btn-primary" style="min-height:44px">Start hive recording</button><button class="btn btn-ghost" style="min-height:44px;color:#b04a3f;border-color:#b04a3f">Stop hive</button></div></div>
+<div style="padding:20px;display:flex;flex-direction:column;gap:18px">
+<div class="blueprint"><i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+<div style="display:flex;align-items:center;gap:16px;padding:12px 16px;border-bottom:1px solid #e7e7ea">
+<span style="display:inline-flex;align-items:center;gap:8px;font:600 14px ui-monospace,Menlo,monospace"><span style="width:8px;height:8px;border-radius:50%;background:#2f7a52;display:inline-block"></span>fk-kal-01</span>
+<span style="font:12px ui-monospace,Menlo,monospace;color:#5d5d60">site: kalambo-north · 100.84.2.11 · disk 61.4 h · clock +0.3 s · rtt 64 ms · hb 31 s ago</span>
+<div style="margin-left:auto;display:flex;gap:8px"><button class="btn btn-ghost" style="min-height:40px;font-size:13px">Log tail</button><button class="btn btn-ghost" style="min-height:40px;font-size:13px">Stop node</button></div></div>
+<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:14px;padding:14px 16px">
+<div style="display:flex;flex-direction:column;gap:8px">
+<div style="aspect-ratio:16/9;background:repeating-linear-gradient(45deg,#e2e6ea 0 8px,#d9dee3 8px 16px);border:1px solid #d4d4d7;display:flex;align-items:end;justify-content:space-between"><span style="font:10px ui-monospace,Menlo,monospace;color:#5d5d60;padding:5px 7px">snapshot · 12 s</span><span style="font:600 10px ui-monospace,Menlo,monospace;color:#416180;padding:5px 7px">TAP FOR LIVE ▸</span></div>
+<span style="display:flex;align-items:center;gap:8px;font:600 12px ui-monospace,Menlo,monospace"><span style="width:8px;height:8px;border-radius:50%;background:#2f7a52"></span>cam4 · RECORDING</span>
+<span style="height:8px;background:#2f7a52"></span></div>
+<div style="display:flex;flex-direction:column;gap:8px">
+<div style="aspect-ratio:16/9;background:#3a2a2a;border:1px solid #b04a3f;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px"><span style="font:600 12px ui-monospace,Menlo,monospace;color:#e8b4ae">RECONNECTING 3.2 H</span><span style="font:10px ui-monospace,Menlo,monospace;color:#c99">last frame 10:53Z</span></div>
+<span style="display:flex;align-items:center;gap:8px;font:600 12px ui-monospace,Menlo,monospace;color:#b04a3f"><span style="width:8px;height:8px;border-radius:50%;background:#b04a3f"></span>cam5 · RECONNECTING</span>
+<span style="height:8px;background:linear-gradient(90deg,#2f7a52 0 71%,#b04a3f 71% 100%)"></span></div>
+<div style="display:flex;flex-direction:column;gap:8px">
+<div style="aspect-ratio:16/9;background:repeating-linear-gradient(45deg,#e2e6ea 0 8px,#d9dee3 8px 16px);border:1px solid #d4d4d7;display:flex;align-items:end;justify-content:space-between"><span style="font:10px ui-monospace,Menlo,monospace;color:#5d5d60;padding:5px 7px">snapshot · 9 s</span><span style="font:600 10px ui-monospace,Menlo,monospace;color:#416180;padding:5px 7px">TAP FOR LIVE ▸</span></div>
+<span style="display:flex;align-items:center;gap:8px;font:600 12px ui-monospace,Menlo,monospace"><span style="width:8px;height:8px;border-radius:50%;background:#2f7a52"></span>cam6 · RECORDING</span>
+<span style="height:8px;background:#2f7a52"></span></div></div></div>
+<div class="blueprint" style="background:#fdf3f2"><i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+<div style="display:flex;align-items:center;gap:16px;padding:14px 16px;min-height:56px">
+<span style="display:inline-flex;align-items:center;gap:8px;font:600 14px ui-monospace,Menlo,monospace"><span style="width:8px;height:8px;border-radius:50%;background:#b04a3f;display:inline-block"></span>fk-kal-02 · OFFLINE 42 MIN</span>
+<span style="font:12px ui-monospace,Menlo,monospace;color:#5d5d60">last hb 14:24Z · last state: 3 cams recording · desired state stored: recording=on</span>
+<div style="margin-left:auto"><button class="btn btn-ghost" style="min-height:40px;font-size:13px">History</button></div></div></div>
+<div class="blueprint"><i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+<div style="display:flex;align-items:center;gap:16px;padding:14px 16px;min-height:56px">
+<span style="display:inline-flex;align-items:center;gap:8px;font:600 14px ui-monospace,Menlo,monospace"><span style="width:8px;height:8px;border-radius:50%;background:#9a6d1f;display:inline-block"></span>fk-kal-03 · HEARTBEAT ONLY</span>
+<span style="font:12px ui-monospace,Menlo,monospace;color:#9a6d1f">control channel up, tailnet media path down — no live video, no on-demand snapshots. Heartbeat snapshots every 60 s. 3 cams recording per heartbeat.</span>
+<div style="margin-left:auto"><button class="btn btn-ghost" style="min-height:40px;font-size:13px">Log tail</button></div></div></div>
+<p style="font:12px ui-monospace,Menlo,monospace;color:#98989b;margin:0">ONE LIVE STREAM AT A TIME — OPENING A CAMERA CLOSES ANY OTHER STREAM. RECORDING BANDWIDTH ON THE NODE ALWAYS WINS.</p>
+</div></div></div>
+
+<div class="dv-opt" id="1g"><div class="dv-olabel"><a class="dv-oid" href="#1g">1g</a>Camera focus — /kalambo/fk-kal-01/cam4 · the one live stream</div>
+<div class="dv-card" style="width:1180px;background:#111417" data-screen-label="1g Camera focus">
+<div style="display:flex;align-items:center;gap:20px;background:#1d2d3d;color:#f2f2f3;padding:0 20px;min-height:56px">
+<div style="font-family:'Barlow Condensed',sans-serif;font-weight:600;font-size:21px;letter-spacing:.03em">FIELDKIT <span style="color:#94bce3">HIVE OPS</span></div>
+<span style="font:13px ui-monospace,Menlo,monospace;color:#9ebbd8"><a href="#1a" style="color:#9ebbd8;text-decoration:none">FLEET</a> › <a href="#1f" style="color:#9ebbd8;text-decoration:none">KALAMBO</a> › fk-kal-01 › <b style="color:#f2f2f3">cam4</b></span>
+<span style="margin-left:auto;font:600 11px ui-monospace,Menlo,monospace;letter-spacing:.1em;border:1px solid #416180;padding:6px 10px;color:#d6ebff">1 LIVE STREAM — THIS ONE</span></div>
+<div style="display:grid;grid-template-columns:1fr 280px;gap:0">
+<div>
+<div style="aspect-ratio:16/9;background:repeating-linear-gradient(45deg,#1a2027 0 10px,#151a20 10px 20px);position:relative;display:flex;align-items:center;justify-content:center">
+<span style="font:13px ui-monospace,Menlo,monospace;color:#8a939b">live WebRTC sub-stream — browser → node go2rtc, direct over tailnet</span>
+<span style="position:absolute;top:14px;left:14px;display:inline-flex;align-items:center;gap:7px;font:600 12px ui-monospace,Menlo,monospace;color:#e8eaec;background:rgba(0,0,0,.55);padding:7px 10px"><span style="width:8px;height:8px;border-radius:50%;background:#4a9e6f;display:inline-block"></span>LIVE · SUB-STREAM 704×576</span>
+<span style="position:absolute;top:14px;right:14px;font:12px ui-monospace,Menlo,monospace;color:#8a939b;background:rgba(0,0,0,.55);padding:7px 10px">latency 380 ms</span></div>
+<div style="display:flex;flex-wrap:wrap;gap:0;border-top:1px solid rgba(255,255,255,.14);padding:12px 18px;color:#e8eaec">
+<div style="display:flex;flex-direction:column;gap:3px;padding-right:22px;border-right:1px solid rgba(255,255,255,.14)"><span style="font:600 10px/1 ui-monospace,Menlo,monospace;letter-spacing:.14em;color:#8a939b">STATE</span><span style="display:inline-flex;align-items:center;gap:7px;font:600 13px ui-monospace,Menlo,monospace"><span style="width:8px;height:8px;border-radius:50%;background:#4a9e6f;display:inline-block"></span>RECORDING</span></div>
+<div style="display:flex;flex-direction:column;gap:3px;padding:0 22px;border-right:1px solid rgba(255,255,255,.14)"><span style="font:600 10px/1 ui-monospace,Menlo,monospace;letter-spacing:.14em;color:#8a939b">SEGMENT AGE</span><span style="font:13px ui-monospace,Menlo,monospace">212 s / 600 s</span></div>
+<div style="display:flex;flex-direction:column;gap:3px;padding:0 22px;border-right:1px solid rgba(255,255,255,.14)"><span style="font:600 10px/1 ui-monospace,Menlo,monospace;letter-spacing:.14em;color:#8a939b">MAIN STREAM</span><span style="font:13px ui-monospace,Menlo,monospace">records on node — never streamed here</span></div>
+<div style="display:flex;flex-direction:column;gap:3px;padding:0 22px"><span style="font:600 10px/1 ui-monospace,Menlo,monospace;letter-spacing:.14em;color:#8a939b">DISK</span><span style="font:13px ui-monospace,Menlo,monospace">61.4 h left</span></div></div>
+<div style="padding:14px 18px;border-top:1px solid rgba(255,255,255,.14)">
+<span style="font:600 10px/1 ui-monospace,Menlo,monospace;letter-spacing:.14em;color:#8a939b">COVERAGE — LAST 24 H · 600 S SEGMENTS</span>
+<div style="height:14px;background:linear-gradient(90deg,#4a9e6f 0 46%,#c25454 46% 48%,#4a9e6f 48% 100%);margin:10px 0 6px"></div>
+<div style="display:flex;justify-content:space-between;font:11px ui-monospace,Menlo,monospace;color:#8a939b"><span>-24 h</span><span style="color:#c25454">gap 11:02–11:14Z (12 min)</span><span>now</span></div></div>
+</div>
+<div style="border-left:1px solid rgba(255,255,255,.14);padding:16px;display:flex;flex-direction:column;gap:12px;color:#e8eaec">
+<span style="font:600 10px/1 ui-monospace,Menlo,monospace;letter-spacing:.14em;color:#8a939b">OTHER CAMS — fk-kal-01</span>
+<div style="display:flex;flex-direction:column;gap:6px"><div style="aspect-ratio:16/9;background:#3a2a2a;border:1px solid #c25454;display:flex;align-items:center;justify-content:center"><span style="font:600 11px ui-monospace,Menlo,monospace;color:#e8b4ae">RECONNECTING</span></div><span style="font:12px ui-monospace,Menlo,monospace;color:#c25454">cam5 — no stream to switch to</span></div>
+<div style="display:flex;flex-direction:column;gap:6px"><div style="aspect-ratio:16/9;background:repeating-linear-gradient(45deg,#1e242b 0 8px,#181d23 8px 16px);display:flex;align-items:end"><span style="font:10px ui-monospace,Menlo,monospace;color:#8a939b;padding:4px 6px">snapshot · 9 s</span></div><span style="font:12px ui-monospace,Menlo,monospace;color:#8a939b">cam6 — switch (closes cam4 stream)</span></div>
+<div style="margin-top:auto;display:flex;flex-direction:column;gap:10px">
+<button class="btn" style="min-height:48px;color:#e8eaec;border:1px solid rgba(255,255,255,.3);background:none">Node log tail</button>
+<button class="btn" style="min-height:48px;color:#c25454;border:1px solid #c25454;background:none">Stop this camera</button></div>
+</div></div></div></div>
+
+<div class="dv-opt" id="1h"><div class="dv-olabel"><a class="dv-oid" href="#1h">1h</a>Fleet action confirm — scope + offline forecast before commanding</div>
+<div class="dv-card" style="width:560px;background:#c9ccd0;padding:28px" data-screen-label="1h Fleet action confirm">
+<div class="blueprint" style="background:#f2f2f3;box-shadow:0 12px 32px rgba(43,43,45,.22)"><i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+<div style="padding:20px 22px">
+<h4 style="margin:0 0 14px">START RECORDING</h4>
+<div style="display:flex;border:1px solid #b7b7ba;margin-bottom:14px">
+<span style="flex:1;text-align:center;padding:12px;font:600 13px ui-monospace,Menlo,monospace;background:#1d2d3d;color:#f2f2f3">HIVE · KALAMBO</span>
+<span style="flex:1;text-align:center;padding:12px;font:600 13px ui-monospace,Menlo,monospace;color:#5d5d60">ENTIRE FLEET</span></div>
+<div style="font:13px/1.7 ui-monospace,Menlo,monospace;color:#424244">3 nodes · 9 cameras<br><span style="color:#2f7a52">2 nodes online — will ack within one heartbeat (≤60 s)</span><br><span style="color:#9a6d1f">1 node offline (fk-kal-02) — target stored, applies when it reconnects</span></div>
+<p style="font:12px/1.5 'Barlow',sans-serif;color:#5d5d60;margin:12px 0 0">Desired state, not fire-and-forget: nodes reconcile on their next heartbeat. This command is written to the audit log as you.</p></div>
+<div style="display:flex;gap:10px;padding:0 22px 20px">
+<button class="btn btn-primary" style="min-height:52px;flex:1;font-size:16px">Command start — 3 nodes</button>
+<button class="btn btn-ghost" style="min-height:52px">Cancel</button></div></div></div></div>
+
+<div class="dv-opt" id="1i"><div class="dv-olabel"><a class="dv-oid" href="#1i">1i</a>Alerts — flap suppression made visible; clears are automatic</div>
+<div class="dv-card" style="width:760px" data-screen-label="1i Alerts panel">
+<div style="display:flex;align-items:center;gap:20px;background:#1d2d3d;color:#f2f2f3;padding:0 20px;min-height:56px">
+<div style="font-family:'Barlow Condensed',sans-serif;font-weight:600;font-size:21px">FIELDKIT <span style="color:#94bce3">HIVE OPS</span></div>
+<span style="font:600 12px ui-monospace,Menlo,monospace;letter-spacing:.12em;border-bottom:2px solid #94bce3;padding:14px 0">ALERTS</span></div>
+<div style="padding:20px;display:flex;flex-direction:column;gap:12px">
+<div class="blueprint" style="background:#fdf3f2;padding:14px 16px"><i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+<div style="display:flex;align-items:center;gap:10px;font:600 13px ui-monospace,Menlo,monospace"><span style="width:8px;height:8px;border-radius:50%;background:#b04a3f;flex:none"></span>FIRING · NODE SILENT<span style="margin-left:auto;color:#5d5d60;font-weight:400">42 min</span></div>
+<div style="font:13px ui-monospace,Menlo,monospace;margin:6px 0 2px">kalambo › fk-kal-02</div>
+<div style="font:12px ui-monospace,Menlo,monospace;color:#5d5d60">persisted 3/3 heartbeats before firing · webhook posted to #field-ops 14:26Z · clears itself on next heartbeat</div></div>
+<div class="blueprint" style="background:#fdf3f2;padding:14px 16px"><i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+<div style="display:flex;align-items:center;gap:10px;font:600 13px ui-monospace,Menlo,monospace"><span style="width:8px;height:8px;border-radius:50%;background:#b04a3f;flex:none"></span>FIRING · CAMERA NOT RECORDING<span style="margin-left:auto;color:#5d5d60;font-weight:400">3.2 h</span></div>
+<div style="font:13px ui-monospace,Menlo,monospace;margin:6px 0 2px">kalambo › fk-kal-01 › cam5</div>
+<div style="font:12px ui-monospace,Menlo,monospace;color:#5d5d60">RECONNECTING since 10:53Z · gap growing in coverage bar · webhook posted 10:56Z</div></div>
+<div class="blueprint" style="padding:14px 16px"><i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+<div style="display:flex;align-items:center;gap:10px;font:600 13px ui-monospace,Menlo,monospace;color:#9a6d1f"><span style="width:8px;height:8px;border-radius:50%;background:#9a6d1f;flex:none"></span>PENDING 2/3 · DISK UNDER 6 H<span style="margin-left:auto;color:#5d5d60;font-weight:400">62 s</span></div>
+<div style="font:13px ui-monospace,Menlo,monospace;margin:6px 0 2px">ben bella › fk-bb-01 — 4.2 h left</div>
+<div style="font:12px ui-monospace,Menlo,monospace;color:#5d5d60">fires only if it persists one more heartbeat — flap suppression; no webhook yet</div></div>
+<div class="blueprint" style="padding:14px 16px;opacity:.6"><i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+<div style="display:flex;align-items:center;gap:10px;font:600 13px ui-monospace,Menlo,monospace;color:#5d5d60"><span style="width:8px;height:8px;border-radius:50%;background:#98989b;flex:none"></span>CLEARED · GAP DETECTED · cam4<span style="margin-left:auto;font-weight:400">11:14Z</span></div>
+<div style="font:12px ui-monospace,Menlo,monospace;color:#98989b;margin-top:4px">condition gone 2 consecutive heartbeats → auto-cleared · resolution posted to #field-ops · kept 24 h then audit log only</div></div>
+</div></div></div>
+
+<div class="dv-opt" id="1j"><div class="dv-olabel"><a class="dv-oid" href="#1j">1j</a>Remote log tail — the truck-roll saver</div>
+<div class="dv-card" style="width:760px" data-screen-label="1j Log tail">
+<div style="display:flex;align-items:center;gap:16px;padding:14px 20px;border-bottom:1px solid #d4d4d7">
+<h5 style="margin:0">LOG TAIL — fk-kal-01</h5>
+<div style="display:flex;border:1px solid #b7b7ba">
+<span style="padding:10px 16px;font:600 12px ui-monospace,Menlo,monospace;background:#1d2d3d;color:#f2f2f3">RECORDER</span>
+<span style="padding:10px 16px;font:600 12px ui-monospace,Menlo,monospace;color:#5d5d60">GO2RTC</span></div>
+<span style="margin-left:auto;font:12px ui-monospace,Menlo,monospace;color:#5d5d60">last 200 lines · over control channel · no ssh</span>
+<button class="btn btn-secondary" style="min-height:44px;font-size:13px">Follow</button></div>
+<div style="background:#0b0e10;padding:14px 18px;font:12.5px/1.7 ui-monospace,Menlo,monospace;color:#8a939b">
+<div>14:05:12 [cam4] segment closed 20260808T140002.mkv (600.0 s, 412 MB, sha256 ok)</div>
+<div>14:05:12 [cam4] segment opened 20260808T140512.mkv</div>
+<div style="color:#c25454">14:05:31 [cam5] rtsp read timeout (attempt 47) — backing off 30 s</div>
+<div style="color:#c25454">14:06:01 [cam5] reconnect failed: connection refused 192.168.8.15:554</div>
+<div>14:06:44 [disk] free 1.81 TB → 61.4 h at current write rate</div>
+<div>14:07:01 [hb] state pushed · 3 cams · seq 88412 · rtt 64 ms</div>
+<div style="color:#e8eaec">█</div></div>
+<div style="padding:10px 20px;font:11px ui-monospace,Menlo,monospace;color:#98989b;border-top:1px solid #d4d4d7">READ-ONLY. VIEWING IS WRITTEN TO THE AUDIT LOG.</div>
+</div></div>
+
+<div class="dv-opt" id="1k"><div class="dv-olabel"><a class="dv-oid" href="#1k">1k</a>Audit log — append-only, chain-of-custody companion</div>
+<div class="dv-card" style="width:900px" data-screen-label="1k Audit log">
+<div style="display:flex;align-items:center;gap:20px;padding:14px 20px;border-bottom:1px solid #d4d4d7">
+<h5 style="margin:0">AUDIT LOG</h5><span style="font:12px ui-monospace,Menlo,monospace;color:#5d5d60">append-only JSONL · one shared team credential, so origin device is recorded</span>
+<button class="btn btn-ghost" style="margin-left:auto;min-height:44px;font-size:13px">Export .jsonl</button></div>
+<table class="table" style="width:100%;font-family:ui-monospace,Menlo,monospace;font-size:13px">
+<thead><tr><th>TIME (UTC)</th><th>ORIGIN</th><th>ACTION</th><th>SCOPE</th><th>RESULT</th></tr></thead>
+<tbody>
+<tr><td>14:07:22</td><td>ops-console · 100.71.0.4</td><td>START RECORDING</td><td>hive kalambo · 3 nodes</td><td style="color:#9a6d1f">2/3 acked · 1 stored (offline)</td></tr>
+<tr><td>14:02:10</td><td>ops-console · 100.71.0.4</td><td>LOG TAIL VIEWED</td><td>fk-kal-01 · recorder</td><td style="color:#2f7a52">200 lines</td></tr>
+<tr><td>13:52:40</td><td>ops-console · 100.71.0.9</td><td>STOP RECORDING</td><td>node fk-chi-04</td><td style="color:#2f7a52">1/1 acked 13:52:58</td></tr>
+<tr><td>13:41:03</td><td>node fk-bb-01 (local UI)</td><td>NVR PULL COMPLETE</td><td>cam2 · 14 segments</td><td style="color:#2f7a52">sha256 manifest · .verified</td></tr>
+<tr><td>12:58:19</td><td>system</td><td>ALERT FIRED → WEBHOOK</td><td>cam5 not recording</td><td style="color:#2f7a52">#field-ops 200 OK</td></tr>
+</tbody></table>
+</div></div>
+
+<div class="dv-opt" id="1l"><div class="dv-olabel"><a class="dv-oid" href="#1l">1l</a>Degraded &amp; empty states — every ambiguous condition has one look</div>
+<div class="dv-card" style="width:1180px;padding:20px;display:flex;flex-wrap:wrap;gap:16px" data-screen-label="1l Degraded states">
+<div class="blueprint" style="width:352px;padding:16px;background:#fdf3f2"><i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+<h6 style="margin:0 0 8px;color:#5d5d60">Offline node</h6>
+<span style="display:flex;align-items:center;gap:8px;font:600 13px ui-monospace,Menlo,monospace"><span style="width:8px;height:8px;border-radius:50%;background:#b04a3f"></span>fk-kal-02 · OFFLINE 42 MIN</span>
+<p style="font:12px/1.5 'Barlow',sans-serif;color:#5d5d60;margin:8px 0 0">Dead-man's-switch: absence of heartbeat IS the alert. Row pins to top, tinted; last-known state shown dimmed with its timestamp — never blank, never hidden.</p></div>
+<div class="blueprint" style="width:352px;padding:16px"><i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+<h6 style="margin:0 0 8px;color:#5d5d60">Heartbeat-only node</h6>
+<span style="display:flex;align-items:center;gap:8px;font:600 13px ui-monospace,Menlo,monospace"><span style="width:8px;height:8px;border-radius:50%;background:#9a6d1f"></span>fk-kal-03 · HB ONLY — NO MEDIA PATH</span>
+<p style="font:12px/1.5 'Barlow',sans-serif;color:#5d5d60;margin:8px 0 0">Control up, tailnet media down. Distinct amber state — never conflated with offline. All numbers current; live/snapshot buttons disabled with the reason inline.</p></div>
+<div class="blueprint" style="width:352px;padding:16px"><i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+<h6 style="margin:0 0 8px;color:#5d5d60">Stale snapshot</h6>
+<div style="aspect-ratio:16/9;background:repeating-linear-gradient(45deg,#e2e6ea 0 8px,#d9dee3 8px 16px);position:relative;margin-bottom:8px"><span style="position:absolute;inset:auto 0 0 0;background:#9a6d1f;color:#fff;font:600 11px ui-monospace,Menlo,monospace;padding:5px 8px;letter-spacing:.08em">SNAPSHOT 4 MIN OLD</span></div>
+<p style="font:12px/1.5 'Barlow',sans-serif;color:#5d5d60;margin:0">Past 2× refresh interval the age chip turns amber and the image dims 20%. A stale frame that looks live is the worst lie the grid can tell.</p></div>
+<div class="blueprint" style="width:352px;padding:16px"><i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+<h6 style="margin:0 0 8px;color:#5d5d60">Camera reconnecting — the flagship failure</h6>
+<span style="display:flex;align-items:center;gap:8px;font:600 12px ui-monospace,Menlo,monospace;color:#b04a3f;background:#fdf3f2;border:1px solid #b04a3f;padding:6px 8px;width:fit-content">● cam5 RECONNECTING 3.2 H</span>
+<p style="font:12px/1.5 'Barlow',sans-serif;color:#5d5d60;margin:8px 0 0">Duration is part of the state text everywhere it appears. A green node never masks a red camera: node dot stays green, but the hive and fleet rollups count the camera problem and sort it up.</p></div>
+<div class="blueprint" style="width:352px;padding:16px"><i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+<h6 style="margin:0 0 8px;color:#5d5d60">Console cold start</h6>
+<div style="border:1px dashed #b7b7ba;padding:18px;text-align:center;font:12px ui-monospace,Menlo,monospace;color:#98989b">WAITING FOR HEARTBEATS…<br><span style="color:#5d5d60">0 of ~14 known nodes reported (from JSONL replay)</span></div>
+<p style="font:12px/1.5 'Barlow',sans-serif;color:#5d5d60;margin:8px 0 0">Replay shows the roster dimmed as "last known, unconfirmed" rather than an empty screen; each row confirms as its first heartbeat lands.</p></div>
+<div class="blueprint" style="width:352px;padding:16px"><i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+<h6 style="margin:0 0 8px;color:#5d5d60">Version divergence (passive)</h6>
+<span style="font:12px ui-monospace,Menlo,monospace;color:#9a6d1f">fk-chi-02 · fieldkit a41c9e2 (fleet: 7d03b1f) · ffmpeg 6.1 ✓ · go2rtc 1.9.4 ✓</span>
+<p style="font:12px/1.5 'Barlow',sans-serif;color:#5d5d60;margin:8px 0 0">Divergence is a dim amber line in node details and a count on the fleet strip — informational, never an alert, no update machinery.</p></div>
+</div></div>
+
+<div class="dv-group">D · Phone — same ledger, one column</div>
+
+<div class="dv-opt" id="1m"><div class="dv-olabel"><a class="dv-oid" href="#1m">1m</a>Phone global view — 390 px, thumb-first, worst-first</div>
+<div class="dv-card" style="width:390px" data-screen-label="1m Phone global view">
+<div style="display:flex;align-items:center;gap:12px;background:#1d2d3d;color:#f2f2f3;padding:0 16px;min-height:52px">
+<div style="font-family:'Barlow Condensed',sans-serif;font-weight:600;font-size:17px;white-space:nowrap">FIELDKIT <span style="color:#94bce3">HIVE OPS</span></div>
+<span style="margin-left:auto;font:600 12px ui-monospace,Menlo,monospace;color:#f2f2f3;background:#b04a3f;padding:4px 8px;border-radius:9px">4</span></div>
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:1px;background:#d4d4d7;border-bottom:1px solid #d4d4d7">
+<div style="background:#e9e9ea;padding:10px 14px"><span style="font:600 9px/1 ui-monospace,Menlo,monospace;letter-spacing:.14em;color:#5d5d60">NODES</span><div style="font:13px ui-monospace,Menlo,monospace;margin-top:3px"><b style="color:#2f7a52">11</b>·<b style="color:#9a6d1f">2</b>·<b style="color:#b04a3f">1</b></div></div>
+<div style="background:#e9e9ea;padding:10px 14px"><span style="font:600 9px/1 ui-monospace,Menlo,monospace;letter-spacing:.14em;color:#5d5d60">CAMS REC</span><div style="font:13px ui-monospace,Menlo,monospace;margin-top:3px">37<span style="color:#98989b">/41</span> · 96.2%</div></div></div>
+<div style="padding:14px;display:flex;flex-direction:column;gap:12px">
+<div class="blueprint"><i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+<div style="display:flex;align-items:center;gap:10px;padding:12px 14px;border-bottom:1px solid #e7e7ea;min-height:48px"><h5 style="margin:0">KALAMBO</h5><span style="display:inline-flex;align-items:center;gap:6px;font:600 10px ui-monospace,Menlo,monospace;color:#b04a3f"><span style="width:8px;height:8px;border-radius:50%;background:#b04a3f"></span>2</span><span style="margin-left:auto;font:13px ui-monospace,Menlo,monospace;color:#416180">▾</span></div>
+<div style="display:flex;align-items:center;gap:10px;padding:0 14px;min-height:52px;background:#fdf3f2;font:600 12px ui-monospace,Menlo,monospace"><span style="width:8px;height:8px;border-radius:50%;background:#b04a3f;flex:none"></span>fk-kal-02<span style="margin-left:auto;color:#b04a3f;font-weight:400">OFFLINE 42m</span></div>
+<div style="display:flex;align-items:center;gap:10px;padding:0 14px;min-height:52px;border-top:1px solid #e7e7ea;font:600 12px ui-monospace,Menlo,monospace"><span style="width:8px;height:8px;border-radius:50%;background:#2f7a52;flex:none"></span>fk-kal-01<span style="margin-left:auto;color:#b04a3f;font-weight:400">cam5 RECON 3.2h</span></div>
+<div style="display:flex;align-items:center;gap:10px;padding:0 14px;min-height:52px;border-top:1px solid #e7e7ea;font:600 12px ui-monospace,Menlo,monospace"><span style="width:8px;height:8px;border-radius:50%;background:#9a6d1f;flex:none"></span>fk-kal-03<span style="margin-left:auto;color:#9a6d1f;font-weight:400">HB ONLY</span></div></div>
+<div class="blueprint"><i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+<div style="display:flex;align-items:center;gap:10px;padding:12px 14px;min-height:48px"><h5 style="margin:0">BEN BELLA</h5><span style="display:inline-flex;align-items:center;gap:6px;font:600 10px ui-monospace,Menlo,monospace;color:#9a6d1f"><span style="width:8px;height:8px;border-radius:50%;background:#9a6d1f"></span>4.2h DISK</span><span style="margin-left:auto;font:13px ui-monospace,Menlo,monospace;color:#416180">▸</span></div></div>
+<div class="blueprint"><i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+<div style="display:flex;align-items:center;gap:10px;padding:12px 14px;min-height:48px"><h5 style="margin:0;color:#5d5d60">CHINGOLA</h5><span style="display:inline-flex;align-items:center;gap:6px;font:600 10px ui-monospace,Menlo,monospace;color:#2f7a52"><span style="width:8px;height:8px;border-radius:50%;background:#2f7a52"></span>OK</span><span style="margin-left:auto;font:13px ui-monospace,Menlo,monospace;color:#416180">▸</span></div></div>
+<div style="display:flex;gap:10px"><button class="btn btn-secondary" style="min-height:52px;flex:1">Start all</button><button class="btn btn-ghost" style="min-height:52px;flex:1;color:#b04a3f;border-color:#b04a3f">Stop all</button></div>
+</div></div></div>
+
+</div>
+<p class="dv-next">Try next: "go with <a class="dv-oid" href="#1a">1a</a> + the ticket tray <a class="dv-oid" href="#1e">1e</a>, make it a clickable prototype" · "riff on <a class="dv-oid" href="#1c">1c</a> with snapshots in the queue cards" · "phone versions of the camera focus and ack flow"</p>
+</section>
+</x-dc>
+</body>
+</html>

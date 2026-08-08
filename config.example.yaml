@@ -41,3 +41,10 @@ offload:
   secret_access_key: ""  # R2 API token secret
   bucket: fieldkit-recordings
   min_free_gb: 20        # below this, the oldest finished segments upload and are then deleted
+
+# Ops console (optional). Leave this block out — or any field empty — and the node
+# never phones home; it is a self-contained site console, exactly as before.
+ops:
+  url: ""                # ws://<console-host>:8090/ingest — outbound only, console never dials in
+  token: ""              # enrollment token, issued once by the console's Enroll page
+  hive: ""               # hive tag this node belongs to, e.g. kalambo

@@ -9,5 +9,9 @@ go2rtc.yaml
 config.yaml
 # live recording sessions, rewritten by the recorder so restarts resume them
 record_state.json
+# ops console: enrollment token hashes, fleet history, audit trail
+ops_state/
+# ops console config: copied from ops_config.example.yaml on first boot
+ops_config.yaml
 dist/
 .venv/

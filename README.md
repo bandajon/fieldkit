@@ -253,6 +253,7 @@ thereafter. It is shared with `nvr_pull.py`, which reads the first three keys.
 | `go2rtc_binary` | FieldKit | Absolute path to the go2rtc binary. Empty means the Monitor tab stays on snapshots. FieldKit never downloads it. |
 | `camera_defaults` | FieldKit | Credentials the discovery sweep tries against cameras that are not yet in `cameras`. |
 | `offload` | FieldKit | Optional Cloudflare R2 upload when the recording drive runs low. Off unless `offload.enabled` is true — see [Cloud offload](#cloud-offload-optional). |
+| `ops` | FieldKit | Optional ops console enrolment: `url`, `token`, `hive`. Absent or empty means the node never phones home — see [Joining a hive](#joining-a-hive-optional). |
 
 Relative paths resolve against the app directory, not the shell's working
 directory, so `python app.py` behaves the same from anywhere.
@@ -437,6 +438,21 @@ reported by `/api/record/status`.
 
 **Self-hosting?** Leave `enabled: false`, the default. Nothing ever leaves the
 node, no credentials are needed, and the uploader thread does nothing at all.
+
+---
+
+## Joining a hive (optional)
+
+Several nodes can report to one ops console. Fill the `ops` block with the
+console's ingest URL (`ws://<console>:8090/ingest`), an enrolment `token` from
+its Enroll page, and the `hive` tag this node belongs to. The node then keeps an
+outbound WebSocket open — the console never dials in — sending a heartbeat every
+30 s with recording state, 24 h coverage, and a camera still every third beat,
+and applying start/stop commands through the same recorder the Record tab uses.
+
+Leave `ops` out (the default) and none of that runs: no thread, no socket, no
+traffic. The protocol is `docs/HIVE_PROTOCOL.md`; the node's own status is on
+`/api/status` under `hive`.
 
 ---
 
