@@ -7,5 +7,7 @@ go2rtc.yaml
 
 # operator config: copied from config.example.yaml on first boot, holds field passwords
 config.yaml
+# live recording sessions, rewritten by the recorder so restarts resume them
+record_state.json
 dist/
 .venv/

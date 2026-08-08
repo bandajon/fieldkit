@@ -326,6 +326,13 @@ restarted with a backoff that widens from 2 s to 30 s.
 Megabytes can read 0.0 for the first minute of a healthy recording — Matroska
 flushes in clusters, so nothing is durable on disk until the first one lands.
 
+Sessions survive restarts: live sessions are noted in `record_state.json`
+(untracked), and on boot FieldKit re-arms whatever was recording when the
+process died — including the remaining time of a timed run. A timer that
+expired while the node was powered off stays stopped. Combined with the
+boot-on-power setup scripts, a field node that loses power resumes recording
+by itself when power returns.
+
 ### NVR Pull
 
 Pick a date and a time window, select NVRs (or **Pull All**), and go. Each site
