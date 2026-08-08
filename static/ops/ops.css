@@ -123,13 +123,14 @@ main { padding: 20px; display: flex; flex-direction: column; gap: 18px; }
 }
 .agechip.warn { background: var(--warn); color: #fff; }
 
-/* — coverage — */
+/* — coverage: 24 hour-cells; hatched when the node is silent (unknown ≠ fine) — */
 .cov { display: flex; align-items: center; gap: 8px; font: 11px var(--mono); }
-.cov .bar {
-  position: relative; flex: 1; height: 8px; min-width: 40px; background: var(--ok);
+.cov .bar { display: flex; gap: 1px; flex: 1; height: 8px; min-width: 40px; }
+.cov .bar i { flex: 1; background: var(--ok); }
+.cov .bar i.gap { background: var(--bad); }
+.cov.unknown .bar i {
+  background: repeating-linear-gradient(45deg, var(--color-neutral-400) 0 3px, var(--color-bg) 3px 6px);
 }
-.cov .bar i { position: absolute; top: 0; bottom: 0; background: var(--bad); }
-.cov.unknown .bar { background: var(--color-neutral-400); }
 
 /* — hive page camera cards — */
 .node { padding: 0; }

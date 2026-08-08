@@ -447,7 +447,7 @@ Several nodes can report to one ops console. Fill the `ops` block with the
 console's ingest URL (`ws://<console>:8090/ingest`), an enrolment `token` from
 its Enroll page, and the `hive` tag this node belongs to. The node then keeps an
 outbound WebSocket open — the console never dials in — sending a heartbeat every
-30 s with recording state, 24 h coverage, and a camera still every third beat,
+30 s with recording state, 24 h coverage, and a camera still every second beat,
 and applying start/stop commands through the same recorder the Record tab uses.
 
 Leave `ops` out (the default) and none of that runs: no thread, no socket, no

@@ -30,7 +30,8 @@ export function hm(sec) {
 
 export const camAge = (cam, now) => cam.snap_at == null ? null : now - cam.snap_at;
 
-export const SNAP_EVERY = 10;
+// Nodes send a still every 2nd 30 s heartbeat; stale = twice that cadence missed.
+export const SNAP_EVERY = 60;
 
 // --- camera bits ---
 
@@ -52,15 +53,23 @@ export function thumb(nodeKey, cam, now, hb, big) {
     ><span class="agechip${stale || hb ? ' warn' : ''}">${esc(label)}</span></span>`;
 }
 
-/** 24 h bar; gaps are absolute epochs, placed against the window ending now. */
+/** 24 discrete hour-cells (design 1g) against the window ending now. A cell reads
+ * as a gap from half a segment (300 s) of missing footage in its hour; the exact
+ * intervals are on the camera view, and each cell's title carries its minutes. */
 export function coverage(cam, now, unknown) {
   const t0 = now - 86400;
-  const slivers = (cam.gaps || []).map(([a, b]) => {
-    const l = Math.max(0, (a - t0) / 864), r = Math.min(100, (b - t0) / 864);
-    return r > l ? `<i style="left:${l.toFixed(2)}%;width:${Math.max(0.4, r - l).toFixed(2)}%"></i>` : '';
-  }).join('');
+  const miss = Array(24).fill(0);
+  for (const [a, b] of cam.gaps || []) {
+    const lo = Math.max(a, t0), hi = Math.min(b, now);
+    for (let h = Math.max(0, Math.floor((lo - t0) / 3600));
+         h < 24 && t0 + h * 3600 < hi; h++) {
+      miss[h] += Math.max(0, Math.min(hi, t0 + (h + 1) * 3600) - Math.max(lo, t0 + h * 3600));
+    }
+  }
+  const cells = miss.map((s, h) => `<i class="${s >= 300 ? 'gap' : ''}" title="${
+    24 - h} h ago${s ? ` · ${Math.round(s / 60)} min missing` : ''}"></i>`).join('');
   const pct = cam.coverage_pct == null ? '—' : `${cam.coverage_pct}%`;
-  return `<span class="cov${unknown ? ' unknown' : ''}"><span class="bar">${slivers}</span
+  return `<span class="cov${unknown ? ' unknown' : ''}"><span class="bar">${cells}</span
     ><span class="pct">${esc(pct)}</span></span>`;
 }
 

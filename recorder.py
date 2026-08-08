@@ -257,7 +257,9 @@ class Recorder:
                     "minutes": round((now - start) / 60, 1) if start else 0,
                     "until": s["until"],
                     "restarts": s["restarts"],
-                    "log": list(s["tail"])[-5:],
+                    # Whole tail (20 lines): the ops console's log drawer diagnoses a
+                    # remote camera from exactly this — 5 lines hid the retry history.
+                    "log": list(s["tail"]),
                 }
         return out
 

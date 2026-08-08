@@ -186,7 +186,7 @@ class Hive:
         """Beat, then listen until the next beat is due. Returns on revocation."""
         beats = 0
         while True:
-            ws.send(json.dumps(self.heartbeat(beats % 3 == 0)))
+            ws.send(json.dumps(self.heartbeat(beats % 2 == 0)))
             self.last_beat = time.time()
             beats += 1
             deadline = self.last_beat + BEAT_SECONDS
@@ -338,7 +338,7 @@ if __name__ == "__main__":
     assert hb["coverage"]["cam1"]["pct"] >= 0 and "cam2" in hb["coverage"], hb["coverage"]
     assert hb["log"][-1] == "cam1 frame=1", hb["log"]
     assert hb["snapshots"] == {}, hb["snapshots"]      # unreachable camera is skipped
-    assert "snapshots" not in hb2, "snapshots must ride every 3rd beat only"
+    assert "snapshots" not in hb2, "snapshots must ride every 2nd beat only"
     assert rec.calls == [("start", ["cam1", "ghost"], 4.0)], rec.calls
     assert ack == {"type": "ack", "cmd_id": "0142", "ok": True,
                    "applied": ["cam1"], "error": ""}, ack     # ghost is not on this node

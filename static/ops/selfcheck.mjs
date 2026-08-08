@@ -118,12 +118,18 @@ assert.match(row(kalambo.nodes[1], NOW, false), /OFFLINE 42 MIN/);
 assert.match(fleetView({ ...doc, rollup: { ...doc.rollup, nodes: 0 } }, NOW), /NO NODES ENROLLED/);
 
 // hive page: full cards with coverage, timer, and a 3-line log tail
+const noop = () => {};
 const hive = hiveView(doc, 'kalambo', NOW);
 assert.match(hive, /class="thumb[^"]* big"/);
 assert.match(hive, /href="\/h\/kalambo\/fk-bb-01\/cam5"/);
 assert.match(hive, /two\nthree\nfour/);
 assert.ok(!hive.includes('one\ntwo\nthree\nfour'), 'log tail is the last 3 lines');
 assert.match(hive, /88\.4%/);
+// cam6's ~2 h gap lands as red hour-cells in a 24-cell bar, with named hours
+assert.equal((hive.match(/class="gap"/g) || []).length >= 2, true, 'gap hours must go red');
+assert.match(hive, /title="12 h ago · \d+ min missing"/);
+assert.equal((cameraView(doc, 'kalambo', 'fk-bb-01', 'cam6', NOW, () => {})
+  .match(/<i class="[^"]*" title="/g) || []).length, 24, 'coverage renders 24 hour cells');
 assert.match(hive, /UNTIL STOPPED/);
 assert.match(hiveView(doc, 'nope', NOW), /NO HIVE NOPE/);
 
@@ -138,7 +144,6 @@ assert.equal(liveUrl({ ips: [] }, 'cam4'), '');       // no address = nothing to
 assert.equal(liveUrl({}, 'cam4'), '');
 
 // camera focus: one live iframe straight at the node's go2rtc, siblings say what a switch costs
-const noop = () => {};
 const focus = cameraView(doc, 'kalambo', 'fk-bb-01', 'cam5', NOW, noop);
 assert.match(focus, /data-live="http:\/\/100\.84\.2\.11:1984\/stream\.html\?src=cam5"/);
 assert.match(focus, /LIVE VIA NODE GO2RTC — blank means go2rtc is off/);

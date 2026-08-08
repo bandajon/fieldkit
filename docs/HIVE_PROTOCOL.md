@@ -28,8 +28,9 @@ text.
 }
 ```
 
-- `snapshots` present only every 3rd heartbeat (and on the first after
-  connect); omitted otherwise. Sub-stream-sized (camera.snapshot downscaled
+- `snapshots` present only every 2nd heartbeat (and on the first after
+  connect); omitted otherwise. The UI's stale threshold assumes this ~60 s
+  cadence — change them together. Sub-stream-sized (camera.snapshot downscaled
   is NOT required in v1 — send what `/api/camera/snapshot` returns if under
   ~60 KB, else skip that camera this round).
 - `coverage` is 24 h of segment arithmetic per camera: expected 600 s

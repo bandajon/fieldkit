@@ -1,5 +1,16 @@
 /* Industry — design-system tokens and component classes. This file is the source of truth for the system's look; retune it here and see readme.md. */
-@import url('https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;700&family=Barlow+Condensed:wght@400;600&display=swap');
+/* Vendored (Google Fonts latin woff2, OFL) — the console must render on a
+   field LAN with no internet; nothing here fetches beyond its own origin. */
+@font-face { font-family: 'Barlow'; font-style: normal; font-weight: 400; font-display: swap;
+  src: url('/fonts/Barlow-400.woff2') format('woff2'); }
+@font-face { font-family: 'Barlow'; font-style: normal; font-weight: 500; font-display: swap;
+  src: url('/fonts/Barlow-500.woff2') format('woff2'); }
+@font-face { font-family: 'Barlow'; font-style: normal; font-weight: 700; font-display: swap;
+  src: url('/fonts/Barlow-700.woff2') format('woff2'); }
+@font-face { font-family: 'Barlow Condensed'; font-style: normal; font-weight: 400; font-display: swap;
+  src: url('/fonts/BarlowCondensed-400.woff2') format('woff2'); }
+@font-face { font-family: 'Barlow Condensed'; font-style: normal; font-weight: 600; font-display: swap;
+  src: url('/fonts/BarlowCondensed-600.woff2') format('woff2'); }
 
 :root {
   --color-bg: #f2f2f3;

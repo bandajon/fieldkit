@@ -2,6 +2,15 @@
 ## Build spec distilled from the approved Claude Design project "FieldKit Ops console design"
 ## (Design Spec v1 2026-08-08, Hive Console prototype, Wireframes 1a+1d+1g). Same repo as FieldKit.
 
+> **Status note (as built, v1):** this is the design-session distillation kept
+> for intent and acceptance criteria. Where it disagrees with
+> `docs/HIVE_PROTOCOL.md` or the code, those are authoritative. Main deltas:
+> the console is `ops.py` (the node agent is `hive.py`), WS path is
+> `/ingest`, heartbeats are 30 s, the UI uses real History-API paths under
+> `static/ops/` (not hash routes), rejected connections surface as audit
+> rows rather than a dedicated ledger panel, and fonts load via CSS import
+> with system-font fallback instead of vendored woff2.
+
 ## What this is
 Two halves, one repo, one wire protocol:
 
