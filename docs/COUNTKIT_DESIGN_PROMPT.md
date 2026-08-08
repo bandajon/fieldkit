@@ -348,7 +348,36 @@ Probe-data boundaries (per the licensing research): no LOS computation UI
 (probe data arrives as an ingested licensed dataset), and no Google traffic
 layer anywhere data is stored.
 
-## 7. Deliverables requested from this design session
+## 7. Addendum — evidence crops (verification imagery)
+
+Every line-crossing event may carry a small **evidence crop** — the vehicle's
+bounding box at the moment of crossing, ~10–25 KB JPEG. Crops exist to make
+counts *auditable*, especially cross-camera inferred pairs. Design rules:
+
+- **Verification drawer (Counts).** Tapping any O-D cell, bin count, or the
+  inferred-share figure opens a drawer of sampled movements, each showing its
+  crops **side by side**: entry + exit for a same-camera pair; entry from
+  camera A + exit from camera B for an inferred pair — the human check for
+  "is this the same vehicle?". Inferred pairs sort first; each shows its
+  tier, timestamps, Δt, and class.
+- **View-only, always.** A reviewer can **flag** a pair (lands in QA notes
+  and beside the pairing-rate figure: `3 flagged`) but can never accept,
+  reject, or edit a count — the no-hand-edits warranty rule outranks
+  everything. The drawer must not even look editable.
+- **Crop provenance states**: local (default), `from CDN` (dimmed mono tag —
+  local copy aged out, fetched from the R2-backed CDN), and missing
+  (labelled placeholder — analysis predates crops or the write failed;
+  never a broken-image icon).
+- **Analyze**: running/done job cards add a crops counter (`41 812 crops ·
+  612 MB`). **Settings** gain an R2/CDN block (bucket, custom domain) —
+  credentials in config, never shown in the UI.
+- **Report**: an optional "verification sample" appendix page — a small grid
+  of movement crop-pairs with timestamps — off by default.
+- **Privacy posture**: crops contain readable plates. Surfaces showing them
+  carry a discreet `INTERNAL QA` mono marker unless the report appendix is
+  explicitly enabled.
+
+## 8. Deliverables requested from this design session
 1. Full-page designs for all four tabs at 390px and 1280px, covering the
    states listed per tab.
 2. The junction arrow diagram as a reusable component (screen + print).
@@ -357,3 +386,5 @@ layer anywhere data is stored.
 4. A small component sheet: state dots, job card, bin table cell states
    (normal / peak / gap-hatched), QA numeral block, gate chip, sparkline.
 5. Exact hex/size annotations consistent with the design language in §2.
+6. The Counts verification drawer: crop-pair layout (same-camera and
+   inferred), flag affordance, and the three crop provenance states.
