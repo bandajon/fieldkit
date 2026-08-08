@@ -25,6 +25,7 @@ import camera
 import hostnet
 import live
 import nvr_pull
+import offload
 import recorder
 
 ROOT = Path(__file__).resolve().parent
@@ -88,6 +89,8 @@ load_config()
 REC = recorder.Recorder(CONFIG.get("cameras", []), record_dir(), CONFIG.get("site", "site1"))
 LIVE = live.Live(CONFIG.get("cameras", []), CONFIG.get("go2rtc_binary", ""), ROOT / "go2rtc.yaml")
 LIVE.start()   # no-op unless a binary is configured and present
+OFFLOAD = offload.Offload(CONFIG, record_dir())   # holds CONFIG: config edits land live
+OFFLOAD.start()   # no-op unless offload.enabled is set
 
 
 @atexit.register
@@ -135,9 +138,25 @@ def live_stop():
 @app.get("/api/record/status")
 def record_status():
     du = shutil.disk_usage(record_dir())
+    # Recordings and NVR pulls often live on different drives (one internal, one USB),
+    # so report each distinct filesystem — deduped by device, not by path.
+    disks, seen = [], set()
+    for d in (record_dir(), out_root()):
+        try:
+            dev = os.stat(d).st_dev
+        except OSError:        # out_dir is only created by the first pull
+            continue
+        if dev in seen:
+            continue
+        seen.add(dev)
+        u = shutil.disk_usage(d)
+        disks.append({"path": str(d), "free_gb": round(u.free / 1e9, 1),
+                      "total_gb": round(u.total / 1e9, 1)})
     return {"cameras": REC.status(),
             "disk_free_gb": round(du.free / 1e9, 1),
-            "disk_total_gb": round(du.total / 1e9, 1)}
+            "disk_total_gb": round(du.total / 1e9, 1),
+            "disks": disks,
+            "offload": OFFLOAD.info()}
 
 
 def sync_clocks(names):
@@ -152,9 +171,17 @@ def sync_clocks(names):
 @app.post("/api/record/start")
 def record_start(body: dict = Body(default={})):
     names = set(body.get("cams") or [c["name"] for c in CONFIG["cameras"]])
+    hours = body.get("hours")             # absent = record until someone presses Stop
+    if hours is not None:
+        try:
+            hours = float(hours)
+            if not 0 < hours <= 720:
+                raise ValueError
+        except (TypeError, ValueError):
+            raise HTTPException(400, "hours must be a number between 0 and 720")
     # Off-thread and best-effort: an unreachable camera must never delay a record start.
     threading.Thread(target=sync_clocks, args=(names,), daemon=True).start()
-    REC.start(body.get("cams") or None)   # empty/missing = every configured camera
+    REC.start(body.get("cams") or None, hours=hours)   # empty/missing cams = every camera
     return record_status()
 
 

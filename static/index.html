@@ -66,6 +66,8 @@
   .bar { height:4px; background:rgba(255,255,255,.10); border-radius:2px;
          overflow:hidden; margin:14px 0 6px; }
   .bar > div { height:100%; background:var(--fg); }
+  /* One line per drive when recordings and pulls sit on different filesystems. */
+  #diskinfo { white-space:pre-line; }
 
   .cam, .dev { background:var(--panel); border:1px solid var(--line); border-radius:4px;
                padding:16px; margin-bottom:10px; }
@@ -161,6 +163,10 @@
     <div class="rowbtns">
       <button class="btn go" id="start-all">Start All</button>
       <button class="btn halt" id="stop-all">Stop All</button>
+    </div>
+    <div class="acts">
+      <label class="res" for="rec-hours">for hrs (blank = until stopped)</label>
+      <input id="rec-hours" type="number" min="0.5" step="0.5" placeholder="hrs">
     </div>
     <div class="bar"><div id="diskbar"></div></div>
     <div id="diskinfo" class="num">…</div>
@@ -258,7 +264,10 @@ async function post(url, body) {
 }
 
 async function rec(act, cam) {
-  await post('/api/record/' + act, {cams: cam ? [cam] : []});
+  const body = {cams: cam ? [cam] : []};
+  const hrs = parseFloat(document.getElementById('rec-hours').value);   // '' -> NaN
+  if (act === 'start' && hrs > 0) body.hours = hrs;
+  await post('/api/record/' + act, body);
   recPoll();
 }
 document.getElementById('start-all').onclick = () => rec('start');
@@ -288,8 +297,10 @@ async function recPoll() {
   try { s = await (await fetch('/api/record/status')).json(); } catch (e) { return; }
   const used = s.disk_total_gb ? (s.disk_total_gb - s.disk_free_gb) / s.disk_total_gb : 0;
   document.getElementById('diskbar').style.width = (used * 100).toFixed(0) + '%';
-  document.getElementById('diskinfo').textContent =
-    `${s.disk_free_gb} GB free of ${s.disk_total_gb} GB`;
+  const disks = s.disks || [];
+  document.getElementById('diskinfo').textContent = disks.length > 1
+    ? disks.map(d => `${d.free_gb} GB free of ${d.total_gb} GB — ${d.path}`).join('\n')
+    : `${s.disk_free_gb} GB free of ${s.disk_total_gb} GB`;
   const cams = Object.entries(s.cameras);
   setCount('record', cams.length, 'configured');
   document.getElementById('reclist').innerHTML = cams.length === 0
@@ -301,6 +312,8 @@ async function recPoll() {
           ${chip(c.state)}
           <span class="num">${c.minutes} min</span>
           <span class="num">${(c.bytes / 1e6).toFixed(1)} MB</span>
+          ${c.until && c.state !== 'STOPPED'
+            ? `<span class="num">stops ${new Date(c.until * 1000).toTimeString().slice(0, 5)}</span>` : ''}
           ${c.restarts ? `<span class="num">${c.restarts} restarts</span>` : ''}
           ${act === 'start' ? `<button class="btn quiet" data-cam="${esc(n)}"
                   data-act="rename">Rename</button>

@@ -30,3 +30,14 @@ go2rtc_binary: ""        # path to the go2rtc binary; empty = Monitor stays on s
 camera_defaults:         # credentials tried by the discovery sweep on unknown cameras
   user: admin
   password: ""
+
+# Cloudflare R2 offload. Nothing ever leaves this node unless enabled is true.
+# Credentials: Cloudflare dashboard -> R2 -> Manage R2 API Tokens (Object Read & Write,
+# scoped to the bucket). Needs `pip install boto3`.
+offload:
+  enabled: false         # leave false to self-host: footage stays on the drive
+  account_id: ""         # Cloudflare account ID; the endpoint is <account_id>.r2.cloudflarestorage.com
+  access_key_id: ""      # R2 API token key
+  secret_access_key: ""  # R2 API token secret
+  bucket: fieldkit-recordings
+  min_free_gb: 20        # below this, the oldest finished segments upload and are then deleted
