@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """ffmpeg stream-copy recorder: one supervised process per camera."""
 
+import json
+import os
 import signal
 import subprocess
 import sys
@@ -41,10 +43,13 @@ def _graceful(p):
 
 
 class Recorder:
-    def __init__(self, cameras, out_root, site):
+    def __init__(self, cameras, out_root, site, state_path=None):
         self.cams = {c["name"]: c for c in cameras}
         self.out_root = Path(out_root)
         self.site = site
+        # Desired state survives the process: which cameras should record, until when.
+        # Without it, a crash or reboot on an always-on field node silently ends recording.
+        self.state_path = Path(state_path) if state_path else None
         self.st = {n: {"desired": False, "proc": None, "state": "STOPPED",
                        "started": None, "until": None, "restarts": 0, "alive_since": 0.0,
                        "next_spawn": 0.0, "backoff": 2.0, "tail": deque(maxlen=20),
@@ -165,6 +170,41 @@ class Recorder:
                 self.stop(expired)
             time.sleep(1)
 
+    def _save_state(self):
+        """Persist desired sessions. Caller holds the lock. Atomic: field nodes lose
+        power mid-write, and a torn file must not poison the next boot."""
+        if not self.state_path:
+            return
+        state = {n: {"until": s["until"]} for n, s in self.st.items() if s["desired"]}
+        tmp = self.state_path.with_suffix(".tmp")
+        try:
+            tmp.write_text(json.dumps(state))
+            os.replace(tmp, self.state_path)
+        except OSError as e:      # a read-only or full disk must not break start/stop
+            print(f"recorder: cannot save state: {e}", flush=True)
+
+    def resume(self):
+        """Re-arm the sessions that were live when the process last died."""
+        if not self.state_path or not self.state_path.exists():
+            return []
+        try:
+            saved = json.loads(self.state_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            return []
+        now, resumed = time.time(), []
+        for n, e in saved.items():
+            until = e.get("until") if isinstance(e, dict) else None
+            if n not in self.cams:
+                continue
+            if until and until <= now:
+                continue          # the deadline passed while the node was powered off
+            self.start([n], hours=(until - now) / 3600 if until else None)
+            resumed.append(n)
+        if not resumed:
+            with self.lock:
+                self._save_state()   # drop expired/unknown entries so they never revive
+        return resumed
+
     def start(self, names=None, hours=None):
         # A run length is optional: no hours (or a non-positive/garbage one) records
         # until someone presses Stop.
@@ -180,6 +220,7 @@ class Recorder:
                     continue
                 s.update(desired=True, state="RECONNECTING", started=time.time(),
                          until=until, restarts=0, backoff=2.0, next_spawn=0.0, last_bytes=0)
+            self._save_state()
 
     def stop(self, names=None):
         names = list(names or self.cams)
@@ -200,6 +241,7 @@ class Recorder:
                 # A start() that landed mid-stop owns the state now; don't clobber it.
                 if s and not s["desired"]:
                     s.update(proc=None, state="STOPPED", started=None, until=None)
+            self._save_state()
 
     def status(self):
         now = time.time()
@@ -252,6 +294,26 @@ if __name__ == "__main__":
     t.start(["timed"], hours=0)              # non-positive = record until Stop
     assert t.st["timed"]["until"] is None
     t.stop(["timed"])
+
+    # Desired state must survive the process: same state file, fresh Recorder, resume().
+    sp = Path(tempfile.mkdtemp()) / "record_state.json"
+    fake = {"name": "fake", "ip": "127.0.0.1", "user": "u", "password": "p"}
+    p1 = Recorder([fake], tempfile.mkdtemp(), "selftest", state_path=sp)
+    p1.start(["fake"], hours=1.0)                # then the process "dies" — no stop()
+    p2 = Recorder([fake], tempfile.mkdtemp(), "selftest", state_path=sp)
+    assert p2.resume() == ["fake"]
+    s2 = p2.st["fake"]
+    assert s2["desired"] and s2["until"] and s2["until"] > time.time() + 3500, s2["until"]
+    p2.stop(["fake"])
+    assert json.loads(sp.read_text()) == {}, "stop must clear the persisted session"
+    assert p2.resume() == []                     # a clean stop stays stopped after reboot
+
+    # A deadline that passed while the node was powered off must not revive.
+    sp.write_text(json.dumps({"fake": {"until": time.time() - 5}, "ghost": {"until": None}}))
+    p3 = Recorder([fake], tempfile.mkdtemp(), "selftest", state_path=sp)
+    assert p3.resume() == []                     # expired + unconfigured camera
+    assert not p3.st["fake"]["desired"]
+    assert json.loads(sp.read_text()) == {}, "dead entries must be dropped, not kept"
 
     assert "p%40ss%3Aw%2Frd" in rtsp_url(
         {"user": "admin", "password": "p@ss:w/rd", "ip": "10.0.0.1"})

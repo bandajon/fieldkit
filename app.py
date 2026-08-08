@@ -86,9 +86,15 @@ if not CONFIG_PATH.exists():      # first boot (and cloud deploys, where it is u
     print(f"created {CONFIG_PATH.name} from {EXAMPLE_PATH.name}", flush=True)
 
 load_config()
-REC = recorder.Recorder(CONFIG.get("cameras", []), record_dir(), CONFIG.get("site", "site1"))
+REC = recorder.Recorder(CONFIG.get("cameras", []), record_dir(), CONFIG.get("site", "site1"),
+                        state_path=ROOT / "record_state.json")
 LIVE = live.Live(CONFIG.get("cameras", []), CONFIG.get("go2rtc_binary", ""), ROOT / "go2rtc.yaml")
 LIVE.start()   # no-op unless a binary is configured and present
+# A reboot or crash must not end a session on an unattended node: re-arm whatever
+# was recording when the process died (expired timers stay stopped).
+resumed = REC.resume()
+if resumed:
+    print(f"resumed recording after restart: {', '.join(resumed)}", flush=True)
 OFFLOAD = offload.Offload(CONFIG, record_dir())   # holds CONFIG: config edits land live
 OFFLOAD.start()   # no-op unless offload.enabled is set
 
