@@ -1,0 +1,105 @@
+# Fusing Congestion-API Data with Camera Vehicle Counts: A Feasibility, Licensing, Cost & Provider Report for Dexterity System Solutions / VisentraIQ (Lusaka, Zambia)
+
+## TL;DR
+- **Technically feasible; licensing is the binding constraint.** Google's Routes API (not the Roads API) gives you the traffic signal you want (`duration` vs `staticDuration`, plus `NORMAL`/`SLOW`/`TRAFFIC_JAM` speedReadingIntervals), but Google's Terms of Service prohibit caching/storing responses, creating derivative datasets, and using the data to train models — which makes Use Case 1 (validation) grey, Use Case 2 (LOS analysis) grey-to-prohibited, and Use Case 3 (selling an extrapolated continuous-volume product) clearly prohibited under standard terms.
+- **For the fusion product, TomTom is the recommended provider, not Google.** TomTom explicitly licenses historical/real-time floating-car data (Traffic Stats, Junction Analytics, Route Monitoring) to road authorities and analytics firms for exactly this use, with storable outputs (Shape/JSON/Excel), and Junction Analytics covers the 74 countries incl. Zambia. HERE and INRIX are viable enterprise alternatives; Waze for Cities is free but likely ineligible for a private firm; Uber Movement is discontinued.
+- **Data-quality caveat for Lusaka is real.** Probe/floating-car data in sub-Saharan African cities is under-validated and biased by low smartphone/vehicle penetration and heavy minibus/paratransit share. Use it as corroboration and for relative congestion patterns, not as ground truth — and treat Use Case 3 volume extrapolation as a research-grade, caveated product, not a precise count substitute.
+
+## Key Findings
+
+### 1. Google APIs — correct endpoints and signals
+- **Confirmed: the Roads API does NOT provide congestion data.** It provides three services only — Snap to Roads, Nearest Roads, and Speed Limits (posted limits, which Google states are "not real-time, and may be estimated, inaccurate, incomplete, and/or outdated"; the Speed Limits service requires an Asset Tracking license). No live traffic/congestion signal is available from the Roads API.
+- **The traffic-aware signal comes from the Routes API** (`computeRoutes` / `computeRouteMatrix`). Set `routingPreference: TRAFFIC_AWARE` or `TRAFFIC_AWARE_OPTIMAL` plus `departureTime`. The response returns:
+  - `duration` (traffic-adjusted) vs `staticDuration` (no traffic) — the difference is your delay signal for a junction approach.
+  - `travelAdvisory.speedReadingIntervals` — per-polyline-segment congestion categories: `NORMAL`, `SLOW`, `TRAFFIC_JAM`. Enable with `extraComputations: TRAFFIC_ON_POLYLINE` and include `speedReadingIntervals` in the field mask; available at both route level and leg level (`routes.legs.travelAdvisory.speedReadingIntervals`).
+- **Granularity/update:** Live traffic is baked into the ETA at request time (near-real-time). There is **no** public Google endpoint exposing the raw "traffic layer" as a standalone density feed you can store; you only get congestion embedded in a route computation. `TRAFFIC_AWARE_OPTIMAL` is the highest-accuracy/highest-latency option (equivalent to what the Google Maps app uses).
+
+### 2. Google licensing — the make-or-break question
+The governing documents are the **Google Maps Platform Terms of Service** (cloud.google.com/maps-platform/terms) and the **Service Specific Terms** (…/maps-service-terms). Key clauses:
+
+- **(a) Caching/storage — §3.2.3(b) "No Caching":** "Customer will not cache Google Maps Content except as expressly permitted under the Maps Service Specific Terms." For the Routes/Directions family, the Service Specific Terms permit caching only **latitude/longitude values for up to 30 consecutive calendar days** and **place_id indefinitely** — NOT durations, delays, or speed intervals. Storing travel-time/delay results to build a time series is therefore not permitted under standard terms.
+- **(b) Derivative datasets / model training — §3.2.3(c) "No Creating Content From Google Maps Content":** explicitly forbids creating content based on Maps Content, including "(vii) use Google Maps Content to improve machine learning and artificial intelligence models, including to train, test, validate or fine-tune the models."
+- **(c) Use in client reports:** No blanket prohibition on showing a result to a client, but the anti-scraping clause (§3.2.3(a)) forbids "export, extract, or otherwise scrape Google Maps Content for use outside the Services," and attribution (§3.2.2(b)) is mandatory. A one-off, attributed screenshot/plot is defensible; a stored, reprocessed dataset embedded in a deliverable is not.
+- **(d) Use alongside/enhancing a competing dataset — §3.2.3(d) "No Re-Creating Google Products or Features"** forbids using the services to build something "substantially similar to" Google products; §3.2.3(e) "No Use With Non-Google Maps" restricts combining with non-Google maps.
+- **(e) Verdict on Use Case 3:** Selling an extrapolated continuous-volume dataset calibrated on Google delay data is **prohibited** — it requires (i) storing the delay time series (barred by No Caching), (ii) creating a derivative dataset/model (barred by No Creating Content), and (iii) distributing that content commercially (barred by the general license restrictions).
+
+**Per-use-case verdict for Google (standard terms):**
+| Use case | Verdict | Why |
+|---|---|---|
+| **UC1 — Validation plot in one client report** | **Grey (defensible if live + attributed + not stored)** | A live, attributed lookup shown once is arguably within bounds; persisting the data to disk to build the plot brushes against No Caching. |
+| **UC2 — LOS analysis in engineering reports** | **Grey → prohibited** | Systematic combination of stored Google delay with your volumes to assess performance implies storage/derivation, which the terms bar. |
+| **UC3 — Extrapolated continuous-volume product for sale** | **Prohibited** | Requires storage + derivative dataset + model calibration + commercial distribution — each independently barred. |
+
+- **Enterprise option:** Google does negotiate custom agreements (historically the "Google Maps for Work / Premium Plan" master agreements) that can add caching/storage exceptions — e.g., the publicly filed **Uber–Google Amendment No. 2** added a "4.6(E)(3) Exception for End User Map Usage" permitting storage of latitude/longitude under specified conditions. Storage/derivative rights for **traffic** data would need to be explicitly negotiated and are not guaranteed. **This requires direct Google enterprise contact and should not be assumed.**
+
+### 3. Google Routes API cost model
+Pricing (2026, post-March-2025 SKU model), per 1,000 requests after the free monthly allowance:
+- **Compute Routes Essentials (Basic):** ~$5 / 1,000; free cap 10,000/month.
+- **Compute Routes Pro (traffic-aware):** ~$10 / 1,000; free cap 5,000/month. Google's billing docs confirm the `TRAFFIC_AWARE`/`TRAFFIC_AWARE_OPTIMAL` modifiers trigger the **Pro** SKU — this is the SKU your requests will hit.
+- **Compute Route Matrix:** billed **per element** (origins × destinations); traffic-aware elements bill at the Pro rate. (A "Preferred" tier at ~$15/1,000 exists for specialized features.)
+
+**Modeled polling cost — 35 origin–destination route requests (7 junctions × ~5 approaches), TRAFFIC_AWARE = Pro SKU @ $10/1,000, 22 workdays/month:**
+
+| Cadence | Requests/cycle | Requests/day | Requests/month | Monthly cost (after 5k free @ $10/1k) |
+|---|---|---|---|---|
+| Every 10 min, 16 h/day (96 cycles) | 35 | 3,360 | ~73,920 | ~**$689/mo** |
+| Every 15 min, 16 h/day (64 cycles) | 35 | 2,240 | ~49,280 | ~**$443/mo** |
+| Every 15 min, peaks only (~6 h/day, 24 cycles) | 35 | 840 | ~18,480 | ~**$135/mo** |
+| Continuous 24/7 @ 10 min (144 cycles) | 35 | 5,040 | ~110,880 | ~**$1,059/mo** |
+
+(Running 30 calendar days instead of 22 scales costs up ~1.36×.) Route Matrix could reduce request overhead but bills per element, so 7×5 = 35 elements per cycle nets out similarly. **Critical caveat: even the cheapest cadence is only lawful if you do NOT store the results — which defeats the fusion use case under standard Google terms.** The cost model therefore matters mainly if you (a) obtain an enterprise storage license, or (b) restrict Google to live, unstored sanity-checks.
+
+### 4. Alternative providers (ranked for the fusion product)
+- **TomTom — RECOMMENDED.** Built for exactly this workflow. Its floating-car data is sourced from **over 660 million connected GPS devices generating more than 60 billion anonymous data points**, with Traffic Flow updated every 30 seconds (TomTom Newsroom). Products:
+  - **Junction Analytics** — per-approach travel times, queue lengths, turn ratios and current delay at signalized intersections; covers 74 countries **including Zambia**; delivered via API + MOVE web app; designed to complement in-situ hardware (camera feeds, loop counters) — precisely your fusion scenario.
+  - **Traffic Stats** — 10+ year historical archive, 70+ countries, custom route/area queries, outputs as Shape/JSON/GeoJSON/Excel/KML **with per-segment sample size** for confidence; licensed **per directional mile/km**.
+  - **Area Analysis / Traffic Density** — the Traffic Density product returns the **number of probe vehicles per segment**, directly useful for volume calibration (UC3).
+  - **Route Monitoring** and **O/D Analysis** round out the suite. TomTom's Traffic Stats PM Kristina Vuletic frames the product as the affordable alternative to "expensive built-in hardware, like traffic cameras" — i.e., analytics/derivative use is the intended market. Real-time Traffic Flow API has a free tier (2,500 transactions/day) then credit packs. **Stats/Junction Analytics pricing is quote-based via TomTom sales/partner — must contact.**
+- **HERE — strong enterprise alternative.** Traffic API v7: Flow (speed + "jam factor" JF, updated every minute) and Incidents; covers 70+ countries incl. Middle East & Africa. HERE Speed Data is explicitly marketed to "transportation agencies & consulting firms" for historical analysis and modelling. Freemium then usage/enterprise licensing; resellers (e.g., OnTerra) can provision keys. Good licensing posture for consulting derivatives; **confirm Lusaka probe density**.
+- **INRIX — capable but restrictive licensing.** Rich traffic/volume analytics (Signal Analytics, Trip Paths, AI Traffic; 145+ countries). However, standard license terms bar combining INRIX data with other traffic data "for purposes of reselling the combined data or creating a competitive product" and bar derivative works "except as permitted by the Intended Use." Its volume products are US-centric (2.65M miles of US roads). Enterprise quote required; **least friendly to UC3** unless specifically licensed.
+- **Mapbox — possible, developer-friendly.** Directions/Matrix APIs with a traffic profile and congestion annotations; less specialized for junction analytics; African probe density likely thinner than TomTom/HERE. (Detailed 2026 Mapbox pricing and Lusaka coverage not confirmed in this research — verify.)
+- **Waze for Cities — free but likely ineligible.** Two-way data exchange (jams, alerts, irregularities via a 2-minute GeoRSS XML/JSON feed). Eligibility is government agencies, road operators, emergency services, and event/venue operators. A private survey firm would generally not qualify unless acting under/for a public road authority. Worth pursuing only via a public-agency client (e.g., RDA/LCC).
+- **Uber Movement — discontinued.** The data platform has been shut down (historical CSV archives only, and its former license was Creative Commons Attribution Non-Commercial). Not an option.
+- **Open alternatives:** OSM/Nominatim provide no live congestion; there is no viable free floating-car congestion source with meaningful Lusaka coverage.
+
+### 5. Floating-car-data validity in African cities & the volume-from-speed calibration approach
+- **The calibration approach has clear precedent.** Estimating flow/volume from probe speeds via a calibrated fundamental diagram (FD) is an established method (Van Aerde single-regime FD calibration; Bayesian flow-from-speed estimation; probe-count-to-volume scaling with a penetration coefficient *k*). Recent work explicitly fuses floating-car data + traffic-camera counts + network-flow analysis to propagate camera-calibrated factors to un-counted segments — essentially a published version of your UC3 (arXiv "Harnessing Floating Car Data, Traffic Camera Observations, and Network Flow Analysis for Traffic Volume Estimation").
+- **But accuracy is regime-dependent and weak in free-flow.** The literature consistently finds speed→volume mapping unreliable in free-flow (speed stays near free-flow speed regardless of volume) and better in congestion. A Manitoba (Canada) study found mean travel speed could **not** predict volume at all; probe *counts* showed moderate correlation with volume (R² up to 0.65 all vehicles, up to 0.9 for trucks). **Implication: calibrate on probe counts/density (TomTom Traffic Density) rather than speed alone wherever possible.**
+- **Sub-Saharan Africa specifically — under-validated and biased.** The key review is **Bruwer, M.M., Behrens, R. & Andersen, S.J. (2023), "Commercial floating car data application in Sub-Saharan African transport planning contexts: A critical review and research agenda," *Scientific African* Vol. 20, e01692, doi:10.1016/j.sciaf.2023.e01692** (Stellenbosch/UCT — note this is *not* by "Cebecauer" and is in *Scientific African*, not *Case Studies on Transport Policy*). It finds FCD accuracy and biases are "not widely understood" in SSA and that "biases are likely to occur… because of the representation and behaviours of the sample reporting FCD, as well as the urban form of Sub-Saharan African cities" — probe/CDR samples under-cover "low income, female, rural" populations, and minibus/paratransit fleets dominate the traffic stream.
+- **Direct field validations (best available datapoints):**
+  - **Lagos:** Google Maps mean travel-time error ≈ **14 minutes** vs journeys physically replicated by drivers — far better than free tools (>45 min error) but still material; modelling said 100% of women were within 60 min of care, driven replication showed only **57%** were (Banke-Thomas et al. 2021, *BMJ Global Health*).
+  - **Kano / Port-Harcourt / Lagos:** Google Directions API vs AccessMod model — ward-level concordance **72–90%**, cell-level correlation ≥0.8, adjusted **R² ≈ 0.62–0.81** (Macharia/Banke-Thomas et al. 2024, *Geospatial Health*). (Method-vs-method, not vs physical counts.)
+  - **Jakarta (LMIC comparator):** Google API vs reported travel times **R² = 0.374** (time), 0.177 (cost), with systematic underestimation for private vehicles — versus **"less than 6%" deviation** found in high-income (German) GPS test-drive validation (Bastarianto et al. 2025, *Case Studies on Transport Policy*, citing Wagner et al. 2020).
+  - **Underlying probe-sample skew:** Kenya mobile-phone ownership was **84% in Nairobi vs 9% in Marsabit** (Wesolowski et al. 2012, *PLOS ONE*) — illustrating why any phone/vehicle-based probe sample is socioeconomically and geographically skewed in SSA.
+  - **No published measured commercial-FCD penetration rate exists for Lusaka** (or most SSA cities) — consistent with Bruwer et al.'s central finding that FCD representativeness in SSA is essentially unquantified.
+- **Net implication:** Probe data in Lusaka will capture private-car/ride-hail movement reasonably on main arterials but under-represent minibuses and low-income flows. Congestion *patterns* (peak timing, relative delay) will be usable; absolute volume extrapolation (UC3) must be **camera-calibrated per approach** and reported with confidence bounds and probe sample sizes.
+
+### 6. Technical integration sketch
+- **Recommended stack: TomTom.** For validation/LOS (UC1/UC2) use **Junction Analytics** (per-approach travel time, queue length, turn ratios, current delay) mapped to your seven intersections. For the derivative volume product (UC3) use **Traffic Stats Area Analysis + Traffic Density** (per-segment probe counts and speeds with sample size) — bulk historical exports beat polling and are storable/licensable.
+- **If polling live flow instead:** a Python service (`requests` + `APScheduler`) hits TomTom Traffic Flow (`/traffic/services/4/flowSegmentData/...` by lat/long per approach; returns current speed, free-flow speed, current travel time, confidence) or HERE Flow (`/flow` by bounding box; returns speed + jamFactor + segment geometry). Persist `{junction_id, approach_id, timestamp, current_speed, freeflow_speed, delay, jam_factor, sample_confidence}` to Postgres/Parquet.
+- **Aligning to your 15-minute count bins:** floor each probe timestamp to a 15-minute bucket, average within bucket, and join on `(junction, approach, 15min_bin)` to your classified counts. Output per approach: (a) UC1 — overlay of provider delay/travel-time curve against your measured volume bins; (b) UC2 — LOS classification from volume + speed/delay; (c) UC3 — fitted volume↔(delay, probe-count) regression with R² and confidence bands, calibrated on counted days and applied to provider data on non-counted days.
+- **Prefer bulk historical exports over polling.** TomTom Traffic Stats jobs (asynchronous — submit, poll job status, download Shape/JSON/Excel; max route length 200 km, up to 366-day ranges) and HERE Speed Data are cheaper, cleaner, storable under license, and crucially include **sample-size fields** so you can attach confidence to every estimate. Webhooks are not central here.
+
+## Recommendations
+**Stage 0 (this week):** Register for TomTom's free developer tier and stand up the Python poller against Traffic Flow for your 7 junctions × 4–6 approaches at 15-minute cadence (peaks + off-peak) to prototype the alignment with your existing 15-minute count bins. This validates the technical join at near-zero cost and is licensing-safe for internal prototyping.
+
+**Stage 1 (UC1 validation, weeks 2–3):** Request a TomTom Junction Analytics / Traffic Stats evaluation quote for the seven intersections. Produce the corroboration plots (measured volume bins vs provider delay/travel-time curve) in one client deliverable. Get written confirmation that the license permits including derived charts in client reports.
+
+**Stage 2 (UC2 LOS analysis):** Once licensed, combine measured volume + TomTom speed/delay for junction LOS assessment. This is squarely within TomTom's intended analytics use.
+
+**Stage 3 (UC3 derivative product):** Negotiate an explicit TomTom (or HERE) enterprise/derivative license permitting creation and sale of a continuous-volume dataset. Calibrate per-approach volume↔(delay, probe-count) relationships on counted days; validate against held-out counted days; publish with confidence intervals and probe sample sizes. **Do NOT build this on Google data.**
+
+**Google's role:** acceptable only for a live, non-stored, attributed sanity-check lookup (a defensible UC1 corroboration glance). Anything involving storing a time series or selling a derivative must run on a provider whose license permits it — or on a specifically negotiated Google enterprise agreement.
+
+**Benchmarks that change the plan:**
+- If TomTom/HERE probe sample sizes for your specific Lusaka approaches come back very low (e.g., single-digit vehicles per 15-min bin off-peak), downgrade UC3 to "peak-period only," or sell only peak-calibrated estimates rather than a continuous 24/7 product.
+- If a public road authority (RDA / Lusaka City Council) is your client, pursue **Waze for Cities** (free) under their sponsorship as a supplementary incident/jam feed.
+- If UC3 calibration R² against your held-out counted days is below ~0.6 on key approaches, do not market it as a volume substitute — position it as a relative-congestion index instead.
+
+## Caveats & items requiring direct provider contact
+- **Google enterprise terms** (any storage/derivative rights) — must be negotiated directly; not available on standard terms, and not guaranteed for traffic data.
+- **TomTom pricing** for Traffic Stats (per directional km), Junction Analytics, and derivative/resale licensing — quote-based via TomTom sales/partner; obtain the UC3 derivative/resale rights **in writing**.
+- **HERE and INRIX** enterprise quotes and Lusaka-specific probe coverage/density — confirm with sales; INRIX standard terms are hostile to combined/derivative resale.
+- **Lusaka probe density is the single biggest technical unknown.** No published measured commercial-FCD penetration rate exists for Lusaka (or most SSA cities). Request sample-size/coverage data for your exact junctions before committing to UC3.
+- **Mapbox 2026 pricing and African congestion coverage** were not fully confirmed here.
+- **Legal review recommended** before publishing any deliverable that reuses third-party traffic data, and before launching UC3 as a commercial product. This report summarizes provider terms as of 2025–2026 but is not a legal opinion.
