@@ -453,6 +453,26 @@ def cold_start_replay_is_unconfirmed():
     assert ops.NODES["kalambo/quiet"]["confirmed"] is True, "a live beat must confirm"
 
 
+def password_gate_when_hosted():
+    """OPS_PASSWORD set (public hosting): every HTTP surface wants the cookie;
+    unset (tailnet): untouched. Node /ingest is a WebSocket — never gated here."""
+    c = TestClient(ops.app)      # fresh client against the (possibly reloaded) module
+    assert c.get("/api/fleet").status_code == 200, "auth must be off by default"
+    ops.OPS_PASSWORD = "pw"
+    try:
+        assert c.get("/api/fleet", cookies={}).status_code == 401
+        r = c.get("/?key=pw", follow_redirects=False)
+        assert r.status_code in (302, 307) and "ops_auth" in r.headers.get("set-cookie", "")
+        assert c.get("/api/fleet", cookies={"ops_auth": "pw"}).status_code == 200
+        assert c.get("/api/fleet", cookies={"ops_auth": "wrong"}).status_code == 401
+        # Fresh client: the jar above already holds the good cookie, which would
+        # (correctly) outrank a wrong key on the same client.
+        assert TestClient(ops.app).get("/?key=wrong",
+                                       follow_redirects=False).status_code == 401
+    finally:
+        ops.OPS_PASSWORD = ""
+
+
 for name, fn in list(globals().items()):
     if callable(fn) and not name.startswith("_") and fn.__module__ == "__main__" \
             and name not in ("check", "wait", "beat", "push", "rec", "node_of"):

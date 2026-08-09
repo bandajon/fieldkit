@@ -621,6 +621,29 @@ def boot():
 boot()
 app = FastAPI(title="FIELDKIT HIVE OPS")
 
+# On a tailnet the network is the boundary and this stays off (env unset). On a
+# public host (Railway) set OPS_PASSWORD: every HTTP surface then needs the cookie,
+# obtained once by opening /?key=<password>. Node ingest is a WebSocket — untouched
+# by this middleware — and stays gated by enrollment tokens, exactly as designed.
+OPS_PASSWORD = os.environ.get("OPS_PASSWORD", "")
+
+
+@app.middleware("http")
+async def _guard(request, call_next):
+    if OPS_PASSWORD:
+        import secrets as _s
+        supplied = request.query_params.get("key", "")
+        if supplied and _s.compare_digest(supplied, OPS_PASSWORD):
+            from fastapi.responses import RedirectResponse
+            r = RedirectResponse(request.url.path)     # strip the key from the URL bar
+            r.set_cookie("ops_auth", OPS_PASSWORD, httponly=True,
+                         max_age=30 * 86400, samesite="lax")
+            return r
+        if not _s.compare_digest(request.cookies.get("ops_auth", ""), OPS_PASSWORD):
+            return Response("FIELDKIT HIVE OPS — open /?key=<password> to sign in",
+                            status_code=401, media_type="text/plain")
+    return await call_next(request)
+
 
 @app.websocket("/ingest")
 async def ingest(ws: WebSocket):
