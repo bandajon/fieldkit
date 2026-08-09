@@ -622,27 +622,50 @@ boot()
 app = FastAPI(title="FIELDKIT HIVE OPS")
 
 # On a tailnet the network is the boundary and this stays off (env unset). On a
-# public host (Railway) set OPS_PASSWORD: every HTTP surface then needs the cookie,
-# obtained once by opening /?key=<password>. Node ingest is a WebSocket — untouched
+# public host (Railway) set OPS_PASSWORD: every HTTP surface then wants a session
+# cookie, obtained by POSTing the password to /login — never a query string, which
+# would put the password in edge logs and browser history. The cookie is a random
+# token, not the password, so a stolen cookie is revocable (restart clears all
+# sessions) without rotating the password. Node ingest is a WebSocket — untouched
 # by this middleware — and stays gated by enrollment tokens, exactly as designed.
 OPS_PASSWORD = os.environ.get("OPS_PASSWORD", "")
+SESSIONS = set()      # in-memory: a console restart signs operators out, honestly
+
+LOGIN_HTML = """<!doctype html><meta charset="utf-8"><title>FIELDKIT HIVE OPS</title>
+<body style="background:#f2f2f3;color:#1d1f20;font:14px system-ui;display:grid;
+place-items:center;min-height:100vh;margin:0">
+<form method="post" action="/login" style="border:1px solid rgba(29,31,32,.3);
+padding:26px;display:flex;flex-direction:column;gap:12px;background:#fff">
+<b style="letter-spacing:.1em">FIELDKIT HIVE OPS</b>
+<input type="password" name="key" placeholder="console password" autofocus
+ style="min-height:44px;padding:0 10px;font:inherit">
+<button style="min-height:44px;font:600 13px system-ui;letter-spacing:.06em;
+background:#1d2d3d;color:#fff;border:0;cursor:pointer">SIGN IN</button>
+</form></body>"""
 
 
 @app.middleware("http")
 async def _guard(request, call_next):
-    if OPS_PASSWORD:
-        import secrets as _s
-        supplied = request.query_params.get("key", "")
-        if supplied and _s.compare_digest(supplied, OPS_PASSWORD):
+    if not OPS_PASSWORD:
+        return await call_next(request)
+    import secrets as _s
+    if request.cookies.get("ops_auth", "") in SESSIONS:
+        return await call_next(request)
+    if request.url.path == "/login" and request.method == "POST":
+        # Parsed by hand: urlencoded only, no multipart dependency.
+        from urllib.parse import parse_qs
+        supplied = parse_qs((await request.body()).decode()).get("key", [""])[0]
+        if _s.compare_digest(supplied, OPS_PASSWORD):
             from fastapi.responses import RedirectResponse
-            r = RedirectResponse(request.url.path)     # strip the key from the URL bar
-            r.set_cookie("ops_auth", OPS_PASSWORD, httponly=True,
+            tok = _s.token_urlsafe(32)
+            SESSIONS.add(tok)
+            r = RedirectResponse("/", status_code=303)
+            # secure=True: OPS_PASSWORD implies the hosted/HTTPS deployment; a
+            # tailnet console leaves the password unset and never reaches here.
+            r.set_cookie("ops_auth", tok, httponly=True, secure=True,
                          max_age=30 * 86400, samesite="lax")
             return r
-        if not _s.compare_digest(request.cookies.get("ops_auth", ""), OPS_PASSWORD):
-            return Response("FIELDKIT HIVE OPS — open /?key=<password> to sign in",
-                            status_code=401, media_type="text/plain")
-    return await call_next(request)
+    return Response(LOGIN_HTML, status_code=401, media_type="text/html")
 
 
 @app.websocket("/ingest")

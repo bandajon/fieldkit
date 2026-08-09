@@ -454,23 +454,28 @@ def cold_start_replay_is_unconfirmed():
 
 
 def password_gate_when_hosted():
-    """OPS_PASSWORD set (public hosting): every HTTP surface wants the cookie;
-    unset (tailnet): untouched. Node /ingest is a WebSocket — never gated here."""
+    """OPS_PASSWORD set (public hosting): POST /login mints a random session
+    token — the password itself never rides a URL or a cookie. Unset (tailnet):
+    untouched. Node /ingest is a WebSocket — never gated here."""
     c = TestClient(ops.app)      # fresh client against the (possibly reloaded) module
     assert c.get("/api/fleet").status_code == 200, "auth must be off by default"
     ops.OPS_PASSWORD = "pw"
     try:
-        assert c.get("/api/fleet", cookies={}).status_code == 401
-        r = c.get("/?key=pw", follow_redirects=False)
-        assert r.status_code in (302, 307) and "ops_auth" in r.headers.get("set-cookie", "")
-        assert c.get("/api/fleet", cookies={"ops_auth": "pw"}).status_code == 200
-        assert c.get("/api/fleet", cookies={"ops_auth": "wrong"}).status_code == 401
-        # Fresh client: the jar above already holds the good cookie, which would
-        # (correctly) outrank a wrong key on the same client.
-        assert TestClient(ops.app).get("/?key=wrong",
-                                       follow_redirects=False).status_code == 401
+        r = c.get("/api/fleet", cookies={})
+        assert r.status_code == 401 and "SIGN IN" in r.text, "401 must carry the form"
+        assert c.get("/?key=pw", cookies={}).status_code == 401, \
+            "a query-string password must never authenticate"
+        r = c.post("/login", data={"key": "pw"}, follow_redirects=False)
+        assert r.status_code == 303, r.status_code
+        tok = r.cookies.get("ops_auth", "")
+        assert tok and tok != "pw" and tok in ops.SESSIONS, "cookie must be a session token"
+        assert c.get("/api/fleet", cookies={"ops_auth": tok}).status_code == 200
+        assert c.get("/api/fleet", cookies={"ops_auth": "forged"}).status_code == 401
+        assert c.post("/login", data={"key": "wrong"},
+                      follow_redirects=False).status_code == 401
     finally:
         ops.OPS_PASSWORD = ""
+        ops.SESSIONS.clear()
 
 
 for name, fn in list(globals().items()):
