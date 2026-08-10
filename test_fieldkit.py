@@ -67,11 +67,8 @@ def readme_documents_config():
     # config.example.yaml, not config.yaml: the latter is untracked and field-edited.
     cfg = yaml.safe_load((ROOT / "config.example.yaml").read_text())
     keys = set(cfg)
-    for section in ("nvrs", "cameras"):
-        for entry in cfg.get(section) or []:
-            keys |= set(entry)
-    for ch in (cfg.get("nvrs") or [{}])[0].get("channels") or []:
-        keys |= set(ch)
+    for entry in cfg.get("cameras") or []:
+        keys |= set(entry)
     keys |= set(cfg.get("camera_defaults") or {})
     missing = sorted(k for k in keys if not re.search(rf"\b{re.escape(k)}\b", readme))
     assert not missing, f"undocumented config keys: {missing}"

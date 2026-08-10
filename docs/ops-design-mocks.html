@@ -41,7 +41,7 @@
 <div style="display:grid;grid-template-columns:150px 1fr 240px 240px 130px;gap:0 16px;align-items:center;padding:13px 18px;border-top:1px solid #e7e7ea;min-height:60px">
 <span style="display:inline-flex;align-items:center;gap:8px;font:600 13px ui-monospace,Menlo,monospace"><span style="width:8px;height:8px;border-radius:50%;background:#2f7a52;display:inline-block"></span>fk-kal-01</span>
 <span style="display:flex;flex-direction:column;gap:4px;font:12px ui-monospace,Menlo,monospace"><span><span style="color:#2f7a52">●</span> 3 cams REC · <b style="background:#e9e9ea;padding:2px 6px">⏱ STOPS 18:07Z · 3:58 LEFT</b></span></span>
-<span style="display:flex;flex-direction:column;gap:3px;font:12px ui-monospace,Menlo,monospace"><span>recordings 61.4 h</span><span style="color:#5d5d60">nvr-staging 210 h</span></span>
+<span style="display:flex;flex-direction:column;gap:3px;font:12px ui-monospace,Menlo,monospace"><span>recordings 61.4 h</span></span>
 <span style="display:inline-flex;align-items:center;gap:7px;font:600 11px ui-monospace,Menlo,monospace;color:#416180;letter-spacing:.04em">▲ UPLOADING 20260808T1340_cam4.mkv</span>
 <span style="font:13px ui-monospace,Menlo,monospace;color:#5d5d60">31 s</span></div>
 <div style="display:grid;grid-template-columns:150px 1fr 240px 240px 130px;gap:0 16px;align-items:center;padding:13px 18px;border-top:1px solid #e7e7ea;min-height:60px">
@@ -53,7 +53,7 @@
 <div style="display:grid;grid-template-columns:150px 1fr 240px 240px 130px;gap:0 16px;align-items:center;padding:13px 18px;border-top:1px solid #e7e7ea;min-height:60px;background:#fdf3f2">
 <span style="display:inline-flex;align-items:center;gap:8px;font:600 13px ui-monospace,Menlo,monospace"><span style="width:8px;height:8px;border-radius:50%;background:#2f7a52;display:inline-block"></span>fk-bb-01</span>
 <span style="font:12px ui-monospace,Menlo,monospace"><span style="color:#2f7a52">●</span> 2 cams REC · UNTIL STOPPED</span>
-<span style="display:flex;flex-direction:column;gap:3px;font:12px ui-monospace,Menlo,monospace"><span style="color:#b04a3f;font-weight:600">recordings 4.2 h ⚠</span><span style="color:#5d5d60">nvr-staging 96 h</span></span>
+<span style="display:flex;flex-direction:column;gap:3px;font:12px ui-monospace,Menlo,monospace"><span style="color:#b04a3f;font-weight:600">recordings 4.2 h ⚠</span></span>
 <span style="display:inline-flex;align-items:center;gap:7px;font:600 11px ui-monospace,Menlo,monospace;color:#b04a3f;background:#fff;border:1px solid #b04a3f;padding:5px 8px">▲ FAILED 3 H · R2 403 — DISK 4.2 H</span>
 <span style="font:13px ui-monospace,Menlo,monospace;color:#5d5d60">18 s</span></div>
 </div>
@@ -92,7 +92,6 @@
 <div><span style="font:600 10px/1 ui-monospace,Menlo,monospace;letter-spacing:.14em;color:#5d5d60">DRIVES</span>
 <div style="display:flex;justify-content:space-between;font:13px ui-monospace,Menlo,monospace;margin-top:8px"><span>recordings</span><b>61.4 h</b></div>
 <div style="height:6px;background:#d4d4d7;margin:5px 0 10px"><div style="height:100%;width:64%;background:#2f7a52"></div></div>
-<div style="display:flex;justify-content:space-between;font:13px ui-monospace,Menlo,monospace;color:#5d5d60"><span>nvr-staging</span><b>210 h</b></div>
 <div style="height:6px;background:#d4d4d7;margin-top:5px"><div style="height:100%;width:88%;background:#98989b"></div></div>
 <div style="font:11px ui-monospace,Menlo,monospace;color:#98989b;margin-top:6px">hours at each drive's own write rate · worst drive sorts the node</div></div>
 <div class="blueprint" style="padding:12px 14px"><i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
@@ -682,7 +681,7 @@
 <tr><td>14:07:22</td><td>ops-console · 100.71.0.4</td><td>START RECORDING</td><td>hive kalambo · 3 nodes</td><td style="color:#9a6d1f">2/3 acked · 1 stored (offline)</td></tr>
 <tr><td>14:02:10</td><td>ops-console · 100.71.0.4</td><td>LOG TAIL VIEWED</td><td>fk-kal-01 · recorder</td><td style="color:#2f7a52">200 lines</td></tr>
 <tr><td>13:52:40</td><td>ops-console · 100.71.0.9</td><td>STOP RECORDING</td><td>node fk-chi-04</td><td style="color:#2f7a52">1/1 acked 13:52:58</td></tr>
-<tr><td>13:41:03</td><td>node fk-bb-01 (local UI)</td><td>NVR PULL COMPLETE</td><td>cam2 · 14 segments</td><td style="color:#2f7a52">sha256 manifest · .verified</td></tr>
+<tr><td>13:41:03</td><td>node fk-bb-01 (local UI)</td><td>OFFLOAD COMPLETE</td><td>cam2 · 14 segments</td><td style="color:#2f7a52">sha256-checksummed R2 upload</td></tr>
 <tr><td>12:58:19</td><td>system</td><td>ALERT FIRED → WEBHOOK</td><td>cam5 not recording</td><td style="color:#2f7a52">#field-ops 200 OK</td></tr>
 </tbody></table>
 </div></div>

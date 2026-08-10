@@ -1,19 +1,16 @@
-# FieldKit — Dexterity on-site capture & extraction console
+# FieldKit — Dexterity on-site capture console
 ## Build specification for Claude Code — target: working tool in ≤3 hours
 
 ## What this is
 A single local-first web app that makes Dexterity 100% recorder-agnostic in the
-field. It must do three jobs from one screen:
+field. It must do two jobs from one screen:
 
 1. **First-contact camera setup** — discover factory-fresh or configured
    Hikvision cameras on the LAN, activate new ones (set password), assign each
    a static IP, and show a live-ish preview for aiming.
-2. **Record on anything that isn't an NVR** — start/stop robust RTSP
-   stream-copy recordings (ffmpeg) for any subset of cameras, on whatever
-   machine runs the app (Windows laptop, Ubuntu mini-PC, Jetson Orin Nano).
-3. **Pull from multiple NVRs on a switch** — drive the existing
-   `nvr_pull.py` ISAPI extraction as a library: select NVRs, date, window;
-   watch progress; see per-site VERIFIED status.
+2. **Record** — start/stop robust RTSP stream-copy recordings (ffmpeg) for any
+   subset of cameras, on whatever machine runs the app (Windows laptop, Ubuntu
+   mini-PC, Jetson Orin Nano).
 
 ## Platform decision (already made — do not revisit)
 Local web app: **Python 3.10+ / FastAPI / uvicorn**, one `static/index.html`
@@ -26,9 +23,8 @@ fieldkit/
   app.py               # FastAPI app + all routes
   camera.py            # SADP discovery, ISAPI activation/IP/preview helpers
   recorder.py          # ffmpeg process manager
-  nvr_pull.py          # EXISTS ALREADY — import as module, do not rewrite
-  config.yaml          # sites/NVRs (same schema as nvr_pull) + tool settings
-  static/index.html    # entire UI, single file, tabs: Cameras | Record | NVR Pull
+  config.yaml          # cameras + tool settings
+  static/index.html    # entire UI, single file, tabs: Cameras | Record | Monitor
   requirements.txt     # fastapi, uvicorn, requests, pyyaml
   README.md            # run instructions incl. Windows + Nano notes
 ```
@@ -70,15 +66,12 @@ fieldkit/
 - Graceful stop = SIGINT/CTRL_BREAK so the last segment finalises; never
   SIGKILL first.
 
-## NVR pull tab
-- Import `nvr_pull` and run its per-site pull in a background thread pool via
-  the same functions (do not shell out); stream log lines to the UI over a
-  WebSocket or SSE endpoint; show per-site VERIFIED / ATTENTION badge from the
-  return status and link the manifest.json.
-- Config edit: textarea that round-trips config.yaml with validation.
+## Config editing
+- Config edit (Record tab): textarea that round-trips config.yaml with
+  validation.
 
 ## UI (static/index.html — keep it plain and thumb-friendly)
-- Three tabs. Big touch targets (phone use at a junction, in sunlight —
+- Big touch targets (phone use at a junction, in sunlight —
   high contrast, no tiny icons).
 - **Cameras tab**: Scan button → table (IP, MAC, model, Activated?, reachable?);
   per-row actions: Activate (password field), Set IP (next-free suggestion from
@@ -87,16 +80,13 @@ fieldkit/
 - **Record tab**: checklist of configured cameras with live state, one
   Start All / Stop All + per-camera toggles, disk-free bar, per-camera minutes
   + size counters.
-- **NVR Pull tab**: NVR list from config with reachability dot, date + window
-  pickers, Pull Selected / Pull All, live log pane, VERIFIED badges.
 - Status strip on every tab: hostname, IP the server is bound to (so the
   operator knows what to type on the phone), disk free, clock.
 
 ## Non-goals for v1 (do not build)
 - No user accounts/auth on the tool itself (field LAN only) — but bind
-  camera/NVR credentials from config, never hardcode.
+  camera credentials from config, never hardcode.
 - No self-built streaming/transcoding — live video comes ONLY from the managed go2rtc sidecar (sub-streams); no HLS, no custom WebRTC.
-- No editing of NVR recording schedules.
 - No packaging/installers — `pip install -r requirements.txt && python app.py`.
 
 ## Acceptance checklist (run before calling it done)
@@ -109,11 +99,10 @@ fieldkit/
 5. Start Record on 2 cameras → files appear in segment tree, wall-clock
    timestamps verified with ffprobe; kill camera link → state shows
    RECONNECTING and recording resumes when link returns.
-6. NVR Pull tab runs a real pull of a 10-minute window and shows VERIFIED.
-7. With a go2rtc binary present, Live mode shows moving video for 2 cameras
+6. With a go2rtc binary present, Live mode shows moving video for 2 cameras
    in the browser (laptop and phone), and killing go2rtc flips the grid back
    to snapshots without breaking the page.
-8. Everything above works with the server on the Jetson (ARM) unchanged.
+7. Everything above works with the server on the Jetson (ARM) unchanged.
 
 ## Build order for the 3 hours
 1. (30 min) FastAPI skeleton + config load + static UI shell with tabs
@@ -121,9 +110,8 @@ fieldkit/
    highest value, build it before discovery)
 3. (45 min) camera.py discovery + preview + Test RTSP
 4. (30 min) activation + static-IP actions
-5. (30 min) NVR Pull tab wiring around existing nvr_pull.py
-6. (30 min) live.py go2rtc sidecar + Monitor tab Live toggle
-7. (remaining) acceptance checklist + README
+5. (30 min) live.py go2rtc sidecar + Monitor tab Live toggle
+6. (remaining) acceptance checklist + README
 
 Note: with Tier 3 in scope the realistic build is 3–3.5 hours. If the clock
 wins, ship with the Live toggle greyed out — the sidecar design means it can
@@ -140,7 +128,7 @@ must degrade gracefully on a phone (single column).
 remote monitoring = Tailscale on the host + any internet source (4G router /
 phone hotspot) at the node. README must include a short "Remote access via
 Tailscale" section: install, `tailscale up`, open http://<tailscale-ip>:8080.
-Note that NVR web UIs on the same LAN become reachable the same way via
+Note that camera web UIs on the same LAN become reachable the same way via
 `tailscale up --advertise-routes=<site-subnet>` on the node host.
 
 **Tier 3 (IN SCOPE — v1.2): smooth live video via a go2rtc sidecar.**

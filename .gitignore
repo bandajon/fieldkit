@@ -1,6 +1,8 @@
 __pycache__/
 *.pyc
 recordings/
+# extraction trees from the removed pull feature still exist on deployed nodes —
+# keep ignoring them so a git add -A there never stages footage
 ingest/
 # generated from config.yaml; contains camera passwords
 go2rtc.yaml

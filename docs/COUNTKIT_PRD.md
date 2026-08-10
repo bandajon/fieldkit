@@ -15,8 +15,12 @@ repo** (not in fieldkit/) — it shares conventions and the ingest tree, not
 code paths.
 
 ## Inputs
-- The verified ingest tree produced by nvr_pull:
-  `/data/ingest/<date>/<site>/<cam>/*.mkv` + manifest.json (`.verified` gate)
+- The FieldKit recordings tree:
+  `<record_dir>/<site>/<cam>/*.mkv` (wall-clock-named 600 s segments).
+  FieldKit no longer ships a verification step, so **CountKit's ingest must
+  produce the gate itself**: probe every segment readable with a non-zero
+  duration, then write the per-site-day manifest.json (sha256 + durations)
+  and the `.verified` marker the Analyze tab gates on
 - Per-camera calibration files produced by the Label tab
 - Per-camera time offsets: **extend the manifest schema with `time_offset_s`**
   (float, seconds to ADD to file timestamps to get true Africa/Lusaka time).

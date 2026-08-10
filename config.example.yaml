@@ -1,20 +1,6 @@
-# FieldKit config. Shares the schema nvr_pull.py reads, plus FieldKit keys.
+# FieldKit config.
 
-# --- read by nvr_pull.py ---
-out_dir: ./ingest        # root of the NVR extraction tree: <out_dir>/<date>/<site>/<cam>/
-remux_mkv: true          # remux pulled .mp4 segments to .mkv (stream copy, no re-encode)
-
-nvrs:                    # one entry per Hikvision NVR on the switch
-  - name: site1-greatnorth
-    host: 192.168.1.64   # NVR web/ISAPI address (port 80)
-    user: admin
-    password: ""         # NVR ISAPI password — never hardcode elsewhere
-    channels:            # id = ISAPI track (cam N main stream = N*100 + 1)
-      - {id: 101, label: cam1}
-      - {id: 201, label: cam2}
-
-# --- FieldKit ---
-cameras:                 # cameras recorded directly over RTSP (no NVR)
+cameras:                 # cameras recorded directly over RTSP
   - name: cam1
     ip: 192.168.1.111
     user: admin

@@ -40,7 +40,6 @@ const kalambo = {
       state: 'warn', sort: 4, issues: ['disk low'], worst_hours: 4.2,
       disks: [
         { path: '/srv/recordings', free_gb: 42, total_gb: 1000, hours_left: 4.2 },
-        { path: '/mnt/nvr-staging', free_gb: 960, total_gb: 2000, hours_left: null },
       ],
       offload: { enabled: true, uploaded: 411, last_file: 'x/20260808T1340_cam4.mkv', last_error: null },
       cameras: [
@@ -93,7 +92,6 @@ assert.ok(html.indexOf('REVOKED') < html.indexOf('fk-kal-02'), 'revoked row must
 assert.match(html, /⏱ STOPS \d\d?:\d\d · 3:58 LEFT/);
 assert.match(html, /MIXED/);
 assert.match(html, /4\.2 H LEFT · 42\/1000 GB — recordings/);
-assert.match(html, /— H LEFT · 960\/2000 GB — nvr-staging/);
 assert.match(html, /▲ UPLOADING 20260808T1340_cam4\.mkv/);
 assert.match(html, /CLOCK ±4\.2s/);
 assert.match(html, /RTT —/);

@@ -1,20 +1,17 @@
 # FieldKit
 
-On-site capture and extraction console for Hikvision gear. One local web app,
-one screen, three jobs:
+On-site capture console for Hikvision gear. One local web app, one screen,
+two jobs:
 
 1. **First-contact camera setup** — find factory-fresh or already-configured
    cameras on the LAN, activate the new ones, give each a static IP, and aim
    them using a live snapshot preview.
-2. **Record on anything that isn't an NVR** — robust ffmpeg stream-copy
-   recording of any subset of cameras, on whatever machine runs the app
-   (Windows laptop, Ubuntu mini-PC, Jetson Orin Nano).
-3. **Pull from multiple NVRs on a switch** — drive the existing ISAPI
-   extraction in `nvr_pull.py`, watch progress live, and get a per-site
-   VERIFIED badge before anyone clears a disk.
+2. **Record** — robust ffmpeg stream-copy recording of any subset of cameras,
+   on whatever machine runs the app (Windows laptop, Ubuntu mini-PC, Jetson
+   Orin Nano).
 
 It binds `0.0.0.0:8080`, so a phone on the same field WiFi can drive it. No
-accounts, no auth — it is a field-LAN tool. Camera and NVR credentials live in
+accounts, no auth — it is a field-LAN tool. Camera credentials live in
 `config.yaml` and are never hardcoded.
 
 ---
@@ -30,8 +27,8 @@ Then open `http://<the machine's LAN IP>:8080`. The status strip at the top of
 every tab shows the hostname and the bound IPs, so you can read off exactly
 what to type on a phone.
 
-`ffmpeg` and `ffprobe` must be on `PATH` — recording, the RTSP test, and the
-NVR pull's verification step all shell out to them.
+`ffmpeg` and `ffprobe` must be on `PATH` — recording and the RTSP test shell
+out to them.
 
 On first run FieldKit copies `config.example.yaml` to `config.yaml` for you.
 There is nothing to edit before you start.
@@ -54,8 +51,9 @@ immediately — no restart. For a camera that already has the address you want,
 **Add to config** on its row does the same thing without changing its IP; the
 button only appears for cameras that are not in the config yet.
 
-Removing a camera is the one thing that still needs the editor: delete it from
-`config.yaml` (NVR Pull tab → Edit config.yaml) and restart the app.
+Removing a camera is the **Remove** button on its Record-tab row — no editor,
+no restart. It refuses while that camera is recording (stop it first), and
+recordings already on disk are kept.
 
 `config.yaml` is **not** tracked in git, so the passwords you type in the field
 never land in a commit. `config.example.yaml` is the tracked, commented
@@ -231,20 +229,11 @@ force-killed first. To stop the always-on task itself:
 ## Configuration reference (`config.yaml`)
 
 One file, created from `config.example.yaml` on first boot and untracked
-thereafter. It is shared with `nvr_pull.py`, which reads the first three keys.
+thereafter.
 
 | Key | Read by | Meaning |
 | --- | --- | --- |
-| `out_dir` | nvr_pull | Root of the extraction tree: `<out_dir>/<date>/<site>/<cam>/`. |
-| `remux_mkv` | nvr_pull | Remux pulled `.mp4` segments into `.mkv` with `-c copy`. No re-encode, no quality change. If the remux fails the original container is kept. |
-| `nvrs` | nvr_pull, NVR tab | List of NVRs on the switch. One entry per unit. |
-| `nvrs[].name` | both | Site name. Becomes a directory name and the badge label. Must be unique. |
-| `nvrs[].host` | both | NVR address for ISAPI on port 80. |
-| `nvrs[].user` / `nvrs[].password` | both | ISAPI digest credentials for that NVR. |
-| `nvrs[].channels` | both | Which tracks to pull. |
-| `channels[].id` | both | ISAPI track ID. Camera N's main stream is `N*100 + 1` — cam1 = `101`, cam2 = `201`, cam3 = `301`. |
-| `channels[].label` | both | Directory name for that camera's footage inside the site folder. |
-| `cameras` | FieldKit | Cameras recorded directly over RTSP, with no NVR in the path. |
+| `cameras` | FieldKit | Cameras recorded directly over RTSP. |
 | `cameras[].name` | FieldKit | Short name. Used as the recording subdirectory and as the go2rtc stream name. |
 | `cameras[].ip` | FieldKit | Camera address. |
 | `cameras[].user` / `cameras[].password` | FieldKit | RTSP and ISAPI credentials for that camera. |
@@ -258,11 +247,12 @@ thereafter. It is shared with `nvr_pull.py`, which reads the first three keys.
 Relative paths resolve against the app directory, not the shell's working
 directory, so `python app.py` behaves the same from anywhere.
 
-You can edit this file from the **NVR Pull** tab (Edit config.yaml). It is
+You can edit this file from the **Record** tab (Edit config.yaml). It is
 validated before it is written and your comments are preserved. Cameras you
 add — by hand or via Set IP / Add to config — take effect immediately.
-Removing a camera, or changing `site`, `record_dir` or `go2rtc_binary`, needs a
-restart.
+Camera removals made by editing the file need a restart (the Record tab's
+**Remove** button removes live); changing `site`, `record_dir` or
+`go2rtc_binary` needs a restart.
 
 ---
 
@@ -333,31 +323,6 @@ process died — including the remaining time of a timed run. A timer that
 expired while the node was powered off stays stopped. Combined with the
 boot-on-power setup scripts, a field node that loses power resumes recording
 by itself when power returns.
-
-### NVR Pull
-
-Pick a date and a time window, select NVRs (or **Pull All**), and go. Each site
-pulls in its own background thread and streams its log lines into the pane
-underneath. **Dry Run** lists what would be downloaded without fetching it.
-
-Every NVR row has a reachability dot, a state badge, and — once a pull has
-finished — a link to that site-day's `manifest.json`.
-
-**The verification rule, which matters more than anything else on this tab:**
-
-- FieldKit and `nvr_pull.py` **never delete anything from an NVR**. Ever.
-- After a pull, each site-day gets a `manifest.json` listing every file with
-  its size, duration, and sha256.
-- A `.verified` marker file is written **only if every single check passed** —
-  every channel returned segments, every file downloaded, and every file
-  probed back as readable with a non-zero duration.
-- **VERIFIED** (green) means that marker exists. **ATTENTION** (red) means it
-  does not, and the log says why: no recordings in the window, a failed search,
-  a failed download, or an unreadable file.
-- An operator clears an NVR's disk **only** after the site-day shows VERIFIED
-  and a human has reviewed it. No marker, no clearing — re-run instead.
-
-Re-running a pull is safe and cheap: files that already exist are skipped.
 
 ### Monitor
 
@@ -492,8 +457,9 @@ sudo tailscale up
 
 Then open `http://<tailscale-ip>:8080` from your laptop or phone.
 
-To reach the **NVR web UIs** on the site LAN the same way, advertise the site
-subnet from the node host and approve the route in the Tailscale admin console:
+To reach the **camera web UIs** on the site LAN the same way, advertise the
+site subnet from the node host and approve the route in the Tailscale admin
+console:
 
 ```
 sudo tailscale up --advertise-routes=192.168.1.0/24
@@ -514,8 +480,8 @@ installer and no container, on purpose.
 
 The GitHub repository auto-deploys to Railway as a **UI demo and staging
 environment only**. Everything that matters needs the field LAN: SADP discovery
-is a broadcast, the TCP sweep scans a local `/24`, recording needs a route to
-the cameras, and the NVR pull needs the NVRs. None of that works from a cloud
+is a broadcast, the TCP sweep scans a local `/24`, and recording needs a route
+to the cameras. None of that works from a cloud
 host — the cloud instance is for looking at the interface, nothing else. The
 app honours the `PORT` environment variable so that deploy works; locally it
 defaults to 8080.
@@ -554,7 +520,6 @@ app.py             FastAPI app, all routes
 camera.py          SADP discovery, TCP sweep, activation, static IP, snapshot, RTSP test
 recorder.py        ffmpeg process supervisor
 live.py            go2rtc sidecar manager
-nvr_pull.py        existing ISAPI extraction tool, used as a library
 test_fieldkit.py   stdlib test runner
 config.example.yaml  tracked, commented reference schema
 config.yaml        live config (untracked; auto-created on first boot)
