@@ -35,7 +35,10 @@ def wait(pred, seconds, what):
 
 def main():
     state = tempfile.mkdtemp()
-    env = dict(os.environ, OPS_STATE=state, PORT=str(PORT))
+    # The console is a subprocess: its R2 env is this dict, not our os.environ.
+    env = dict(os.environ, OPS_STATE=state, PORT=str(PORT),
+               R2_ACCOUNT_ID="e2e-acct", R2_ACCESS_KEY_ID="e2e-ak",
+               R2_SECRET_ACCESS_KEY="e2e-sk", R2_BUCKET="e2e-bucket")
     server = subprocess.Popen([sys.executable, os.path.join(ROOT, "ops.py")],
                               env=env, cwd=ROOT,
                               stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
@@ -69,6 +72,15 @@ def main():
         node = doc["hives"][0]["nodes"][0]
         assert node["key"] == me and node["confirmed"], node
         assert [c["name"] for c in node["cameras"]] == ["fake"], node["cameras"]
+
+        # The console pushes its R2 creds unasked, right after the first beat.
+        wait(lambda: (cfg.get("offload") or {}).get("access_key_id") == "e2e-ak",
+             20, "offload creds pushed")
+        creds = cfg["offload"]
+        assert creds["account_id"] == "e2e-acct", creds
+        assert creds["secret_access_key"] == "e2e-sk", creds
+        assert creds["bucket"] == "e2e-bucket", creds
+        assert not creds.get("enabled"), creds        # creds never switch offload on
 
         # Command round trip: start lands on the REAL recorder and acks.
         t = requests.post(f"{BASE}/api/command",

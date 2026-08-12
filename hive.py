@@ -180,6 +180,20 @@ class Hive:
         print(f"hive: {action} from console: {ack['applied']}", flush=True)
         return ack
 
+    def offload_creds(self, msg):
+        """Console-pushed R2 credentials: fill the blanks in CONFIG["offload"].
+
+        A value the operator put in config.yaml always wins, and nothing is
+        written to disk — the creds live only in this process.
+        """
+        dst = self.cfg.setdefault("offload", {})
+        for field in ("account_id", "access_key_id", "secret_access_key", "bucket"):
+            v = msg.get(field)
+            if isinstance(v, str) and v and not dst.get(field):
+                dst[field] = v
+        self.log.append(f"{time.strftime('%H:%M:%S')} offload creds received from console")
+        print("hive: offload creds received from console", flush=True)
+
     # --- connection ---
 
     def _session(self, ws):
@@ -201,6 +215,9 @@ class Hive:
                 if msg.get("type") == "command":
                     ws.send(json.dumps(self.apply(msg)))
                     break                      # then an immediate fresh heartbeat
+                if msg.get("type") == "offload_creds":
+                    self.offload_creds(msg)
+                    continue                   # fire-and-forget: no ack, keep listening
                 if msg.get("type") == "rejected":
                     self.state = "REVOKED"
                     reason = msg.get("reason", "")
@@ -356,6 +373,33 @@ if __name__ == "__main__":
     bad = ws.sent[3]
     assert bad["ok"] is False and "unknown action" in bad["error"], bad
 
+    # Console-pushed offload creds fill the blanks only, and are never acked.
+    CFG["offload"] = {"bucket": "operator-bucket"}      # what config.yaml already set
+    ws = FakeWS([{"type": "offload_creds", "account_id": "acc", "access_key_id": "AK",
+                  "secret_access_key": "SK", "bucket": "console-bucket"}])
+    try:
+        h._session(ws)
+    except Done:
+        pass
+    creds = CFG["offload"]
+    assert creds["bucket"] == "operator-bucket", creds       # the operator's value wins
+    assert creds["account_id"] == "acc" and creds["access_key_id"] == "AK", creds
+    assert creds["secret_access_key"] == "SK", creds
+    assert "enabled" not in creds, creds                     # only the four named fields
+    assert [m["type"] for m in ws.sent] == ["heartbeat"], ws.sent   # fire-and-forget
+    assert "offload creds" in h.log[-1] and "SK" not in h.log[-1], list(h.log)
+
+    # Garbage lands no field and never breaks the session.
+    h2 = Hive({}, rec, status, no_snapshot, list)
+    ws = FakeWS([{"type": "offload_creds", "access_key_id": 42},
+                 {"type": "offload_creds"},
+                 {"type": "nonsense"}])
+    try:
+        h2._session(ws)
+    except Done:
+        pass
+    assert h2.cfg["offload"] == {}, h2.cfg
+
     # A rejected node stops beating and marks itself for the hourly retry.
     ws = FakeWS([{"type": "rejected", "reason": "unknown or revoked token"}])
     h.state = "CONNECTED"
@@ -363,4 +407,5 @@ if __name__ == "__main__":
     assert h.state == "REVOKED" and len(ws.sent) == 1, (h.state, ws.sent)
     assert h.info()["configured"] and h.info()["last_beat"] > 0, h.info()
 
-    print("hive self-check ok: coverage arithmetic, command dispatch, off without config")
+    print("hive self-check ok: coverage arithmetic, command dispatch, offload creds, "
+          "off without config")

@@ -72,7 +72,13 @@ class Offload:
         missing = [k for k in ("account_id", "access_key_id", "secret_access_key")
                    if not o.get(k)]
         if missing:
-            self.last_error = "offload enabled but config is missing: " + ", ".join(missing)
+            # An enrolled node's blanks are the console's job to fill (offload_creds,
+            # first beat of each session) — say "waiting", not "you forgot".
+            ops = self.cfg.get("ops") or {}
+            self.last_error = (
+                "offload enabled — awaiting credentials from console"
+                if all(ops.get(k) for k in ("url", "token", "hive"))
+                else "offload enabled but config is missing: " + ", ".join(missing))
             return None
         try:
             import boto3
@@ -198,5 +204,19 @@ if __name__ == "__main__":
     half.free_gb = lambda: 0.0
     half.sweep()
     assert "account_id" in half.last_error, half.last_error
+    assert "missing" in half.last_error, half.last_error
+
+    # Same blanks on a node enrolled with a console: it is waiting, not misconfigured.
+    OPS = {"url": "ws://console/ingest", "token": "tok", "hive": "kalambo"}
+    waiting = Offload({"offload": {"enabled": True}, "ops": OPS}, root)
+    waiting.free_gb = lambda: 0.0
+    waiting.sweep()
+    assert waiting.last_error == "offload enabled — awaiting credentials from console", \
+        waiting.last_error
+    # A half-filled ops block is not enrolled: back to the plain missing-keys message.
+    lone = Offload({"offload": {"enabled": True}, "ops": dict(OPS, token="")}, root)
+    lone.free_gb = lambda: 0.0
+    lone.sweep()
+    assert "missing" in lone.last_error, lone.last_error
 
     print("offload self-check ok: oldest-first, verified, deletes only after upload")
