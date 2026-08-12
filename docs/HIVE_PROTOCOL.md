@@ -61,6 +61,23 @@ if still unacked — the node result is idempotent)
 - Node applies via its own recorder (same code path as the local UI) and
   replies with `ack`, then an immediate fresh heartbeat.
 
+### offload_creds (R2 credentials the console holds on the node's behalf)
+
+```json
+{"type": "offload_creds", "account_id": "…", "access_key_id": "…",
+ "secret_access_key": "…", "bucket": "fieldkit-recordings"}
+```
+
+- Sent once per session, right after the first accepted heartbeat, and only
+  when the console's `R2_ACCOUNT_ID` / `R2_ACCESS_KEY_ID` /
+  `R2_SECRET_ACCESS_KEY` env vars are all set. Never audited or persisted
+  console-side.
+- The node fills only the **empty** fields of its in-memory offload config: a
+  value in the node's own config.yaml always wins. Nothing is written to disk,
+  so a reboot drops them and the next connect re-delivers.
+- No ack — fire-and-forget. A node running older code ignores the unknown
+  type and keeps listening, so the console can push to a mixed fleet.
+
 ### rejected (console → node, then console closes the socket)
 
 ```json

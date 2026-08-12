@@ -631,6 +631,20 @@ app = FastAPI(title="FIELDKIT HIVE OPS")
 OPS_PASSWORD = os.environ.get("OPS_PASSWORD", "")
 SESSIONS = set()      # in-memory: a console restart signs operators out, honestly
 
+
+def offload_creds_frame():
+    """R2 creds to hand a node, or None when this console has none to give.
+
+    Read at call time, not import: the env is the deployment's (Railway), and a
+    test toggles it around a running process. Never audited, never persisted.
+    """
+    env = {f: os.environ.get(f"R2_{f.upper()}", "")
+           for f in ("account_id", "access_key_id", "secret_access_key")}
+    if not all(env.values()):
+        return None
+    return {"type": "offload_creds",
+            "bucket": os.environ.get("R2_BUCKET") or "fieldkit-recordings", **env}
+
 LOGIN_HTML = """<!doctype html><meta charset="utf-8"><title>FIELDKIT HIVE OPS</title>
 <body style="background:#f2f2f3;color:#1d1f20;font:14px system-ui;display:grid;
 place-items:center;min-height:100vh;margin:0">
@@ -698,6 +712,9 @@ async def ingest(ws: WebSocket):
             CONNS[key] = {"loop": asyncio.get_running_loop(), "q": out}
             if pump is None:
                 pump = asyncio.create_task(_pump(ws, out))
+                creds = offload_creds_frame()
+                if creds:
+                    out.put_nowait(creds)   # once per session, first beat only
             await asyncio.to_thread(on_heartbeat, msg, now())
             await asyncio.to_thread(deliver, key)   # the node's apply is idempotent
             await asyncio.to_thread(publish)
