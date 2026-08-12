@@ -72,11 +72,19 @@ if still unacked — the node result is idempotent)
   when the console's `R2_ACCOUNT_ID` / `R2_ACCESS_KEY_ID` /
   `R2_SECRET_ACCESS_KEY` env vars are all set. Never audited or persisted
   console-side.
-- The node fills only the **empty** fields of its in-memory offload config: a
-  value in the node's own config.yaml always wins. Nothing is written to disk,
-  so a reboot drops them and the next connect re-delivers.
+- The node keeps them in a separate in-memory overlay, never in its own config:
+  each frame **replaces** the overlay wholesale, so rotating the key on the
+  console reaches a node on its next connect. At read time the node merges
+  overlay under config.yaml — every offload field the operator actually set
+  wins. Nothing is written to disk, so a reboot drops them and reconnect
+  re-delivers.
 - No ack — fire-and-forget. A node running older code ignores the unknown
   type and keeps listening, so the console can push to a mixed fleet.
+- **These creds are only as protected as the enrollment token.** Anyone
+  holding a hive's token can connect and be handed them. A lost or stolen box
+  means revoking that token on the console's Tokens page, which cuts off both
+  commands and credentials; rotate the R2 key too if the box was out of your
+  hands.
 
 ### rejected (console → node, then console closes the socket)
 

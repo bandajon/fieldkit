@@ -81,9 +81,22 @@ def coverage(spans, now, hours=COVERAGE_HOURS):
     return {"pct": round(100 * (1 - missing / win), 1), "gaps": gaps[-MAX_GAPS:]}
 
 
+def enrolled(cfg):
+    """True when config.yaml has a complete ops block — a node the console can reach.
+
+    offload.py asks this too, to tell "waiting on the console" from "you forgot to
+    fill this in"; keep it the one definition of enrolled.
+    """
+    o = (cfg or {}).get("ops") or {}
+    return all(o.get(k) for k in ("url", "token", "hive"))
+
+
 class Hive:
-    def __init__(self, cfg, rec, record_status, snapshot, ips):
+    def __init__(self, cfg, rec, record_status, snapshot, ips, console_creds=None):
         self.cfg = cfg                  # the live CONFIG dict: edits land without a reload
+        # Console-pushed creds live in their own dict, shared with Offload — never in
+        # cfg, which app.py writes back to config.yaml whenever a camera is edited.
+        self.console_creds = {} if console_creds is None else console_creds
         self.rec = rec
         self.record_status = record_status
         self.snapshot = snapshot
@@ -97,8 +110,7 @@ class Hive:
         return self.cfg.get("ops") or {}
 
     def configured(self):
-        o = self.opts()
-        return all(o.get(k) for k in ("url", "token", "hive"))
+        return enrolled(self.cfg)
 
     def info(self):
         return {"configured": self.configured(), "state": self.state,
@@ -181,16 +193,21 @@ class Hive:
         return ack
 
     def offload_creds(self, msg):
-        """Console-pushed R2 credentials: fill the blanks in CONFIG["offload"].
+        """Console-pushed R2 credentials into the overlay dict. Never cfg, never disk.
 
-        A value the operator put in config.yaml always wins, and nothing is
-        written to disk — the creds live only in this process.
+        Each frame REPLACES the overlay wholesale, so rotating the key on the
+        console reaches a running node on its next connect. Which value actually
+        gets used is offload.py's merge — config.yaml still wins field by field.
         """
-        dst = self.cfg.setdefault("offload", {})
-        for field in ("account_id", "access_key_id", "secret_access_key", "bucket"):
-            v = msg.get(field)
-            if isinstance(v, str) and v and not dst.get(field):
-                dst[field] = v
+        need = ("account_id", "access_key_id", "secret_access_key")
+        fresh = {f: msg[f] for f in need + ("bucket",)
+                 if isinstance(msg.get(f), str) and msg[f]}
+        if not all(f in fresh for f in need):
+            return          # not a usable set: a malformed frame must not evict good creds
+        if fresh == self.console_creds:
+            return          # a flapping link must not push real diagnostics out of the log
+        self.console_creds.clear()
+        self.console_creds.update(fresh)
         self.log.append(f"{time.strftime('%H:%M:%S')} offload creds received from console")
         print("hive: offload creds received from console", flush=True)
 
@@ -373,32 +390,46 @@ if __name__ == "__main__":
     bad = ws.sent[3]
     assert bad["ok"] is False and "unknown action" in bad["error"], bad
 
-    # Console-pushed offload creds fill the blanks only, and are never acked.
-    CFG["offload"] = {"bucket": "operator-bucket"}      # what config.yaml already set
-    ws = FakeWS([{"type": "offload_creds", "account_id": "acc", "access_key_id": "AK",
-                  "secret_access_key": "SK", "bucket": "console-bucket"}])
+    # Console-pushed creds land in the overlay, never in CONFIG, and are never acked.
+    CFG["offload"] = {"enabled": True, "bucket": "operator-bucket"}   # from config.yaml
+    overlay = {}
+    hc = Hive(CFG, rec, status, no_snapshot, list, console_creds=overlay)
+    frame = {"type": "offload_creds", "account_id": "acc", "access_key_id": "AK",
+             "secret_access_key": "SK", "bucket": "console-bucket"}
+    ws = FakeWS([frame])
     try:
-        h._session(ws)
+        hc._session(ws)
     except Done:
         pass
-    creds = CFG["offload"]
-    assert creds["bucket"] == "operator-bucket", creds       # the operator's value wins
-    assert creds["account_id"] == "acc" and creds["access_key_id"] == "AK", creds
-    assert creds["secret_access_key"] == "SK", creds
-    assert "enabled" not in creds, creds                     # only the four named fields
+    assert overlay == {"account_id": "acc", "access_key_id": "AK",
+                       "secret_access_key": "SK", "bucket": "console-bucket"}, overlay
+    assert CFG["offload"] == {"enabled": True, "bucket": "operator-bucket"}, CFG["offload"]
     assert [m["type"] for m in ws.sent] == ["heartbeat"], ws.sent   # fire-and-forget
-    assert "offload creds" in h.log[-1] and "SK" not in h.log[-1], list(h.log)
+    assert "offload creds" in hc.log[-1] and "SK" not in hc.log[-1], list(hc.log)
 
-    # Garbage lands no field and never breaks the session.
-    h2 = Hive({}, rec, status, no_snapshot, list)
-    ws = FakeWS([{"type": "offload_creds", "access_key_id": 42},
-                 {"type": "offload_creds"},
+    # A re-send replaces the overlay wholesale, so a rotated key reaches the node —
+    # and an identical re-send is silent, or a flapping link would flood the log.
+    logged = len(hc.log)
+    hc.offload_creds(frame)
+    assert len(hc.log) == logged, list(hc.log)
+    hc.offload_creds(dict(frame, access_key_id="AK2", bucket="b2"))
+    assert overlay["access_key_id"] == "AK2" and overlay["bucket"] == "b2", overlay
+    assert len(hc.log) == logged + 1, list(hc.log)
+
+    # Garbage changes nothing, logs nothing, and never breaks the session. An empty
+    # `offload:` block in config.yaml parses as None — that must not crash either.
+    h2 = Hive({"offload": None}, rec, status, no_snapshot, list, console_creds=overlay)
+    ws = FakeWS([{"type": "offload_creds", "access_key_id": 42},   # not a string
+                 {"type": "offload_creds"},                        # no fields at all
+                 {"type": "offload_creds", "bucket": "only-bucket"},   # no cred triple
                  {"type": "nonsense"}])
     try:
         h2._session(ws)
     except Done:
         pass
-    assert h2.cfg["offload"] == {}, h2.cfg
+    assert overlay["access_key_id"] == "AK2" and overlay["bucket"] == "b2", overlay
+    assert not h2.log, list(h2.log)
+    assert h2.cfg == {"offload": None}, h2.cfg     # the node's own config is untouched
 
     # A rejected node stops beating and marks itself for the hourly retry.
     ws = FakeWS([{"type": "rejected", "reason": "unknown or revoked token"}])
