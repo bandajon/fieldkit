@@ -11,12 +11,15 @@ import threading
 import time
 from pathlib import Path
 
+from hive import enrolled
 from recorder import SEGMENT_SECONDS
 
 # ffmpeg only ever appends to the newest segment, so anything older than one segment
 # plus a margin is closed and safe to ship.
 FINISHED = SEGMENT_SECONDS + 60
 SWEEP_SECONDS = 60
+CRED_KEYS = ("account_id", "access_key_id", "secret_access_key")
+AWAITING = "offload enabled — awaiting credentials from console"
 
 
 def sha256_b64(path):
@@ -29,20 +32,43 @@ def sha256_b64(path):
 
 
 class Offload:
-    def __init__(self, cfg, rec_root):
+    def __init__(self, cfg, rec_root, console_creds=None):
         self.cfg = cfg              # the live CONFIG dict: config edits land without a reload
+        # Creds the ops console pushed (hive.py writes this same dict). Separate from
+        # cfg because cfg gets dumped back to config.yaml; a pushed secret must not.
+        self.console_creds = {} if console_creds is None else console_creds
         self.rec_root = Path(rec_root)
         self.client = None
+        self.client_creds = None    # the triple self.client was built with
         self.uploaded = 0
         self.last_file = ""
         self.last_error = ""
 
     def opts(self):
-        return self.cfg.get("offload") or {}
+        """Console creds under config.yaml: the operator wins every field they set.
+
+        Unset means absent, null or empty string — but `enabled: false` and
+        `min_free_gb: 0` are real answers and survive the merge.
+        """
+        merged = dict(self.console_creds)
+        merged.update((k, v) for k, v in (self.cfg.get("offload") or {}).items()
+                      if v is not None and v != "")
+        return merged
+
+    def cred_status(self, o=None):
+        """Why offload cannot run yet, or "". Config alone — no disk, no client build,
+        so the Status tab says "waiting on the console" before the drive ever fills."""
+        o = self.opts() if o is None else o
+        missing = [k for k in CRED_KEYS if not o.get(k)]
+        if not (o.get("enabled") and missing):
+            return ""
+        return (AWAITING if enrolled(self.cfg)
+                else "offload enabled but config is missing: " + ", ".join(missing))
 
     def info(self):
         return {"enabled": bool(self.opts().get("enabled")), "uploaded": self.uploaded,
-                "last_file": self.last_file, "last_error": self.last_error}
+                "last_file": self.last_file, "last_error": self.last_error,
+                "status": self.cred_status()}
 
     def start(self):
         threading.Thread(target=self._loop, daemon=True).start()
@@ -67,18 +93,11 @@ class Offload:
         return sorted(files, key=lambda f: f.stat().st_mtime)
 
     def _get_client(self, o):
-        if self.client is not None:
+        creds = tuple(o.get(k) or "" for k in CRED_KEYS)
+        if self.client is not None and creds == self.client_creds:
             return self.client
-        missing = [k for k in ("account_id", "access_key_id", "secret_access_key")
-                   if not o.get(k)]
-        if missing:
-            # An enrolled node's blanks are the console's job to fill (offload_creds,
-            # first beat of each session) — say "waiting", not "you forgot".
-            ops = self.cfg.get("ops") or {}
-            self.last_error = (
-                "offload enabled — awaiting credentials from console"
-                if all(ops.get(k) for k in ("url", "token", "hive"))
-                else "offload enabled but config is missing: " + ", ".join(missing))
+        if not all(creds):
+            self.last_error = self.cred_status(o)
             return None
         try:
             import boto3
@@ -95,6 +114,7 @@ class Offload:
             # endpoint rejects; send only the sha256 we compute.
             config=Config(request_checksum_calculation="when_required",
                           response_checksum_validation="when_required"))
+        self.client_creds = creds     # rotated creds rebuild rather than reuse this
         return self.client
 
     def sweep(self):
@@ -158,12 +178,14 @@ if __name__ == "__main__":
         (d / "seg-live.mkv").write_bytes(b"live")
         return root, d
 
-    CFG = {"offload": {"enabled": True, "bucket": "b", "min_free_gb": 10}}
+    CREDS = {"account_id": "a", "access_key_id": "k", "secret_access_key": "s"}
+    TRIPLE = ("a", "k", "s")        # what a client built from CREDS is tagged with
+    CFG = {"offload": {"enabled": True, "bucket": "b", "min_free_gb": 10, **CREDS}}
 
     # Full drive: ships every closed segment, oldest first, and deletes only after the PUT.
     root, d = tree()
     o = Offload(CFG, root)
-    o.client, o.free_gb = FakeClient(), lambda: 0.0
+    o.client, o.client_creds, o.free_gb = FakeClient(), TRIPLE, lambda: 0.0
     o.sweep()
     assert o.client.puts == ["site1/cam1/seg-a.mkv", "site1/cam1/seg-b.mkv"], o.client.puts
     assert not (d / "seg-a.mkv").exists() and not (d / "seg-b.mkv").exists()
@@ -174,7 +196,8 @@ if __name__ == "__main__":
     root, d = tree()
     o = Offload(CFG, root)
     seq = [0.0, 99.0]                  # empty at entry, healthy after one delete
-    o.client, o.free_gb = FakeClient(), lambda: seq.pop(0) if seq else 99.0
+    o.client, o.client_creds = FakeClient(), TRIPLE
+    o.free_gb = lambda: seq.pop(0) if seq else 99.0
     o.sweep()
     assert o.client.puts == ["site1/cam1/seg-a.mkv"], o.client.puts
     assert (d / "seg-b.mkv").exists(), "kept deleting past the floor"
@@ -182,7 +205,7 @@ if __name__ == "__main__":
     # A failed upload keeps the footage and surfaces the error.
     root, d = tree()
     o = Offload(CFG, root)
-    o.client, o.free_gb = FakeClient(fail=True), lambda: 0.0
+    o.client, o.client_creds, o.free_gb = FakeClient(fail=True), TRIPLE, lambda: 0.0
     o.sweep()
     assert sorted(f.name for f in d.glob("*.mkv")) == ["seg-a.mkv", "seg-b.mkv", "seg-live.mkv"]
     assert o.uploaded == 0 and "boom" in o.last_error, o.info()
@@ -190,9 +213,31 @@ if __name__ == "__main__":
     # Above the floor: nothing is read, nothing is sent.
     root, d = tree()
     o = Offload(CFG, root)
-    o.client, o.free_gb = FakeClient(fail=True), lambda: 99.0
+    o.client, o.client_creds, o.free_gb = FakeClient(fail=True), TRIPLE, lambda: 99.0
     o.sweep()
     assert o.client.puts == [] and not o.last_error, o.info()
+
+    # The merge: console creds fill the blanks, every field config.yaml sets wins.
+    console = {"account_id": "acc", "access_key_id": "AK", "secret_access_key": "SK",
+               "bucket": "console-bucket"}
+    m = Offload({"offload": {"enabled": False, "bucket": "operator-bucket",
+                             "account_id": ""}}, root, console_creds=console).opts()
+    assert m["bucket"] == "operator-bucket", m         # operator wins
+    assert m["access_key_id"] == "AK", m               # console fills what is unset
+    assert m["account_id"] == "acc", m                 # "" in config.yaml is not a value
+    assert m["enabled"] is False, m                    # but a real False is, and survives
+    # An empty `offload:` block parses as None; console creds still apply.
+    assert Offload({"offload": None}, root, console_creds=console).opts() == console
+
+    # Rotation: replacing the overlay must not keep uploading with the revoked key.
+    rotating = dict(CREDS)
+    rot = Offload({"offload": {"enabled": True, "min_free_gb": 10}}, root,
+                  console_creds=rotating)
+    stale = FakeClient()
+    rot.client, rot.client_creds = stale, TRIPLE
+    assert rot._get_client(rot.opts()) is stale, "rebuilt a client on unchanged creds"
+    rotating["access_key_id"] = "rotated"              # console pushed a new key
+    assert rot._get_client(rot.opts()) is not stale, "reused a client built on old creds"
 
     # The every-node path: no offload block at all must be a silent no-op.
     plain = Offload({}, root)
@@ -205,14 +250,21 @@ if __name__ == "__main__":
     half.sweep()
     assert "account_id" in half.last_error, half.last_error
     assert "missing" in half.last_error, half.last_error
+    assert half.info()["status"] == half.last_error, half.info()   # same words, no disk IO
 
-    # Same blanks on a node enrolled with a console: it is waiting, not misconfigured.
+    # Same blanks on a node enrolled with a console: it is waiting, not misconfigured —
+    # and it says so on the Status tab straight away, not only once the drive fills.
     OPS = {"url": "ws://console/ingest", "token": "tok", "hive": "kalambo"}
     waiting = Offload({"offload": {"enabled": True}, "ops": OPS}, root)
+    assert waiting.info()["status"] == AWAITING, waiting.info()
+    assert not waiting.info()["last_error"], "nothing has failed yet"
     waiting.free_gb = lambda: 0.0
     waiting.sweep()
-    assert waiting.last_error == "offload enabled — awaiting credentials from console", \
-        waiting.last_error
+    assert waiting.last_error == AWAITING, waiting.last_error
+    # Creds in hand: nothing to report, disk untouched either way.
+    assert not Offload({"offload": {"enabled": True}, "ops": OPS}, root,
+                       console_creds=console).info()["status"]
+    assert not Offload({"offload": {"enabled": False}, "ops": OPS}, root).info()["status"]
     # A half-filled ops block is not enrolled: back to the plain missing-keys message.
     lone = Offload({"offload": {"enabled": True}, "ops": dict(OPS, token="")}, root)
     lone.free_gb = lambda: 0.0

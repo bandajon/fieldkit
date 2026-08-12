@@ -61,8 +61,10 @@ def main():
                     "disk_free_gb": 100.0, "disk_total_gb": 200.0,
                     "offload": {"enabled": False}}
 
+        console_creds = {}      # the dict app.py shares between Hive and Offload
         h = hive.Hive(cfg, rec, record_status,
-                      lambda ip, u, p: (None, "no camera"), lambda: ["127.0.0.1"])
+                      lambda ip, u, p: (None, "no camera"), lambda: ["127.0.0.1"],
+                      console_creds=console_creds)
         h.start()
         me = f"e2e/{socket.gethostname()}"
 
@@ -73,14 +75,14 @@ def main():
         assert node["key"] == me and node["confirmed"], node
         assert [c["name"] for c in node["cameras"]] == ["fake"], node["cameras"]
 
-        # The console pushes its R2 creds unasked, right after the first beat.
-        wait(lambda: (cfg.get("offload") or {}).get("access_key_id") == "e2e-ak",
+        # The console pushes its R2 creds unasked, right after the first beat — into
+        # the overlay, never into CONFIG (which the node writes back to config.yaml).
+        wait(lambda: console_creds.get("access_key_id") == "e2e-ak",
              20, "offload creds pushed")
-        creds = cfg["offload"]
-        assert creds["account_id"] == "e2e-acct", creds
-        assert creds["secret_access_key"] == "e2e-sk", creds
-        assert creds["bucket"] == "e2e-bucket", creds
-        assert not creds.get("enabled"), creds        # creds never switch offload on
+        assert console_creds == {"account_id": "e2e-acct", "access_key_id": "e2e-ak",
+                                 "secret_access_key": "e2e-sk",
+                                 "bucket": "e2e-bucket"}, console_creds
+        assert "offload" not in cfg, cfg              # creds never enter the node's config
 
         # Command round trip: start lands on the REAL recorder and acks.
         t = requests.post(f"{BASE}/api/command",

@@ -90,11 +90,17 @@ LIVE.start()   # no-op unless a binary is configured and present
 resumed = REC.resume()
 if resumed:
     print(f"resumed recording after restart: {', '.join(resumed)}", flush=True)
-OFFLOAD = offload.Offload(CONFIG, record_dir())   # holds CONFIG: config edits land live
+# Creds the ops console pushes: Hive writes this dict, Offload reads it. Deliberately
+# NOT in CONFIG — CONFIG is dumped back to config.yaml on every camera edit, and
+# load_config() clears it; either would put a pushed secret on disk or lose it.
+CONSOLE_CREDS = {}
+OFFLOAD = offload.Offload(CONFIG, record_dir(),   # holds CONFIG: config edits land live
+                          console_creds=CONSOLE_CREDS)
 OFFLOAD.start()   # no-op unless offload.enabled is set
 # lambda: record_status is a route defined further down, and the heartbeat sends its
 # body verbatim — the console sees exactly what the local Record tab does.
-HIVE = hive.Hive(CONFIG, REC, lambda: record_status(), camera.snapshot, local_ips)
+HIVE = hive.Hive(CONFIG, REC, lambda: record_status(), camera.snapshot, local_ips,
+                 console_creds=CONSOLE_CREDS)
 HIVE.start()   # no-op unless config.yaml has an ops: block
 
 

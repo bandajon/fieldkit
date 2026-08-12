@@ -20,6 +20,9 @@ sys.path.insert(0, str(ROOT))
 
 STATE = Path(tempfile.mkdtemp(prefix="ops_state_test_"))
 os.environ["OPS_STATE"] = str(STATE)
+# Hermetic: a developer with real R2 creds exported must not get a different suite.
+for _k in ("R2_ACCOUNT_ID", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY", "R2_BUCKET"):
+    os.environ.pop(_k, None)
 
 import ops                                    # noqa: E402
 from fastapi.testclient import TestClient     # noqa: E402
@@ -298,6 +301,45 @@ def superseded_ticket_retires_quietly():
         for d in (ops.CONNS, ops.ESCALATED, ops.DESIRED):
             d.pop("kalambo/relay", None)
         CLOCK[0] = T0
+
+
+def creds_frame_once():
+    """R2 env set: one offload_creds frame per session, ahead of anything else."""
+    os.environ.update(R2_ACCOUNT_ID="acct", R2_ACCESS_KEY_ID="ak",
+                      R2_SECRET_ACCESS_KEY="sk", R2_BUCKET="buck")
+    try:
+        raw = client.post("/api/tokens", json={"hive": "kalambo"}).json()["token"]
+        with client.websocket_connect("/ingest") as ws:
+            ws.send_json(beat("creddy", cams={"cam1": rec()}, token=raw))
+            assert ws.receive_json() == {
+                "type": "offload_creds", "account_id": "acct", "access_key_id": "ak",
+                "secret_access_key": "sk", "bucket": "buck"}, "creds must be the first frame"
+            # Nothing else is sent unprompted, so a command is the probe: if the second
+            # beat had re-sent the creds, this receive would return them instead.
+            ws.send_json(beat("creddy", cams={"cam1": rec()}, seq=2, token=raw))
+            t = client.post("/api/command", json={"scope": {"node": "creddy"},
+                                                  "action": "stop"}).json()
+            assert ws.receive_json()["cmd_id"] == t["id"], "creds were sent twice"
+            ws.send_json({"type": "ack", "cmd_id": t["id"], "ok": True,
+                          "applied": ["cam1"], "error": ""})
+            wait(lambda: ops.TICKETS[t["id"]]["state"] == "done", "ticket to complete")
+    finally:
+        for k in ("R2_ACCOUNT_ID", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY", "R2_BUCKET"):
+            os.environ.pop(k, None)
+
+
+def no_creds_frame_without_env():
+    """The env unset (every tailnet console): the frame never appears at all."""
+    raw = client.post("/api/tokens", json={"hive": "kalambo"}).json()["token"]
+    with client.websocket_connect("/ingest") as ws:
+        ws.send_json(beat("plain", cams={"cam1": rec()}, token=raw))
+        wait(lambda: "kalambo/plain" in ops.CONNS, "plain to connect")
+        t = client.post("/api/command", json={"scope": {"node": "plain"},
+                                              "action": "stop"}).json()
+        assert ws.receive_json()["cmd_id"] == t["id"], "sent creds with no R2 env set"
+        ws.send_json({"type": "ack", "cmd_id": t["id"], "ok": True,
+                      "applied": ["cam1"], "error": ""})
+        wait(lambda: ops.TICKETS[t["id"]]["state"] == "done", "ticket to complete")
 
 
 # --- alerts -------------------------------------------------------------------

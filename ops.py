@@ -714,7 +714,7 @@ async def ingest(ws: WebSocket):
                 pump = asyncio.create_task(_pump(ws, out))
                 creds = offload_creds_frame()
                 if creds:
-                    out.put_nowait(creds)   # once per session, first beat only
+                    send(key, creds)        # once per session, first beat only
             await asyncio.to_thread(on_heartbeat, msg, now())
             await asyncio.to_thread(deliver, key)   # the node's apply is idempotent
             await asyncio.to_thread(publish)

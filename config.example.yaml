@@ -25,10 +25,11 @@ offload:
   account_id: ""         # Cloudflare account ID; the endpoint is <account_id>.r2.cloudflarestorage.com
   access_key_id: ""      # R2 API token key
   secret_access_key: ""  # R2 API token secret
-  # The three above may stay empty on a node enrolled with an ops console whose
-  # R2_* env vars are set: it supplies them in memory at connect, nothing is
-  # written here. `enabled` stays this node's own switch either way.
-  bucket: fieldkit-recordings
+  # Any field above may stay empty on a node enrolled with an ops console whose
+  # R2_* env vars are set: it supplies them in memory at connect and they are never
+  # written back here. Anything you DO set wins over the console for that field, so
+  # leave a key blank rather than guessing it. `enabled` stays this node's own switch.
+  bucket: ""             # empty = whatever the console supplies, else fieldkit-recordings
   min_free_gb: 20        # below this, the oldest finished segments upload and are then deleted
 
 # Ops console (optional). Leave this block out — or any field empty — and the node
