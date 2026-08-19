@@ -32,7 +32,7 @@ IDLE_WAIT = 0.2          # no new frames anywhere: don't spin
 SETTLED = 5.0            # a reader that survives this long resets its backoff
 MAX_BACKOFF = 30.0
 CAPTURE_EVERY = 30.0     # dataset samples per camera
-DATASET_CAP = 500        # pending samples: stop capturing until the operator labels some
+DATASET_CAP = 1000       # rolling buffer of the freshest unlabeled frames
 SOI, EOI = b"\xff\xd8", b"\xff\xd9"
 MAX_BUF = 8_000_000      # a camera emitting garbage must not grow the buffer forever
 PIP_HINT = "detection needs: pip install ultralytics pillow"
@@ -401,8 +401,12 @@ class Detector:
     def _capture(self, name, jpeg, shown, w, h):
         """Raw (un-annotated) frame + YOLO labels for the Label tab to review.
 
+        Pending is a rolling window: at the cap the oldest unlabeled frame is dropped so
+        capture never stops (an overnight fill used to mean no morning-peak samples).
+        Eviction only ever touches pending — approved samples are permanent.
+
         ponytail: the pending cap is counted per capture attempt (at most once per
-        CAPTURE_EVERY per camera), not per pass — a glob of 500 names every frame buys
+        CAPTURE_EVERY per camera), not per pass — a glob of 1000 names every frame buys
         nothing. Upgrade path: keep a counter once something else writes the directory.
         """
         now = time.monotonic()
@@ -412,8 +416,14 @@ class Detector:
         self.last_capture[name] = now     # set first: a failing disk must not retry per frame
         pending = self.dataset_dir / "pending"
         try:
-            if sum(1 for _ in (pending / "images").glob("*.jpg")) >= DATASET_CAP:
-                return                    # operator has a backlog; stop hoarding frames
+            imgs = list((pending / "images").glob("*.jpg"))
+            if len(imgs) >= DATASET_CAP:
+                # By mtime, not by name: a camera name may contain dashes, so the stem's
+                # timestamp is not the lexicographic tail. Files are written once, so
+                # mtime is the capture time.
+                oldest = min(imgs, key=lambda p: p.stat().st_mtime)
+                oldest.unlink()
+                (pending / "labels" / f"{oldest.stem}.txt").unlink(missing_ok=True)
             stem = f"{name}-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
             lines = [f"{self.display_ids[cls]} {(x1 + x2) / 2 / w:.6f} {(y1 + y2) / 2 / h:.6f} "
                      f"{(x2 - x1) / w:.6f} {(y2 - y1) / h:.6f}"
@@ -619,6 +629,21 @@ if __name__ == "__main__":
     stem = next((tmp / "pending" / "images").glob("*.jpg")).stem
     label = (tmp / "pending" / "labels" / f"{stem}.txt").read_text()
     assert label == "3 0.546875 0.546875 0.781250 0.781250\n", label   # truck's slot, renamed
+
+    # At the cap the OLDEST pending sample is evicted, so capture never stops. Camera
+    # names run reverse-alphabetically here: sorting by name would evict the newest.
+    cap = Path(tempfile.mkdtemp())
+    d = fresh(dataset_dir=cap)
+    d._dataset_init()
+    DATASET_CAP = 2
+    for who, blob in (("z", b"old"), ("m", b"mid"), ("a", b"new")):
+        d._capture(who, blob, [("car", 0.9, BOX)], 64, 64)
+        time.sleep(0.01)                                   # distinct mtimes
+    imgs = list((cap / "pending" / "images").glob("*.jpg"))
+    assert len(imgs) == DATASET_CAP, imgs                  # count holds at the cap
+    assert {p.read_bytes() for p in imgs} == {b"mid", b"new"}, [p.name for p in imgs]
+    assert not list((cap / "pending" / "labels").glob("z-*.txt")), "label must go too"
+    assert len(list((cap / "pending" / "labels").glob("*.txt"))) == DATASET_CAP
 
     # Missing heavy deps report absent with the pip hint; hailo reports its own error.
     a = fresh()
