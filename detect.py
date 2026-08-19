@@ -374,7 +374,11 @@ class Detector:
         try:
             for sub in ("pending/images", "pending/labels"):
                 (self.dataset_dir / sub).mkdir(parents=True, exist_ok=True)
-            (self.dataset_dir / "classes.txt").write_text("\n".join(CLASS_IDS) + "\n")
+            # Append-only, ids are positional: the operator's file wins, or the classes
+            # they added on the Label tab would lose their ids on every restart.
+            classes = self.dataset_dir / "classes.txt"
+            if not classes.exists():
+                classes.write_text("\n".join(CLASS_IDS) + "\n")
         except OSError as e:              # a read-only disk disables capture, not detection
             self.dataset_dir = None
             self._set("running", f"dataset capture off: {e}")
@@ -543,6 +547,13 @@ if __name__ == "__main__":
                 pass
 
         tmp = Path(tempfile.mkdtemp())
+        # An operator-extended classes.txt must survive a restart: ids are positional.
+        keep = "car\nmotorcycle\nbus\ntruck\ntipper\n"
+        (tmp / "classes.txt").write_text(keep)
+        fresh(dataset_dir=tmp)._dataset_init()
+        assert (tmp / "classes.txt").read_text() == keep, "must not clobber added classes"
+        (tmp / "classes.txt").unlink()
+
         d = fresh(dataset_dir=tmp)
         d.readers["c"] = FakeReader()
         with patch.object(Detector, "_sync_readers", lambda self: None), \

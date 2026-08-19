@@ -34,6 +34,7 @@ CONFIG = {}
 CAM_NAME = re.compile(r"^[A-Za-z0-9_-]{1,32}$")   # becomes a directory name
 SAMPLE_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")  # becomes a file name — no dots, no separators
 DET_CLASSES = list(detect.CLASSES.values())       # dataset class ids 0-3, the order detect.py writes
+CLASS_NAME = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")   # YOLO training class name
 
 
 def load_config():
@@ -383,6 +384,15 @@ def valid_sample_id(sid):
     return sid
 
 
+def dataset_classes():
+    """classes.txt wins once it exists: the operator may have added classes past
+    the four detect.py ships with."""
+    f = DATASET / "classes.txt"
+    if f.is_file():
+        return [line.strip() for line in f.read_text().splitlines() if line.strip()]
+    return DET_CLASSES
+
+
 def sample_paths(sid, tree="pending"):
     return (DATASET / tree / "images" / f"{sid}.jpg", DATASET / tree / "labels" / f"{sid}.txt")
 
@@ -413,7 +423,7 @@ def dataset_samples():
         except OSError:      # sample reviewed away mid-listing
             continue
     pending.sort(key=lambda t: t[0], reverse=True)
-    return {"classes": DET_CLASSES, "pending": [s for _, s in pending[:100]]}
+    return {"classes": dataset_classes(), "pending": [s for _, s in pending[:100]]}
 
 
 @app.get("/api/dataset/image")
@@ -437,14 +447,14 @@ def dataset_label(body: dict = Body(default={})):
         img.unlink(missing_ok=True)
         lbl.unlink(missing_ok=True)
         return {"ok": True}
-    lines = []
+    lines, nclasses = [], len(dataset_classes())
     for b in body.get("boxes") or []:   # an empty list is legal: every box removed = a negative sample
         try:
             cls = int(b["cls"])
             coords = [float(b[k]) for k in ("cx", "cy", "w", "h")]
         except (KeyError, TypeError, ValueError):
             raise HTTPException(400, f"malformed box: {b!r}")
-        if not 0 <= cls < len(DET_CLASSES) or not all(0 <= v <= 1 for v in coords):
+        if not 0 <= cls < nclasses or not all(0 <= v <= 1 for v in coords):
             raise HTTPException(400, f"box out of range: {b!r}")
         lines.append(" ".join([str(cls)] + [f"{v:.6f}" for v in coords]))
     dst_img, dst_lbl = sample_paths(sid, "approved")
@@ -454,6 +464,23 @@ def dataset_label(body: dict = Body(default={})):
     img.rename(dst_img)
     lbl.unlink(missing_ok=True)
     return {"ok": True}
+
+
+@app.post("/api/dataset/class")
+def dataset_class(body: dict = Body(default={})):
+    """Append-only: class ids are positional, so renaming or removing one would
+    silently relabel every sample already on disk."""
+    name = body.get("name") or ""
+    if not CLASS_NAME.match(name):
+        raise HTTPException(400, "class name must be lowercase: a letter, then letters, "
+                                 "digits, - or _ (max 32)")
+    classes = dataset_classes()
+    if name not in classes:
+        classes = classes + [name]
+        f = DATASET / "classes.txt"
+        f.parent.mkdir(parents=True, exist_ok=True)   # detection may never have run on this node
+        f.write_text("".join(c + "\n" for c in classes))
+    return {"ok": True, "classes": classes}
 
 
 @app.post("/api/camera/test_rtsp")

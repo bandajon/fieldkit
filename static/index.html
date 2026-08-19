@@ -208,6 +208,10 @@
       <button class="btn go" id="l-ok">Approve</button>
       <button class="btn halt" id="l-no">Discard</button>
     </div>
+    <div class="acts">
+      <input id="l-new" placeholder="new label e.g. excavator">
+      <button class="btn" id="l-add">Add label</button>
+    </div>
     <div id="l-note" class="res"></div>
   </section>
 </main>
@@ -709,6 +713,23 @@ async function labSend(action) {
 }
 document.getElementById('l-ok').onclick = () => labSend('approve');
 document.getElementById('l-no').onclick = () => labSend('discard');
+
+document.getElementById('l-add').onclick = async () => {
+  const el = document.getElementById('l-new'), name = el.value.trim();
+  if (!name) return;
+  try {
+    const r = await post('/api/dataset/class', {name});
+    if (!r.ok) throw new Error(r.detail || 'label rejected');
+    labClasses = r.classes;           // new class joins the tap cycle on the next tap
+    el.value = '';
+    labNote(`added "${name}" · ${labClasses.length} classes`);
+  } catch (e) {
+    labNote(String(e.message || e));
+  }
+};
+document.getElementById('l-new').onkeydown = e => {
+  if (e.key === 'Enter') document.getElementById('l-add').click();
+};
 </script>
 </body>
 </html>
