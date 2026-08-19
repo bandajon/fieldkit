@@ -28,9 +28,12 @@ import recorder
 ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = ROOT / "config.yaml"
 EXAMPLE_PATH = ROOT / "config.example.yaml"
+DATASET = ROOT / "dataset"                        # detection samples awaiting operator review
 
 CONFIG = {}
 CAM_NAME = re.compile(r"^[A-Za-z0-9_-]{1,32}$")   # becomes a directory name
+SAMPLE_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")  # becomes a file name — no dots, no separators
+DET_CLASSES = list(detect.CLASSES.values())       # dataset class ids 0-3, the order detect.py writes
 
 
 def load_config():
@@ -108,7 +111,8 @@ def detect_snapshot(ip, user, password):
     return camera.snapshot(ip, *cam_creds(ip), timeout=3)
 
 
-DETECT = detect.Detector(CONFIG.get("cameras", []), detect_snapshot, CONFIG)
+DETECT = detect.Detector(CONFIG.get("cameras", []), detect_snapshot, CONFIG,
+                         creds_fn=lambda ip: cam_creds(ip), dataset_dir=DATASET)
 DETECT.start()   # no-op unless the optional detection deps are installed
 
 
@@ -370,6 +374,86 @@ def detect_frame(name: str):
 @app.get("/api/detect/counts")
 def detect_counts():
     return DETECT.counts()
+
+
+def valid_sample_id(sid):
+    """Sample ids land in filesystem paths — a basename, never a path."""
+    if not SAMPLE_ID.match(sid or ""):
+        raise HTTPException(400, f"not a sample id: {sid!r}")
+    return sid
+
+
+def sample_paths(sid, tree="pending"):
+    return (DATASET / tree / "images" / f"{sid}.jpg", DATASET / tree / "labels" / f"{sid}.txt")
+
+
+def read_boxes(path):
+    """YOLO label lines -> box dicts. A malformed line is skipped: one bad row
+    must not hide the rest of the sample from the operator."""
+    boxes = []
+    for line in path.read_text().splitlines():
+        f = line.split()
+        if len(f) != 5:
+            continue
+        try:
+            boxes.append({"cls": int(f[0]), "cx": float(f[1]), "cy": float(f[2]),
+                          "w": float(f[3]), "h": float(f[4])})
+        except ValueError:
+            continue
+    return boxes
+
+
+@app.get("/api/dataset/samples")
+def dataset_samples():
+    labels = DATASET / "pending" / "labels"
+    pending = []
+    for p in sorted(labels.glob("*.txt")) if labels.is_dir() else []:
+        try:
+            pending.append((p.stat().st_mtime, {"id": p.stem, "boxes": read_boxes(p)}))
+        except OSError:      # sample reviewed away mid-listing
+            continue
+    pending.sort(key=lambda t: t[0], reverse=True)
+    return {"classes": DET_CLASSES, "pending": [s for _, s in pending[:100]]}
+
+
+@app.get("/api/dataset/image")
+def dataset_image(id: str):
+    img, _ = sample_paths(valid_sample_id(id))
+    if not img.is_file():
+        raise HTTPException(404, f"no pending sample {id!r}")
+    return FileResponse(img, media_type="image/jpeg")
+
+
+@app.post("/api/dataset/label")
+def dataset_label(body: dict = Body(default={})):
+    sid = valid_sample_id(body.get("id"))
+    action = body.get("action")
+    if action not in ("approve", "discard"):
+        raise HTTPException(400, "action must be 'approve' or 'discard'")
+    img, lbl = sample_paths(sid)
+    if not img.is_file():
+        raise HTTPException(404, f"no pending sample {sid!r}")
+    if action == "discard":
+        img.unlink(missing_ok=True)
+        lbl.unlink(missing_ok=True)
+        return {"ok": True}
+    lines = []
+    for b in body.get("boxes") or []:   # an empty list is legal: every box removed = a negative sample
+        try:
+            cls = int(b["cls"])
+            coords = [float(b[k]) for k in ("cx", "cy", "w", "h")]
+        except (KeyError, TypeError, ValueError):
+            raise HTTPException(400, f"malformed box: {b!r}")
+        if not 0 <= cls < len(DET_CLASSES) or not all(0 <= v <= 1 for v in coords):
+            raise HTTPException(400, f"box out of range: {b!r}")
+        lines.append(" ".join([str(cls)] + [f"{v:.6f}" for v in coords]))
+    dst_img, dst_lbl = sample_paths(sid, "approved")
+    dst_img.parent.mkdir(parents=True, exist_ok=True)
+    dst_lbl.parent.mkdir(parents=True, exist_ok=True)
+    dst_lbl.write_text("".join(l + "\n" for l in lines))   # the operator's edit wins over the model's guess
+    img.rename(dst_img)
+    lbl.unlink(missing_ok=True)
+    return {"ok": True}
 
 
 @app.post("/api/camera/test_rtsp")
