@@ -97,7 +97,18 @@ OFFLOAD.start()   # no-op unless offload.enabled is set
 # body verbatim — the console sees exactly what the local Record tab does.
 HIVE = hive.Hive(CONFIG, REC, lambda: record_status(), camera.snapshot, local_ips)
 HIVE.start()   # no-op unless config.yaml has an ops: block
-DETECT = detect.Detector(CONFIG.get("cameras", []), camera.snapshot, CONFIG)
+def detect_snapshot(ip, user, password):
+    """cam_creds chain + short timeout: one dead camera must not stall the whole
+    detection pass (camera.snapshot defaults to 8 s), and config-supplied IPs are
+    untrusted (POST /api/config has no auth on the field LAN)."""
+    try:
+        ipaddress.ip_address(ip)
+    except (ValueError, TypeError):
+        return None, f"not an IP address: {ip!r}"
+    return camera.snapshot(ip, *cam_creds(ip), timeout=3)
+
+
+DETECT = detect.Detector(CONFIG.get("cameras", []), detect_snapshot, CONFIG)
 DETECT.start()   # no-op unless the optional detection deps are installed
 
 
@@ -350,7 +361,7 @@ def detect_frame(name: str):
         raise HTTPException(404, f"no camera named {name!r} in config")
     data = DETECT.frame(name)
     if data is None:      # detection absent or between passes — show the live camera instead
-        data, err = camera.snapshot(cam["ip"], cam.get("user", ""), cam.get("password", ""))
+        data, err = detect_snapshot(cam["ip"], "", "")
         if err:
             raise HTTPException(502, err)
     return Response(content=data, media_type="image/jpeg")
@@ -446,9 +457,7 @@ def config_rename_camera(body: dict = Body(default={})):
         raise HTTPException(400, f"{old} is recording — stop it first")
     cam["name"] = new
     CONFIG_PATH.write_text(yaml.safe_dump(CONFIG, sort_keys=False))
-    REC.add_camera(cam)
-    LIVE.set_cameras(CONFIG["cameras"])
-    DETECT.set_cameras(CONFIG["cameras"])
+    apply_cameras()
     # Already-written segments stay under <record_dir>/<site>/<old>/ — only new ones move.
     return {"ok": True}
 
@@ -462,8 +471,7 @@ def config_remove_camera(body: dict = Body(default={})):
         raise HTTPException(400, f"{name} is recording — stop it first")
     CONFIG["cameras"] = [c for c in CONFIG["cameras"] if c["name"] != name]
     CONFIG_PATH.write_text(yaml.safe_dump(CONFIG, sort_keys=False))
-    LIVE.set_cameras(CONFIG["cameras"])
-    DETECT.set_cameras(CONFIG["cameras"])
+    apply_cameras()
     # Recordings under <record_dir>/<site>/<name>/ are deliberately left on disk.
     return {"ok": True}
 

@@ -134,6 +134,11 @@ class Detector:
         with self.lock:
             self.state, self.error = state, error
 
+    def _known(self, name):
+        """Still configured? A pass in flight when set_cameras() drops a camera would
+        otherwise re-insert the state it just cleaned up. Caller holds the lock."""
+        return any(c["name"] == name for c in self.cams)
+
     def _load(self):
         """Backend + weights. Runs in the thread: the first weight download (tens of MB
         over a field link) must not block app boot."""
@@ -190,10 +195,12 @@ class Detector:
                     shot = annotate(img, dets)
                 except Exception as e:        # a truncated frame must not kill the thread
                     self._set("running", str(e))
+                    self._track(name, [])    # ...and must still age tracks, like a dead camera
                     continue
                 self._track(name, dets)
                 with self.lock:
-                    self.frames[name] = (shot, time.time())
+                    if self._known(name):
+                        self.frames[name] = (shot, time.time())
                     self.error = ""       # a one-off bad frame must not look permanent
             # Inference slower than a tick just runs flat out — no queue, latest wins.
             self.stopping.wait(max(0.0, TICK - (time.monotonic() - began)))
@@ -216,6 +223,8 @@ class Detector:
         stream at ~5 fps server-side instead of snapshot polling.
         """
         with self.lock:
+            if not self._known(name):
+                return
             tracks = self.tracks.setdefault(name, [])
             for t in tracks:
                 t["seen"] = False
@@ -316,6 +325,10 @@ if __name__ == "__main__":
     d.set_cameras([{"name": "other", "ip": "10.0.0.2", "user": "u", "password": ""}])
     assert d.frame("c") is None and "c" not in d.tracks and "c" not in d.visible
     assert d.totals["car"] == 7, d.totals
+    # A pass already in flight over the removed camera must not resurrect its state.
+    d._track("c", det("car"))
+    assert "c" not in d.tracks and "c" not in d.visible, (d.tracks, d.visible)
+    assert d.totals["car"] == 7, d.totals
 
     # Drawing, if Pillow is here: a box at the top edge must keep its label inside frame,
     # at both a thumbnail and a real 1080p frame size (font/outline scale with the width).
@@ -361,12 +374,19 @@ if __name__ == "__main__":
                 time.sleep(0.1)
             assert bad.info()["error"] and bad.info()["state"] == "running", bad.info()
             assert bad.frame("c") is None
+            # A camera spewing corrupt JPEGs must still age its tracks, or a stale
+            # counted track sits in the frame forever and swallows the next vehicle.
+            assert bad.tracks.get("c") == [], bad.tracks
             shot[0] = jpeg
             for _ in range(60):
                 if bad.frame("c"):
                     break
                 time.sleep(0.1)
             assert bad.info() == {"state": "running", "backend": "cpu", "error": ""}, bad.info()
+            # Same race against the live loop: removal must stick, no ghost frame.
+            bad.set_cameras([])
+            time.sleep(TICK * 2)
+            assert bad.frames == {} and bad.counts()["visible"] == {}, bad.frames
             bad.stop()
 
     # Missing heavy deps report absent with the pip hint; hailo reports its own error.

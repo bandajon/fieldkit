@@ -200,6 +200,7 @@ const net24 = ip => ip.split('.').slice(0, 3).join('.');
 const onOurNet = ip => hostIps.some(h => net24(h) === net24(ip));
 let myNet = '192.168.1';   // /24 the Set IP suggestions live in; refreshed from /api/status
 let go2rtc = 'absent';
+let detectState = 'absent', detectError = '';
 document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
   tab = b.dataset.tab;
   document.querySelectorAll('nav button').forEach(x => x.classList.toggle('on', x === b));
@@ -219,6 +220,8 @@ async function refreshStatus() {
     document.getElementById('s-time').textContent = s.time.replace('T', ' ');
     go2rtc = (s.go2rtc || {}).state || 'absent';
     document.getElementById('s-live').textContent = go2rtc;
+    detectState = (s.detect || {}).state || 'absent';
+    detectError = (s.detect || {}).error || '';
     syncLiveToggle();
   } catch (e) {
     document.getElementById('s-time').textContent = 'server unreachable';
@@ -576,6 +579,8 @@ function syncLiveToggle() {
   else if (go2rtc === 'absent') note.textContent =
     'Live needs go2rtc: download the binary for this platform and set go2rtc_binary in config.yaml.';
   else note.textContent = `go2rtc is ${go2rtc} — snapshots only until it is running.`;
+  if (monMode !== 'live' && (detectState === 'absent' || detectState === 'error'))
+    note.textContent += ' · ' + (detectError || `vehicle detection is ${detectState} — no counts.`);
 }
 
 async function monRender() {
@@ -601,11 +606,12 @@ function monTick() {
     // annotated detection frame; the endpoint falls back to a plain snapshot when detection is off
     if (img) img.src = `/api/detect/frame?name=${encodeURIComponent(t.dataset.name)}&_=${Date.now()}`;
   });
+  const el = document.getElementById('counts');
+  if (detectState !== 'running' && detectState !== 'starting') { el.hidden = true; return; }
   fetch('/api/detect/counts').then(r => r.json()).then(c => {
-    const el = document.getElementById('counts'), t = c.totals || {};
     el.hidden = c.state !== 'running' && c.state !== 'starting';
-    if (!el.hidden) el.textContent = `today · trucks ${t.truck || 0} · cars ${t.car || 0}` +
-                                     ` · buses ${t.bus || 0} · bikes ${t.motorcycle || 0}`;
+    if (!el.hidden) el.textContent =
+      'today · ' + Object.entries(c.totals || {}).map(([k, v]) => `${k} ${v}`).join(' · ');
   }).catch(() => {});
 }
 
