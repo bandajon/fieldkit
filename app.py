@@ -408,6 +408,28 @@ def label_files():
             yield from d.glob("*.txt")
 
 
+def approved_counts():
+    """Size of the fine-tuning set. ponytail: full scan per request, same scale
+    note as label_files()."""
+    names, boxes, frames = dataset_classes(), {}, 0
+    d = DATASET / "approved" / "labels"
+    for p in sorted(d.glob("*.txt")) if d.is_dir() else []:
+        try:
+            text = p.read_text()
+        except OSError:
+            continue
+        frames += 1
+        for line in text.splitlines():
+            f = line.split()
+            try:
+                cls = int(f[0])
+            except (IndexError, ValueError):
+                continue
+            if 0 <= cls < len(names):      # a stale id past the class list is skipped, not fatal
+                boxes[names[cls]] = boxes.get(names[cls], 0) + 1
+    return {"frames": frames, "boxes": boxes}
+
+
 def sample_paths(sid, tree="pending"):
     return (DATASET / tree / "images" / f"{sid}.jpg", DATASET / tree / "labels" / f"{sid}.txt")
 
@@ -438,7 +460,8 @@ def dataset_samples():
         except OSError:      # sample reviewed away mid-listing
             continue
     pending.sort(key=lambda t: t[0], reverse=True)
-    return {"classes": dataset_classes(), "pending": [s for _, s in pending[:100]]}
+    return {"classes": dataset_classes(), "approved": approved_counts(),
+            "pending": [s for _, s in pending[:100]]}
 
 
 @app.get("/api/dataset/image")

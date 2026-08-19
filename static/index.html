@@ -211,6 +211,7 @@
     <div id="l-wrap" hidden></div>
     <div class="rowbtns" id="l-acts" hidden>
       <button class="btn go" id="l-ok">Approve</button>
+      <button class="btn" id="l-skip">Skip</button>
       <button class="btn halt" id="l-no">Discard</button>
     </div>
     <div class="acts" id="l-classes"></div>
@@ -218,6 +219,7 @@
       <input id="l-new" placeholder="new label e.g. excavator">
       <button class="btn" id="l-add">Add label</button>
     </div>
+    <div id="l-stats" class="res"></div>
     <div id="l-note" class="res"></div>
   </section>
 </main>
@@ -662,8 +664,12 @@ setInterval(monTick, 1000);   // 1 fps, and monTick no-ops when the tab is hidde
 // Boxes are YOLO-normalized, so percentage CSS positions them with no natural-size math.
 // cls === labClasses.length is the "removed" rung of the tap cycle: drawn dashed rather than
 // hidden so it stays tappable back to car, and dropped from the POST.
-let labClasses = [], labQueue = [], labBoxes = [];
+let labClasses = [], labQueue = [], labBoxes = [], labApproved = {frames: 0, boxes: {}};
 const labNote = t => document.getElementById('l-note').textContent = t;
+const labStats = () => document.getElementById('l-stats').textContent = labApproved.frames
+  ? `fine-tune set: ${labApproved.frames} frames · ` +
+    Object.entries(labApproved.boxes).map(([k, v]) => `${k} ${v}`).join(' · ')
+  : 'fine-tune set: empty — approve samples to grow it';
 const boxCls = b => `box c${b.cls}${b.cls >= labClasses.length ? ' gone' : ''}`;
 
 async function labLoad() {
@@ -671,10 +677,12 @@ async function labLoad() {
     const d = await (await fetch('/api/dataset/samples')).json();
     labClasses = d.classes || [];
     labQueue = d.pending || [];
+    labApproved = d.approved || {frames: 0, boxes: {}};
   } catch (e) {
     labNote('Could not load samples — is the server reachable?');
     return;
   }
+  labStats();
   labChips();
   labShow();
 }
@@ -707,18 +715,29 @@ async function labSend(action) {
   const s = labQueue[0];
   if (!s) return;
   labNote('saving…');
+  const boxes = labBoxes.filter(b => b.cls < labClasses.length);
   try {
-    const r = await post('/api/dataset/label',
-                         {id: s.id, action, boxes: labBoxes.filter(b => b.cls < labClasses.length)});
+    const r = await post('/api/dataset/label', {id: s.id, action, boxes});
     if (!r.ok) throw new Error('rejected');
   } catch (e) {
     labNote('Save failed — sample kept, tap again to retry.');
     return;
   }
+  if (action === 'approve') {   // bumped locally; the next labLoad trues it up from disk
+    labApproved.frames++;
+    boxes.forEach(b => {
+      const n = labClasses[b.cls];
+      labApproved.boxes[n] = (labApproved.boxes[n] || 0) + 1;
+    });
+    labStats();
+  }
   labQueue.shift();
   labShow();
 }
 document.getElementById('l-ok').onclick = () => labSend('approve');
+// Skipped samples stay pending and age out of the rolling capture buffer on their own;
+// Skip is for near-duplicates (parked vehicles) not worth a decision.
+document.getElementById('l-skip').onclick = () => { labQueue.shift(); labShow(); };
 document.getElementById('l-no').onclick = () => labSend('discard');
 
 function labChips() {

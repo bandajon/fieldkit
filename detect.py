@@ -40,6 +40,32 @@ HAILO_HINT = ("hailo backend not implemented yet — runs with detect_backend: c
               "HailoRT integration lands with the site deploy")
 
 
+def iou(a, b):
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    w = min(ax2, bx2) - max(ax1, bx1)
+    h = min(ay2, by2) - max(ay1, by1)
+    if w <= 0 or h <= 0:
+        return 0.0
+    inter = w * h
+    union = (ax2 - ax1) * (ay2 - ay1) + (bx2 - bx1) * (by2 - by1) - inter
+    return inter / union if union > 0 else 0.0
+
+
+def same_scene(a, b, iou_min=0.85):
+    """Two `shown` lists showing the same vehicles in the same places. Greedy same-class
+    matching; equal lengths plus one consumed match each means equal class multisets."""
+    if len(a) != len(b):
+        return False
+    pool = list(b)
+    for cls, _conf, box in a:
+        hit = next((o for o in pool if o[0] == cls and iou(box, o[2]) >= iou_min), None)
+        if hit is None:
+            return False
+        pool.remove(hit)
+    return True
+
+
 def label_of(t):
     """Majority class of a track. A tie keeps the current label: deterministic, and a
     50/50 track then stays put instead of flapping between two names."""
@@ -154,6 +180,7 @@ class Detector:
         self.readers = {}     # camera name -> Reader; owned by the worker thread
         self.models = {}      # camera name -> YOLO; ByteTrack state lives in the instance
         self.last_capture = {}
+        self.last_boxes = {}  # camera name -> last captured `shown`, for scene dedup
         self.lock = threading.Lock()
         self.thread = None
         self.stopping = threading.Event()
@@ -190,7 +217,8 @@ class Detector:
         keep = {c["name"] for c in cams}
         with self.lock:
             self.cams = cams
-            for d in (self.frames, self.tracks, self.visible, self.models, self.last_capture):
+            for d in (self.frames, self.tracks, self.visible, self.models,
+                      self.last_capture, self.last_boxes):
                 for gone in [n for n in d if n not in keep]:
                     d.pop(gone)
 
@@ -414,6 +442,11 @@ class Detector:
                 or now - self.last_capture.get(name, float("-inf")) < CAPTURE_EVERY):
             return
         self.last_capture[name] = now     # set first: a failing disk must not retry per frame
+        # Before the cap check, not after: a duplicate must not evict a real sample.
+        # A vehicle parked for hours is one sample; any new vehicle changes the set and
+        # capture resumes.
+        if same_scene(shown, self.last_boxes.get(name, [])):
+            return
         pending = self.dataset_dir / "pending"
         try:
             imgs = list((pending / "images").glob("*.jpg"))
@@ -430,6 +463,7 @@ class Detector:
                      for cls, _conf, (x1, y1, x2, y2) in shown if cls in self.display_ids]
             (pending / "images" / f"{stem}.jpg").write_bytes(jpeg)
             (pending / "labels" / f"{stem}.txt").write_text("\n".join(lines) + "\n")
+            self.last_boxes[name] = shown
         except OSError as e:
             self._set("running", f"dataset capture failed: {e}")
 
@@ -644,6 +678,28 @@ if __name__ == "__main__":
     assert {p.read_bytes() for p in imgs} == {b"mid", b"new"}, [p.name for p in imgs]
     assert not list((cap / "pending" / "labels").glob("z-*.txt")), "label must go too"
     assert len(list((cap / "pending" / "labels").glob("*.txt"))) == DATASET_CAP
+
+    # A scene that has not changed is not captured again — hours of a parked vehicle
+    # would otherwise fill the pending pool with one duplicate per interval.
+    A = [("car", 0.9, BOX)]
+    assert same_scene(A, A)
+    assert not same_scene(A, [("car", 0.9, (30.0, 30.0, 80.0, 80.0))])   # same car, moved
+    assert not same_scene(A, A + [("truck", 0.8, FAR)])                  # one more vehicle
+    assert not same_scene(A, [("truck", 0.9, BOX)])                      # relabelled
+
+    dup = Path(tempfile.mkdtemp())
+    d = fresh(dataset_dir=dup)
+    d._dataset_init()
+    d._capture("c", b"one", A, 64, 64)
+    kept = list((dup / "pending" / "images").glob("*.jpg"))
+    assert len(kept) == 1, kept
+    d.last_capture.clear()                       # cadence gate open again
+    d._capture("c", b"two", A, 64, 64)
+    assert kept[0].read_bytes() == b"one", "an unchanged scene must not be recaptured"
+    d.last_capture.clear()
+    d._capture("c", b"three", A + [("truck", 0.8, FAR)], 64, 64)
+    assert any(p.read_bytes() == b"three"
+               for p in (dup / "pending" / "images").glob("*.jpg")), "a new vehicle captures"
 
     # Missing heavy deps report absent with the pip hint; hailo reports its own error.
     a = fresh()
