@@ -754,6 +754,15 @@ document.getElementById('l-classes').onclick = async e => {
   }
   const to = (prompt(`Rename "${name}" to:`, name) || '').trim();
   if (!to || to === name) return;
+  if (labClasses.includes(to)) {
+    if (!confirm(`"${to}" already exists. Merge "${name}" and "${to}" into one class named ` +
+                 `"${to}"? Samples of both become "${to}".`)) return;
+    // Merge the other class INTO the one being renamed so the renamed (usually detector) slot
+    // survives; the rename is then collision-free. Merged ids make queued samples stale too.
+    if (await labClassPost({action: 'merge', from: to, into: name}) &&
+        await labClassPost({action: 'rename', from: name, to})) labLoad();
+    return;
+  }
   if (!await labClassPost({action: 'rename', from: name, to})) return;
   // Ids are unchanged by a rename, so relabel the drawn boxes in place and keep the
   // operator's uncommitted taps.

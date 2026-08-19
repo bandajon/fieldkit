@@ -500,8 +500,8 @@ def samples_using(idx):
     return hits
 
 
-def drop_class_id(path, idx):
-    """Shift ids above `idx` down one; the rest of each line stays verbatim."""
+def remap_class_ids(path, fn):
+    """Rewrite each line's class id through `fn`; the rest of the line stays verbatim."""
     lines = []
     for line in path.read_text().splitlines():
         f = line.split(None, 1)
@@ -510,7 +510,7 @@ def drop_class_id(path, idx):
         except (IndexError, ValueError):
             lines.append(line)          # malformed row: leave it exactly as found
             continue
-        lines.append(" ".join([str(cls - 1 if cls > idx else cls)] + f[1:]))
+        lines.append(" ".join([str(fn(cls))] + f[1:]))
     path.write_text("".join(l + "\n" for l in lines))
 
 
@@ -528,7 +528,7 @@ def dataset_class(body: dict = Body(default={})):
         if old not in classes:
             raise HTTPException(404, f"no class named {old!r}")
         if new in classes:
-            raise HTTPException(400, f"{new} already exists")
+            raise HTTPException(400, f"{new} already exists — merge the two classes instead")
         # Ids are positional: renaming a line touches no label file on disk.
         classes[classes.index(old)] = new
         write_classes(classes)
@@ -546,11 +546,27 @@ def dataset_class(body: dict = Body(default={})):
                                      "relabel them before removing it")
         # Label files first: a crash before classes.txt is rewritten leaves every id valid.
         for p in label_files():
-            drop_class_id(p, idx)
+            remap_class_ids(p, lambda c: c - 1 if c > idx else c)
         classes.pop(idx)
         write_classes(classes)
+    elif action == "merge":
+        src, into = body.get("from") or "", body.get("into") or ""
+        for n in (src, into):
+            if n not in classes:
+                raise HTTPException(404, f"no class named {n!r}")
+        if src == into:
+            raise HTTPException(400, f"{src} is already that class")
+        lo, hi = sorted((classes.index(src), classes.index(into)))
+        if hi < len(DET_CLASSES):
+            raise HTTPException(400, "the four detector classes can't be merged with each other — "
+                                     "the detector needs all four slots")
+        # Label files first, same as remove: refs remapped with line hi still present is a valid state.
+        for p in label_files():
+            remap_class_ids(p, lambda c: lo if c == hi else (c - 1 if c > hi else c))
+        classes.pop(hi)   # lo keeps its current name — rename it next if the operator wants the other one
+        write_classes(classes)
     else:
-        raise HTTPException(400, "action must be 'add', 'rename' or 'remove'")
+        raise HTTPException(400, "action must be 'add', 'rename', 'remove' or 'merge'")
     return {"ok": True, "classes": classes}
 
 
