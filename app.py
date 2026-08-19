@@ -390,7 +390,22 @@ def dataset_classes():
     f = DATASET / "classes.txt"
     if f.is_file():
         return [line.strip() for line in f.read_text().splitlines() if line.strip()]
-    return DET_CLASSES
+    return list(DET_CLASSES)      # a copy: callers edit this list
+
+
+def write_classes(classes):
+    f = DATASET / "classes.txt"
+    f.parent.mkdir(parents=True, exist_ok=True)   # detection may never have run on this node
+    f.write_text("".join(c + "\n" for c in classes))
+
+
+def label_files():
+    """Every label file in both trees. ponytail: full scan per class edit — the
+    dataset caps at ~500 pending samples; index them if that ever changes."""
+    for tree in ("pending", "approved"):
+        d = DATASET / tree / "labels"
+        if d.is_dir():
+            yield from d.glob("*.txt")
 
 
 def sample_paths(sid, tree="pending"):
@@ -466,20 +481,76 @@ def dataset_label(body: dict = Body(default={})):
     return {"ok": True}
 
 
-@app.post("/api/dataset/class")
-def dataset_class(body: dict = Body(default={})):
-    """Append-only: class ids are positional, so renaming or removing one would
-    silently relabel every sample already on disk."""
-    name = body.get("name") or ""
-    if not CLASS_NAME.match(name):
+def valid_class_name(name):
+    if not CLASS_NAME.match(name or ""):
         raise HTTPException(400, "class name must be lowercase: a letter, then letters, "
                                  "digits, - or _ (max 32)")
+    return name
+
+
+def samples_using(idx):
+    """How many label files reference class id `idx`."""
+    hits = 0
+    for p in label_files():
+        for line in p.read_text().splitlines():
+            f = line.split()
+            if f and f[0] == str(idx):
+                hits += 1
+                break
+    return hits
+
+
+def drop_class_id(path, idx):
+    """Shift ids above `idx` down one; the rest of each line stays verbatim."""
+    lines = []
+    for line in path.read_text().splitlines():
+        f = line.split(None, 1)
+        try:
+            cls = int(f[0])
+        except (IndexError, ValueError):
+            lines.append(line)          # malformed row: leave it exactly as found
+            continue
+        lines.append(" ".join([str(cls - 1 if cls > idx else cls)] + f[1:]))
+    path.write_text("".join(l + "\n" for l in lines))
+
+
+@app.post("/api/dataset/class")
+def dataset_class(body: dict = Body(default={})):
+    action = body.get("action") or "add"
     classes = dataset_classes()
-    if name not in classes:
-        classes = classes + [name]
-        f = DATASET / "classes.txt"
-        f.parent.mkdir(parents=True, exist_ok=True)   # detection may never have run on this node
-        f.write_text("".join(c + "\n" for c in classes))
+    if action == "add":
+        name = valid_class_name(body.get("name"))
+        if name not in classes:
+            classes.append(name)
+            write_classes(classes)
+    elif action == "rename":
+        old, new = body.get("from") or "", valid_class_name(body.get("to"))
+        if old not in classes:
+            raise HTTPException(404, f"no class named {old!r}")
+        if new in classes:
+            raise HTTPException(400, f"{new} already exists")
+        # Ids are positional: renaming a line touches no label file on disk.
+        classes[classes.index(old)] = new
+        write_classes(classes)
+    elif action == "remove":
+        name = body.get("name") or ""
+        if name not in classes:
+            raise HTTPException(404, f"no class named {name!r}")
+        idx = classes.index(name)
+        if idx < len(DET_CLASSES):
+            raise HTTPException(400, f"{name} is a class the detector writes itself — "
+                                     "rename it to your own term instead")
+        used = samples_using(idx)
+        if used:
+            raise HTTPException(400, f"{name} is used by {used} labelled sample(s) — "
+                                     "relabel them before removing it")
+        # Label files first: a crash before classes.txt is rewritten leaves every id valid.
+        for p in label_files():
+            drop_class_id(p, idx)
+        classes.pop(idx)
+        write_classes(classes)
+    else:
+        raise HTTPException(400, "action must be 'add', 'rename' or 'remove'")
     return {"ok": True, "classes": classes}
 
 

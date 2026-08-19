@@ -145,7 +145,9 @@ class Detector:
         self.state = "stopped"
         self.error = ""
         self.day = date.today().isoformat()
-        self.totals = {n: 0 for n in CLASSES.values()}
+        self.display = {n: n for n in CLASS_IDS}    # internal class -> operator's name
+        self.display_ids = dict(CLASS_IDS)          # operator's name -> dataset id
+        self.totals = {n: 0 for n in CLASS_IDS}
         self.tracks = {}      # camera name -> {track id: state}
         self.frames = {}      # camera name -> (annotated jpeg, wallclock ts)
         self.visible = {}     # camera name -> {class: count} on the latest frame
@@ -316,7 +318,7 @@ class Detector:
         with self.lock:
             if today != self.day:
                 self.day = today
-                self.totals = {n: 0 for n in CLASSES.values()}
+                self.totals = {d: 0 for d in self.display.values()}
                 self.tracks = {}
 
     def _track(self, name, dets):
@@ -339,7 +341,8 @@ class Detector:
             live = []
             for cls, conf, box, tid in dets:
                 if tid is None:
-                    shown.append((cls, conf, box))   # untracked: draw it, never count it
+                    # untracked: draw it, never count it
+                    shown.append((self.display[cls], conf, box))
                     continue
                 t = ids.get(tid)
                 if t is None:
@@ -349,18 +352,20 @@ class Detector:
                 t["hits"] += 1
                 t["last_seen"] = now
                 t["label"] = label_of(t)
+                # Votes and labels stay internal; only what leaves here is renamed.
+                disp = self.display[t["label"]]
                 if t["counted_as"] is None:
                     if t["hits"] >= COUNT_AT_HITS:
-                        t["counted_as"] = t["label"]
-                        self.totals[t["label"]] += 1
-                elif t["counted_as"] != t["label"]:
+                        t["counted_as"] = disp
+                        self.totals[disp] += 1
+                elif t["counted_as"] != disp:
                     # The vote settled on another class: move this id's single tally.
                     # Never negative — counted_as is a class this id incremented.
                     self.totals[t["counted_as"]] -= 1
-                    self.totals[t["label"]] += 1
-                    t["counted_as"] = t["label"]
-                live.append(t["label"])
-                shown.append((t["label"], conf, box))
+                    self.totals[disp] += 1
+                    t["counted_as"] = disp
+                live.append(disp)
+                shown.append((disp, conf, box))
             for tid in [i for i, t in ids.items() if now - t["last_seen"] > ID_EXPIRY]:
                 del ids[tid]
             self.visible[name] = Counter(live)
@@ -379,6 +384,16 @@ class Detector:
             classes = self.dataset_dir / "classes.txt"
             if not classes.exists():
                 classes.write_text("\n".join(CLASS_IDS) + "\n")
+                return
+            # Positions 0-3 are this detector's four classes under whatever names the
+            # operator gave them; anything after is theirs alone. Renames reach the
+            # console on restart — nothing re-reads this file while the loop runs.
+            names = [ln.strip() for ln in classes.read_text().splitlines() if ln.strip()]
+            if len(names) >= len(CLASS_IDS):
+                self.display = dict(zip(CLASS_IDS, names))
+                self.display_ids = {d: i for i, d in enumerate(self.display.values())}
+                COLORS.update({d: COLORS[n] for n, d in self.display.items()})
+                self.totals = {d: 0 for d in self.display.values()}
         except OSError as e:              # a read-only disk disables capture, not detection
             self.dataset_dir = None
             self._set("running", f"dataset capture off: {e}")
@@ -400,9 +415,9 @@ class Detector:
             if sum(1 for _ in (pending / "images").glob("*.jpg")) >= DATASET_CAP:
                 return                    # operator has a backlog; stop hoarding frames
             stem = f"{name}-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
-            lines = [f"{CLASS_IDS[cls]} {(x1 + x2) / 2 / w:.6f} {(y1 + y2) / 2 / h:.6f} "
+            lines = [f"{self.display_ids[cls]} {(x1 + x2) / 2 / w:.6f} {(y1 + y2) / 2 / h:.6f} "
                      f"{(x2 - x1) / w:.6f} {(y2 - y1) / h:.6f}"
-                     for cls, _conf, (x1, y1, x2, y2) in shown if cls in CLASS_IDS]
+                     for cls, _conf, (x1, y1, x2, y2) in shown if cls in self.display_ids]
             (pending / "images" / f"{stem}.jpg").write_bytes(jpeg)
             (pending / "labels" / f"{stem}.txt").write_text("\n".join(lines) + "\n")
         except OSError as e:
@@ -586,6 +601,24 @@ if __name__ == "__main__":
             time.sleep(0.5)
             assert d.frames == {} and d.counts()["visible"] == {}, d.frames
             assert d.stop() == "stopped"
+
+    # Renamed classes: positions 0-3 of classes.txt are this detector's classes, so the
+    # console speaks the operator's words while the dataset keeps the positional ids.
+    tmp = Path(tempfile.mkdtemp())
+    (tmp / "classes.txt").write_text("car\nmotorcycle\nbus\nheavy_goods\ntipper\n")
+    d = fresh(dataset_dir=tmp)
+    d._dataset_init()
+    assert set(d.counts()["totals"]) == {"car", "motorcycle", "bus", "heavy_goods"}, d.counts()
+    d._track("c", det("truck"))
+    shown = d._track("c", det("truck"))
+    assert shown[0][0] == "heavy_goods", shown          # what annotate() draws
+    assert d.counts()["totals"]["heavy_goods"] == 1, d.counts()
+    assert d.counts()["visible"] == {"c": {"heavy_goods": 1}}, d.counts()
+    assert COLORS["heavy_goods"] == COLORS["truck"], "a rename must keep its colour"
+    d._capture("c", b"raw", shown, 64, 64)
+    stem = next((tmp / "pending" / "images").glob("*.jpg")).stem
+    label = (tmp / "pending" / "labels" / f"{stem}.txt").read_text()
+    assert label == "3 0.546875 0.546875 0.781250 0.781250\n", label   # truck's slot, renamed
 
     # Missing heavy deps report absent with the pip hint; hailo reports its own error.
     a = fresh()

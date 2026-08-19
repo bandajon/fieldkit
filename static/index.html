@@ -127,9 +127,14 @@
   .box span { position:absolute; left:0; top:0; padding:2px 6px; background:var(--c); color:#000;
               font:700 13px/1.3 var(--mono); white-space:nowrap; }
   .box.gone { border-style:dashed; opacity:.5; }
-  .box { --c:#e8eaec; }
-  .box.c0 { --c:#ffd400; } .box.c1 { --c:#ff45e0; }
-  .box.c2 { --c:#25dede; } .box.c3 { --c:#ff4b3e; }
+  .box, .chip { --c:#e8eaec; }
+  .c0 { --c:#ffd400; } .c1 { --c:#ff45e0; } .c2 { --c:#25dede; } .c3 { --c:#ff4b3e; }
+  .chip { display:inline-flex; align-items:center; gap:2px; padding-left:10px;
+          background:var(--panel); border:1px solid var(--line); border-left:5px solid var(--c);
+          border-radius:4px; font:600 14px/1 var(--mono); }
+  .chip button { min-width:40px; min-height:40px; background:none; border:0; color:var(--dim);
+                 font-size:17px; cursor:pointer; }
+  .chip button:hover { color:var(--fg); }
   #preview img { width:100%; max-width:640px; border:1px solid var(--line); border-radius:4px;
                  background:#000; display:block; margin-top:10px; }
 
@@ -208,6 +213,7 @@
       <button class="btn go" id="l-ok">Approve</button>
       <button class="btn halt" id="l-no">Discard</button>
     </div>
+    <div class="acts" id="l-classes"></div>
     <div class="acts">
       <input id="l-new" placeholder="new label e.g. excavator">
       <button class="btn" id="l-add">Add label</button>
@@ -669,6 +675,7 @@ async function labLoad() {
     labNote('Could not load samples — is the server reachable?');
     return;
   }
+  labChips();
   labShow();
 }
 
@@ -714,17 +721,52 @@ async function labSend(action) {
 document.getElementById('l-ok').onclick = () => labSend('approve');
 document.getElementById('l-no').onclick = () => labSend('discard');
 
+function labChips() {
+  document.getElementById('l-classes').innerHTML = labClasses.map((n, i) =>
+    `<span class="chip c${i}">${esc(n)}
+       <button data-act="rename" data-i="${i}" title="rename">&#9998;</button>
+       <button data-act="remove" data-i="${i}" title="remove">&times;</button></span>`).join('');
+}
+
+// Returns true on success; classes and chips are refreshed from the server's list.
+async function labClassPost(body) {
+  try {
+    const r = await post('/api/dataset/class', body);
+    if (!r.ok) throw new Error(r.detail || 'rejected');
+    labClasses = r.classes;           // new classes join the tap cycle on the next tap
+    labChips();
+    return true;
+  } catch (e) {
+    labNote(String(e.message || e));
+    return false;
+  }
+}
+
+document.getElementById('l-classes').onclick = async e => {
+  const b = e.target.closest('button');
+  if (!b) return;
+  const name = labClasses[b.dataset.i];
+  if (b.dataset.act === 'remove') {
+    // A remove may remap class ids in the stored label files, so every queued sample's
+    // box classes are stale — refetch the list instead of guessing the new numbering.
+    if (await labClassPost({action: 'remove', name})) labLoad();
+    return;
+  }
+  const to = (prompt(`Rename "${name}" to:`, name) || '').trim();
+  if (!to || to === name) return;
+  if (!await labClassPost({action: 'rename', from: name, to})) return;
+  // Ids are unchanged by a rename, so relabel the drawn boxes in place and keep the
+  // operator's uncommitted taps.
+  document.querySelectorAll('#l-wrap .box').forEach(d =>
+    d.querySelector('span').textContent = labClasses[labBoxes[d.dataset.i].cls] || 'removed');
+};
+
 document.getElementById('l-add').onclick = async () => {
   const el = document.getElementById('l-new'), name = el.value.trim();
   if (!name) return;
-  try {
-    const r = await post('/api/dataset/class', {name});
-    if (!r.ok) throw new Error(r.detail || 'label rejected');
-    labClasses = r.classes;           // new class joins the tap cycle on the next tap
+  if (await labClassPost({name})) {
     el.value = '';
     labNote(`added "${name}" · ${labClasses.length} classes`);
-  } catch (e) {
-    labNote(String(e.message || e));
   }
 };
 document.getElementById('l-new').onkeydown = e => {
