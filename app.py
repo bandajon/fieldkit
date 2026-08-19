@@ -18,6 +18,7 @@ from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 import camera
+import detect
 import hive
 import hostnet
 import live
@@ -96,6 +97,8 @@ OFFLOAD.start()   # no-op unless offload.enabled is set
 # body verbatim — the console sees exactly what the local Record tab does.
 HIVE = hive.Hive(CONFIG, REC, lambda: record_status(), camera.snapshot, local_ips)
 HIVE.start()   # no-op unless config.yaml has an ops: block
+DETECT = detect.Detector(CONFIG.get("cameras", []), camera.snapshot, CONFIG)
+DETECT.start()   # no-op unless the optional detection deps are installed
 
 
 @atexit.register
@@ -104,6 +107,7 @@ def _shutdown():
     would then fight the restarted app for the same segment paths."""
     REC.stop()
     LIVE.stop()
+    DETECT.stop()
 
 app = FastAPI(title="FieldKit")
 app.mount("/static", StaticFiles(directory=ROOT / "static"), name="static")
@@ -123,6 +127,7 @@ def status():
         "time": datetime.now().isoformat(timespec="seconds"),
         "go2rtc": LIVE.info(),
         "hive": HIVE.info(),
+        "detect": DETECT.info(),
     }
 
 
@@ -338,6 +343,24 @@ def camera_snapshot(ip: str):
     return Response(content=data, media_type="image/jpeg")
 
 
+@app.get("/api/detect/frame")
+def detect_frame(name: str):
+    cam = next((c for c in CONFIG["cameras"] if c["name"] == name), None)
+    if not cam:
+        raise HTTPException(404, f"no camera named {name!r} in config")
+    data = DETECT.frame(name)
+    if data is None:      # detection absent or between passes — show the live camera instead
+        data, err = camera.snapshot(cam["ip"], cam.get("user", ""), cam.get("password", ""))
+        if err:
+            raise HTTPException(502, err)
+    return Response(content=data, media_type="image/jpeg")
+
+
+@app.get("/api/detect/counts")
+def detect_counts():
+    return DETECT.counts()
+
+
 @app.post("/api/camera/test_rtsp")
 def camera_test_rtsp(body: dict = Body(default={})):
     ip = valid_ip(body.get("ip"))
@@ -386,6 +409,7 @@ def apply_cameras():
     for c in CONFIG["cameras"]:
         REC.add_camera(c)
     LIVE.set_cameras(CONFIG["cameras"])
+    DETECT.set_cameras(CONFIG["cameras"])
 
 
 @app.post("/api/config/add_camera")
@@ -424,6 +448,7 @@ def config_rename_camera(body: dict = Body(default={})):
     CONFIG_PATH.write_text(yaml.safe_dump(CONFIG, sort_keys=False))
     REC.add_camera(cam)
     LIVE.set_cameras(CONFIG["cameras"])
+    DETECT.set_cameras(CONFIG["cameras"])
     # Already-written segments stay under <record_dir>/<site>/<old>/ — only new ones move.
     return {"ok": True}
 
@@ -438,6 +463,7 @@ def config_remove_camera(body: dict = Body(default={})):
     CONFIG["cameras"] = [c for c in CONFIG["cameras"] if c["name"] != name]
     CONFIG_PATH.write_text(yaml.safe_dump(CONFIG, sort_keys=False))
     LIVE.set_cameras(CONFIG["cameras"])
+    DETECT.set_cameras(CONFIG["cameras"])
     # Recordings under <record_dir>/<site>/<name>/ are deliberately left on disk.
     return {"ok": True}
 
