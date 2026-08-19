@@ -461,7 +461,8 @@ def dataset_samples():
             continue
     pending.sort(key=lambda t: t[0], reverse=True)
     return {"classes": dataset_classes(), "approved": approved_counts(),
-            "pending": [s for _, s in pending[:100]]}
+            # the list is capped for payload size; pending_total is the real pile
+            "pending_total": len(pending), "pending": [s for _, s in pending[:100]]}
 
 
 @app.get("/api/dataset/image")

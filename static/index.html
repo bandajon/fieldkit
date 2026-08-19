@@ -664,7 +664,8 @@ setInterval(monTick, 1000);   // 1 fps, and monTick no-ops when the tab is hidde
 // Boxes are YOLO-normalized, so percentage CSS positions them with no natural-size math.
 // cls === labClasses.length is the "removed" rung of the tap cycle: drawn dashed rather than
 // hidden so it stays tappable back to car, and dropped from the POST.
-let labClasses = [], labQueue = [], labBoxes = [], labApproved = {frames: 0, boxes: {}};
+let labClasses = [], labQueue = [], labBoxes = [], labTotal = 0,
+    labApproved = {frames: 0, boxes: {}};
 const labNote = t => document.getElementById('l-note').textContent = t;
 const labStats = () => document.getElementById('l-stats').textContent = labApproved.frames
   ? `fine-tune set: ${labApproved.frames} frames · ` +
@@ -677,6 +678,7 @@ async function labLoad() {
     const d = await (await fetch('/api/dataset/samples')).json();
     labClasses = d.classes || [];
     labQueue = d.pending || [];
+    labTotal = d.pending_total ?? labQueue.length;   // the list is capped at 100 per fetch
     labApproved = d.approved || {frames: 0, boxes: {}};
   } catch (e) {
     labNote('Could not load samples — is the server reachable?');
@@ -689,12 +691,15 @@ async function labLoad() {
 
 function labShow() {
   const s = labQueue[0], wrap = document.getElementById('l-wrap');
-  setCount('label', labQueue.length, 'to review');
+  setCount('label', labTotal, 'to review');
   wrap.hidden = document.getElementById('l-acts').hidden = !s;
-  if (!s) return labNote('No samples waiting — detection captures one every ~30 s per camera ' +
-                         'when vehicles are visible.');
+  if (!s) {
+    // The batch is done but more may wait on disk (the fetch is capped at 100).
+    if (labTotal > 0) return labLoad();
+    return labNote('No samples waiting — detection captures one when the scene changes.');
+  }
   labBoxes = s.boxes.map(b => ({...b}));
-  labNote(`${labQueue.length} remaining · tap a box to change its class`);
+  labNote(`${labTotal} remaining · tap a box to change its class`);
   wrap.innerHTML = `<img src="/api/dataset/image?id=${encodeURIComponent(s.id)}" alt="">` +
     labBoxes.map((b, i) => `<div class="${boxCls(b)}" data-i="${i}"
         style="left:${(b.cx - b.w / 2) * 100}%; top:${(b.cy - b.h / 2) * 100}%;
@@ -732,6 +737,7 @@ async function labSend(action) {
     labStats();
   }
   labQueue.shift();
+  labTotal = Math.max(0, labTotal - 1);   // skip leaves the total: the frame stays on disk
   labShow();
 }
 document.getElementById('l-ok').onclick = () => labSend('approve');
