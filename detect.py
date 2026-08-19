@@ -8,6 +8,7 @@ so a node without them reports state "absent" and the rest of FieldKit runs.
 import io
 import threading
 import time
+from collections import Counter
 from datetime import date
 
 CLASSES = {2: "car", 3: "motorcycle", 5: "bus", 7: "truck"}      # COCO ids
@@ -36,6 +37,13 @@ def iou(a, b):
     inter = w * h
     union = (ax2 - ax1) * (ay2 - ay1) + (bx2 - bx1) * (by2 - by1) - inter
     return inter / union if union > 0 else 0.0
+
+
+def label_of(t):
+    """Majority class of a track. A tie keeps the current label: deterministic, and a
+    50/50 track then stays put instead of flapping between two names."""
+    top = max(t["votes"].values())
+    return t["label"] if t["votes"][t["label"]] == top else t["votes"].most_common(1)[0][0]
 
 
 def annotate(img, dets, quality=85):
@@ -153,8 +161,9 @@ class Detector:
             """-> [(cls_name, conf, (x1, y1, x2, y2))]. A hailo backend is a drop-in
             replacement for exactly this shape — tracker and drawing see nothing else."""
             out = []
+            # agnostic_nms: one vehicle must not survive NMS as both a car and a truck box.
             for r in model.predict(img, imgsz=IMGSZ, conf=CONF, classes=list(CLASSES),
-                                   verbose=False):
+                                   agnostic_nms=True, verbose=False):
                 for box, cid, conf in zip(r.boxes.xyxy.tolist(), r.boxes.cls.tolist(),
                                           r.boxes.conf.tolist()):
                     name = CLASSES.get(int(cid))
@@ -215,12 +224,18 @@ class Detector:
                 self.tracks = {}
 
     def _track(self, name, dets):
-        """Greedy same-class IoU matching. Called with [] when the snapshot failed.
+        """Greedy IoU matching, class-agnostic. Called with [] when the snapshot failed.
+
+        A car passing a truck picks up the truck's label for a frame or two. Matching on
+        position alone keeps that one track, and the class is decided by majority vote
+        over its whole life instead of by whatever the first frame guessed.
 
         ponytail: at 1 fps a vehicle that parks, is occluded, or crosses the frame in
         under a second can be counted twice or missed entirely — totals are a traffic
-        estimate, not a toll gate. Upgrade path: feed this tracker from the go2rtc sub
-        stream at ~5 fps server-side instead of snapshot polling.
+        estimate, not a toll gate. Class-agnostic matching also merges two vehicles that
+        genuinely overlap by IOU_MATCH into one track: an undercount, and the price of
+        absorbing class flips. Upgrade path: feed this tracker from the go2rtc sub stream
+        at ~5 fps server-side instead of snapshot polling.
         """
         with self.lock:
             if not self._known(name):
@@ -231,24 +246,35 @@ class Detector:
             for cls, conf, box in dets:
                 best, best_iou = None, IOU_MATCH
                 for t in tracks:
-                    if t["cls"] != cls or t["seen"]:
+                    if t["seen"]:
                         continue
                     v = iou(t["box"], box)
                     if v >= best_iou:
                         best, best_iou = t, v
                 if best is None:
-                    tracks.append({"cls": cls, "box": box, "hits": 1, "misses": 0,
-                                   "seen": True, "counted": False})
+                    tracks.append({"votes": Counter([cls]), "label": cls, "box": box,
+                                   "hits": 1, "misses": 0, "seen": True, "counted_as": None})
                 else:
-                    best.update(box=box, hits=best["hits"] + 1, misses=0, seen=True)
+                    best["votes"][cls] += 1
+                    best.update(box=box, hits=best["hits"] + 1, misses=0, seen=True,
+                                label=label_of(best))
             for t in tracks:
                 if not t["seen"]:
                     t["misses"] += 1
-                elif t["hits"] >= COUNT_AT_HITS and not t["counted"]:
-                    t["counted"] = True
-                    self.totals[t["cls"]] += 1
+                elif t["counted_as"] is None:
+                    if t["hits"] >= COUNT_AT_HITS:
+                        t["counted_as"] = t["label"]
+                        self.totals[t["label"]] += 1
+                elif t["counted_as"] != t["label"]:
+                    # The vote settled on another class: move this track's single tally.
+                    # Never negative — counted_as is a class this track incremented.
+                    self.totals[t["counted_as"]] -= 1
+                    self.totals[t["label"]] += 1
+                    t["counted_as"] = t["label"]
             self.tracks[name] = [t for t in tracks if t["misses"] <= MAX_MISSES]
-            self.visible[name] = {c: sum(1 for x in dets if x[0] == c) for c, _, _ in dets}
+            # Voted labels of live tracks, not raw detections — raw labels are exactly
+            # what flickers during an occlusion.
+            self.visible[name] = Counter(t["label"] for t in tracks if t["seen"])
 
 
 if __name__ == "__main__":
@@ -286,11 +312,37 @@ if __name__ == "__main__":
     d._track("c", [])
     d._track("c", [])
     assert d.totals["car"] == 0, d.totals
-    # ...and a class change over the same pixels is a different vehicle, not a match.
+    # A class change over the same pixels is the SAME vehicle relabelled, not a second
+    # one: one track, one count, majority label (a 1-1 tie keeps the first label).
     d = fresh()
     d._track("c", det("bus"))
+    d._track("c", det("truck", SHIFT))
+    assert len(d.tracks["c"]) == 1, d.tracks
+    assert sum(d.totals.values()) == 1 and d.totals["bus"] == 1, d.totals
+
+    # Occlusion: car, car, truck, car counts one car and no truck — the flip is outvoted.
+    d = fresh()
+    for cls in ("car", "car", "truck", "car"):
+        d._track("c", det(cls, SHIFT))
+    assert d.totals == {"car": 1, "motorcycle": 0, "bus": 0, "truck": 0}, d.totals
+    assert d.counts()["visible"] == {"c": {"car": 1}}, d.counts()
+
+    # ...and if the vote settles after counting, the tally moves rather than doubling.
+    d = fresh()
     d._track("c", det("truck"))
-    assert d.totals == {"car": 0, "motorcycle": 0, "bus": 0, "truck": 0}, d.totals
+    d._track("c", det("car", SHIFT))          # hit 2: counted under the 1-1 tie label
+    assert d.totals["truck"] == 1, d.totals
+    for _ in range(3):
+        d._track("c", det("car", SHIFT))
+    assert d.totals == {"car": 1, "motorcycle": 0, "bus": 0, "truck": 0}, d.totals
+    assert min(d.totals.values()) >= 0, d.totals
+
+    # Two vehicles far apart stay two tracks, one count each, even mid-flip.
+    d = fresh()
+    for _ in range(2):
+        d._track("c", det("car") + det("truck", FAR))
+    assert d.totals["car"] == 1 and d.totals["truck"] == 1, d.totals
+    assert d.counts()["visible"] == {"c": {"car": 1, "truck": 1}}, d.counts()
 
     # (c) expire after MAX_MISSES, then the same spot is a new vehicle.
     d = fresh()
@@ -402,5 +454,6 @@ if __name__ == "__main__":
     h.thread.join(timeout=3)
     assert h.info()["state"] == "error" and "hailo" in h.info()["error"], h.info()
 
-    print("detect self-check ok: counts once at 2 hits, flickers ignored, "
+    print("detect self-check ok: counts once at 2 hits, flickers ignored, class flips "
+          "outvoted, "
           "tracks expire after", MAX_MISSES, "misses, daily reset + stale frames ok")
