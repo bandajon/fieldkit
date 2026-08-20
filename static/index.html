@@ -132,6 +132,9 @@
   .box span { position:absolute; left:0; top:0; padding:2px 6px; background:var(--c); color:#000;
               font:700 13px/1.3 var(--mono); white-space:nowrap; }
   .box.gone { border-style:dashed; opacity:.5; }
+  .box .x { position:absolute; right:-3px; top:-3px; width:24px; height:24px; background:var(--c);
+            border:2px solid #000; border-radius:3px; color:#000; cursor:pointer;
+            font:700 16px/20px var(--mono); text-align:center; }
   .box, .chip { --c:#e8eaec; }
   .c0 { --c:#ffd400; } .c1 { --c:#ff45e0; } .c2 { --c:#25dede; } .c3 { --c:#ff4b3e; }
   .chip { display:inline-flex; align-items:center; gap:2px; padding-left:10px;
@@ -215,6 +218,7 @@
     <h2 id="cnt-label"></h2>
     <div id="l-wrap" hidden></div>
     <div class="rowbtns" id="l-acts" hidden>
+      <button class="btn" id="l-back">&larr; Back</button>
       <button class="btn go" id="l-ok">Approve</button>
       <button class="btn" id="l-skip">Skip</button>
       <button class="btn halt" id="l-no">Discard</button>
@@ -670,6 +674,7 @@ setInterval(monTick, 1000);   // 1 fps, and monTick no-ops when the tab is hidde
 // cls === labClasses.length is the "removed" rung of the tap cycle: drawn dashed rather than
 // hidden so it stays tappable back to car, and dropped from the POST.
 let labLastCls = 0;
+let labDone = [];   // ids approved this session, newest last — the Back button's stack
 let labClasses = [], labQueue = [], labBoxes = [], labTotal = 0,
     labApproved = {frames: 0, boxes: {}};
 const labNote = t => document.getElementById('l-note').textContent = t;
@@ -698,15 +703,19 @@ async function labLoad() {
 function labShow() {
   const s = labQueue[0], wrap = document.getElementById('l-wrap');
   setCount('label', labTotal, 'to review');
-  wrap.hidden = document.getElementById('l-acts').hidden = !s;
+  wrap.hidden = !s;
+  // The row survives an empty queue while Back can still reopen the last approval.
+  document.getElementById('l-acts').hidden = !s && !labDone.length;
+  document.getElementById('l-back').disabled = !labDone.length;
+  ['l-ok', 'l-skip', 'l-no'].forEach(id => document.getElementById(id).disabled = !s);
   if (!s) {
     // The batch is done but more may wait on disk (the fetch is capped at 100).
     if (labTotal > 0) return labLoad();
     return labNote('No samples waiting — detection captures one when the scene changes.');
   }
   labBoxes = s.boxes.map(b => ({...b}));
-  labNote(`${labTotal} remaining · tap a box to change its class, drag to move, corner to resize, ` +
-          `drag empty area to add a box`);
+  labNote(`${labTotal} remaining · tap a box to change its class, × to delete, drag to move, ` +
+          `corner to resize, drag empty area to add a box`);
   wrap.innerHTML = `<img src="/api/dataset/image?id=${encodeURIComponent(s.id)}" alt="">` +
     labBoxes.map(boxHtml).join('');
 }
@@ -714,7 +723,7 @@ function labShow() {
 const boxHtml = (b, i) => `<div class="${boxCls(b)}" data-i="${i}"
     style="left:${(b.cx - b.w / 2) * 100}%; top:${(b.cy - b.h / 2) * 100}%;
            width:${b.w * 100}%; height:${b.h * 100}%">
-    <span>${esc(labClasses[b.cls] || 'removed')}</span><i class="grip"></i></div>`;
+    <span>${esc(labClasses[b.cls] || 'removed')}</span><b class="x">&times;</b><i class="grip"></i></div>`;
 
 // Rubber-band draw: the two corners in any order → a normalized box clamped to the frame
 // (pointer capture happily reports coordinates outside the image).
@@ -746,6 +755,11 @@ document.getElementById('l-wrap').onpointerdown = e => {
   const d = e.target.closest('.box');
   if (!d) return labDraw(e);
   const b = labBoxes[d.dataset.i], b0 = {...b}, r = d.parentElement.getBoundingClientRect();
+  if (e.target.classList.contains('x')) {
+    // Deleted, not spliced: data-i of the surviving boxes must keep pointing at labBoxes.
+    b.del = true;
+    return d.remove();
+  }
   const grip = e.target.classList.contains('grip'), x0 = e.clientX, y0 = e.clientY;
   let moved = false;
   d.setPointerCapture(e.pointerId);
@@ -794,7 +808,7 @@ async function labSend(action) {
   const s = labQueue[0];
   if (!s) return;
   labNote('saving…');
-  const boxes = labBoxes.filter(b => b.cls < labClasses.length);
+  const boxes = labBoxes.filter(b => !b.del && b.cls < labClasses.length);
   try {
     const r = await post('/api/dataset/label', {id: s.id, action, boxes});
     if (!r.ok) throw new Error('rejected');
@@ -803,6 +817,7 @@ async function labSend(action) {
     return;
   }
   if (action === 'approve') {   // bumped locally; the next labLoad trues it up from disk
+    labDone.push(s.id);         // approvals only — a discard is deleted server-side
     labApproved.frames++;
     boxes.forEach(b => {
       const n = labClasses[b.cls];
@@ -819,6 +834,30 @@ document.getElementById('l-ok').onclick = () => labSend('approve');
 // Skip is for near-duplicates (parked vehicles) not worth a decision.
 document.getElementById('l-skip').onclick = () => { labQueue.shift(); labShow(); };
 document.getElementById('l-no').onclick = () => labSend('discard');
+
+// Reopen the last approval to amend it. Undoes the optimistic stats bump the same way
+// labSend applied it; the next labLoad trues both up from disk.
+document.getElementById('l-back').onclick = async () => {
+  const id = labDone.pop();
+  if (!id) return;
+  let r;
+  try {
+    r = await post('/api/dataset/label', {id, action: 'unapprove'});
+    if (!r.ok) throw new Error(r.detail || 'rejected');
+  } catch (e) {
+    labNote(String(e.message || e));   // id stays popped: it is not coming back
+    return labShow();
+  }
+  labQueue.unshift({id, boxes: r.boxes});
+  labTotal++;
+  labApproved.frames = Math.max(0, labApproved.frames - 1);
+  r.boxes.forEach(b => {
+    const n = labClasses[b.cls];
+    labApproved.boxes[n] = Math.max(0, (labApproved.boxes[n] || 0) - 1);
+  });
+  labStats();
+  labShow();
+};
 
 function labChips() {
   document.getElementById('l-classes').innerHTML = labClasses.map((n, i) =>

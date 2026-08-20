@@ -477,8 +477,21 @@ def dataset_image(id: str):
 def dataset_label(body: dict = Body(default={})):
     sid = valid_sample_id(body.get("id"))
     action = body.get("action")
+    if action == "unapprove":
+        src_img, src_lbl = sample_paths(sid, "approved")
+        if not src_img.is_file():
+            raise HTTPException(404, f"{sid} is not in the approved set")
+        img, lbl = sample_paths(sid)
+        img.parent.mkdir(parents=True, exist_ok=True)
+        lbl.parent.mkdir(parents=True, exist_ok=True)
+        src_img.rename(img)
+        lbl.write_text(src_lbl.read_text() if src_lbl.is_file() else "")
+        src_lbl.unlink(missing_ok=True)
+        for p in (img, lbl):
+            os.utime(p, None)   # front of the review queue, last in line for eviction
+        return {"ok": True, "id": sid, "boxes": read_boxes(lbl)}
     if action not in ("approve", "discard"):
-        raise HTTPException(400, "action must be 'approve' or 'discard'")
+        raise HTTPException(400, "action must be 'approve', 'discard' or 'unapprove'")
     img, lbl = sample_paths(sid)
     if not img.is_file():
         raise HTTPException(404, f"no pending sample {sid!r}")
