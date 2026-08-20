@@ -32,7 +32,9 @@ IDLE_WAIT = 0.2          # no new frames anywhere: don't spin
 SETTLED = 5.0            # a reader that survives this long resets its backoff
 MAX_BACKOFF = 30.0
 CAPTURE_EVERY = 10.0     # dataset samples per camera; dedup already skips unchanged scenes
-DATASET_CAP = 1000       # rolling buffer of the freshest unlabeled frames
+DATASET_CAP = 10000      # rolling buffer of the freshest unlabeled frames; ~2-3 GB of JPEGs.
+                         # Sized for the fleet goal: 9 toll gates, >=10k contributed each,
+                         # 100k-image combined dataset.
 SOI, EOI = b"\xff\xd8", b"\xff\xd9"
 MAX_BUF = 8_000_000      # a camera emitting garbage must not grow the buffer forever
 PIP_HINT = "detection needs: pip install ultralytics pillow"
