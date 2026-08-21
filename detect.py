@@ -22,6 +22,7 @@ CLASS_IDS = {n: i for i, n in enumerate(CLASSES.values())}       # dataset ids, 
 COLORS = {"car": (255, 208, 0), "motorcycle": (255, 0, 200),
           "bus": (0, 210, 255), "truck": (230, 40, 40)}
 WEIGHTS = "yolov8n.pt"
+EXTRA_COLORS = [(120, 255, 120), (255, 140, 0), (150, 150, 255), (255, 255, 255)]
 CONF = 0.4
 IMGSZ = 1280      # sub-streams are 1280x720, so this is ~native; 640 missed distant trucks
 FPS = 5           # ffmpeg decimates to this — the loop then runs flat out
@@ -66,6 +67,13 @@ def same_scene(a, b, iou_min=0.85):
             return False
         pool.remove(hit)
     return True
+
+
+def palette(names):
+    """A stable box colour per class: the four known ones keep theirs, the rest cycle
+    EXTRA_COLORS by position."""
+    return {n: COLORS.get(n) or EXTRA_COLORS[i % len(EXTRA_COLORS)]
+            for i, n in enumerate(names)}
 
 
 def label_of(t):
@@ -170,6 +178,8 @@ class Detector:
         self.dataset_dir = Path(dataset_dir) if dataset_dir else None
         self.backend = str(cfg.get("detect_backend", "cpu") or "cpu").strip().lower()
         self.hef_path = cfg.get("hef_path", "")   # hailo model; read here, used once that backend lands
+        # Fine-tuned weights bring their own taxonomy: model.names replaces the COCO four.
+        self.weights = str(cfg.get("detect_weights", "") or "").strip()
         self.state = "stopped"
         self.error = ""
         self.day = date.today().isoformat()
@@ -238,7 +248,8 @@ class Detector:
 
     def info(self):
         with self.lock:
-            return {"state": self.state, "backend": self.backend, "error": self.error}
+            return {"state": self.state, "backend": self.backend, "error": self.error,
+                    "weights": self.weights}
 
     # --- worker -----------------------------------------------------------
 
@@ -273,27 +284,40 @@ class Detector:
         if self.backend != "cpu":
             raise RuntimeError(HAILO_HINT if self.backend == "hailo"
                                else f"unknown detect_backend: {self.backend}")
+        if self.weights and not Path(self.weights).exists():
+            # Never fall back to the COCO weights: the counts would silently change meaning.
+            raise RuntimeError(f"detect_weights not found: {self.weights}")
         from ultralytics import YOLO
         try:
             import torch
             dev = "mps" if torch.backends.mps.is_available() else "cpu"
         except Exception:                 # torch rides along with ultralytics; CPU regardless
             dev = "cpu"
+        path = self.weights or WEIGHTS
+        lookup, extra = CLASSES, {"classes": list(CLASSES)}
+        if self.weights:
+            # A fine-tuned model was trained from classes.txt, so its names already are
+            # the operator's taxonomy: keep every class it knows, and no COCO filter.
+            lookup, extra = dict(YOLO(path).names), {}
+            self.display = {n: n for n in lookup.values()}
+            self.display_ids = {n: i for i, n in lookup.items()}
+            self.totals = {n: 0 for n in lookup.values()}
+            COLORS.update(palette(lookup.values()))
 
         def track(name, img):
             model = self.models.get(name)
             if model is None:
-                model = self.models[name] = YOLO(WEIGHTS)   # one per camera: tracker state
+                model = self.models[name] = YOLO(path)   # one per camera: tracker state
             out = []
             # agnostic_nms: one vehicle must not survive NMS as both a car and a truck box.
-            for r in model.track(img, imgsz=IMGSZ, conf=CONF, classes=list(CLASSES),
-                                 agnostic_nms=True, persist=True, tracker="bytetrack.yaml",
-                                 device=dev, verbose=False):
+            for r in model.track(img, imgsz=IMGSZ, conf=CONF, agnostic_nms=True,
+                                 persist=True, tracker="bytetrack.yaml",
+                                 device=dev, verbose=False, **extra):
                 ids = r.boxes.id
                 ids = ids.tolist() if ids is not None else [None] * len(r.boxes)
                 for box, cid, conf, tid in zip(r.boxes.xyxy.tolist(), r.boxes.cls.tolist(),
                                                r.boxes.conf.tolist(), ids):
-                    cls = CLASSES.get(int(cid))
+                    cls = lookup.get(int(cid))
                     if cls:
                         out.append((cls, float(conf), tuple(float(v) for v in box),
                                     None if tid is None else int(tid)))
@@ -412,6 +436,8 @@ class Detector:
             # Append-only, ids are positional: the operator's file wins, or the classes
             # they added on the Label tab would lose their ids on every restart.
             classes = self.dataset_dir / "classes.txt"
+            if self.weights:
+                return          # classes.txt is what this model was trained from: hands off
             if not classes.exists():
                 classes.write_text("\n".join(CLASS_IDS) + "\n")
                 return
@@ -631,7 +657,8 @@ if __name__ == "__main__":
                 if d.frame("c"):
                     break
                 time.sleep(0.1)
-            assert d.info() == {"state": "running", "backend": "cpu", "error": ""}, d.info()
+            assert d.info() == {"state": "running", "backend": "cpu", "error": "",
+                                "weights": ""}, d.info()
             assert d.counts()["totals"]["car"] == 1, d.counts()   # one id, one count
 
             assert (tmp / "classes.txt").read_text() == "car\nmotorcycle\nbus\ntruck\n"
@@ -703,12 +730,66 @@ if __name__ == "__main__":
     assert any(p.read_bytes() == b"three"
                for p in (dup / "pending" / "images").glob("*.jpg")), "a new vehicle captures"
 
+    # Fine-tuned weights: the model's own names are the taxonomy, end to end.
+    import sys
+    import types
+
+    class T(list):
+        def tolist(self):
+            return list(self)
+
+    class FakeBoxes:
+        xyxy, cls, conf, id = T([[10.0, 10.0, 60.0, 60.0]]), T([4.0]), T([0.9]), T([7.0])
+
+        def __len__(self):
+            return 1
+
+    class FakeModel:
+        names = {0: "bike", 1: "minibus", 2: "car", 3: "tipper", 4: "haulage", 5: "tractor"}
+        seen = {}
+
+        def track(self, img, **kw):
+            FakeModel.seen = kw
+            return [types.SimpleNamespace(boxes=FakeBoxes())]
+
+    fine = Path(tempfile.mkdtemp())
+    weights = fine / "custom.pt"
+    weights.write_bytes(b"")                     # _load only checks that it exists
+    (fine / "classes.txt").write_text("bike\nminibus\ncar\ntipper\nharvester\n")
+    sys.modules["ultralytics"] = types.SimpleNamespace(YOLO=lambda p: FakeModel())
+    try:
+        d = Detector([CAM], nosnap, {"detect_weights": str(weights)}, dataset_dir=fine)
+        run = d._load()
+        assert d.info()["weights"] == str(weights), d.info()
+        assert set(d.display) == set(FakeModel.names.values()), d.display
+        assert d.display_ids["tipper"] == 3 and d.display_ids["tractor"] == 5, d.display_ids
+        assert set(d.counts()["totals"]) == set(FakeModel.names.values()), d.counts()
+        assert d.counts()["totals"]["haulage"] == 0
+        assert run("c", None) == [("haulage", 0.9, (10.0, 10.0, 60.0, 60.0), 7)], run("c", None)
+        assert "classes" not in FakeModel.seen, FakeModel.seen   # no COCO filter
+        assert COLORS["car"] == (255, 208, 0), "a known class keeps its colour"
+        assert COLORS["haulage"] in EXTRA_COLORS and COLORS["bike"] in EXTRA_COLORS
+        d._dataset_init()
+        assert (fine / "classes.txt").read_text().endswith("harvester\n"), "hands off"
+        d._capture("c", b"raw", [("haulage", 0.9, BOX)], 64, 64)
+        stem = next((fine / "pending" / "images").glob("*.jpg")).stem
+        assert (fine / "pending" / "labels" / f"{stem}.txt").read_text().startswith("4 ")
+    finally:
+        del sys.modules["ultralytics"]
+
+    # Missing weights must fail loudly — falling back to COCO would silently change counts.
+    m = Detector([], nosnap, {"detect_weights": "/nope/custom.pt"})
+    m.start()
+    m.thread.join(timeout=3)
+    assert m.info()["state"] == "error" and "/nope/custom.pt" in m.info()["error"], m.info()
+
     # Missing heavy deps report absent with the pip hint; hailo reports its own error.
     a = fresh()
     with patch.object(Detector, "_load", side_effect=ImportError("no ultralytics")):
         a.start()
         a.thread.join(timeout=3)
-    assert a.info() == {"state": "absent", "backend": "cpu", "error": PIP_HINT}, a.info()
+    assert a.info() == {"state": "absent", "backend": "cpu", "error": PIP_HINT,
+                        "weights": ""}, a.info()
     assert a.stop() == "absent", "stop must not erase the pip hint"
 
     h = Detector([], nosnap, {"detect_backend": "hailo", "hef_path": "/opt/yolov8n.hef"})
