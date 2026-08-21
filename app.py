@@ -162,6 +162,17 @@ def live_stop():
     return {"state": LIVE.stop()}
 
 
+@app.post("/api/detect/start")
+def detect_start():
+    return {"state": DETECT.start()}
+
+
+@app.post("/api/detect/stop")
+def detect_stop():
+    """Frees the GPU/CPU for training runs; Monitor falls back to raw snapshots."""
+    return {"state": DETECT.stop()}
+
+
 @app.get("/api/record/status")
 def record_status():
     du = shutil.disk_usage(record_dir())
