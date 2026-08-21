@@ -243,6 +243,16 @@ class Recorder:
                     s.update(proc=None, state="STOPPED", started=None, until=None)
             self._save_state()
 
+    def shutdown(self):
+        """Process exit: kill the children so an orphaned ffmpeg can't fight the
+        restarted app for segment paths — but leave `desired` and the state file
+        alone, so resume() re-arms these sessions on the next boot. stop() is the
+        operator's intent; this is not."""
+        with self.lock:
+            procs = [s["proc"] for s in self.st.values() if s["proc"]]
+        for p in procs:
+            _graceful(p)     # SIGINT first: the last segment must finalise
+
     def status(self):
         now = time.time()
         out = {}

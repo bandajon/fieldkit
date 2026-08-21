@@ -121,7 +121,7 @@ DETECT.start()   # no-op unless the optional detection deps are installed
 def _shutdown():
     """Children spawned in their own process group survive Ctrl-C; an orphaned ffmpeg
     would then fight the restarted app for the same segment paths."""
-    REC.stop()
+    REC.shutdown()   # not stop(): a restart must not erase the sessions resume() re-arms
     LIVE.stop()
     DETECT.stop()
 
