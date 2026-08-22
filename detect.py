@@ -108,6 +108,56 @@ def annotate(img, dets, quality=85):
     return buf.getvalue()
 
 
+_review = {}                      # lazy singleton: model + class lookup, built on first call
+_review_lock = threading.Lock()
+
+
+def review_frame(jpeg, cfg):
+    """Annotate one still for the Review tab. -> (jpeg bytes, None) | (None, error).
+
+    predict(), not track(): stills have no continuity, and the live models belong to the
+    worker thread — sharing one would corrupt its ByteTrack state.
+
+    ponytail: one model behind one lock, so concurrent scrubs queue instead of racing it.
+    Upgrade path: a small pool if review ever needs parallelism.
+    """
+    weights = str(cfg.get("detect_weights", "") or "").strip()
+    if weights and not Path(weights).exists():
+        return None, f"detect_weights not found: {weights}"
+    path = weights or WEIGHTS
+    with _review_lock:
+        try:
+            if _review.get("path") != path:
+                from ultralytics import YOLO
+                try:
+                    import torch
+                    dev = "mps" if torch.backends.mps.is_available() else "cpu"
+                except Exception:
+                    dev = "cpu"
+                model = YOLO(path)
+                # Fine-tuned weights carry the operator's taxonomy; stock weights are COCO.
+                lookup = dict(model.names) if weights else CLASSES
+                COLORS.update(palette(lookup.values()))
+                _review.update(path=path, model=model, lookup=lookup, dev=dev,
+                               extra={} if weights else {"classes": list(CLASSES)})
+            from PIL import Image
+            img = Image.open(io.BytesIO(jpeg)).convert("RGB")
+            dets = []
+            for r in _review["model"].predict(img, imgsz=IMGSZ, conf=CONF, agnostic_nms=True,
+                                              device=_review["dev"], verbose=False,
+                                              **_review["extra"]):
+                for box, cid, conf in zip(r.boxes.xyxy.tolist(), r.boxes.cls.tolist(),
+                                          r.boxes.conf.tolist()):
+                    cls = _review["lookup"].get(int(cid))
+                    if cls:
+                        dets.append((cls, float(conf), tuple(float(v) for v in box)))
+            return annotate(img, dets), None
+        except ImportError:
+            return None, PIP_HINT
+        except Exception as e:
+            return None, str(e)
+
+
 class Reader:
     """One ffmpeg per camera decoding the sub stream to mjpeg on stdout. Keeps only the
     latest complete frame — the inference loop is slower than the stream and old frames
@@ -752,11 +802,15 @@ if __name__ == "__main__":
             FakeModel.seen = kw
             return [types.SimpleNamespace(boxes=FakeBoxes())]
 
+        predict = track
+
     fine = Path(tempfile.mkdtemp())
     weights = fine / "custom.pt"
     weights.write_bytes(b"")                     # _load only checks that it exists
     (fine / "classes.txt").write_text("bike\nminibus\ncar\ntipper\nharvester\n")
-    sys.modules["ultralytics"] = types.SimpleNamespace(YOLO=lambda p: FakeModel())
+    built = []
+    sys.modules["ultralytics"] = types.SimpleNamespace(
+        YOLO=lambda p: (built.append(p), FakeModel())[1])
     try:
         d = Detector([CAM], nosnap, {"detect_weights": str(weights)}, dataset_dir=fine)
         run = d._load()
@@ -774,6 +828,20 @@ if __name__ == "__main__":
         d._capture("c", b"raw", [("haulage", 0.9, BOX)], 64, 64)
         stem = next((fine / "pending" / "images").glob("*.jpg")).stem
         assert (fine / "pending" / "labels" / f"{stem}.txt").read_text().startswith("4 ")
+
+        # review_frame: one still, one shared model, never the worker's tracking models.
+        assert review_frame(b"x", {"detect_weights": "/nope.pt"}) == (
+            None, "detect_weights not found: /nope.pt")
+        if jpeg:                       # needs Pillow, same as annotate
+            built.clear()
+            worker_models = dict(d.models)
+            out, err = review_frame(jpeg, {"detect_weights": str(weights)})
+            assert err is None and out.startswith(SOI), (err, out and out[:4])
+            assert review_frame(jpeg, {"detect_weights": str(weights)})[0], "second call"
+            assert len(built) == 1, built            # built once, reused
+            assert d.models == worker_models, "review must not touch the worker's models"
+            assert review_frame(b"not a jpeg", {})[0] is None
+            assert review_frame(b"not a jpeg", {})[1], "a bad still must report why"
     finally:
         del sys.modules["ultralytics"]
 

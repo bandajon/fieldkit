@@ -143,6 +143,13 @@
   .chip button { min-width:40px; min-height:40px; background:none; border:0; color:var(--dim);
                  font-size:17px; cursor:pointer; }
   .chip button:hover { color:var(--fg); }
+  #r-img { display:block; width:100%; aspect-ratio:16/9; background:#000; border-radius:4px;
+           border:1px solid var(--line); }
+  #r-slider { width:100%; height:48px; accent-color:var(--fg); }
+  #r-cov { position:relative; height:8px; margin-bottom:12px; background:var(--panel);
+           border:1px solid var(--line); border-radius:3px; overflow:hidden; }
+  #r-cov i { position:absolute; top:0; bottom:0; background:var(--ok); }
+  #r-time { flex:1; text-align:center; font:600 17px/48px var(--mono); }
   #preview img { width:100%; max-width:640px; border:1px solid var(--line); border-radius:4px;
                  background:#000; display:block; margin-top:10px; }
 
@@ -164,6 +171,7 @@
   <button data-tab="record">Record</button>
   <button data-tab="monitor">Monitor</button>
   <button data-tab="label">Label</button>
+  <button data-tab="review">Review</button>
 </nav>
 
 <main>
@@ -231,6 +239,26 @@
     <div id="l-stats" class="res"></div>
     <div id="l-note" class="res"></div>
   </section>
+  <section id="review">
+    <h2 id="cnt-review"></h2>
+    <div class="acts">
+      <select id="r-cam"></select>
+      <select id="r-day"></select>
+    </div>
+    <img id="r-img" alt="">
+    <input type="range" id="r-slider" min="0" max="0" step="1" value="0">
+    <div id="r-cov"></div>
+    <div class="rowbtns">
+      <button class="btn" data-step="-600">-10m</button>
+      <button class="btn" data-step="-60">-1m</button>
+      <button class="btn" data-step="-10">-10s</button>
+      <b id="r-time" class="num">--:--:--</b>
+      <button class="btn" data-step="10">+10s</button>
+      <button class="btn" data-step="60">+1m</button>
+      <button class="btn" data-step="600">+10m</button>
+    </div>
+    <div id="r-note" class="res"></div>
+  </section>
 </main>
 
 <script>
@@ -248,6 +276,7 @@ document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
   if (tab === 'record') recPoll();
   if (tab === 'monitor') monRender();
   if (tab === 'label') labLoad();
+  if (tab === 'review') revInit();
 });
 
 async function refreshStatus() {
@@ -919,6 +948,86 @@ document.getElementById('l-add').onclick = async () => {
 document.getElementById('l-new').onkeydown = e => {
   if (e.key === 'Enter') document.getElementById('l-add').click();
 };
+
+// --- Review tab ---
+let revSegs = [], revT = 0, revTimer = null, revUrl = '';
+const revNote = t => document.getElementById('r-note').textContent = t;
+const revDayKey = t => new Date(t * 1000).toLocaleDateString();
+
+// pure so the self-check can exercise the day split without a DOM
+function revRange(segs, day) {
+  const inDay = segs.filter(s => revDayKey(s.start) === day);
+  if (!inDay.length) return null;
+  const last = inDay[inDay.length - 1];
+  return {segs: inDay, min: inDay[0].start, max: Math.round(last.start + last.duration)};
+}
+
+async function revInit() {
+  const sel = document.getElementById('r-cam');
+  if (!sel.options.length) {
+    if (!monCams) monCams = await (await fetch('/api/cameras')).json();
+    sel.innerHTML = monCams.map(c => `<option>${esc(c.name)}</option>`).join('');
+  }
+  revSegments();     // re-fetched per visit: the recorder keeps adding segments
+}
+
+async function revSegments() {
+  const name = document.getElementById('r-cam').value;
+  if (!name) return revNote('No cameras in config.yaml.');
+  try {
+    const r = await fetch('/api/review/segments?name=' + encodeURIComponent(name));
+    revSegs = (await r.json()).segments || [];
+  } catch (e) {
+    return revNote('Could not load segments — is the server reachable?');
+  }
+  setCount('review', revSegs.length, 'segments');
+  const days = [...new Set(revSegs.map(s => revDayKey(s.start)))].reverse();   // newest first
+  document.getElementById('r-day').innerHTML = days.map(d => `<option>${esc(d)}</option>`).join('');
+  revDay();
+}
+
+function revDay() {
+  const sl = document.getElementById('r-slider');
+  const range = revRange(revSegs, document.getElementById('r-day').value);
+  sl.disabled = !range;
+  if (!range) return revNote('No footage recorded yet for this camera.');
+  sl.min = range.min; sl.max = range.max; sl.value = range.min;
+  const span = range.max - range.min || 1;
+  document.getElementById('r-cov').innerHTML = range.segs.map(s =>
+    `<i style="left:${(s.start - range.min) / span * 100}%; width:${s.duration / span * 100}%"></i>`)
+    .join('');
+  revSeek(range.min, true);
+}
+
+function revSeek(t, now) {
+  revT = t;
+  document.getElementById('r-time').textContent = new Date(t * 1000).toLocaleTimeString();
+  clearTimeout(revTimer);
+  revTimer = setTimeout(revFrame, now ? 0 : 250);   // scrubbing must not fire a request per pixel
+}
+
+async function revFrame() {
+  const name = document.getElementById('r-cam').value;
+  revNote('loading…');
+  try {
+    const r = await fetch(`/api/review/frame?name=${encodeURIComponent(name)}&t=${revT}`);
+    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || `error ${r.status}`);
+    URL.revokeObjectURL(revUrl);       // a blob per seek would leak for the whole session
+    document.getElementById('r-img').src = revUrl = URL.createObjectURL(await r.blob());
+    revNote('');
+  } catch (e) {
+    revNote(String(e.message || e));   // gaps are normal: keep the last good frame on screen
+  }
+}
+
+document.getElementById('r-cam').onchange = revSegments;
+document.getElementById('r-day').onchange = revDay;
+document.getElementById('r-slider').oninput = e => revSeek(+e.target.value);
+document.querySelectorAll('#review [data-step]').forEach(b => b.onclick = () => {
+  const sl = document.getElementById('r-slider');
+  sl.value = revT + +b.dataset.step;   // the range input clamps to min/max for us
+  revSeek(+sl.value, true);
+});
 </script>
 </body>
 </html>

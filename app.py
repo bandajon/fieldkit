@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import socket
+import subprocess
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -33,6 +34,7 @@ DATASET = ROOT / "dataset"                        # detection samples awaiting o
 CONFIG = {}
 CAM_NAME = re.compile(r"^[A-Za-z0-9_-]{1,32}$")   # becomes a directory name
 SAMPLE_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")  # becomes a file name — no dots, no separators
+SEGMENT_MAX = 660                                 # 600 s segments plus slack for a late finalise
 DET_CLASSES = list(detect.CLASSES.values())       # dataset class ids 0-3, the order detect.py writes
 CLASS_NAME = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")   # YOLO training class name
 
@@ -370,11 +372,16 @@ def camera_snapshot(ip: str):
     return Response(content=data, media_type="image/jpeg")
 
 
-@app.get("/api/detect/frame")
-def detect_frame(name: str):
+def cam_or_404(name):
     cam = next((c for c in CONFIG["cameras"] if c["name"] == name), None)
     if not cam:
         raise HTTPException(404, f"no camera named {name!r} in config")
+    return cam
+
+
+@app.get("/api/detect/frame")
+def detect_frame(name: str):
+    cam = cam_or_404(name)
     data = DETECT.frame(name)
     if data is None:      # detection absent or between passes — show the live camera instead
         data, err = detect_snapshot(cam["ip"], "", "")
@@ -386,6 +393,55 @@ def detect_frame(name: str):
 @app.get("/api/detect/counts")
 def detect_counts():
     return DETECT.counts()
+
+
+def segments(name):
+    """(path, start epoch, duration) per recorded segment, oldest first. Names are
+    local wallclock starts (recorder contract) and mtime is the end — still moving
+    on the segment being written, which is what a live scrubber wants."""
+    d = record_dir() / CONFIG.get("site", "site1") / name
+    out = []
+    for p in d.glob("*.mkv") if d.is_dir() else []:
+        try:
+            start = datetime.strptime(p.stem, "%Y%m%d-%H%M%S").timestamp()
+            dur = p.stat().st_mtime - start
+        except (ValueError, OSError):      # not a segment name, or deleted mid-scan
+            continue
+        out.append((p, start, round(min(max(dur, 0), SEGMENT_MAX), 1)))
+    return sorted(out, key=lambda s: s[1])
+
+
+@app.get("/api/review/segments")
+def review_segments(name: str):
+    cam_or_404(name)
+    return {"segments": [{"start": s, "duration": d} for _, s, d in segments(name)]}
+
+
+@app.get("/api/review/frame")
+def review_frame(name: str, t: str):
+    cam_or_404(name)
+    try:
+        when = float(t)
+    except (TypeError, ValueError):
+        raise HTTPException(400, f"not a timestamp: {t!r}")
+    seg = next((x for x in segments(name) if x[1] <= when < x[1] + x[2]), None)
+    if not seg:
+        raise HTTPException(404, "no footage at that time")
+    try:
+        # -ss before -i seeks by keyframe index instead of decoding from the top
+        out = subprocess.run(["ffmpeg", "-ss", f"{when - seg[1]:.3f}", "-i", str(seg[0]),
+                              "-frames:v", "1", "-f", "image2", "-c:v", "mjpeg", "-q:v", "3", "-"],
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=10)
+    except subprocess.TimeoutExpired:
+        raise HTTPException(502, "frame extraction timed out")
+    if not out.stdout:
+        raise HTTPException(502, "could not extract a frame")
+    data, err = detect.review_frame(out.stdout, CONFIG)
+    if err == detect.PIP_HINT:   # no model on this node: scrubbing without boxes beats no scrubbing
+        return Response(content=out.stdout, media_type="image/jpeg")
+    if err:
+        raise HTTPException(502, err)
+    return Response(content=data, media_type="image/jpeg")
 
 
 def valid_sample_id(sid):
