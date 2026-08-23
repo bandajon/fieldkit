@@ -143,7 +143,7 @@
             border:2px solid #000; border-radius:3px; color:#000; cursor:pointer;
             font:700 16px/20px var(--mono); text-align:center; }
   .box, .chip { --c:#e8eaec; }
-  .c0 { --c:#ffd400; } .c1 { --c:#ff45e0; } .c2 { --c:#25dede; } .c3 { --c:#ff4b3e; }
+  /* per-class --c is set inline via clsColor(): golden-angle hues, unique for any count */
   .chip { display:inline-flex; align-items:center; gap:2px; padding-left:10px;
           background:var(--panel); border:1px solid var(--line); border-left:5px solid var(--c);
           border-radius:4px; font:600 14px/1 var(--mono); }
@@ -749,7 +749,9 @@ const labStats = () => document.getElementById('l-stats').textContent = labAppro
   ? `fine-tune set: ${labApproved.frames} frames · ` +
     Object.entries(labApproved.boxes).map(([k, v]) => `${k} ${v}`).join(' · ')
   : 'fine-tune set: empty — approve samples to grow it';
-const boxCls = b => `box c${b.cls}${b.cls >= labClasses.length ? ' gone' : ''}`;
+const boxCls = b => `box${b.cls >= labClasses.length ? ' gone' : ''}`;
+// Same golden-angle formula as detect.py's palette(): server boxes and UI chips agree.
+const clsColor = i => `hsl(${(i * 137.508) % 360} 85% 55%)`;
 
 async function labLoad() {
   try {
@@ -821,7 +823,7 @@ function labPayload(all) {
 }
 
 const boxHtml = (b, i) => `<div class="${boxCls(b)}" data-i="${i}"
-    style="left:${(b.cx - b.w / 2) * 100}%; top:${(b.cy - b.h / 2) * 100}%;
+    style="--c:${clsColor(b.cls)}; left:${(b.cx - b.w / 2) * 100}%; top:${(b.cy - b.h / 2) * 100}%;
            width:${b.w * 100}%; height:${b.h * 100}%">
     <span>${esc(labClasses[b.cls] || 'removed')}</span><b class="x">&times;</b><i class="grip"></i></div>`;
 
@@ -877,6 +879,7 @@ document.getElementById('l-wrap').onpointerdown = e => {
     b.cls = (b.cls + 1) % (labClasses.length + 1);
     if (b.cls < labClasses.length) labLastCls = b.cls;   // runs of one missed class draw as that class
     d.className = boxCls(b);
+    d.style.setProperty('--c', clsColor(b.cls));
     d.querySelector('span').textContent = labClasses[b.cls] || 'removed';
   };
 };
@@ -965,7 +968,7 @@ document.getElementById('l-back').onclick = async () => {
 
 function labChips() {
   document.getElementById('l-classes').innerHTML = labClasses.map((n, i) =>
-    `<span class="chip c${i}">${esc(n)}
+    `<span class="chip" style="--c:${clsColor(i)}">${esc(n)}
        <button data-act="rename" data-i="${i}" title="rename">&#9998;</button>
        <button data-act="remove" data-i="${i}" title="remove">&times;</button></span>`).join('');
 }

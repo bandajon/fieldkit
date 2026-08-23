@@ -25,3 +25,5 @@ dist/
 runs/
 # playwright session artifacts
 .playwright-mcp/
+# daily count tallies, one JSON per day — site data, not code
+counts/

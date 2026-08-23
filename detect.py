@@ -8,6 +8,7 @@ FieldKit runs. Design: docs/superpowers/specs/2026-08-19-video-feed-and-labeling
 """
 
 import io
+import json
 import subprocess
 import threading
 import time
@@ -20,11 +21,9 @@ from live import sub_url          # /102 by contract — the recorder owns /101
 
 CLASSES = {2: "car", 3: "motorcycle", 5: "bus", 7: "truck"}      # COCO ids
 CLASS_IDS = {n: i for i, n in enumerate(CLASSES.values())}       # dataset ids, classes.txt order
-COLORS = {"car": (255, 208, 0), "motorcycle": (255, 0, 200),
-          "bus": (0, 210, 255), "truck": (230, 40, 40)}
+COLORS = {}               # class -> RGB, filled by palette() when a model loads
 WEIGHTS = "yolov8n.pt"
 WHEEL = "wheel"          # a detector class, but never a vehicle: it feeds axle counting
-EXTRA_COLORS = [(120, 255, 120), (255, 140, 0), (150, 150, 255), (255, 255, 255)]
 CONF = 0.4
 IMGSZ = 1280      # sub-streams are 1280x720, so this is ~native; 640 missed distant trucks
 FPS = 5           # ffmpeg decimates to this — the loop then runs flat out
@@ -34,6 +33,7 @@ FRAME_STALE = 10.0       # a frame older than this is not "live" any more
 IDLE_WAIT = 0.2          # no new frames anywhere: don't spin
 SETTLED = 5.0            # a reader that survives this long resets its backoff
 MAX_BACKOFF = 30.0
+SAVE_EVERY = 60.0        # persist the day's tallies at most this often
 CAPTURE_EVERY = 10.0     # dataset samples per camera; dedup already skips unchanged scenes
 DATASET_CAP = 10000      # rolling buffer of the freshest unlabeled frames; ~2-3 GB of JPEGs.
                          # Sized for the fleet goal: 9 toll gates, >=10k contributed each,
@@ -141,10 +141,14 @@ def attr_classifier(path, dev="cpu"):
 
 
 def palette(names):
-    """A stable box colour per class: the four known ones keep theirs, the rest cycle
-    EXTRA_COLORS by position."""
-    return {n: COLORS.get(n) or EXTRA_COLORS[i % len(EXTRA_COLORS)]
-            for i, n in enumerate(names)}
+    """A unique, stable colour per class: golden-angle hues by position, so any number
+    of classes stays visually distinct and the UI (same formula in hsl) matches."""
+    import colorsys
+    out = {}
+    for i, n in enumerate(names):
+        r, g, b = colorsys.hsv_to_rgb((i * 137.508 / 360) % 1.0, 0.85, 1.0)
+        out[n] = (int(r * 255), int(g * 255), int(b * 255))
+    return out
 
 
 def label_of(t):
@@ -307,11 +311,14 @@ class Reader:
 
 
 class Detector:
-    def __init__(self, cameras, snapshot_fn, cfg, creds_fn=None, dataset_dir=None):
+    def __init__(self, cameras, snapshot_fn, cfg, creds_fn=None, dataset_dir=None,
+                 counts_dir=None):
         self.cams = [dict(c) for c in (cameras or [])]
         self.snapshot = snapshot_fn     # unused here: app.py's frame() fallback while a reader is down
         self.creds_fn = creds_fn        # ip -> (user, password); else the cam dict's own
         self.dataset_dir = Path(dataset_dir) if dataset_dir else None
+        self.counts_dir = Path(counts_dir) if counts_dir else None
+        self.dirty = False              # a tally moved since the last write
         self.backend = str(cfg.get("detect_backend", "cpu") or "cpu").strip().lower()
         self.hef_path = cfg.get("hef_path", "")   # hailo model; read here, used once that backend lands
         # Fine-tuned weights bring their own taxonomy: model.names replaces the COCO four.
@@ -360,6 +367,8 @@ class Detector:
         with self.lock:
             if self.state in ("starting", "running"):   # absent/error keep their hint
                 self.state = "stopped"
+            doc = self._snapshot()
+        self._save(doc)
         return self.state
 
     def set_cameras(self, cameras):
@@ -381,14 +390,17 @@ class Detector:
             return None                 # a stale frame must not masquerade as live
         return f[0]
 
+    def _snapshot(self):
+        """The day's tallies, as counts() reports them and as they persist. Caller
+        holds the lock. Categories a reassignment emptied are dropped, not sent as {}."""
+        return {"date": self.day, "totals": dict(self.totals),
+                "breakdown": {cat: {h: dict(c) for h, c in heads.items() if c}
+                              for cat, heads in self.breakdown.items() if any(heads.values())}}
+
     def counts(self):
         with self.lock:
-            return {"state": self.state, "date": self.day, "totals": dict(self.totals),
-                    "visible": {n: dict(v) for n, v in self.visible.items()},
-                    # Categories a reassignment emptied are dropped, not reported as {}.
-                    "breakdown": {cat: {h: dict(c) for h, c in heads.items() if c}
-                                  for cat, heads in self.breakdown.items()
-                                  if any(heads.values())}}
+            return {**self._snapshot(), "state": self.state,
+                    "visible": {n: dict(v) for n, v in self.visible.items()}}
 
     def info(self):
         with self.lock:
@@ -400,6 +412,37 @@ class Detector:
     def _set(self, state, error):
         with self.lock:
             self.state, self.error = state, error
+
+    def _save(self, doc):
+        """One file per day, atomically: a field node loses power mid-write, and the
+        authority's numbers must not come back torn."""
+        if not self.counts_dir:
+            return
+        self.dirty = False
+        try:
+            self.counts_dir.mkdir(parents=True, exist_ok=True)
+            tmp = self.counts_dir / f"{doc['date']}.tmp"
+            tmp.write_text(json.dumps(doc))
+            tmp.replace(self.counts_dir / f"{doc['date']}.json")
+        except OSError as e:              # a read-only disk loses history, not detection
+            self.counts_dir = None
+            with self.lock:
+                self.error = f"count persistence off: {e}"
+
+    def _restore(self):
+        """A restart mid-day continues the day's tallies instead of zeroing them."""
+        if not self.counts_dir:
+            return
+        f = self.counts_dir / f"{self.day}.json"
+        try:
+            doc = json.loads(f.read_text())
+            with self.lock:
+                self.totals.update({k: int(v) for k, v in doc["totals"].items()
+                                    if k in self.totals})
+                self.breakdown = {cat: {h: Counter(c) for h, c in heads.items()}
+                                  for cat, heads in doc["breakdown"].items()}
+        except (OSError, ValueError, TypeError, AttributeError, KeyError):
+            pass          # torn or hand-edited: start the day fresh rather than crash
 
     def _known(self, name):
         """Still configured? A pass in flight when set_cameras() drops a camera would
@@ -448,7 +491,7 @@ class Detector:
             self.display = {n: n for n in lookup.values()}
             self.display_ids = {n: i for i, n in lookup.items()}
             self.totals = {n: 0 for n in lookup.values()}
-            COLORS.update(palette(lookup.values()))
+        COLORS.update(palette(lookup.values()))   # both modes: every class gets its colour
         if self.attr_weights:
             self.attrs = attr_classifier(self.attr_weights, dev)   # worker thread only
 
@@ -484,8 +527,10 @@ class Detector:
             self._set("error", str(e))
             return
         self._set("running", "")
-        self._dataset_init()
+        self._dataset_init()      # may re-key totals from classes.txt, so restore after it
+        self._restore()
         seen_seq = {}
+        saved = time.monotonic()
         while not self.stopping.is_set():
             self._roll_date()
             self._sync_readers()
@@ -511,6 +556,11 @@ class Detector:
                         self.frames[name] = (shot, time.time())
                     self.error = ""       # a one-off bad frame must not look permanent
                 self._capture(name, jpeg, shown, img.width, img.height)
+            if self.dirty and time.monotonic() - saved >= SAVE_EVERY:
+                saved = time.monotonic()
+                with self.lock:
+                    doc = self._snapshot()
+                self._save(doc)
             if idle:
                 self.stopping.wait(IDLE_WAIT)
         self._set("stopped", "")
@@ -518,11 +568,14 @@ class Detector:
     def _roll_date(self):
         today = date.today().isoformat()
         with self.lock:
-            if today != self.day:
-                self.day = today
-                self.totals = {d: 0 for d in self.display.values()}
-                self.breakdown = {}
-                self.tracks = {}
+            if today == self.day:
+                return
+            closing = self._snapshot()
+            self.day = today
+            self.totals = {d: 0 for d in self.display.values()}
+            self.breakdown = {}
+            self.tracks = {}
+        self._save(closing)      # the closing day's final word, before anyone counts again
 
     def _track(self, name, dets, img=None):
         """Count by ByteTrack id, one count per id, into its majority class.
@@ -612,6 +665,7 @@ class Detector:
     def _bump(self, category, attrs, n):
         """Move one vehicle's attributes into (n=1) or out of (n=-1) a category's tally.
         Caller holds the lock."""
+        self.dirty = True     # every count and every reassignment lands here
         b = self.breakdown.setdefault(category, {})
         for head, value in attrs.items():
             c = b.setdefault(head, Counter())
@@ -642,7 +696,8 @@ class Detector:
             if len(names) >= len(CLASS_IDS):
                 self.display = dict(zip(CLASS_IDS, names))
                 self.display_ids = {d: i for i, d in enumerate(self.display.values())}
-                COLORS.update({d: COLORS[n] for n, d in self.display.items()})
+                base = palette(CLASS_IDS)   # positional colours even before a model loads
+                COLORS.update({d: COLORS.get(n) or base[n] for n, d in self.display.items()})
                 self.totals = {d: 0 for d in self.display.values()}
         except OSError as e:              # a read-only disk disables capture, not detection
             self.dataset_dir = None
@@ -926,6 +981,35 @@ if __name__ == "__main__":
     assert any(p.read_bytes() == b"three"
                for p in (dup / "pending" / "images").glob("*.jpg")), "a new vehicle captures"
 
+    # The day's tallies survive midnight and a restart: authority reporting reads them.
+    books = Path(tempfile.mkdtemp())
+    d = fresh(counts_dir=books)
+    d.totals["truck"] = 3
+    d._bump("truck", {"axles": "6"}, 1)
+    d.day = "2000-01-01"                          # pretend the clock just passed midnight
+    d._roll_date()
+    closing = json.loads((books / "2000-01-01.json").read_text())
+    assert closing["totals"]["truck"] == 3, closing
+    assert closing["breakdown"] == {"truck": {"axles": {"6": 1}}}, closing
+    assert d.totals["truck"] == 0 and d.counts()["breakdown"] == {}, d.counts()
+
+    d._bump("bus", {"type": "coaster"}, 1)        # today's tallies, then a "crash"
+    d.totals["bus"] = 2
+    d.stop()
+    back = fresh(counts_dir=books)
+    back._restore()
+    assert back.totals["bus"] == 2, back.totals    # the day continues, it does not restart
+    assert back.counts()["breakdown"] == {"bus": {"type": {"coaster": 1}}}, back.counts()
+    back._track("c", det("bus"))
+    back._track("c", det("bus"))
+    assert back.totals["bus"] == 3, back.totals
+
+    (books / f"{date.today().isoformat()}.json").write_text("{ this is not json")
+    fresh_start = fresh(counts_dir=books)
+    fresh_start._restore()
+    assert fresh_start.totals["bus"] == 0, "a torn file starts the day fresh, never crashes"
+    assert not (books / f"{date.today().isoformat()}.tmp").exists(), "no tmp left behind"
+
     # Axles from wheels. Gaps of 2 and 1 px are the same axle seen doubled; 38-40 px
     # gaps are separate axles, so these six wheels are 4 axles.
     assert x_clusters([10, 12, 50, 90, 130, 131], 8) == 4
@@ -1026,8 +1110,9 @@ if __name__ == "__main__":
         assert d.counts()["totals"]["haulage"] == 0
         assert run("c", None) == [("haulage", 0.9, (10.0, 10.0, 60.0, 60.0), 7)], run("c", None)
         assert "classes" not in FakeModel.seen, FakeModel.seen   # no COCO filter
-        assert COLORS["car"] == (255, 208, 0), "a known class keeps its colour"
-        assert COLORS["haulage"] in EXTRA_COLORS and COLORS["bike"] in EXTRA_COLORS
+        # Golden-angle palette: every class present, all colours pairwise distinct.
+        fake_colors = [COLORS[n] for n in FakeModel.names.values()]
+        assert len(set(fake_colors)) == len(fake_colors), fake_colors
         d._dataset_init()
         assert (fine / "classes.txt").read_text().endswith("harvester\n"), "hands off"
         d._capture("c", b"raw", [("haulage", 0.9, BOX)], 64, 64)
