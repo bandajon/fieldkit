@@ -121,6 +121,10 @@
             background:var(--panel); border:1px solid var(--line); border-radius:4px;
             font:600 17px/1.3 var(--mono); color:var(--fg); }
   #counts[hidden] { display:none; }
+  #counts.more { cursor:pointer; }
+  #bdown { position:fixed; right:12px; bottom:66px; z-index:5; max-height:50vh; overflow-y:auto;
+           padding:10px 14px; background:var(--panel); border:1px solid var(--line); border-radius:4px;
+           font:600 13px/1.5 var(--mono); color:var(--fg); white-space:pre; }
   #l-wrap { position:relative; background:#000; border:1px solid var(--line); border-radius:4px;
             touch-action:none; }
   /* pointer-events:none keeps the image from swallowing draw gestures or native-dragging itself */
@@ -223,6 +227,7 @@
     </div>
     <div id="m-note" class="res"></div>
     <div id="grid"></div>
+    <div id="bdown" hidden></div>
     <div id="counts" hidden></div>
   </section>
   <section id="label">
@@ -639,6 +644,7 @@ document.getElementById('cfgreset').onclick = async () => {
 
 // --- Monitor tab ---
 let monCams = null, monMode = 'snapshots';
+let monBreak = null, monOpen = false;   // attribute breakdown from /api/detect/counts; panel state
 const LIVE_NOTE = 'Live is the 640×360 sub-stream for aiming, not evidence quality. ' +
                   'Recording quality is unaffected.';
 
@@ -658,6 +664,8 @@ function syncLiveToggle() {
 }
 
 async function monRender() {
+  monOpen = false;   // collapse on tab/mode switch
+  monPanel();
   if (!monCams) monCams = await (await fetch('/api/cameras')).json();
   setCount('monitor', monCams.length, 'configured');
   const host = location.hostname;
@@ -681,13 +689,38 @@ function monTick() {
     if (img) img.src = `/api/detect/frame?name=${encodeURIComponent(t.dataset.name)}&_=${Date.now()}`;
   });
   const el = document.getElementById('counts');
-  if (detectState !== 'running' && detectState !== 'starting') { el.hidden = true; return; }
+  if (detectState !== 'running' && detectState !== 'starting') { el.hidden = true; return monPanel(); }
   fetch('/api/detect/counts').then(r => r.json()).then(c => {
     el.hidden = c.state !== 'running' && c.state !== 'starting';
+    monBreak = c.breakdown || null;
+    el.classList.toggle('more', !!monBreak);
     if (!el.hidden) el.textContent =
-      'today · ' + Object.entries(c.totals || {}).map(([k, v]) => `${k} ${v}`).join(' · ');
+      'today · ' + Object.entries(c.totals || {}).map(([k, v]) => `${k} ${v}`).join(' · ') +
+      (monBreak ? (monOpen ? ' ▾' : ' ▴') : '');
+    monPanel();
   }).catch(() => {});
 }
+
+function monShort(v) {   // width is scarce on a phone pill
+  return v === '7plus' ? '7+' : v.replace(/-(transport|equipment|liquid)$/, '');
+}
+
+// textContent + white-space:pre — no markup to escape, and the vocab is operator-editable.
+function monPanel() {
+  const p = document.getElementById('bdown');
+  p.hidden = !monOpen || !monBreak || document.getElementById('counts').hidden;
+  if (p.hidden) return;
+  p.textContent = Object.entries(monBreak).map(([cat, heads]) =>
+    [cat, ...Object.entries(heads).map(([head, vals]) =>
+      `  ${head} · ` + Object.entries(vals).map(([v, n]) => `${monShort(v)} ${n}`).join('  '))
+    ].join('\n')).join('\n');
+}
+
+document.getElementById('counts').onclick = () => {
+  if (!monBreak) return;
+  monOpen = !monOpen;
+  monPanel();
+};
 
 function setMode(mode) {
   monMode = mode;
