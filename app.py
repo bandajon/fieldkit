@@ -522,16 +522,16 @@ def attrs_path(sid, tree="pending"):
     return DATASET / tree / "attrs" / f"{sid}.json"
 
 
-def attr_constraints():
-    """Class name -> {head: allowed values}, from attributes.yaml's `constraints` key.
-    UI guidance only: the server still validates against the full vocab, so editing
-    constraints never invalidates labels already on disk."""
+def attr_meta(key):
+    """A guidance mapping from attributes.yaml (`constraints`, `defaults`, `implies`).
+    UI-only: the server validates against the full vocab, so editing these never
+    invalidates labels already on disk."""
     f = DATASET / "attributes.yaml"
     try:
         v = yaml.safe_load(f.read_text())
     except (yaml.YAMLError, OSError, FileNotFoundError):
         return {}
-    c = v.get("constraints") if isinstance(v, dict) else None
+    c = v.get(key) if isinstance(v, dict) else None
     return c if isinstance(c, dict) else {}
 
 
@@ -594,7 +594,8 @@ def dataset_samples():
             continue
     pending.sort(key=lambda t: t[0], reverse=True)
     return {"classes": dataset_classes(), "attributes": attr_vocab(),
-            "attr_constraints": attr_constraints(), "approved": approved_counts(),
+            "attr_constraints": attr_meta("constraints"), "attr_defaults": attr_meta("defaults"),
+            "attr_implies": attr_meta("implies"), "approved": approved_counts(),
             # the list is capped for payload size; pending_total is the real pile
             "pending_total": len(pending), "pending": [s for _, s in pending[:100]]}
 
