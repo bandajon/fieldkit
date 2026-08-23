@@ -132,17 +132,19 @@
   /* Boxes and chips are translucent so the vehicle underneath stays readable;
      the selected box firms up for focus. */
   .box { position:absolute; box-sizing:border-box; cursor:move; touch-action:none;
-         border:3px solid color-mix(in srgb, var(--c) 55%, transparent); }
+         border:3px solid color-mix(in srgb, var(--c) 35%, transparent); }
   .grip { position:absolute; right:-3px; bottom:-3px; width:24px; height:24px;
-          background:color-mix(in srgb, var(--c) 65%, transparent);
-          border:2px solid rgba(0,0,0,.6); border-radius:3px; cursor:nwse-resize; }
-  .box span { position:absolute; left:-3px; bottom:100%; padding:2px 6px; color:#000;
-              background:color-mix(in srgb, var(--c) 70%, transparent);
+          background:color-mix(in srgb, var(--c) 40%, transparent);
+          border:2px solid rgba(0,0,0,.4); border-radius:3px; cursor:nwse-resize; }
+  /* Faint tint + light text with a shadow: readable on day and night frames alike. */
+  .box span { position:absolute; left:-3px; bottom:100%; padding:2px 6px; color:#fff;
+              text-shadow:0 1px 2px rgba(0,0,0,.9);
+              background:color-mix(in srgb, var(--c) 30%, transparent);
               font:700 13px/1.3 var(--mono); white-space:nowrap; }
   .box.in span { bottom:auto; top:0; }
   .box.gone { border-style:dashed; opacity:.5; }
   .box.sel { border-width:5px; border-color:var(--c); }
-  .box.sel span { background:var(--c); }
+  .box.sel span { background:var(--c); color:#000; text-shadow:none; }
   #l-attrs .btn { flex:0 0 auto; min-height:40px; padding:0 12px; font-size:14px; }
   #l-attrs i { min-width:52px; font-style:normal; }
   #l-attrs [data-cls] { border-color:var(--c); }
