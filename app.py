@@ -3,6 +3,7 @@
 
 import atexit
 import ipaddress
+import json
 import os
 import re
 import shutil
@@ -35,6 +36,15 @@ CONFIG = {}
 CAM_NAME = re.compile(r"^[A-Za-z0-9_-]{1,32}$")   # becomes a directory name
 SAMPLE_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")  # becomes a file name — no dots, no separators
 SEGMENT_MAX = 660                                 # 600 s segments plus slack for a late finalise
+# Attribute heads (spec: toll-taxonomy-attributes). Operator-editable in
+# dataset/attributes.yaml — append-only per head, ids positional like classes.txt.
+ATTR_DEFAULTS = {
+    "type": ["car", "suv", "van", "minivan", "pickup", "minibus", "coaster", "bus",
+             "rigid-truck", "articulated", "tanker", "other"],
+    "axles": ["2", "3", "4", "5", "6", "7plus"],
+    "cargo": ["none", "general", "container", "tanker-liquid", "mineral-transport",
+              "mining-equipment", "construction-equipment", "other"],
+}
 DET_CLASSES = list(detect.CLASSES.values())       # dataset class ids 0-3, the order detect.py writes
 CLASS_NAME = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")   # YOLO training class name
 
@@ -507,6 +517,38 @@ def sample_paths(sid, tree="pending"):
     return (DATASET / tree / "images" / f"{sid}.jpg", DATASET / tree / "labels" / f"{sid}.txt")
 
 
+def attrs_path(sid, tree="pending"):
+    return DATASET / tree / "attrs" / f"{sid}.json"
+
+
+def attr_vocab():
+    """Head -> allowed values. Materialised with the spec defaults on first read;
+    a corrupt file falls back to them rather than blocking labelling — and is left
+    alone, so the operator's own edit is still there to fix."""
+    f = DATASET / "attributes.yaml"
+    defaults = {h: list(v) for h, v in ATTR_DEFAULTS.items()}
+    if not f.is_file():
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(yaml.safe_dump(ATTR_DEFAULTS, sort_keys=False))
+        return defaults
+    try:
+        v = yaml.safe_load(f.read_text())
+    except (yaml.YAMLError, OSError):
+        v = None
+    if not isinstance(v, dict):
+        return defaults
+    return {h: [str(x) for x in vals] for h, vals in v.items() if isinstance(vals, list)} or defaults
+
+
+def read_attrs(path):
+    """Sidecar attributes, or {} — a sample without them is the normal case."""
+    try:
+        v = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+    return v if isinstance(v, dict) else {}
+
+
 def read_boxes(path):
     """YOLO label lines -> box dicts. A malformed line is skipped: one bad row
     must not hide the rest of the sample from the operator."""
@@ -529,11 +571,15 @@ def dataset_samples():
     pending = []
     for p in sorted(labels.glob("*.txt")) if labels.is_dir() else []:
         try:
-            pending.append((p.stat().st_mtime, {"id": p.stem, "boxes": read_boxes(p)}))
+            s = {"id": p.stem, "boxes": read_boxes(p)}
+            attrs = read_attrs(attrs_path(p.stem))
+            if attrs:
+                s["attrs"] = attrs
+            pending.append((p.stat().st_mtime, s))
         except OSError:      # sample reviewed away mid-listing
             continue
     pending.sort(key=lambda t: t[0], reverse=True)
-    return {"classes": dataset_classes(), "approved": approved_counts(),
+    return {"classes": dataset_classes(), "attributes": attr_vocab(), "approved": approved_counts(),
             # the list is capped for payload size; pending_total is the real pile
             "pending_total": len(pending), "pending": [s for _, s in pending[:100]]}
 
@@ -560,9 +606,15 @@ def dataset_label(body: dict = Body(default={})):
         src_img.rename(img)
         lbl.write_text(src_lbl.read_text() if src_lbl.is_file() else "")
         src_lbl.unlink(missing_ok=True)
+        src_attrs, attrs_dst = attrs_path(sid, "approved"), attrs_path(sid)
+        attrs = read_attrs(src_attrs)
+        if attrs:
+            attrs_dst.parent.mkdir(parents=True, exist_ok=True)
+            attrs_dst.write_text(json.dumps(attrs))
+        src_attrs.unlink(missing_ok=True)
         for p in (img, lbl):
             os.utime(p, None)   # front of the review queue, last in line for eviction
-        return {"ok": True, "id": sid, "boxes": read_boxes(lbl)}
+        return {"ok": True, "id": sid, "boxes": read_boxes(lbl), "attrs": attrs}
     if action not in ("approve", "discard"):
         raise HTTPException(400, "action must be 'approve', 'discard' or 'unapprove'")
     img, lbl = sample_paths(sid)
@@ -571,6 +623,7 @@ def dataset_label(body: dict = Body(default={})):
     if action == "discard":
         img.unlink(missing_ok=True)
         lbl.unlink(missing_ok=True)
+        attrs_path(sid).unlink(missing_ok=True)
         return {"ok": True}
     lines, nclasses = [], len(dataset_classes())
     for b in body.get("boxes") or []:   # an empty list is legal: every box removed = a negative sample
@@ -582,13 +635,49 @@ def dataset_label(body: dict = Body(default={})):
         if not 0 <= cls < nclasses or not all(0 <= v <= 1 for v in coords):
             raise HTTPException(400, f"box out of range: {b!r}")
         lines.append(" ".join([str(cls)] + [f"{v:.6f}" for v in coords]))
+    attrs = valid_attrs(body.get("attrs"), len(lines))
     dst_img, dst_lbl = sample_paths(sid, "approved")
     dst_img.parent.mkdir(parents=True, exist_ok=True)
     dst_lbl.parent.mkdir(parents=True, exist_ok=True)
     dst_lbl.write_text("".join(l + "\n" for l in lines))   # the operator's edit wins over the model's guess
+    dst_attrs = attrs_path(sid, "approved")
+    if attrs:
+        dst_attrs.parent.mkdir(parents=True, exist_ok=True)
+        dst_attrs.write_text(json.dumps(attrs))
+    else:
+        dst_attrs.unlink(missing_ok=True)   # re-approved with the attributes cleared
     img.rename(dst_img)
     lbl.unlink(missing_ok=True)
+    attrs_path(sid).unlink(missing_ok=True)
     return {"ok": True}
+
+
+def valid_attrs(attrs, nboxes):
+    """{"<box index>": {head: value}} — sparse per box and per head. An unknown head
+    or value is a typo in the caller, never a default: the operator's judgment is the
+    whole point of the sidecar."""
+    if not attrs:
+        return {}
+    if not isinstance(attrs, dict):
+        raise HTTPException(400, "attrs must map a box index to its attributes")
+    vocab, out = attr_vocab(), {}
+    for k, v in attrs.items():
+        try:
+            i = int(k)
+        except (TypeError, ValueError):
+            raise HTTPException(400, f"not a box index: {k!r}")
+        if not 0 <= i < nboxes:
+            raise HTTPException(400, f"box index {i} is outside the {nboxes} posted boxes")
+        if not isinstance(v, dict):
+            raise HTTPException(400, f"attributes for box {i} must be a mapping")
+        for head, val in v.items():
+            if head not in vocab:
+                raise HTTPException(400, f"unknown attribute: {head!r}")
+            if val not in vocab[head]:
+                raise HTTPException(400, f"{val!r} is not a {head} value")
+        if v:
+            out[str(i)] = v
+    return out
 
 
 def valid_class_name(name):
