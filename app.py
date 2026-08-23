@@ -522,6 +522,19 @@ def attrs_path(sid, tree="pending"):
     return DATASET / tree / "attrs" / f"{sid}.json"
 
 
+def attr_constraints():
+    """Class name -> {head: allowed values}, from attributes.yaml's `constraints` key.
+    UI guidance only: the server still validates against the full vocab, so editing
+    constraints never invalidates labels already on disk."""
+    f = DATASET / "attributes.yaml"
+    try:
+        v = yaml.safe_load(f.read_text())
+    except (yaml.YAMLError, OSError, FileNotFoundError):
+        return {}
+    c = v.get("constraints") if isinstance(v, dict) else None
+    return c if isinstance(c, dict) else {}
+
+
 def attr_vocab():
     """Head -> allowed values. Materialised with the spec defaults on first read;
     a corrupt file falls back to them rather than blocking labelling — and is left
@@ -580,7 +593,8 @@ def dataset_samples():
         except OSError:      # sample reviewed away mid-listing
             continue
     pending.sort(key=lambda t: t[0], reverse=True)
-    return {"classes": dataset_classes(), "attributes": attr_vocab(), "approved": approved_counts(),
+    return {"classes": dataset_classes(), "attributes": attr_vocab(),
+            "attr_constraints": attr_constraints(), "approved": approved_counts(),
             # the list is capped for payload size; pending_total is the real pile
             "pending_total": len(pending), "pending": [s for _, s in pending[:100]]}
 

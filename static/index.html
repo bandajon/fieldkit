@@ -743,7 +743,7 @@ let labLastCls = 0;
 let labDone = [];   // ids approved this session, newest last — the Back button's stack
 let labClasses = [], labQueue = [], labBoxes = [], labTotal = 0,
     labApproved = {frames: 0, boxes: {}};
-let labAttrs = {}, labSel = -1;   // attribute vocab {head: [values]}; index of the selected box
+let labAttrs = {}, labConstraints = {}, labSel = -1;   // attribute vocab {head: [values]}; index of the selected box
 const labNote = t => document.getElementById('l-note').textContent = t;
 const labStats = () => document.getElementById('l-stats').textContent = labApproved.frames
   ? `fine-tune set: ${labApproved.frames} frames · ` +
@@ -761,6 +761,7 @@ async function labLoad() {
     labTotal = d.pending_total ?? labQueue.length;   // the list is capped at 100 per fetch
     labApproved = d.approved || {frames: 0, boxes: {}};
     labAttrs = d.attributes || {};
+    labConstraints = d.attr_constraints || {};
   } catch (e) {
     labNote('Could not load samples — is the server reachable?');
     return;
@@ -796,13 +797,26 @@ function labSelect(i) {
   labSel = i;
   document.querySelectorAll('#l-wrap .box').forEach(d => d.classList.toggle('sel', +d.dataset.i === i));
   const el = document.getElementById('l-attrs'), b = labBoxes[i];
-  el.hidden = !b || b.del;
+  const name = b ? labClasses[b.cls] : '';
+  el.hidden = !b || b.del || name === 'wheel';   // wheels carry no attributes
   if (el.hidden) return;
-  el.innerHTML = Object.entries(labAttrs).map(([head, vals]) =>
-    `<div class="acts toggle"><i class="res">${esc(head)}</i>` + vals.map(v =>
-      `<button class="btn${b.attrs[head] === v ? ' on' : ''}" data-head="${esc(head)}"
-                data-val="${esc(v)}">${esc(v === '7plus' ? '7+' : v)}</button>`).join('') +
+  el.innerHTML = Object.keys(labAttrs).map(head =>
+    `<div class="acts toggle"><i class="res">${esc(head)}</i>` +
+    labVocab(head, name, b.attrs[head]).map(([v, stale]) =>
+      `<button class="btn${b.attrs[head] === v ? ' on' : ''}${stale ? ' halt' : ''}"
+                data-head="${esc(head)}" data-val="${esc(v)}"
+        >${esc(v === '7plus' ? '7+' : v)}</button>`).join('') +
     '</div>').join('');
+}
+
+// Values allowed for one head given the box's class, each flagged stale or not. Constraints are
+// guidance, so a value the box already carries always renders even when now disallowed —
+// re-classing a tagged box must never silently drop its label. Tapping it clears it as usual.
+function labVocab(head, name, cur) {
+  const allowed = (labConstraints[name] || {})[head] || labAttrs[head] || [];
+  const out = allowed.map(v => [v, false]);
+  if (cur && !allowed.includes(cur)) out.push([cur, true]);
+  return out;
 }
 
 document.getElementById('l-attrs').onclick = e => {
@@ -881,6 +895,7 @@ document.getElementById('l-wrap').onpointerdown = e => {
     d.className = boxCls(b);
     d.style.setProperty('--c', clsColor(b.cls));
     d.querySelector('span').textContent = labClasses[b.cls] || 'removed';
+    labSelect(+d.dataset.i);   // the new class brings its own allowed values
   };
 };
 
