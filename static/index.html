@@ -133,8 +133,11 @@
          touch-action:none; }
   .grip { position:absolute; right:-3px; bottom:-3px; width:24px; height:24px; background:var(--c);
           border:2px solid #000; border-radius:3px; cursor:nwse-resize; }
-  .box span { position:absolute; left:0; top:0; padding:2px 6px; background:var(--c); color:#000;
+  /* Chip sits ABOVE the box so it never covers the vehicle; .in flips it back inside
+     when the box touches the top of the frame. */
+  .box span { position:absolute; left:-3px; bottom:100%; padding:2px 6px; background:var(--c); color:#000;
               font:700 13px/1.3 var(--mono); white-space:nowrap; }
+  .box.in span { bottom:auto; top:0; }
   .box.gone { border-style:dashed; opacity:.5; }
   .box.sel { border-width:6px; }
   #l-attrs .btn { flex:0 0 auto; min-height:40px; padding:0 12px; font-size:14px; }
@@ -751,7 +754,8 @@ const labStats = () => document.getElementById('l-stats').textContent = labAppro
   ? `fine-tune set: ${labApproved.frames} frames · ` +
     Object.entries(labApproved.boxes).map(([k, v]) => `${k} ${v}`).join(' · ')
   : 'fine-tune set: empty — approve samples to grow it';
-const boxCls = b => `box${b.cls >= labClasses.length ? ' gone' : ''}`;
+const boxCls = b =>
+  `box${b.cls >= labClasses.length ? ' gone' : ''}${b.cy - b.h / 2 < 0.05 ? ' in' : ''}`;
 // Same golden-angle formula as detect.py's palette(): server boxes and UI chips agree.
 const clsColor = i => `hsl(${(i * 137.508) % 360} 85% 55%)`;
 
@@ -878,9 +882,12 @@ function labDrag(b0, dx, dy, grip) {
   return {...b0, w, h, cx: x + w / 2, cy: y + h / 2};
 }
 
-const labPlace = (d, b) => Object.assign(d.style, {
-  left: `${(b.cx - b.w / 2) * 100}%`, top: `${(b.cy - b.h / 2) * 100}%`,
-  width: `${b.w * 100}%`, height: `${b.h * 100}%`});
+const labPlace = (d, b) => {
+  Object.assign(d.style, {
+    left: `${(b.cx - b.w / 2) * 100}%`, top: `${(b.cy - b.h / 2) * 100}%`,
+    width: `${b.w * 100}%`, height: `${b.h * 100}%`});
+  d.classList.toggle('in', b.cy - b.h / 2 < 0.05);   // dragged to the top edge: chip flips inside
+};
 
 // One delegated pointer handler for both gestures: a press that never travels past the
 // threshold is the class-cycle tap, anything beyond it drags (or resizes, from the grip).
