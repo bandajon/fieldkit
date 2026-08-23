@@ -139,6 +139,8 @@
   .box.sel { border-width:6px; }
   #l-attrs .btn { flex:0 0 auto; min-height:40px; padding:0 12px; font-size:14px; }
   #l-attrs i { min-width:52px; font-style:normal; }
+  #l-attrs [data-cls] { border-color:var(--c); }
+  #l-attrs .rm { border-style:dashed; color:var(--dim); }
   .box .x { position:absolute; right:-3px; top:-3px; width:24px; height:24px; background:var(--c);
             border:2px solid #000; border-radius:3px; color:#000; cursor:pointer;
             font:700 16px/20px var(--mono); text-align:center; }
@@ -786,8 +788,8 @@ function labShow() {
   }
   // Sidecar attrs are keyed by the sample's own box order, so hydrate before anything filters.
   labBoxes = s.boxes.map((b, i) => ({...b, attrs: {...(s.attrs || {})[i]}}));
-  labNote(`${labTotal} remaining · tap a box to change its class, × to delete, drag to move, ` +
-          `corner to resize, drag empty area to add a box`);
+  labNote(`${labTotal} remaining · tap a box to select it, set class and attributes below, ` +
+          `× to delete, drag to move, corner to resize, drag empty area to add a box`);
   wrap.innerHTML = `<img src="/api/dataset/image?id=${encodeURIComponent(s.id)}" alt="">` +
     labBoxes.map(boxHtml).join('');
   labSelect(-1);
@@ -797,16 +799,21 @@ function labSelect(i) {
   labSel = i;
   document.querySelectorAll('#l-wrap .box').forEach(d => d.classList.toggle('sel', +d.dataset.i === i));
   const el = document.getElementById('l-attrs'), b = labBoxes[i];
-  const name = b ? labClasses[b.cls] : '';
-  el.hidden = !b || b.del || name === 'wheel';   // wheels carry no attributes
+  el.hidden = !b || b.del;
   if (el.hidden) return;
-  el.innerHTML = Object.keys(labAttrs).map(head =>
-    `<div class="acts toggle"><i class="res">${esc(head)}</i>` +
-    labVocab(head, name, b.attrs[head]).map(([v, stale]) =>
-      `<button class="btn${b.attrs[head] === v ? ' on' : ''}${stale ? ' halt' : ''}"
-                data-head="${esc(head)}" data-val="${esc(v)}"
-        >${esc(v === '7plus' ? '7+' : v)}</button>`).join('') +
-    '</div>').join('');
+  const name = labClasses[b.cls], row = (l, chips) => `<div class="acts toggle"><i class="res">${l}</i>${chips}</div>`;
+  // Removed boxes and wheels take no attributes; their class row stays so either can be undone.
+  const heads = b.cls >= labClasses.length || name === 'wheel' ? '' :
+    Object.keys(labAttrs).map(head => row(esc(head),
+      labVocab(head, name, b.attrs[head]).map(([v, stale]) =>
+        `<button class="btn${b.attrs[head] === v ? ' on' : ''}${stale ? ' halt' : ''}"
+                  data-head="${esc(head)}" data-val="${esc(v)}"
+          >${esc(v === '7plus' ? '7+' : v)}</button>`).join(''))).join('');
+  el.innerHTML = row('class', labClasses.map((n, j) =>
+      `<button class="btn${b.cls === j ? ' on' : ''}" style="--c:${clsColor(j)}" data-cls="${j}"
+        >${esc(n)}</button>`).join('') +
+      `<button class="btn rm${b.cls >= labClasses.length ? ' on' : ''}"
+                data-cls="${labClasses.length}">remove</button>`) + heads;
 }
 
 // Values allowed for one head given the box's class, each flagged stale or not. Constraints are
@@ -820,10 +827,20 @@ function labVocab(head, name, cur) {
 }
 
 document.getElementById('l-attrs').onclick = e => {
-  const t = e.target.closest('[data-head]'), b = labBoxes[labSel];
+  const t = e.target.closest('[data-head], [data-cls]'), b = labBoxes[labSel];
   if (!t || !b) return;
-  if (b.attrs[t.dataset.head] === t.dataset.val) delete b.attrs[t.dataset.head];   // tap again unsets
-  else b.attrs[t.dataset.head] = t.dataset.val;
+  if (t.dataset.cls !== undefined) {
+    b.cls = +t.dataset.cls;
+    if (b.cls < labClasses.length) labLastCls = b.cls;   // runs of one missed class draw as that class
+    const d = document.querySelector(`#l-wrap .box[data-i="${labSel}"]`);
+    d.className = boxCls(b);        // labSelect re-adds .sel below
+    d.style.setProperty('--c', clsColor(b.cls));
+    d.querySelector('span').textContent = labClasses[b.cls] || 'removed';
+  } else if (b.attrs[t.dataset.head] === t.dataset.val) {
+    delete b.attrs[t.dataset.head];   // tap the active chip to unset
+  } else {
+    b.attrs[t.dataset.head] = t.dataset.val;
+  }
   labSelect(labSel);
 };
 
@@ -887,15 +904,9 @@ document.getElementById('l-wrap').onpointerdown = e => {
     Object.assign(b, labDrag(b0, (ev.clientX - x0) / r.width, (ev.clientY - y0) / r.height, grip));
     labPlace(d, b);
   };
-  d.onpointerup = d.onpointercancel = ev => {
+  // Selection already happened on pointerdown; the class is set from the strip's class row.
+  d.onpointerup = d.onpointercancel = () => {
     d.onpointermove = d.onpointerup = d.onpointercancel = null;
-    if (moved || ev.type !== 'pointerup') return;
-    b.cls = (b.cls + 1) % (labClasses.length + 1);
-    if (b.cls < labClasses.length) labLastCls = b.cls;   // runs of one missed class draw as that class
-    d.className = boxCls(b);
-    d.style.setProperty('--c', clsColor(b.cls));
-    d.querySelector('span').textContent = labClasses[b.cls] || 'removed';
-    labSelect(+d.dataset.i);   // the new class brings its own allowed values
   };
 };
 
