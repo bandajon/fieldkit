@@ -21,3 +21,7 @@ ops_state/
 ops_config.yaml
 dist/
 .venv/
+# ultralytics writes val outputs here
+runs/
+# playwright session artifacts
+.playwright-mcp/
