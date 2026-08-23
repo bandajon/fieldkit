@@ -132,6 +132,9 @@
   .box span { position:absolute; left:0; top:0; padding:2px 6px; background:var(--c); color:#000;
               font:700 13px/1.3 var(--mono); white-space:nowrap; }
   .box.gone { border-style:dashed; opacity:.5; }
+  .box.sel { border-width:6px; }
+  #l-attrs .btn { flex:0 0 auto; min-height:40px; padding:0 12px; font-size:14px; }
+  #l-attrs i { min-width:52px; font-style:normal; }
   .box .x { position:absolute; right:-3px; top:-3px; width:24px; height:24px; background:var(--c);
             border:2px solid #000; border-radius:3px; color:#000; cursor:pointer;
             font:700 16px/20px var(--mono); text-align:center; }
@@ -231,6 +234,7 @@
       <button class="btn" id="l-skip">Skip</button>
       <button class="btn halt" id="l-no">Discard</button>
     </div>
+    <div id="l-attrs" hidden></div>
     <div class="acts" id="l-classes"></div>
     <div class="acts">
       <input id="l-new" placeholder="new label e.g. excavator">
@@ -706,6 +710,7 @@ let labLastCls = 0;
 let labDone = [];   // ids approved this session, newest last — the Back button's stack
 let labClasses = [], labQueue = [], labBoxes = [], labTotal = 0,
     labApproved = {frames: 0, boxes: {}};
+let labAttrs = {}, labSel = -1;   // attribute vocab {head: [values]}; index of the selected box
 const labNote = t => document.getElementById('l-note').textContent = t;
 const labStats = () => document.getElementById('l-stats').textContent = labApproved.frames
   ? `fine-tune set: ${labApproved.frames} frames · ` +
@@ -720,6 +725,7 @@ async function labLoad() {
     labQueue = d.pending || [];
     labTotal = d.pending_total ?? labQueue.length;   // the list is capped at 100 per fetch
     labApproved = d.approved || {frames: 0, boxes: {}};
+    labAttrs = d.attributes || {};
   } catch (e) {
     labNote('Could not load samples — is the server reachable?');
     return;
@@ -742,11 +748,43 @@ function labShow() {
     if (labTotal > 0) return labLoad();
     return labNote('No samples waiting — detection captures one when the scene changes.');
   }
-  labBoxes = s.boxes.map(b => ({...b}));
+  // Sidecar attrs are keyed by the sample's own box order, so hydrate before anything filters.
+  labBoxes = s.boxes.map((b, i) => ({...b, attrs: {...(s.attrs || {})[i]}}));
   labNote(`${labTotal} remaining · tap a box to change its class, × to delete, drag to move, ` +
           `corner to resize, drag empty area to add a box`);
   wrap.innerHTML = `<img src="/api/dataset/image?id=${encodeURIComponent(s.id)}" alt="">` +
     labBoxes.map(boxHtml).join('');
+  labSelect(-1);
+}
+
+function labSelect(i) {
+  labSel = i;
+  document.querySelectorAll('#l-wrap .box').forEach(d => d.classList.toggle('sel', +d.dataset.i === i));
+  const el = document.getElementById('l-attrs'), b = labBoxes[i];
+  el.hidden = !b || b.del;
+  if (el.hidden) return;
+  el.innerHTML = Object.entries(labAttrs).map(([head, vals]) =>
+    `<div class="acts toggle"><i class="res">${esc(head)}</i>` + vals.map(v =>
+      `<button class="btn${b.attrs[head] === v ? ' on' : ''}" data-head="${esc(head)}"
+                data-val="${esc(v)}">${esc(v === '7plus' ? '7+' : v)}</button>`).join('') +
+    '</div>').join('');
+}
+
+document.getElementById('l-attrs').onclick = e => {
+  const t = e.target.closest('[data-head]'), b = labBoxes[labSel];
+  if (!t || !b) return;
+  if (b.attrs[t.dataset.head] === t.dataset.val) delete b.attrs[t.dataset.head];   // tap again unsets
+  else b.attrs[t.dataset.head] = t.dataset.val;
+  labSelect(labSel);
+};
+
+// Attr keys index the POSTED boxes array, and filtering out deleted/removed boxes renumbers
+// them — pure so the self-check can pin the remap.
+function labPayload(all) {
+  const kept = all.filter(b => !b.del && b.cls < labClasses.length);
+  const attrs = {};
+  kept.forEach((b, i) => { if (b.attrs && Object.keys(b.attrs).length) attrs[i] = b.attrs; });
+  return {boxes: kept.map(({cls, cx, cy, w, h}) => ({cls, cx, cy, w, h})), attrs};
 }
 
 const boxHtml = (b, i) => `<div class="${boxCls(b)}" data-i="${i}"
@@ -784,10 +822,12 @@ document.getElementById('l-wrap').onpointerdown = e => {
   const d = e.target.closest('.box');
   if (!d) return labDraw(e);
   const b = labBoxes[d.dataset.i], b0 = {...b}, r = d.parentElement.getBoundingClientRect();
+  if (!e.target.classList.contains('x')) labSelect(+d.dataset.i);
   if (e.target.classList.contains('x')) {
     // Deleted, not spliced: data-i of the surviving boxes must keep pointing at labBoxes.
     b.del = true;
-    return d.remove();
+    d.remove();
+    return labSelect(-1);
   }
   const grip = e.target.classList.contains('grip'), x0 = e.clientX, y0 = e.clientY;
   let moved = false;
@@ -829,7 +869,9 @@ function labDraw(e) {
     wrap.onpointermove = wrap.onpointerup = wrap.onpointercancel = null;
     if (!nd) return;                                    // a plain tap on the background
     if (ev.type !== 'pointerup' || nb.w < .008 || nb.h < .008) return nd.remove();
+    nb.attrs = {};
     labBoxes.push(nb);                                  // data-i already holds this index
+    labSelect(labBoxes.length - 1);
   };
 }
 
@@ -837,9 +879,9 @@ async function labSend(action) {
   const s = labQueue[0];
   if (!s) return;
   labNote('saving…');
-  const boxes = labBoxes.filter(b => !b.del && b.cls < labClasses.length);
+  const {boxes, attrs} = labPayload(labBoxes);
   try {
-    const r = await post('/api/dataset/label', {id: s.id, action, boxes});
+    const r = await post('/api/dataset/label', {id: s.id, action, boxes, attrs});
     if (!r.ok) throw new Error('rejected');
   } catch (e) {
     labNote('Save failed — sample kept, tap again to retry.');
@@ -877,7 +919,7 @@ document.getElementById('l-back').onclick = async () => {
     labNote(String(e.message || e));   // id stays popped: it is not coming back
     return labShow();
   }
-  labQueue.unshift({id, boxes: r.boxes});
+  labQueue.unshift({id, boxes: r.boxes, attrs: r.attrs});
   labTotal++;
   labApproved.frames = Math.max(0, labApproved.frames - 1);
   r.boxes.forEach(b => {

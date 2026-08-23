@@ -14,6 +14,7 @@ import time
 from collections import Counter
 from datetime import date, datetime, timezone
 from pathlib import Path
+from statistics import median
 
 from live import sub_url          # /102 by contract — the recorder owns /101
 
@@ -22,6 +23,7 @@ CLASS_IDS = {n: i for i, n in enumerate(CLASSES.values())}       # dataset ids, 
 COLORS = {"car": (255, 208, 0), "motorcycle": (255, 0, 200),
           "bus": (0, 210, 255), "truck": (230, 40, 40)}
 WEIGHTS = "yolov8n.pt"
+WHEEL = "wheel"          # a detector class, but never a vehicle: it feeds axle counting
 EXTRA_COLORS = [(120, 255, 120), (255, 140, 0), (150, 150, 255), (255, 255, 255)]
 CONF = 0.4
 IMGSZ = 1280      # sub-streams are 1280x720, so this is ~native; 640 missed distant trucks
@@ -69,6 +71,75 @@ def same_scene(a, b, iou_min=0.85):
     return True
 
 
+def crop(img, box, pad=0.1):
+    """Box crop with a little context — a tight crop cuts the wheels off a truck."""
+    x1, y1, x2, y2 = box
+    dx, dy = (x2 - x1) * pad, (y2 - y1) * pad
+    return img.crop((max(0, x1 - dx), max(0, y1 - dy),
+                     min(img.width, x2 + dx), min(img.height, y2 + dy)))
+
+
+def x_clusters(centres, width, gap=1.5):
+    """Axles from wheel centres: wheels sharing an x-position are one axle, and a gap
+    wider than `gap` wheel-widths starts the next."""
+    xs = sorted(centres)
+    return 1 + sum(1 for a, b in zip(xs, xs[1:]) if b - a > gap * width)
+
+
+def wheel_axles(vehicles, wheels):
+    """-> {vehicle index: axle count}. A wheel belongs to the smallest box containing its
+    centre; one wheel proves nothing, so only pairs and up get an estimate."""
+    groups = {}
+    for _c, _cf, (wx1, wy1, wx2, wy2), *_ in wheels:
+        cx, cy = (wx1 + wx2) / 2, (wy1 + wy2) / 2
+        best, area = None, float("inf")
+        for i, (_n, _n2, (x1, y1, x2, y2), *_) in enumerate(vehicles):
+            if x1 <= cx <= x2 and y1 <= cy <= y2 and (x2 - x1) * (y2 - y1) < area:
+                best, area = i, (x2 - x1) * (y2 - y1)
+        if best is not None:
+            groups.setdefault(best, []).append((cx, wx2 - wx1))
+    return {i: x_clusters([c for c, _ in ws], median([w for _, w in ws]))
+            for i, ws in groups.items() if len(ws) >= 2}
+
+
+def attr_text(attrs):
+    """type · 6ax · cargo, for a box label."""
+    return " · ".join(f"{v}ax" if h == "axles" else str(v) for h, v in attrs.items() if v)
+
+
+def attr_classifier(path, dev="cpu"):
+    """-> fn(PIL crop) -> {head: value}. Rebuilds train_attrs.py's model (mobilenet_v3_small
+    backbone + one linear head per attribute) around the saved vocab — the ModuleDict keys
+    below must stay in step with that script's module attributes."""
+    import torch
+    from torchvision import models, transforms
+
+    # weights_only: the checkpoint is tensors, strings and ints — never unpickle a model
+    # file as arbitrary code just because it sits in the operator's dataset directory.
+    ck = torch.load(path, map_location=dev, weights_only=True)
+    vocab = ck["heads"]
+    net = models.mobilenet_v3_small()
+    feats = net.classifier[3].in_features
+    net.classifier[3] = torch.nn.Identity()
+    model = torch.nn.ModuleDict({
+        "backbone": net,
+        "heads": torch.nn.ModuleDict({h: torch.nn.Linear(feats, len(v))
+                                      for h, v in vocab.items()})})
+    model.load_state_dict(ck["state_dict"])
+    model.eval().to(dev)
+    size = ck.get("input", 224)
+    prep = transforms.Compose([transforms.Resize((size, size)), transforms.ToTensor(),
+                               transforms.Normalize([0.485, 0.456, 0.406],
+                                                    [0.229, 0.224, 0.225])])
+
+    def classify(pil):
+        with torch.no_grad():
+            f = model["backbone"](prep(pil).unsqueeze(0).to(dev))
+            return {h: vocab[h][int(model["heads"][h](f).argmax())] for h in vocab}
+
+    return classify
+
+
 def palette(names):
     """A stable box colour per class: the four known ones keep theirs, the rest cycle
     EXTRA_COLORS by position."""
@@ -94,10 +165,14 @@ def annotate(img, dets, quality=85):
     except TypeError:                     # Pillow < 10.1 has no size argument
         font = ImageFont.load_default()
     d = ImageDraw.Draw(img)
-    for cls, conf, (x1, y1, x2, y2) in dets:
+    for cls, conf, (x1, y1, x2, y2), *rest in dets:
         color = COLORS.get(cls, (255, 255, 255))
+        if cls == WHEEL:
+            # ponytail: thin, unlabelled — a dozen wheel chips would smother the vehicles.
+            d.rectangle([x1, y1, x2, y2], outline=color, width=2)
+            continue
         d.rectangle([x1, y1, x2, y2], outline=color, width=max(2, img.width // 640))
-        label = f"{cls} {conf:.0%}"
+        label = f"{cls} {conf:.0%}" + (f" · {rest[0]}" if rest and rest[0] else "")
         lx1, ly1, lx2, ly2 = d.textbbox((0, 0), label, font=font)
         tw, th = lx2 - lx1, ly2 - ly1
         top = max(0, y1 - th - 5)                 # a box at the top edge keeps its label
@@ -124,6 +199,9 @@ def review_frame(jpeg, cfg):
     weights = str(cfg.get("detect_weights", "") or "").strip()
     if weights and not Path(weights).exists():
         return None, f"detect_weights not found: {weights}"
+    attrs_path = str(cfg.get("attr_weights", "") or "").strip()
+    if attrs_path and not Path(attrs_path).exists():
+        return None, f"attr_weights not found: {attrs_path}"
     path = weights or WEIGHTS
     with _review_lock:
         try:
@@ -140,6 +218,10 @@ def review_frame(jpeg, cfg):
                 COLORS.update(palette(lookup.values()))
                 _review.update(path=path, model=model, lookup=lookup, dev=dev,
                                extra={} if weights else {"classes": list(CLASSES)})
+            if _review.get("attrs_path") != attrs_path:
+                _review["attrs"] = (attr_classifier(attrs_path, _review["dev"])
+                                    if attrs_path else None)
+                _review["attrs_path"] = attrs_path
             from PIL import Image
             img = Image.open(io.BytesIO(jpeg)).convert("RGB")
             dets = []
@@ -149,8 +231,12 @@ def review_frame(jpeg, cfg):
                 for box, cid, conf in zip(r.boxes.xyxy.tolist(), r.boxes.cls.tolist(),
                                           r.boxes.conf.tolist()):
                     cls = _review["lookup"].get(int(cid))
-                    if cls:
-                        dets.append((cls, float(conf), tuple(float(v) for v in box)))
+                    if not cls:
+                        continue
+                    box = tuple(float(v) for v in box)
+                    attrs = _review["attrs"](crop(img, box)) if (
+                        _review["attrs"] and cls != WHEEL) else {}
+                    dets.append((cls, float(conf), box, attr_text(attrs)))
             return annotate(img, dets), None
         except ImportError:
             return None, PIP_HINT
@@ -230,12 +316,16 @@ class Detector:
         self.hef_path = cfg.get("hef_path", "")   # hailo model; read here, used once that backend lands
         # Fine-tuned weights bring their own taxonomy: model.names replaces the COCO four.
         self.weights = str(cfg.get("detect_weights", "") or "").strip()
+        # Stage 2: attributes off the counted vehicle's best crop (type/axles/cargo).
+        self.attr_weights = str(cfg.get("attr_weights", "") or "").strip()
+        self.attrs = None
         self.state = "stopped"
         self.error = ""
         self.day = date.today().isoformat()
         self.display = {n: n for n in CLASS_IDS}    # internal class -> operator's name
         self.display_ids = dict(CLASS_IDS)          # operator's name -> dataset id
         self.totals = {n: 0 for n in CLASS_IDS}
+        self.breakdown = {}   # category -> {head: Counter of attribute values}
         self.tracks = {}      # camera name -> {track id: state}
         self.frames = {}      # camera name -> (annotated jpeg, wallclock ts)
         self.visible = {}     # camera name -> {class: count} on the latest frame
@@ -294,7 +384,11 @@ class Detector:
     def counts(self):
         with self.lock:
             return {"state": self.state, "date": self.day, "totals": dict(self.totals),
-                    "visible": {n: dict(v) for n, v in self.visible.items()}}
+                    "visible": {n: dict(v) for n, v in self.visible.items()},
+                    # Categories a reassignment emptied are dropped, not reported as {}.
+                    "breakdown": {cat: {h: dict(c) for h, c in heads.items() if c}
+                                  for cat, heads in self.breakdown.items()
+                                  if any(heads.values())}}
 
     def info(self):
         with self.lock:
@@ -337,6 +431,8 @@ class Detector:
         if self.weights and not Path(self.weights).exists():
             # Never fall back to the COCO weights: the counts would silently change meaning.
             raise RuntimeError(f"detect_weights not found: {self.weights}")
+        if self.attr_weights and not Path(self.attr_weights).exists():
+            raise RuntimeError(f"attr_weights not found: {self.attr_weights}")
         from ultralytics import YOLO
         try:
             import torch
@@ -353,6 +449,8 @@ class Detector:
             self.display_ids = {n: i for i, n in lookup.items()}
             self.totals = {n: 0 for n in lookup.values()}
             COLORS.update(palette(lookup.values()))
+        if self.attr_weights:
+            self.attrs = attr_classifier(self.attr_weights, dev)   # worker thread only
 
         def track(name, img):
             model = self.models.get(name)
@@ -403,7 +501,7 @@ class Detector:
                 try:
                     img = Image.open(io.BytesIO(jpeg)).convert("RGB")
                     dets = track(name, img)
-                    shown = self._track(name, dets)      # voted labels, ready to draw
+                    shown = self._track(name, dets, img)  # voted labels, ready to draw
                     shot = annotate(img, shown)
                 except Exception as e:    # a truncated frame must not kill the thread
                     self._set("running", str(e))
@@ -423,12 +521,16 @@ class Detector:
             if today != self.day:
                 self.day = today
                 self.totals = {d: 0 for d in self.display.values()}
+                self.breakdown = {}
                 self.tracks = {}
 
-    def _track(self, name, dets):
+    def _track(self, name, dets, img=None):
         """Count by ByteTrack id, one count per id, into its majority class.
         Returns [(voted label, conf, box)] for drawing — the raw per-frame class is
         exactly what flickers when a car passes a truck.
+
+        Wheel boxes never become tracks: they are grouped into their vehicle's box and
+        clustered by x-position, which counts axles far better than a crop classifier can.
 
         ponytail: ByteTrack at ~5 fps absorbs the old 1 fps ceiling (a parked or briefly
         occluded vehicle no longer re-counts). What remains: counts follow the effective
@@ -438,12 +540,16 @@ class Detector:
         """
         now = time.monotonic()
         shown = []
+        wheels = [d for d in dets if d[0] == WHEEL]
+        dets = [d for d in dets if d[0] != WHEEL]
+        axles = wheel_axles(dets, wheels)         # {det index: axles seen this frame}
         with self.lock:
             if not self._known(name):
                 return shown
             ids = self.tracks.setdefault(name, {})
             live = []
-            for cls, conf, box, tid in dets:
+            shown += [(self.display.get(c, c), cf, b) for c, cf, b, _t in wheels]
+            for i, (cls, conf, box, tid) in enumerate(dets):
                 if tid is None:
                     # untracked: draw it, never count it
                     shown.append((self.display[cls], conf, box))
@@ -451,22 +557,36 @@ class Detector:
                 t = ids.get(tid)
                 if t is None:
                     t = ids[tid] = {"votes": Counter(), "label": cls, "hits": 0,
-                                    "counted_as": None, "last_seen": now}
+                                    "counted_as": None, "last_seen": now,
+                                    "axles": 0, "best": (0.0, None), "attrs": {}}
                 t["votes"][cls] += 1
                 t["hits"] += 1
                 t["last_seen"] = now
                 t["label"] = label_of(t)
+                t["axles"] = max(t["axles"], axles.get(i, 0))
+                # Best crop only until the id counts — attributes are classified once, at
+                # that moment, so cropping afterwards would be work nobody reads.
+                if self.attrs and img is not None and t["counted_as"] is None:
+                    area = (box[2] - box[0]) * (box[3] - box[1])
+                    if area > t["best"][0]:
+                        buf = io.BytesIO()
+                        crop(img, box).save(buf, "JPEG", quality=80)
+                        t["best"] = (area, buf.getvalue())
                 # Votes and labels stay internal; only what leaves here is renamed.
                 disp = self.display[t["label"]]
                 if t["counted_as"] is None:
                     if t["hits"] >= COUNT_AT_HITS:
+                        t["attrs"] = self._classify(t)
                         t["counted_as"] = disp
                         self.totals[disp] += 1
+                        self._bump(disp, t["attrs"], 1)
                 elif t["counted_as"] != disp:
                     # The vote settled on another class: move this id's single tally.
                     # Never negative — counted_as is a class this id incremented.
                     self.totals[t["counted_as"]] -= 1
                     self.totals[disp] += 1
+                    self._bump(t["counted_as"], t["attrs"], -1)
+                    self._bump(disp, t["attrs"], 1)
                     t["counted_as"] = disp
                 live.append(disp)
                 shown.append((disp, conf, box))
@@ -474,6 +594,30 @@ class Detector:
                 del ids[tid]
             self.visible[name] = Counter(live)
         return shown
+
+    def _classify(self, t):
+        """Attributes for an id at the moment it counts. Caller holds the lock.
+        A wheel-derived axle count beats the classifier's guess whenever there is one."""
+        a = {}
+        if self.attrs and t["best"][1]:
+            try:
+                from PIL import Image
+                a = dict(self.attrs(Image.open(io.BytesIO(t["best"][1])).convert("RGB")))
+            except Exception as e:      # a bad crop costs attributes, never the count
+                self.error = f"attrs: {e}"
+        if t["axles"] >= 2:
+            a["axles"] = "7plus" if t["axles"] >= 7 else str(t["axles"])
+        return a
+
+    def _bump(self, category, attrs, n):
+        """Move one vehicle's attributes into (n=1) or out of (n=-1) a category's tally.
+        Caller holds the lock."""
+        b = self.breakdown.setdefault(category, {})
+        for head, value in attrs.items():
+            c = b.setdefault(head, Counter())
+            c[value] += n
+            if c[value] <= 0:
+                del c[value]            # a moved tally must not leave a zero behind
 
     # --- dataset capture --------------------------------------------------
 
@@ -659,7 +803,9 @@ if __name__ == "__main__":
         from PIL import Image
         for w, h in ((200, 200), (1280, 720)):
             out = annotate(Image.new("RGB", (w, h)),
-                           [("truck", 0.93, (5.0, 2.0, 90.0, 80.0)), ("car", 0.5, BOX)])
+                           [("truck", 0.93, (5.0, 2.0, 90.0, 80.0), "articulated · 6ax"),
+                            ("wheel", 0.7, (10.0, 60.0, 26.0, 76.0)),   # thin, no chip
+                            ("car", 0.5, BOX)])
             assert out.startswith(SOI) and len(out) > 500, (w, len(out))
         buf = io.BytesIO()
         Image.new("RGB", (64, 64)).save(buf, "JPEG")
@@ -779,6 +925,65 @@ if __name__ == "__main__":
     d._capture("c", b"three", A + [("truck", 0.8, FAR)], 64, 64)
     assert any(p.read_bytes() == b"three"
                for p in (dup / "pending" / "images").glob("*.jpg")), "a new vehicle captures"
+
+    # Axles from wheels. Gaps of 2 and 1 px are the same axle seen doubled; 38-40 px
+    # gaps are separate axles, so these six wheels are 4 axles.
+    assert x_clusters([10, 12, 50, 90, 130, 131], 8) == 4
+    assert x_clusters([10], 8) == 1 and x_clusters([10, 200], 8) == 2
+
+    VEH = (0.0, 0.0, 200.0, 100.0)
+    def wheel(cx):
+        return (WHEEL, 0.8, (cx - 4.0, 80.0, cx + 4.0, 96.0), None)
+    six = [wheel(20), wheel(24), wheel(90), wheel(140), wheel(180), wheel(184)]
+    assert wheel_axles([("truck", 0.9, VEH, 1)], six) == {0: 4}
+    assert wheel_axles([("truck", 0.9, VEH, 1)], [wheel(20)]) == {}, "one wheel proves nothing"
+    # The smallest containing box wins, so a wheel is never claimed by the scene-wide box.
+    assert wheel_axles([("bus", 0.9, (0.0, 0.0, 600.0, 400.0), 1),
+                        ("truck", 0.9, VEH, 2)], six) == {1: 4}
+
+    # Wheels never become tracks, but are still drawn (and captured) as boxes.
+    d = fresh()
+    shown = d._track("c", det("truck") + [wheel(20), wheel(120)])
+    assert len(d.tracks["c"]) == 1, d.tracks
+    assert sorted(s[0] for s in shown) == ["truck", "wheel", "wheel"], shown
+
+    # Attributes: classified once at count time, wheel axles overriding the classifier.
+    d = fresh()
+    d.attrs = lambda pil: {"type": "articulated", "axles": "2", "cargo": "mineral"}
+    if jpeg:
+        from PIL import Image
+        pic = Image.new("RGB", (300, 200))
+        d._track("c", [("truck", 0.9, (0.0, 0.0, 40.0, 40.0), 1)], pic)
+        small = d.tracks["c"][1]["best"][0]
+        assert small == 1600.0, small
+        d._track("c", [("truck", 0.9, VEH, 1)] + six, pic)   # bigger box, and 4 axles
+        t = d.tracks["c"][1]
+        assert t["best"][0] == 20000.0, t["best"][0]         # best crop is the largest box
+        assert t["attrs"] == {"type": "articulated", "axles": "4", "cargo": "mineral"}, t
+        assert d.counts()["breakdown"] == {
+            "truck": {"type": {"articulated": 1}, "axles": {"4": 1}, "cargo": {"mineral": 1}}}
+        d._track("c", [("truck", 0.9, (0.0, 0.0, 300.0, 200.0), 1)], pic)
+        assert d.tracks["c"][1]["best"][0] == 20000.0, "counted ids stop cropping"
+
+        # A category flip moves the whole breakdown with the tally — no zeros left behind.
+        for _ in range(4):              # outvote the three truck frames above
+            d._track("c", [("bus", 0.9, VEH, 1)], pic)
+        assert d.totals["bus"] == 1 and d.totals["truck"] == 0, d.totals
+        assert d.counts()["breakdown"] == {
+            "bus": {"type": {"articulated": 1}, "axles": {"4": 1}, "cargo": {"mineral": 1}}}
+        assert min(d.totals.values()) >= 0, d.totals
+
+    # Attributes off: everything else still works, and no crops are taken.
+    d = fresh()
+    d._track("c", det("truck"))
+    d._track("c", det("truck"))
+    assert d.totals["truck"] == 1 and d.counts()["breakdown"] == {}, d.counts()
+
+    # A missing attr_weights file is loud, like a missing detector model.
+    n = Detector([], nosnap, {"attr_weights": "/nope/attrs.pt"})
+    n.start()
+    n.thread.join(timeout=3)
+    assert n.info()["state"] == "error" and "/nope/attrs.pt" in n.info()["error"], n.info()
 
     # Fine-tuned weights: the model's own names are the taxonomy, end to end.
     import sys
