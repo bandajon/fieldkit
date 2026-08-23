@@ -24,7 +24,14 @@ changes):
 | 4  | b-light     | light-vehicles                | B 40 |
 | 5  | d-medium    | medium-heavy-vehicles         | D 200|
 | 6  | f-abnormal  | abnormal-load-vehicles        | F 3000|
-| 7  | minibuses   | DISSOLVES: review pass splits each box into a-small (≤16 seats, Hiace-size) or b-light (17–30, Coaster-size); class removed when empty |
+| 7  | b-minibuses | minibuses                     | B 40 |
+
+AMENDED 2026-08-23 per the gate's actual rules: ALL minibuses toll as B and
+motorcycles as A, so both keep their own visually-distinct class and carry
+the toll letter as a name prefix (motorcycle -> a-motorcycle). The seat-count
+split was cancelled; its 311 queued frames were restored to approved. The
+TOLL CATEGORY of any class is its name prefix before the first dash — the
+aggregation rule for counts/<date>.json consumers.
 
 Honest limit: tonnage/seat thresholds are not visible; categories are the
 same visual judgment a toll clerk makes. Attributes make it auditable.
