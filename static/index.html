@@ -117,6 +117,39 @@
   .tile .cap { padding:10px 12px; font-size:13px; color:var(--dim); }
   .tile img, .tile iframe { display:block; width:100%; aspect-ratio:16/9; border:0; background:#000; }
   .toggle .btn.on { background:rgba(255,255,255,.10); border-color:var(--fg); }
+  #counts { position:fixed; right:12px; bottom:12px; z-index:5; padding:10px 14px;
+            background:var(--panel); border:1px solid var(--line); border-radius:4px;
+            font:600 17px/1.3 var(--mono); color:var(--fg); }
+  #counts[hidden] { display:none; }
+  #l-wrap { position:relative; background:#000; border:1px solid var(--line); border-radius:4px;
+            touch-action:none; }
+  /* pointer-events:none keeps the image from swallowing draw gestures or native-dragging itself */
+  #l-wrap img { display:block; width:100%; pointer-events:none; }
+  .box { position:absolute; box-sizing:border-box; border:3px solid var(--c); cursor:move;
+         touch-action:none; }
+  .grip { position:absolute; right:-3px; bottom:-3px; width:24px; height:24px; background:var(--c);
+          border:2px solid #000; border-radius:3px; cursor:nwse-resize; }
+  .box span { position:absolute; left:0; top:0; padding:2px 6px; background:var(--c); color:#000;
+              font:700 13px/1.3 var(--mono); white-space:nowrap; }
+  .box.gone { border-style:dashed; opacity:.5; }
+  .box .x { position:absolute; right:-3px; top:-3px; width:24px; height:24px; background:var(--c);
+            border:2px solid #000; border-radius:3px; color:#000; cursor:pointer;
+            font:700 16px/20px var(--mono); text-align:center; }
+  .box, .chip { --c:#e8eaec; }
+  .c0 { --c:#ffd400; } .c1 { --c:#ff45e0; } .c2 { --c:#25dede; } .c3 { --c:#ff4b3e; }
+  .chip { display:inline-flex; align-items:center; gap:2px; padding-left:10px;
+          background:var(--panel); border:1px solid var(--line); border-left:5px solid var(--c);
+          border-radius:4px; font:600 14px/1 var(--mono); }
+  .chip button { min-width:40px; min-height:40px; background:none; border:0; color:var(--dim);
+                 font-size:17px; cursor:pointer; }
+  .chip button:hover { color:var(--fg); }
+  #r-img { display:block; width:100%; aspect-ratio:16/9; background:#000; border-radius:4px;
+           border:1px solid var(--line); }
+  #r-slider { width:100%; height:48px; accent-color:var(--fg); }
+  #r-cov { position:relative; height:8px; margin-bottom:12px; background:var(--panel);
+           border:1px solid var(--line); border-radius:3px; overflow:hidden; }
+  #r-cov i { position:absolute; top:0; bottom:0; background:var(--ok); }
+  #r-time { flex:1; text-align:center; font:600 17px/48px var(--mono); }
   #preview img { width:100%; max-width:640px; border:1px solid var(--line); border-radius:4px;
                  background:#000; display:block; margin-top:10px; }
 
@@ -137,6 +170,8 @@
   <button data-tab="cameras" class="on">Cameras</button>
   <button data-tab="record">Record</button>
   <button data-tab="monitor">Monitor</button>
+  <button data-tab="label">Label</button>
+  <button data-tab="review">Review</button>
 </nav>
 
 <main>
@@ -185,6 +220,44 @@
     </div>
     <div id="m-note" class="res"></div>
     <div id="grid"></div>
+    <div id="counts" hidden></div>
+  </section>
+  <section id="label">
+    <h2 id="cnt-label"></h2>
+    <div id="l-wrap" hidden></div>
+    <div class="rowbtns" id="l-acts" hidden>
+      <button class="btn" id="l-back">&larr; Back</button>
+      <button class="btn go" id="l-ok">Approve</button>
+      <button class="btn" id="l-skip">Skip</button>
+      <button class="btn halt" id="l-no">Discard</button>
+    </div>
+    <div class="acts" id="l-classes"></div>
+    <div class="acts">
+      <input id="l-new" placeholder="new label e.g. excavator">
+      <button class="btn" id="l-add">Add label</button>
+    </div>
+    <div id="l-stats" class="res"></div>
+    <div id="l-note" class="res"></div>
+  </section>
+  <section id="review">
+    <h2 id="cnt-review"></h2>
+    <div class="acts">
+      <select id="r-cam"></select>
+      <select id="r-day"></select>
+    </div>
+    <img id="r-img" alt="">
+    <input type="range" id="r-slider" min="0" max="0" step="1" value="0">
+    <div id="r-cov"></div>
+    <div class="rowbtns">
+      <button class="btn" data-step="-600">-10m</button>
+      <button class="btn" data-step="-60">-1m</button>
+      <button class="btn" data-step="-10">-10s</button>
+      <b id="r-time" class="num">--:--:--</b>
+      <button class="btn" data-step="10">+10s</button>
+      <button class="btn" data-step="60">+1m</button>
+      <button class="btn" data-step="600">+10m</button>
+    </div>
+    <div id="r-note" class="res"></div>
   </section>
 </main>
 
@@ -195,12 +268,15 @@ const net24 = ip => ip.split('.').slice(0, 3).join('.');
 const onOurNet = ip => hostIps.some(h => net24(h) === net24(ip));
 let myNet = '192.168.1';   // /24 the Set IP suggestions live in; refreshed from /api/status
 let go2rtc = 'absent';
+let detectState = 'absent', detectError = '';
 document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
   tab = b.dataset.tab;
   document.querySelectorAll('nav button').forEach(x => x.classList.toggle('on', x === b));
   document.querySelectorAll('section').forEach(s => s.classList.toggle('on', s.id === tab));
   if (tab === 'record') recPoll();
   if (tab === 'monitor') monRender();
+  if (tab === 'label') labLoad();
+  if (tab === 'review') revInit();
 });
 
 async function refreshStatus() {
@@ -214,6 +290,8 @@ async function refreshStatus() {
     document.getElementById('s-time').textContent = s.time.replace('T', ' ');
     go2rtc = (s.go2rtc || {}).state || 'absent';
     document.getElementById('s-live').textContent = go2rtc;
+    detectState = (s.detect || {}).state || 'absent';
+    detectError = (s.detect || {}).error || '';
     syncLiveToggle();
   } catch (e) {
     document.getElementById('s-time').textContent = 'server unreachable';
@@ -571,6 +649,8 @@ function syncLiveToggle() {
   else if (go2rtc === 'absent') note.textContent =
     'Live needs go2rtc: download the binary for this platform and set go2rtc_binary in config.yaml.';
   else note.textContent = `go2rtc is ${go2rtc} — snapshots only until it is running.`;
+  if (monMode !== 'live' && (detectState === 'absent' || detectState === 'error'))
+    note.textContent += ' · ' + (detectError || `vehicle detection is ${detectState} — no counts.`);
 }
 
 async function monRender() {
@@ -593,12 +673,21 @@ function monTick() {
   if (tab !== 'monitor' || document.hidden || monMode !== 'snapshots') return;
   document.querySelectorAll('#grid .tile').forEach(t => {
     const img = t.querySelector('img');
-    if (img) img.src = snapUrl(t.dataset.ip);
+    // annotated detection frame; the endpoint falls back to a plain snapshot when detection is off
+    if (img) img.src = `/api/detect/frame?name=${encodeURIComponent(t.dataset.name)}&_=${Date.now()}`;
   });
+  const el = document.getElementById('counts');
+  if (detectState !== 'running' && detectState !== 'starting') { el.hidden = true; return; }
+  fetch('/api/detect/counts').then(r => r.json()).then(c => {
+    el.hidden = c.state !== 'running' && c.state !== 'starting';
+    if (!el.hidden) el.textContent =
+      'today · ' + Object.entries(c.totals || {}).map(([k, v]) => `${k} ${v}`).join(' · ');
+  }).catch(() => {});
 }
 
 function setMode(mode) {
   monMode = mode;
+  if (mode !== 'snapshots') document.getElementById('counts').hidden = true;
   document.getElementById('m-snap').classList.toggle('on', mode === 'snapshots');
   document.getElementById('m-live').classList.toggle('on', mode === 'live');
   monRender();
@@ -608,6 +697,337 @@ document.getElementById('m-snap').onclick = () => setMode('snapshots');
 document.getElementById('m-live').onclick = () => setMode('live');
 
 setInterval(monTick, 1000);   // 1 fps, and monTick no-ops when the tab is hidden
+
+// --- Label tab ---
+// Boxes are YOLO-normalized, so percentage CSS positions them with no natural-size math.
+// cls === labClasses.length is the "removed" rung of the tap cycle: drawn dashed rather than
+// hidden so it stays tappable back to car, and dropped from the POST.
+let labLastCls = 0;
+let labDone = [];   // ids approved this session, newest last — the Back button's stack
+let labClasses = [], labQueue = [], labBoxes = [], labTotal = 0,
+    labApproved = {frames: 0, boxes: {}};
+const labNote = t => document.getElementById('l-note').textContent = t;
+const labStats = () => document.getElementById('l-stats').textContent = labApproved.frames
+  ? `fine-tune set: ${labApproved.frames} frames · ` +
+    Object.entries(labApproved.boxes).map(([k, v]) => `${k} ${v}`).join(' · ')
+  : 'fine-tune set: empty — approve samples to grow it';
+const boxCls = b => `box c${b.cls}${b.cls >= labClasses.length ? ' gone' : ''}`;
+
+async function labLoad() {
+  try {
+    const d = await (await fetch('/api/dataset/samples')).json();
+    labClasses = d.classes || [];
+    labQueue = d.pending || [];
+    labTotal = d.pending_total ?? labQueue.length;   // the list is capped at 100 per fetch
+    labApproved = d.approved || {frames: 0, boxes: {}};
+  } catch (e) {
+    labNote('Could not load samples — is the server reachable?');
+    return;
+  }
+  labStats();
+  labChips();
+  labShow();
+}
+
+function labShow() {
+  const s = labQueue[0], wrap = document.getElementById('l-wrap');
+  setCount('label', labTotal, 'to review');
+  wrap.hidden = !s;
+  // The row survives an empty queue while Back can still reopen the last approval.
+  document.getElementById('l-acts').hidden = !s && !labDone.length;
+  document.getElementById('l-back').disabled = !labDone.length;
+  ['l-ok', 'l-skip', 'l-no'].forEach(id => document.getElementById(id).disabled = !s);
+  if (!s) {
+    // The batch is done but more may wait on disk (the fetch is capped at 100).
+    if (labTotal > 0) return labLoad();
+    return labNote('No samples waiting — detection captures one when the scene changes.');
+  }
+  labBoxes = s.boxes.map(b => ({...b}));
+  labNote(`${labTotal} remaining · tap a box to change its class, × to delete, drag to move, ` +
+          `corner to resize, drag empty area to add a box`);
+  wrap.innerHTML = `<img src="/api/dataset/image?id=${encodeURIComponent(s.id)}" alt="">` +
+    labBoxes.map(boxHtml).join('');
+}
+
+const boxHtml = (b, i) => `<div class="${boxCls(b)}" data-i="${i}"
+    style="left:${(b.cx - b.w / 2) * 100}%; top:${(b.cy - b.h / 2) * 100}%;
+           width:${b.w * 100}%; height:${b.h * 100}%">
+    <span>${esc(labClasses[b.cls] || 'removed')}</span><b class="x">&times;</b><i class="grip"></i></div>`;
+
+// Rubber-band draw: the two corners in any order → a normalized box clamped to the frame
+// (pointer capture happily reports coordinates outside the image).
+function labRect(ax, ay, bx, by) {
+  const cl = v => Math.min(1, Math.max(0, v));
+  const x1 = cl(Math.min(ax, bx)), x2 = cl(Math.max(ax, bx));
+  const y1 = cl(Math.min(ay, by)), y2 = cl(Math.max(ay, by));
+  return {cx: (x1 + x2) / 2, cy: (y1 + y2) / 2, w: x2 - x1, h: y2 - y1};
+}
+
+// Drag maths, pure so the self-check can exercise the clamping without a DOM.
+// dx/dy are normalized (pointer delta / wrapper size); grip resizes with the top-left pinned.
+function labDrag(b0, dx, dy, grip) {
+  const cl = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+  if (!grip) return {...b0, cx: cl(b0.cx + dx, b0.w / 2, 1 - b0.w / 2),
+                            cy: cl(b0.cy + dy, b0.h / 2, 1 - b0.h / 2)};
+  const x = b0.cx - b0.w / 2, y = b0.cy - b0.h / 2;
+  const w = cl(b0.w + dx, .005, 1 - x), h = cl(b0.h + dy, .005, 1 - y);
+  return {...b0, w, h, cx: x + w / 2, cy: y + h / 2};
+}
+
+const labPlace = (d, b) => Object.assign(d.style, {
+  left: `${(b.cx - b.w / 2) * 100}%`, top: `${(b.cy - b.h / 2) * 100}%`,
+  width: `${b.w * 100}%`, height: `${b.h * 100}%`});
+
+// One delegated pointer handler for both gestures: a press that never travels past the
+// threshold is the class-cycle tap, anything beyond it drags (or resizes, from the grip).
+document.getElementById('l-wrap').onpointerdown = e => {
+  const d = e.target.closest('.box');
+  if (!d) return labDraw(e);
+  const b = labBoxes[d.dataset.i], b0 = {...b}, r = d.parentElement.getBoundingClientRect();
+  if (e.target.classList.contains('x')) {
+    // Deleted, not spliced: data-i of the surviving boxes must keep pointing at labBoxes.
+    b.del = true;
+    return d.remove();
+  }
+  const grip = e.target.classList.contains('grip'), x0 = e.clientX, y0 = e.clientY;
+  let moved = false;
+  d.setPointerCapture(e.pointerId);
+  d.onpointermove = ev => {
+    if (!moved && Math.hypot(ev.clientX - x0, ev.clientY - y0) < 6) return;
+    moved = true;
+    Object.assign(b, labDrag(b0, (ev.clientX - x0) / r.width, (ev.clientY - y0) / r.height, grip));
+    labPlace(d, b);
+  };
+  d.onpointerup = d.onpointercancel = ev => {
+    d.onpointermove = d.onpointerup = d.onpointercancel = null;
+    if (moved || ev.type !== 'pointerup') return;
+    b.cls = (b.cls + 1) % (labClasses.length + 1);
+    if (b.cls < labClasses.length) labLastCls = b.cls;   // runs of one missed class draw as that class
+    d.className = boxCls(b);
+    d.querySelector('span').textContent = labClasses[b.cls] || 'removed';
+  };
+};
+
+// Press on the image itself: rubber-band a new box for a vehicle the detector missed.
+function labDraw(e) {
+  const wrap = e.currentTarget, r = wrap.getBoundingClientRect();
+  const ax = (e.clientX - r.left) / r.width, ay = (e.clientY - r.top) / r.height;
+  const x0 = e.clientX, y0 = e.clientY;
+  let nd = null, nb = null;
+  wrap.setPointerCapture(e.pointerId);
+  wrap.onpointermove = ev => {
+    if (!nd && Math.hypot(ev.clientX - x0, ev.clientY - y0) < 6) return;
+    nb = labRect(ax, ay, (ev.clientX - r.left) / r.width, (ev.clientY - r.top) / r.height);
+    nb.cls = labLastCls < labClasses.length ? labLastCls : 0;
+    if (!nd) {   // appended, not re-rendered: rebuilding the wrapper would refetch the image
+      wrap.insertAdjacentHTML('beforeend', boxHtml(nb, labBoxes.length));
+      nd = wrap.lastElementChild;
+    }
+    labPlace(nd, nb);
+  };
+  wrap.onpointerup = wrap.onpointercancel = ev => {
+    wrap.onpointermove = wrap.onpointerup = wrap.onpointercancel = null;
+    if (!nd) return;                                    // a plain tap on the background
+    if (ev.type !== 'pointerup' || nb.w < .008 || nb.h < .008) return nd.remove();
+    labBoxes.push(nb);                                  // data-i already holds this index
+  };
+}
+
+async function labSend(action) {
+  const s = labQueue[0];
+  if (!s) return;
+  labNote('saving…');
+  const boxes = labBoxes.filter(b => !b.del && b.cls < labClasses.length);
+  try {
+    const r = await post('/api/dataset/label', {id: s.id, action, boxes});
+    if (!r.ok) throw new Error('rejected');
+  } catch (e) {
+    labNote('Save failed — sample kept, tap again to retry.');
+    return;
+  }
+  if (action === 'approve') {   // bumped locally; the next labLoad trues it up from disk
+    labDone.push(s.id);         // approvals only — a discard is deleted server-side
+    labApproved.frames++;
+    boxes.forEach(b => {
+      const n = labClasses[b.cls];
+      labApproved.boxes[n] = (labApproved.boxes[n] || 0) + 1;
+    });
+    labStats();
+  }
+  labQueue.shift();
+  labTotal = Math.max(0, labTotal - 1);   // skip leaves the total: the frame stays on disk
+  labShow();
+}
+document.getElementById('l-ok').onclick = () => labSend('approve');
+// Skipped samples stay pending and age out of the rolling capture buffer on their own;
+// Skip is for near-duplicates (parked vehicles) not worth a decision.
+document.getElementById('l-skip').onclick = () => { labQueue.shift(); labShow(); };
+document.getElementById('l-no').onclick = () => labSend('discard');
+
+// Reopen the last approval to amend it. Undoes the optimistic stats bump the same way
+// labSend applied it; the next labLoad trues both up from disk.
+document.getElementById('l-back').onclick = async () => {
+  const id = labDone.pop();
+  if (!id) return;
+  let r;
+  try {
+    r = await post('/api/dataset/label', {id, action: 'unapprove'});
+    if (!r.ok) throw new Error(r.detail || 'rejected');
+  } catch (e) {
+    labNote(String(e.message || e));   // id stays popped: it is not coming back
+    return labShow();
+  }
+  labQueue.unshift({id, boxes: r.boxes});
+  labTotal++;
+  labApproved.frames = Math.max(0, labApproved.frames - 1);
+  r.boxes.forEach(b => {
+    const n = labClasses[b.cls];
+    labApproved.boxes[n] = Math.max(0, (labApproved.boxes[n] || 0) - 1);
+  });
+  labStats();
+  labShow();
+};
+
+function labChips() {
+  document.getElementById('l-classes').innerHTML = labClasses.map((n, i) =>
+    `<span class="chip c${i}">${esc(n)}
+       <button data-act="rename" data-i="${i}" title="rename">&#9998;</button>
+       <button data-act="remove" data-i="${i}" title="remove">&times;</button></span>`).join('');
+}
+
+// Returns true on success; classes and chips are refreshed from the server's list.
+async function labClassPost(body) {
+  try {
+    const r = await post('/api/dataset/class', body);
+    if (!r.ok) throw new Error(r.detail || 'rejected');
+    labClasses = r.classes;           // new classes join the tap cycle on the next tap
+    labChips();
+    return true;
+  } catch (e) {
+    labNote(String(e.message || e));
+    return false;
+  }
+}
+
+document.getElementById('l-classes').onclick = async e => {
+  const b = e.target.closest('button');
+  if (!b) return;
+  const name = labClasses[b.dataset.i];
+  if (b.dataset.act === 'remove') {
+    // A remove may remap class ids in the stored label files, so every queued sample's
+    // box classes are stale — refetch the list instead of guessing the new numbering.
+    if (await labClassPost({action: 'remove', name})) labLoad();
+    return;
+  }
+  const to = (prompt(`Rename "${name}" to:`, name) || '').trim();
+  if (!to || to === name) return;
+  if (labClasses.includes(to)) {
+    if (!confirm(`"${to}" already exists. Merge "${name}" and "${to}" into one class named ` +
+                 `"${to}"? Samples of both become "${to}".`)) return;
+    // Merge the other class INTO the one being renamed so the renamed (usually detector) slot
+    // survives; the rename is then collision-free. Merged ids make queued samples stale too.
+    if (await labClassPost({action: 'merge', from: to, into: name}) &&
+        await labClassPost({action: 'rename', from: name, to})) labLoad();
+    return;
+  }
+  if (!await labClassPost({action: 'rename', from: name, to})) return;
+  // Ids are unchanged by a rename, so relabel the drawn boxes in place and keep the
+  // operator's uncommitted taps.
+  document.querySelectorAll('#l-wrap .box').forEach(d =>
+    d.querySelector('span').textContent = labClasses[labBoxes[d.dataset.i].cls] || 'removed');
+};
+
+document.getElementById('l-add').onclick = async () => {
+  const el = document.getElementById('l-new'), name = el.value.trim();
+  if (!name) return;
+  if (await labClassPost({name})) {
+    el.value = '';
+    labNote(`added "${name}" · ${labClasses.length} classes`);
+  }
+};
+document.getElementById('l-new').onkeydown = e => {
+  if (e.key === 'Enter') document.getElementById('l-add').click();
+};
+
+// --- Review tab ---
+let revSegs = [], revT = 0, revTimer = null, revUrl = '';
+const revNote = t => document.getElementById('r-note').textContent = t;
+const revDayKey = t => new Date(t * 1000).toLocaleDateString();
+
+// pure so the self-check can exercise the day split without a DOM
+function revRange(segs, day) {
+  const inDay = segs.filter(s => revDayKey(s.start) === day);
+  if (!inDay.length) return null;
+  const last = inDay[inDay.length - 1];
+  return {segs: inDay, min: inDay[0].start, max: Math.round(last.start + last.duration)};
+}
+
+async function revInit() {
+  const sel = document.getElementById('r-cam');
+  if (!sel.options.length) {
+    if (!monCams) monCams = await (await fetch('/api/cameras')).json();
+    sel.innerHTML = monCams.map(c => `<option>${esc(c.name)}</option>`).join('');
+  }
+  revSegments();     // re-fetched per visit: the recorder keeps adding segments
+}
+
+async function revSegments() {
+  const name = document.getElementById('r-cam').value;
+  if (!name) return revNote('No cameras in config.yaml.');
+  try {
+    const r = await fetch('/api/review/segments?name=' + encodeURIComponent(name));
+    revSegs = (await r.json()).segments || [];
+  } catch (e) {
+    return revNote('Could not load segments — is the server reachable?');
+  }
+  setCount('review', revSegs.length, 'segments');
+  const days = [...new Set(revSegs.map(s => revDayKey(s.start)))].reverse();   // newest first
+  document.getElementById('r-day').innerHTML = days.map(d => `<option>${esc(d)}</option>`).join('');
+  revDay();
+}
+
+function revDay() {
+  const sl = document.getElementById('r-slider');
+  const range = revRange(revSegs, document.getElementById('r-day').value);
+  sl.disabled = !range;
+  if (!range) return revNote('No footage recorded yet for this camera.');
+  sl.min = range.min; sl.max = range.max; sl.value = range.min;
+  const span = range.max - range.min || 1;
+  document.getElementById('r-cov').innerHTML = range.segs.map(s =>
+    `<i style="left:${(s.start - range.min) / span * 100}%; width:${s.duration / span * 100}%"></i>`)
+    .join('');
+  revSeek(range.min, true);
+}
+
+function revSeek(t, now) {
+  revT = t;
+  document.getElementById('r-time').textContent = new Date(t * 1000).toLocaleTimeString();
+  clearTimeout(revTimer);
+  revTimer = setTimeout(revFrame, now ? 0 : 250);   // scrubbing must not fire a request per pixel
+}
+
+async function revFrame() {
+  const name = document.getElementById('r-cam').value;
+  revNote('loading…');
+  try {
+    const r = await fetch(`/api/review/frame?name=${encodeURIComponent(name)}&t=${revT}`);
+    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || `error ${r.status}`);
+    URL.revokeObjectURL(revUrl);       // a blob per seek would leak for the whole session
+    document.getElementById('r-img').src = revUrl = URL.createObjectURL(await r.blob());
+    revNote('');
+  } catch (e) {
+    revNote(String(e.message || e));   // gaps are normal: keep the last good frame on screen
+  }
+}
+
+document.getElementById('r-cam').onchange = revSegments;
+document.getElementById('r-day').onchange = revDay;
+document.getElementById('r-slider').oninput = e => revSeek(+e.target.value);
+document.querySelectorAll('#review [data-step]').forEach(b => b.onclick = () => {
+  const sl = document.getElementById('r-slider');
+  sl.value = revT + +b.dataset.step;   // the range input clamps to min/max for us
+  revSeek(+sl.value, true);
+});
 </script>
 </body>
 </html>

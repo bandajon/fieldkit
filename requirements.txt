@@ -4,3 +4,5 @@ requests
 pyyaml
 websockets
 # boto3  # optional — only for Cloudflare R2 offload
+# ultralytics  # optional — Monitor detection overlay (vehicle boxes + counts)
+# pillow  # optional — Monitor detection overlay

@@ -6,6 +6,10 @@ recordings/
 ingest/
 # generated from config.yaml; contains camera passwords
 go2rtc.yaml
+# YOLO weights auto-downloaded by the Monitor detection overlay
+*.pt
+# detection training samples, operator-labeled on the Label tab
+dataset/
 
 # operator config: copied from config.example.yaml on first boot, holds field passwords
 config.yaml
@@ -17,3 +21,7 @@ ops_state/
 ops_config.yaml
 dist/
 .venv/
+# ultralytics writes val outputs here
+runs/
+# playwright session artifacts
+.playwright-mcp/

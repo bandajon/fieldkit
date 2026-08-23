@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import socket
+import subprocess
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -18,6 +19,7 @@ from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 import camera
+import detect
 import hive
 import hostnet
 import live
@@ -27,9 +29,14 @@ import recorder
 ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = ROOT / "config.yaml"
 EXAMPLE_PATH = ROOT / "config.example.yaml"
+DATASET = ROOT / "dataset"                        # detection samples awaiting operator review
 
 CONFIG = {}
 CAM_NAME = re.compile(r"^[A-Za-z0-9_-]{1,32}$")   # becomes a directory name
+SAMPLE_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")  # becomes a file name — no dots, no separators
+SEGMENT_MAX = 660                                 # 600 s segments plus slack for a late finalise
+DET_CLASSES = list(detect.CLASSES.values())       # dataset class ids 0-3, the order detect.py writes
+CLASS_NAME = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")   # YOLO training class name
 
 
 def load_config():
@@ -102,14 +109,29 @@ OFFLOAD.start()   # no-op unless offload.enabled is set
 HIVE = hive.Hive(CONFIG, REC, lambda: record_status(), camera.snapshot, local_ips,
                  console_creds=CONSOLE_CREDS)
 HIVE.start()   # no-op unless config.yaml has an ops: block
+def detect_snapshot(ip, user, password):
+    """cam_creds chain + short timeout: one dead camera must not stall the whole
+    detection pass (camera.snapshot defaults to 8 s), and config-supplied IPs are
+    untrusted (POST /api/config has no auth on the field LAN)."""
+    try:
+        ipaddress.ip_address(ip)
+    except (ValueError, TypeError):
+        return None, f"not an IP address: {ip!r}"
+    return camera.snapshot(ip, *cam_creds(ip), timeout=3)
+
+
+DETECT = detect.Detector(CONFIG.get("cameras", []), detect_snapshot, CONFIG,
+                         creds_fn=lambda ip: cam_creds(ip), dataset_dir=DATASET)
+DETECT.start()   # no-op unless the optional detection deps are installed
 
 
 @atexit.register
 def _shutdown():
     """Children spawned in their own process group survive Ctrl-C; an orphaned ffmpeg
     would then fight the restarted app for the same segment paths."""
-    REC.stop()
+    REC.shutdown()   # not stop(): a restart must not erase the sessions resume() re-arms
     LIVE.stop()
+    DETECT.stop()
 
 app = FastAPI(title="FieldKit")
 app.mount("/static", StaticFiles(directory=ROOT / "static"), name="static")
@@ -129,6 +151,7 @@ def status():
         "time": datetime.now().isoformat(timespec="seconds"),
         "go2rtc": LIVE.info(),
         "hive": HIVE.info(),
+        "detect": DETECT.info(),
     }
 
 
@@ -145,6 +168,17 @@ def live_start():
 @app.post("/api/live/stop")
 def live_stop():
     return {"state": LIVE.stop()}
+
+
+@app.post("/api/detect/start")
+def detect_start():
+    return {"state": DETECT.start()}
+
+
+@app.post("/api/detect/stop")
+def detect_stop():
+    """Frees the GPU/CPU for training runs; Monitor falls back to raw snapshots."""
+    return {"state": DETECT.stop()}
 
 
 @app.get("/api/record/status")
@@ -344,6 +378,308 @@ def camera_snapshot(ip: str):
     return Response(content=data, media_type="image/jpeg")
 
 
+def cam_or_404(name):
+    cam = next((c for c in CONFIG["cameras"] if c["name"] == name), None)
+    if not cam:
+        raise HTTPException(404, f"no camera named {name!r} in config")
+    return cam
+
+
+@app.get("/api/detect/frame")
+def detect_frame(name: str):
+    cam = cam_or_404(name)
+    data = DETECT.frame(name)
+    if data is None:      # detection absent or between passes — show the live camera instead
+        data, err = detect_snapshot(cam["ip"], "", "")
+        if err:
+            raise HTTPException(502, err)
+    return Response(content=data, media_type="image/jpeg")
+
+
+@app.get("/api/detect/counts")
+def detect_counts():
+    return DETECT.counts()
+
+
+def segments(name):
+    """(path, start epoch, duration) per recorded segment, oldest first. Names are
+    local wallclock starts (recorder contract) and mtime is the end — still moving
+    on the segment being written, which is what a live scrubber wants."""
+    d = record_dir() / CONFIG.get("site", "site1") / name
+    out = []
+    for p in d.glob("*.mkv") if d.is_dir() else []:
+        try:
+            start = datetime.strptime(p.stem, "%Y%m%d-%H%M%S").timestamp()
+            dur = p.stat().st_mtime - start
+        except (ValueError, OSError):      # not a segment name, or deleted mid-scan
+            continue
+        out.append((p, start, round(min(max(dur, 0), SEGMENT_MAX), 1)))
+    return sorted(out, key=lambda s: s[1])
+
+
+@app.get("/api/review/segments")
+def review_segments(name: str):
+    cam_or_404(name)
+    return {"segments": [{"start": s, "duration": d} for _, s, d in segments(name)]}
+
+
+@app.get("/api/review/frame")
+def review_frame(name: str, t: str):
+    cam_or_404(name)
+    try:
+        when = float(t)
+    except (TypeError, ValueError):
+        raise HTTPException(400, f"not a timestamp: {t!r}")
+    seg = next((x for x in segments(name) if x[1] <= when < x[1] + x[2]), None)
+    if not seg:
+        raise HTTPException(404, "no footage at that time")
+    try:
+        # -ss before -i seeks by keyframe index instead of decoding from the top
+        out = subprocess.run(["ffmpeg", "-ss", f"{when - seg[1]:.3f}", "-i", str(seg[0]),
+                              "-frames:v", "1", "-f", "image2", "-c:v", "mjpeg", "-q:v", "3", "-"],
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=10)
+    except subprocess.TimeoutExpired:
+        raise HTTPException(502, "frame extraction timed out")
+    if not out.stdout:
+        raise HTTPException(502, "could not extract a frame")
+    data, err = detect.review_frame(out.stdout, CONFIG)
+    if err == detect.PIP_HINT:   # no model on this node: scrubbing without boxes beats no scrubbing
+        return Response(content=out.stdout, media_type="image/jpeg")
+    if err:
+        raise HTTPException(502, err)
+    return Response(content=data, media_type="image/jpeg")
+
+
+def valid_sample_id(sid):
+    """Sample ids land in filesystem paths — a basename, never a path."""
+    if not SAMPLE_ID.match(sid or ""):
+        raise HTTPException(400, f"not a sample id: {sid!r}")
+    return sid
+
+
+def dataset_classes():
+    """classes.txt wins once it exists: the operator may have added classes past
+    the four detect.py ships with."""
+    f = DATASET / "classes.txt"
+    if f.is_file():
+        return [line.strip() for line in f.read_text().splitlines() if line.strip()]
+    return list(DET_CLASSES)      # a copy: callers edit this list
+
+
+def write_classes(classes):
+    f = DATASET / "classes.txt"
+    f.parent.mkdir(parents=True, exist_ok=True)   # detection may never have run on this node
+    f.write_text("".join(c + "\n" for c in classes))
+
+
+def label_files():
+    """Every label file in both trees. ponytail: full scan per class edit — the
+    dataset caps at ~500 pending samples; index them if that ever changes."""
+    for tree in ("pending", "approved"):
+        d = DATASET / tree / "labels"
+        if d.is_dir():
+            yield from d.glob("*.txt")
+
+
+def approved_counts():
+    """Size of the fine-tuning set. ponytail: full scan per request, same scale
+    note as label_files()."""
+    names, boxes, frames = dataset_classes(), {}, 0
+    d = DATASET / "approved" / "labels"
+    for p in sorted(d.glob("*.txt")) if d.is_dir() else []:
+        try:
+            text = p.read_text()
+        except OSError:
+            continue
+        frames += 1
+        for line in text.splitlines():
+            f = line.split()
+            try:
+                cls = int(f[0])
+            except (IndexError, ValueError):
+                continue
+            if 0 <= cls < len(names):      # a stale id past the class list is skipped, not fatal
+                boxes[names[cls]] = boxes.get(names[cls], 0) + 1
+    return {"frames": frames, "boxes": boxes}
+
+
+def sample_paths(sid, tree="pending"):
+    return (DATASET / tree / "images" / f"{sid}.jpg", DATASET / tree / "labels" / f"{sid}.txt")
+
+
+def read_boxes(path):
+    """YOLO label lines -> box dicts. A malformed line is skipped: one bad row
+    must not hide the rest of the sample from the operator."""
+    boxes = []
+    for line in path.read_text().splitlines():
+        f = line.split()
+        if len(f) != 5:
+            continue
+        try:
+            boxes.append({"cls": int(f[0]), "cx": float(f[1]), "cy": float(f[2]),
+                          "w": float(f[3]), "h": float(f[4])})
+        except ValueError:
+            continue
+    return boxes
+
+
+@app.get("/api/dataset/samples")
+def dataset_samples():
+    labels = DATASET / "pending" / "labels"
+    pending = []
+    for p in sorted(labels.glob("*.txt")) if labels.is_dir() else []:
+        try:
+            pending.append((p.stat().st_mtime, {"id": p.stem, "boxes": read_boxes(p)}))
+        except OSError:      # sample reviewed away mid-listing
+            continue
+    pending.sort(key=lambda t: t[0], reverse=True)
+    return {"classes": dataset_classes(), "approved": approved_counts(),
+            # the list is capped for payload size; pending_total is the real pile
+            "pending_total": len(pending), "pending": [s for _, s in pending[:100]]}
+
+
+@app.get("/api/dataset/image")
+def dataset_image(id: str):
+    img, _ = sample_paths(valid_sample_id(id))
+    if not img.is_file():
+        raise HTTPException(404, f"no pending sample {id!r}")
+    return FileResponse(img, media_type="image/jpeg")
+
+
+@app.post("/api/dataset/label")
+def dataset_label(body: dict = Body(default={})):
+    sid = valid_sample_id(body.get("id"))
+    action = body.get("action")
+    if action == "unapprove":
+        src_img, src_lbl = sample_paths(sid, "approved")
+        if not src_img.is_file():
+            raise HTTPException(404, f"{sid} is not in the approved set")
+        img, lbl = sample_paths(sid)
+        img.parent.mkdir(parents=True, exist_ok=True)
+        lbl.parent.mkdir(parents=True, exist_ok=True)
+        src_img.rename(img)
+        lbl.write_text(src_lbl.read_text() if src_lbl.is_file() else "")
+        src_lbl.unlink(missing_ok=True)
+        for p in (img, lbl):
+            os.utime(p, None)   # front of the review queue, last in line for eviction
+        return {"ok": True, "id": sid, "boxes": read_boxes(lbl)}
+    if action not in ("approve", "discard"):
+        raise HTTPException(400, "action must be 'approve', 'discard' or 'unapprove'")
+    img, lbl = sample_paths(sid)
+    if not img.is_file():
+        raise HTTPException(404, f"no pending sample {sid!r}")
+    if action == "discard":
+        img.unlink(missing_ok=True)
+        lbl.unlink(missing_ok=True)
+        return {"ok": True}
+    lines, nclasses = [], len(dataset_classes())
+    for b in body.get("boxes") or []:   # an empty list is legal: every box removed = a negative sample
+        try:
+            cls = int(b["cls"])
+            coords = [float(b[k]) for k in ("cx", "cy", "w", "h")]
+        except (KeyError, TypeError, ValueError):
+            raise HTTPException(400, f"malformed box: {b!r}")
+        if not 0 <= cls < nclasses or not all(0 <= v <= 1 for v in coords):
+            raise HTTPException(400, f"box out of range: {b!r}")
+        lines.append(" ".join([str(cls)] + [f"{v:.6f}" for v in coords]))
+    dst_img, dst_lbl = sample_paths(sid, "approved")
+    dst_img.parent.mkdir(parents=True, exist_ok=True)
+    dst_lbl.parent.mkdir(parents=True, exist_ok=True)
+    dst_lbl.write_text("".join(l + "\n" for l in lines))   # the operator's edit wins over the model's guess
+    img.rename(dst_img)
+    lbl.unlink(missing_ok=True)
+    return {"ok": True}
+
+
+def valid_class_name(name):
+    if not CLASS_NAME.match(name or ""):
+        raise HTTPException(400, "class name must be lowercase: a letter, then letters, "
+                                 "digits, - or _ (max 32)")
+    return name
+
+
+def samples_using(idx):
+    """How many label files reference class id `idx`."""
+    hits = 0
+    for p in label_files():
+        for line in p.read_text().splitlines():
+            f = line.split()
+            if f and f[0] == str(idx):
+                hits += 1
+                break
+    return hits
+
+
+def remap_class_ids(path, fn):
+    """Rewrite each line's class id through `fn`; the rest of the line stays verbatim."""
+    lines = []
+    for line in path.read_text().splitlines():
+        f = line.split(None, 1)
+        try:
+            cls = int(f[0])
+        except (IndexError, ValueError):
+            lines.append(line)          # malformed row: leave it exactly as found
+            continue
+        lines.append(" ".join([str(fn(cls))] + f[1:]))
+    path.write_text("".join(l + "\n" for l in lines))
+
+
+@app.post("/api/dataset/class")
+def dataset_class(body: dict = Body(default={})):
+    action = body.get("action") or "add"
+    classes = dataset_classes()
+    if action == "add":
+        name = valid_class_name(body.get("name"))
+        if name not in classes:
+            classes.append(name)
+            write_classes(classes)
+    elif action == "rename":
+        old, new = body.get("from") or "", valid_class_name(body.get("to"))
+        if old not in classes:
+            raise HTTPException(404, f"no class named {old!r}")
+        if new in classes:
+            raise HTTPException(400, f"{new} already exists — merge the two classes instead")
+        # Ids are positional: renaming a line touches no label file on disk.
+        classes[classes.index(old)] = new
+        write_classes(classes)
+    elif action == "remove":
+        name = body.get("name") or ""
+        if name not in classes:
+            raise HTTPException(404, f"no class named {name!r}")
+        idx = classes.index(name)
+        if idx < len(DET_CLASSES):
+            raise HTTPException(400, f"{name} is a class the detector writes itself — "
+                                     "rename it to your own term instead")
+        used = samples_using(idx)
+        if used:
+            raise HTTPException(400, f"{name} is used by {used} labelled sample(s) — "
+                                     "relabel them before removing it")
+        # Label files first: a crash before classes.txt is rewritten leaves every id valid.
+        for p in label_files():
+            remap_class_ids(p, lambda c: c - 1 if c > idx else c)
+        classes.pop(idx)
+        write_classes(classes)
+    elif action == "merge":
+        src, into = body.get("from") or "", body.get("into") or ""
+        for n in (src, into):
+            if n not in classes:
+                raise HTTPException(404, f"no class named {n!r}")
+        if src == into:
+            raise HTTPException(400, f"{src} is already that class")
+        lo, hi = sorted((classes.index(src), classes.index(into)))
+        if hi < len(DET_CLASSES):
+            raise HTTPException(400, "the four detector classes can't be merged with each other — "
+                                     "the detector needs all four slots")
+        # Label files first, same as remove: refs remapped with line hi still present is a valid state.
+        for p in label_files():
+            remap_class_ids(p, lambda c: lo if c == hi else (c - 1 if c > hi else c))
+        classes.pop(hi)   # lo keeps its current name — rename it next if the operator wants the other one
+        write_classes(classes)
+    else:
+        raise HTTPException(400, "action must be 'add', 'rename', 'remove' or 'merge'")
+    return {"ok": True, "classes": classes}
+
+
 @app.post("/api/camera/test_rtsp")
 def camera_test_rtsp(body: dict = Body(default={})):
     ip = valid_ip(body.get("ip"))
@@ -392,6 +728,7 @@ def apply_cameras():
     for c in CONFIG["cameras"]:
         REC.add_camera(c)
     LIVE.set_cameras(CONFIG["cameras"])
+    DETECT.set_cameras(CONFIG["cameras"])
 
 
 @app.post("/api/config/add_camera")
@@ -428,8 +765,7 @@ def config_rename_camera(body: dict = Body(default={})):
         raise HTTPException(400, f"{old} is recording — stop it first")
     cam["name"] = new
     CONFIG_PATH.write_text(yaml.safe_dump(CONFIG, sort_keys=False))
-    REC.add_camera(cam)
-    LIVE.set_cameras(CONFIG["cameras"])
+    apply_cameras()
     # Already-written segments stay under <record_dir>/<site>/<old>/ — only new ones move.
     return {"ok": True}
 
@@ -443,7 +779,7 @@ def config_remove_camera(body: dict = Body(default={})):
         raise HTTPException(400, f"{name} is recording — stop it first")
     CONFIG["cameras"] = [c for c in CONFIG["cameras"] if c["name"] != name]
     CONFIG_PATH.write_text(yaml.safe_dump(CONFIG, sort_keys=False))
-    LIVE.set_cameras(CONFIG["cameras"])
+    apply_cameras()
     # Recordings under <record_dir>/<site>/<name>/ are deliberately left on disk.
     return {"ok": True}
 
