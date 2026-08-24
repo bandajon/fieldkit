@@ -149,6 +149,7 @@
   #l-attrs i { min-width:52px; font-style:normal; }
   #l-attrs [data-cls] { border-color:var(--c); }
   #l-attrs .rm { border-style:dashed; color:var(--dim); }
+  #l-attrs .btn.sug { border-style:dashed; }   /* proposed by the VLM, not yet confirmed */
   .box .x { position:absolute; right:-3px; top:-3px; width:24px; height:24px; background:var(--c);
             border:2px solid #000; border-radius:3px; color:#000; cursor:pointer;
             font:700 16px/20px var(--mono); text-align:center; }
@@ -799,9 +800,13 @@ function labShow() {
   }
   // Sidecar attrs are keyed by the sample's own box order, so hydrate before anything filters.
   // Hydrated values count as touched: they were set deliberately in an earlier pass.
+  // VLM suggestions sit under confirmed attrs: lit and part of the payload, but untouched,
+  // so the operator can see and correct what the machine proposed.
   labBoxes = s.boxes.map((b, i) => {
-    const attrs = {...(s.attrs || {})[i]};
-    return {...b, attrs, touched: new Set(Object.keys(attrs))};
+    const confirmed = {...(s.attrs || {})[i]}, sug = {...(s.suggested || {})[i]};
+    const touched = new Set(Object.keys(confirmed));
+    return {...b, attrs: {...sug, ...confirmed}, touched,
+            suggested: new Set(Object.keys(sug).filter(h => !touched.has(h)))};
   });
   labNote(`${labTotal} remaining · tap a box to select it, set class and attributes below, ` +
           `× to delete, drag to move, corner to resize, drag empty area to add a box`);
@@ -828,9 +833,11 @@ function labSelect(i) {
       const vocab = labVocab(head, name, b.attrs[head], b.attrs);
       if (!vocab.length) return '';   // a class can opt out of a head (axle-config on cars)
       return row(esc(head), vocab.map(([v, stale]) =>
-        `<button class="btn${b.attrs[head] === v ? ' on' : ''}${stale ? ' halt' : ''}"
+        `<button class="btn${b.attrs[head] === v ? ' on' : ''}${stale ? ' halt' : ''}${
+                  b.suggested.has(head) && b.attrs[head] === v ? ' sug' : ''}"
                   data-head="${esc(head)}" data-val="${esc(v)}"
-          >${esc(v === '7plus' ? '7+' : v)}</button>`).join(''));
+          >${esc(v)}</button>`).join('') +
+        `<button class="btn rm" data-add="${esc(head)}">+</button>`);
     }).join('');
   el.innerHTML = row('class', labClasses.map((n, j) =>
       `<button class="btn${b.cls === j ? ' on' : ''}" style="--c:${clsColor(j)}" data-cls="${j}"
@@ -856,18 +863,21 @@ function labVocab(head, name, cur, attrs) {
   return out;
 }
 
-// Fills heads the operator has not tapped, skipping values the class disallows — machinery
-// must never overwrite a deliberate choice nor introduce a flagged-stale value.
+// Tapped by the operator, or proposed by the VLM: either way, machinery leaves the head alone.
+const labLocked = (b, head) => b.touched.has(head) || b.suggested.has(head);
+
+// Fills heads nothing has claimed, skipping values the class disallows — machinery must never
+// overwrite a deliberate choice nor introduce a flagged-stale value.
 function labFill(b, map) {
   const name = labClasses[b.cls];
   for (const [head, v] of Object.entries(map || {}))
-    if (!b.touched.has(head) && labVocab(head, name, null).some(([a]) => a === v)) b.attrs[head] = v;
+    if (!labLocked(b, head) && labVocab(head, name, null).some(([a]) => a === v)) b.attrs[head] = v;
 }
 
 function labDefault(b) {
   const def = labDefaults[labClasses[b.cls]] || {};
   for (const head of Object.keys(b.attrs))     // the old class's defaults do not survive the new one
-    if (!b.touched.has(head) && !(head in def)) delete b.attrs[head];
+    if (!labLocked(b, head) && !(head in def)) delete b.attrs[head];
   labFill(b, def);
 }
 
@@ -875,6 +885,7 @@ document.getElementById('l-attrs').onclick = e => {
   const t = e.target.closest('[data-head], [data-cls]'), b = labBoxes[labSel];
   if (!t || !b) return;
   const head = t.dataset.head;
+  if (t.dataset.add) return labAddValue(t.dataset.add, labClasses[b.cls]);
   if (t.dataset.cls !== undefined) {
     b.cls = +t.dataset.cls;
     if (b.cls < labClasses.length) labLastCls = b.cls;   // runs of one missed class draw as that class
@@ -886,14 +897,48 @@ document.getElementById('l-attrs').onclick = e => {
   } else if (b.attrs[head] === t.dataset.val) {
     delete b.attrs[head];           // tap the active chip to unset
     b.touched.delete(head);
+    b.suggested.delete(head);       // any tap in a head is the operator taking it over
   } else {
     b.attrs[head] = t.dataset.val;
     b.touched.add(head);
+    b.suggested.delete(head);
     // One level, deliberately: chained implies are how a tap starts rewriting the whole strip.
     labFill(b, (labImplies[head] || {})[t.dataset.val]);
   }
   labSelect(labSel);
 };
+
+// First box missing a required attribute, or null. A head is required exactly when the class
+// shows it (non-empty vocab); deleted boxes, the removed rung and wheels are exempt, and a frame
+// with no surviving boxes stays approvable — negative samples are legal.
+function labGap(all) {
+  for (let i = 0; i < all.length; i++) {
+    const b = all[i], name = labClasses[b.cls];
+    if (b.del || b.cls >= labClasses.length || name === 'wheel') continue;
+    for (const head of Object.keys(labAttrs))
+      if (!b.attrs[head] && labVocab(head, name, null, b.attrs).length) return {i, head, name};
+  }
+  return null;
+}
+
+// Not auto-applied to the selected box: the chip renders right there for the operator to tap.
+async function labAddValue(head, name) {
+  const value = (prompt(`New ${head} value:`) || '').trim().toLowerCase();
+  if (!value) return;
+  try {
+    const r = await post('/api/dataset/attr_value', {head, value});
+    if (!r.ok) throw new Error(r.detail || 'rejected');
+    labAttrs = r.attributes;
+    labImplies = r.attr_implies;   // the server derives implies for shapes like 1+3+3
+  } catch (e) {
+    return labNote(String(e.message || e));
+  }
+  labSelect(labSel);
+  // A constrained head renders only what attributes.yaml allows for this class, so a brand-new
+  // value stays invisible here until that list is edited — say so rather than let them hunt.
+  if ((labConstraints[name] || {})[head])
+    labNote(`added — note: ${name}'s allowed ${head} list in attributes.yaml does not include it yet`);
+}
 
 // Attr keys index the POSTED boxes array, and filtering out deleted/removed boxes renumbers
 // them — pure so the self-check can pin the remap.
@@ -987,6 +1032,7 @@ function labDraw(e) {
     if (ev.type !== 'pointerup' || nb.w < .008 || nb.h < .008) return nd.remove();
     nb.attrs = {};
     nb.touched = new Set();
+    nb.suggested = new Set();
     labBoxes.push(nb);                                  // data-i already holds this index
     labSelect(labBoxes.length - 1);
   };
@@ -995,6 +1041,12 @@ function labDraw(e) {
 async function labSend(action) {
   const s = labQueue[0];
   if (!s) return;
+  const gap = action === 'approve' && labGap(labBoxes);
+  if (gap) {
+    labSelect(gap.i);   // open the offending box's strip right where the fix goes
+    return labNote(`box ${gap.i + 1} (${gap.name}): missing ${gap.head} — ` +
+                   `every visible attribute is required before Approve`);
+  }
   labNote('saving…');
   const {boxes, attrs} = labPayload(labBoxes);
   try {

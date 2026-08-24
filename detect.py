@@ -704,7 +704,7 @@ class Detector:
             except Exception as e:      # a bad crop costs attributes, never the count
                 self.error = f"attrs: {e}"
         if t["axles"] >= 2:
-            a["axles"] = "7plus" if t["axles"] >= 7 else str(t["axles"])
+            a["axles"] = str(min(t["axles"], 9))   # 9 is the physical ceiling for legal traffic
         return a
 
     def _bump(self, category, attrs, n):

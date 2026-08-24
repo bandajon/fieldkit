@@ -36,6 +36,8 @@ CONFIG = {}
 CAM_NAME = re.compile(r"^[A-Za-z0-9_-]{1,32}$")   # becomes a directory name
 SAMPLE_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")  # becomes a file name — no dots, no separators
 SEGMENT_MAX = 660                                 # 600 s segments plus slack for a late finalise
+ATTR_VALUE = re.compile(r"^[a-z0-9][a-z0-9+._-]{0,31}$")   # digits and + are legal: axle configs
+AXLE_GROUPS = re.compile(r"^\d+(\+\d+)+$")                 # 1+2+3 -> steer, drive, trailer axles
 # Attribute heads (spec: toll-taxonomy-attributes). Operator-editable in
 # dataset/attributes.yaml — append-only per head, ids positional like classes.txt.
 ATTR_DEFAULTS = {
@@ -522,16 +524,26 @@ def attrs_path(sid, tree="pending"):
     return DATASET / tree / "attrs" / f"{sid}.json"
 
 
+def suggest_path(sid):
+    """VLM pre-fills (suggest_attrs.py). Pending-only: a suggestion the operator
+    confirmed is in attrs, and one they didn't is not a record of anything."""
+    return DATASET / "pending" / "suggest" / f"{sid}.json"
+
+
+def attr_yaml():
+    """The whole attributes.yaml mapping, or {} — heads, constraints, defaults, implies."""
+    try:
+        v = yaml.safe_load((DATASET / "attributes.yaml").read_text())
+    except (yaml.YAMLError, OSError):
+        return {}
+    return v if isinstance(v, dict) else {}
+
+
 def attr_meta(key):
     """A guidance mapping from attributes.yaml (`constraints`, `defaults`, `implies`).
     UI-only: the server validates against the full vocab, so editing these never
     invalidates labels already on disk."""
-    f = DATASET / "attributes.yaml"
-    try:
-        v = yaml.safe_load(f.read_text())
-    except (yaml.YAMLError, OSError, FileNotFoundError):
-        return {}
-    c = v.get(key) if isinstance(v, dict) else None
+    c = attr_yaml().get(key)
     return c if isinstance(c, dict) else {}
 
 
@@ -589,6 +601,9 @@ def dataset_samples():
             attrs = read_attrs(attrs_path(p.stem))
             if attrs:
                 s["attrs"] = attrs
+            suggested = read_attrs(suggest_path(p.stem))
+            if suggested:
+                s["suggested"] = suggested
             pending.append((p.stat().st_mtime, s))
         except OSError:      # sample reviewed away mid-listing
             continue
@@ -628,6 +643,7 @@ def dataset_label(body: dict = Body(default={})):
             attrs_dst.parent.mkdir(parents=True, exist_ok=True)
             attrs_dst.write_text(json.dumps(attrs))
         src_attrs.unlink(missing_ok=True)
+        suggest_path(sid).unlink(missing_ok=True)   # the sample was reviewed once already
         for p in (img, lbl):
             os.utime(p, None)   # front of the review queue, last in line for eviction
         return {"ok": True, "id": sid, "boxes": read_boxes(lbl), "attrs": attrs}
@@ -640,6 +656,7 @@ def dataset_label(body: dict = Body(default={})):
         img.unlink(missing_ok=True)
         lbl.unlink(missing_ok=True)
         attrs_path(sid).unlink(missing_ok=True)
+        suggest_path(sid).unlink(missing_ok=True)
         return {"ok": True}
     lines, nclasses = [], len(dataset_classes())
     for b in body.get("boxes") or []:   # an empty list is legal: every box removed = a negative sample
@@ -665,6 +682,7 @@ def dataset_label(body: dict = Body(default={})):
     img.rename(dst_img)
     lbl.unlink(missing_ok=True)
     attrs_path(sid).unlink(missing_ok=True)
+    suggest_path(sid).unlink(missing_ok=True)
     return {"ok": True}
 
 
@@ -783,6 +801,37 @@ def dataset_class(body: dict = Body(default={})):
     else:
         raise HTTPException(400, "action must be 'add', 'rename', 'remove' or 'merge'")
     return {"ok": True, "classes": classes}
+
+
+@app.post("/api/dataset/attr_value")
+def dataset_attr_value(body: dict = Body(default={})):
+    """Append-only, like classes: sidecars already name these values, and dropping
+    one would silently rewrite what an operator recorded."""
+    head, value = body.get("head") or "", body.get("value") or ""
+    cfg = attr_yaml()
+    if not isinstance(cfg.get(head), list):
+        raise HTTPException(404, f"no attribute named {head!r}")
+    if not ATTR_VALUE.match(value):
+        raise HTTPException(400, "value must start with a lowercase letter or digit, then "
+                                 "lowercase letters, digits, + . _ or - (max 32)")
+    vals = [str(x) for x in cfg[head]]
+    if value not in vals:
+        vals.insert(vals.index("other") if "other" in vals else len(vals), value)  # "other" stays last
+        cfg[head] = vals
+        implies = cfg.setdefault("implies", {}).setdefault("axle-config", {}) \
+            if head == "axle-config" else {}
+        if AXLE_GROUPS.match(value) and value not in implies:
+            # Groups are axle counts front to back: steer + drive is the truck, each
+            # further group a trailer. 9 is the ceiling the vocab tops out at.
+            groups = [int(g) for g in value.split("+")]
+            derived = {"axles": str(min(sum(groups), 9)),
+                       "trailers": str(min(max(len(groups) - 2, 0), 2))}
+            got = {h: v for h, v in derived.items()
+                   if v in [str(x) for x in (cfg.get(h) or [])]}
+            if got:
+                implies[value] = got
+        (DATASET / "attributes.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False))
+    return {"ok": True, "attributes": attr_vocab(), "attr_implies": attr_meta("implies")}
 
 
 @app.post("/api/camera/test_rtsp")
