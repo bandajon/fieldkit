@@ -824,11 +824,14 @@ function labSelect(i) {
   const name = labClasses[b.cls], row = (l, chips) => `<div class="acts toggle"><i class="res">${l}</i>${chips}</div>`;
   // Removed boxes and wheels take no attributes; their class row stays so either can be undone.
   const heads = b.cls >= labClasses.length || name === 'wheel' ? '' :
-    Object.keys(labAttrs).map(head => row(esc(head),
-      labVocab(head, name, b.attrs[head]).map(([v, stale]) =>
+    Object.keys(labAttrs).map(head => {
+      const vocab = labVocab(head, name, b.attrs[head]);
+      if (!vocab.length) return '';   // a class can opt out of a head (axle-config on cars)
+      return row(esc(head), vocab.map(([v, stale]) =>
         `<button class="btn${b.attrs[head] === v ? ' on' : ''}${stale ? ' halt' : ''}"
                   data-head="${esc(head)}" data-val="${esc(v)}"
-          >${esc(v === '7plus' ? '7+' : v)}</button>`).join(''))).join('');
+          >${esc(v === '7plus' ? '7+' : v)}</button>`).join(''));
+    }).join('');
   el.innerHTML = row('class', labClasses.map((n, j) =>
       `<button class="btn${b.cls === j ? ' on' : ''}" style="--c:${clsColor(j)}" data-cls="${j}"
         >${esc(n)}</button>`).join('') +
