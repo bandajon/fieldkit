@@ -825,7 +825,7 @@ function labSelect(i) {
   // Removed boxes and wheels take no attributes; their class row stays so either can be undone.
   const heads = b.cls >= labClasses.length || name === 'wheel' ? '' :
     Object.keys(labAttrs).map(head => {
-      const vocab = labVocab(head, name, b.attrs[head]);
+      const vocab = labVocab(head, name, b.attrs[head], b.attrs);
       if (!vocab.length) return '';   // a class can opt out of a head (axle-config on cars)
       return row(esc(head), vocab.map(([v, stale]) =>
         `<button class="btn${b.attrs[head] === v ? ' on' : ''}${stale ? ' halt' : ''}"
@@ -842,8 +842,15 @@ function labSelect(i) {
 // Values allowed for one head given the box's class, each flagged stale or not. Constraints are
 // guidance, so a value the box already carries always renders even when now disallowed —
 // re-classing a tagged box must never silently drop its label. Tapping it clears it as usual.
-function labVocab(head, name, cur) {
-  const allowed = (labConstraints[name] || {})[head] || labAttrs[head] || [];
+function labVocab(head, name, cur, attrs) {
+  let allowed = (labConstraints[name] || {})[head] || labAttrs[head] || [];
+  if (head === 'axle-config' && attrs && attrs.axles) {
+    // Only configurations consistent with the chosen axle count. Each preset already
+    // declares its count in the implies map, so this derives rather than duplicates;
+    // values with no declared count ("other") always stay.
+    const imp = labImplies['axle-config'] || {};
+    allowed = allowed.filter(v => !(imp[v] || {}).axles || imp[v].axles === attrs.axles);
+  }
   const out = allowed.map(v => [v, false]);
   if (cur && !allowed.includes(cur)) out.push([cur, true]);
   return out;
