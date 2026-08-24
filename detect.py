@@ -29,6 +29,21 @@ IMGSZ = 1280      # sub-streams are 1280x720, so this is ~native; 640 missed dis
 FPS = 5           # ffmpeg decimates to this — the loop then runs flat out
 COUNT_AT_HITS = 2        # an id counts on its 2nd sighting: one-frame blips never count
 ID_EXPIRY = 10.0         # forget an id unseen this long (ByteTrack recycles ids; caps memory)
+RECOUNT_GUARD = 45.0     # a counted vehicle's resting place is remembered this long: a new
+                         # id of the same class in the same spot is the same vehicle, not
+                         # a second count. ponytail: IoU-at-rest is the assumption — one
+                         # that moved far while untracked still recounts; the honest fix
+                         # there is higher effective fps, not longer memory.
+GUARD_IOU = 0.5
+TRACKER_CFG = Path(__file__).resolve().parent / "bytetrack-fieldkit.yaml"
+TRACKER_YAML = """tracker_type: bytetrack
+track_high_thresh: 0.25
+track_low_thresh: 0.1
+new_track_thresh: 0.25
+track_buffer: 90
+match_thresh: 0.8
+fuse_score: True
+"""
 FRAME_STALE = 10.0       # a frame older than this is not "live" any more
 IDLE_WAIT = 0.2          # no new frames anywhere: don't spin
 SETTLED = 5.0            # a reader that survives this long resets its backoff
@@ -159,8 +174,10 @@ def label_of(t):
 
 
 def annotate(img, dets, quality=85):
-    """Boxes + labels burnt into the frame; returns JPEG bytes."""
-    from PIL import ImageDraw, ImageFont
+    """Boxes + labels burnt into the frame; returns JPEG bytes. Matches the Label tab's
+    look: translucent outlines and chips (alpha-composited), chip above the box flipping
+    inside at the top edge, white shadowed text readable on day and night frames."""
+    from PIL import Image, ImageDraw, ImageFont
 
     try:
         # Scale with the frame: the ~11 px default font is unreadable once a 1280-wide
@@ -168,20 +185,24 @@ def annotate(img, dets, quality=85):
         font = ImageFont.load_default(size=max(14, img.width // 60))
     except TypeError:                     # Pillow < 10.1 has no size argument
         font = ImageFont.load_default()
-    d = ImageDraw.Draw(img)
+    layer = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    d = ImageDraw.Draw(layer)
     for cls, conf, (x1, y1, x2, y2), *rest in dets:
         color = COLORS.get(cls, (255, 255, 255))
         if cls == WHEEL:
             # ponytail: thin, unlabelled — a dozen wheel chips would smother the vehicles.
-            d.rectangle([x1, y1, x2, y2], outline=color, width=2)
+            d.rectangle([x1, y1, x2, y2], outline=color + (110,), width=2)
             continue
-        d.rectangle([x1, y1, x2, y2], outline=color, width=max(2, img.width // 640))
+        d.rectangle([x1, y1, x2, y2], outline=color + (90,), width=max(2, img.width // 640))
         label = f"{cls} {conf:.0%}" + (f" · {rest[0]}" if rest and rest[0] else "")
         lx1, ly1, lx2, ly2 = d.textbbox((0, 0), label, font=font)
         tw, th = lx2 - lx1, ly2 - ly1
-        top = max(0, y1 - th - 5)                 # a box at the top edge keeps its label
-        d.rectangle([x1, top, x1 + tw + 7, top + th + 5], fill=color)
-        d.text((x1 + 3, top + 2), label, font=font, fill=(0, 0, 0))
+        ch = th + 5
+        top = y1 - ch if y1 >= ch else y1        # above the box; inside when at the top edge
+        d.rectangle([x1, top, x1 + tw + 7, top + ch], fill=color + (77,))
+        d.text((x1 + 4, top + 3), label, font=font, fill=(0, 0, 0, 230))   # shadow
+        d.text((x1 + 3, top + 2), label, font=font, fill=(255, 255, 255, 255))
+    img = Image.alpha_composite(img.convert("RGBA"), layer).convert("RGB")
     buf = io.BytesIO()
     img.save(buf, "JPEG", quality=quality)
     return buf.getvalue()
@@ -340,6 +361,7 @@ class Detector:
         self.models = {}      # camera name -> YOLO; ByteTrack state lives in the instance
         self.last_capture = {}
         self.last_boxes = {}  # camera name -> last captured `shown`, for scene dedup
+        self.recent = {}      # camera name -> [(label, box, expires)]: the recount guard
         self.lock = threading.Lock()
         self.thread = None
         self.stopping = threading.Event()
@@ -379,7 +401,7 @@ class Detector:
         with self.lock:
             self.cams = cams
             for d in (self.frames, self.tracks, self.visible, self.models,
-                      self.last_capture, self.last_boxes):
+                      self.last_capture, self.last_boxes, self.recent):
                 for gone in [n for n in d if n not in keep]:
                     d.pop(gone)
 
@@ -498,11 +520,15 @@ class Detector:
         def track(name, img):
             model = self.models.get(name)
             if model is None:
+                if not TRACKER_CFG.exists():
+                    # track_buffer 90 (~20 s at our fps) rides out booth-stop occlusions
+                    # that the ~30 default drops, which re-ids and re-counts the vehicle.
+                    TRACKER_CFG.write_text(TRACKER_YAML)
                 model = self.models[name] = YOLO(path)   # one per camera: tracker state
             out = []
             # agnostic_nms: one vehicle must not survive NMS as both a car and a truck box.
             for r in model.track(img, imgsz=IMGSZ, conf=CONF, agnostic_nms=True,
-                                 persist=True, tracker="bytetrack.yaml",
+                                 persist=True, tracker=str(TRACKER_CFG),
                                  device=dev, verbose=False, **extra):
                 ids = r.boxes.id
                 ids = ids.tolist() if ids is not None else [None] * len(r.boxes)
@@ -575,6 +601,7 @@ class Detector:
             self.totals = {d: 0 for d in self.display.values()}
             self.breakdown = {}
             self.tracks = {}
+            self.recent = {}
         self._save(closing)      # the closing day's final word, before anyone counts again
 
     def _track(self, name, dets, img=None):
@@ -615,6 +642,7 @@ class Detector:
                 t["votes"][cls] += 1
                 t["hits"] += 1
                 t["last_seen"] = now
+                t["box"] = box                    # resting place, for the recount guard
                 t["label"] = label_of(t)
                 t["axles"] = max(t["axles"], axles.get(i, 0))
                 # Best crop only until the id counts — attributes are classified once, at
@@ -629,11 +657,23 @@ class Detector:
                 disp = self.display[t["label"]]
                 if t["counted_as"] is None:
                     if t["hits"] >= COUNT_AT_HITS:
-                        t["attrs"] = self._classify(t)
-                        t["counted_as"] = disp
-                        self.totals[disp] += 1
-                        self._bump(disp, t["attrs"], 1)
-                elif t["counted_as"] != disp:
+                        mem = self.recent.get(name, [])
+                        mem[:] = [m for m in mem if m[2] > now]
+                        ghost = next((m for m in mem
+                                      if m[0] == disp and iou(m[1], box) >= GUARD_IOU), None)
+                        if ghost:
+                            # Same class, same resting place, within the guard window:
+                            # this is the vehicle we already counted, re-tracked after an
+                            # occlusion — never a second tally, never a second attrs run.
+                            mem.remove(ghost)
+                            t["counted_as"] = disp
+                            t["ghost"] = True
+                        else:
+                            t["attrs"] = self._classify(t)
+                            t["counted_as"] = disp
+                            self.totals[disp] += 1
+                            self._bump(disp, t["attrs"], 1)
+                elif t["counted_as"] != disp and not t.get("ghost"):
                     # The vote settled on another class: move this id's single tally.
                     # Never negative — counted_as is a class this id incremented.
                     self.totals[t["counted_as"]] -= 1
@@ -644,7 +684,12 @@ class Detector:
                 live.append(disp)
                 shown.append((disp, conf, box))
             for tid in [i for i, t in ids.items() if now - t["last_seen"] > ID_EXPIRY]:
-                del ids[tid]
+                t = ids.pop(tid)
+                # Counted vehicles (ghosts included: a long stop chains through several
+                # track lives) leave their resting place behind for the recount guard.
+                if t["counted_as"] and t.get("box"):
+                    self.recent.setdefault(name, []).append(
+                        (t["counted_as"], t["box"], now + RECOUNT_GUARD))
             self.visible[name] = Counter(live)
         return shown
 
@@ -826,6 +871,35 @@ if __name__ == "__main__":
     d._track("c", [])
     assert d.tracks["c"] == {}, d.tracks
     assert d.totals["car"] == 1, "expiry must not touch the day's totals"
+
+    # Recount guard: an expired counted vehicle leaves its resting place behind, and a
+    # new same-class id there is the same vehicle — a ghost, never a second tally.
+    assert d.recent["c"] and d.recent["c"][0][0] == "car", d.recent
+    for tid in (9, 9):
+        d._track("c", det("car", tid))
+    assert d.totals["car"] == 1, "same class, same spot: no second count"
+    assert d.tracks["c"][9]["ghost"] and not d.recent["c"], "memory consumed"
+    # A ghost's label flip must not move totals or breakdown.
+    d.tracks["c"][9]["votes"]["truck"] += 5
+    d._track("c", det("truck", 9))
+    assert d.totals == {"car": 1, "motorcycle": 0, "bus": 0, "truck": 0}, d.totals
+    # A ghost's expiry re-arms the guard: a long stop chains through track lives.
+    d.tracks["c"][9]["last_seen"] -= ID_EXPIRY + 1
+    d._track("c", [])
+    assert d.recent["c"], "ghost re-remembered"
+    # A DIFFERENT class in the same spot is a new vehicle and counts.
+    for tid in (10, 10):
+        d._track("c", det("bus", tid))
+    assert d.totals["bus"] == 1, d.totals
+    # Same class far away counts too (the ghost's tally never existed, so truck goes 0 -> 1).
+    for tid in (11, 11):
+        d._track("c", det("truck", tid, FAR))
+    assert d.totals["truck"] == 1, d.totals
+    # An expired guard entry no longer suppresses.
+    d.recent["c"] = [(m[0], m[1], time.monotonic() - 1) for m in d.recent["c"]]
+    for tid in (12, 12):
+        d._track("c", det("car", tid))
+    assert d.totals["car"] == 2, "expired memory must not suppress"
 
     # (e) date rollover clears totals and ids.
     d.day = "2000-01-01"

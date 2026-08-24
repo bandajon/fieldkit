@@ -27,3 +27,5 @@ runs/
 .playwright-mcp/
 # daily count tallies, one JSON per day — site data, not code
 counts/
+# generated tracker config (detect.py writes it)
+bytetrack-fieldkit.yaml
