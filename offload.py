@@ -22,6 +22,12 @@ CRED_KEYS = ("account_id", "access_key_id", "secret_access_key")
 AWAITING = "offload enabled — awaiting credentials from console"
 
 
+def marker(f):
+    """`<segment>.mkv.uploaded` — an empty flag meaning "this one is in the bucket".
+    finished() globs *.mkv, so markers are never mistaken for segments."""
+    return f.with_name(f.name + ".uploaded")
+
+
 def sha256_b64(path):
     """R2 verifies this server-side and rejects the PUT if the bytes disagree."""
     h = hashlib.sha256()
@@ -66,9 +72,12 @@ class Offload:
                 else "offload enabled but config is missing: " + ", ".join(missing))
 
     def info(self):
-        return {"enabled": bool(self.opts().get("enabled")), "uploaded": self.uploaded,
+        o = self.opts()
+        return {"enabled": bool(o.get("enabled")), "uploaded": self.uploaded,
+                "mirror": bool(o.get("mirror")),
+                "mirrored": len(list(self.rec_root.glob("*/*/*.mkv.uploaded"))),
                 "last_file": self.last_file, "last_error": self.last_error,
-                "status": self.cred_status()}
+                "status": self.cred_status(o)}
 
     def start(self):
         threading.Thread(target=self._loop, daemon=True).start()
@@ -117,34 +126,57 @@ class Offload:
         self.client_creds = creds     # rotated creds rebuild rather than reuse this
         return self.client
 
+    def _put(self, client, bucket, f):
+        """Upload one segment. -> False with last_error set on any failure — network,
+        credentials, checksum mismatch — so the local copy always survives it."""
+        key = "/".join(f.parts[-3:])                  # <site>/<cam>/<segment>.mkv
+        try:
+            with open(f, "rb") as body:
+                client.put_object(Bucket=bucket, Key=key, Body=body,
+                                  ChecksumSHA256=sha256_b64(f))
+        except Exception as e:
+            self.last_error = f"{key}: {e}"
+            print(f"offload: {self.last_error}", flush=True)
+            return False
+        self.uploaded += 1
+        self.last_file, self.last_error = key, ""
+        print(f"offload: uploaded {key}", flush=True)
+        return True
+
     def sweep(self):
-        """One pass: upload oldest-first until the drive is back above the floor."""
+        """One pass: mirror everything unsent (if mirroring), then upload oldest-first
+        until the drive is back above the floor."""
         o = self.opts()
         if not o.get("enabled"):
             return
         floor = float(o.get("min_free_gb", 20))
-        if self.free_gb() >= floor:
+        mirror = bool(o.get("mirror"))
+        below = self.free_gb() < floor
+        if not (mirror or below):
             return
         client = self._get_client(o)
         if client is None:
             return
         bucket = o.get("bucket") or "fieldkit-recordings"
+        if mirror:
+            for f in self.finished():
+                if marker(f).exists():
+                    continue
+                if not self._put(client, bucket, f):
+                    return                    # keep everything local; next sweep retries
+                marker(f).touch()
+            below = self.free_gb() < floor     # the mirror pass took time; re-read the drive
+        if not below:
+            return
         for f in self.finished():
-            key = "/".join(f.parts[-3:])              # <site>/<cam>/<segment>.mkv
-            try:
-                with open(f, "rb") as body:
-                    client.put_object(Bucket=bucket, Key=key, Body=body,
-                                      ChecksumSHA256=sha256_b64(f))
-            except Exception as e:
-                # Any failure at all — network, credentials, checksum mismatch — keeps
-                # the local copy. Footage is only ever deleted after a verified upload.
-                self.last_error = f"{key}: {e}"
-                print(f"offload: {self.last_error}", flush=True)
+            if marker(f).exists():            # already in the bucket: just reclaim the space
+                marker(f).unlink()            # marker first: a crash here re-uploads, never orphans
+                f.unlink()
+                print(f"offload: freed {'/'.join(f.parts[-3:])} (mirrored)", flush=True)
+            elif self._put(client, bucket, f):
+                f.unlink()
+            else:
                 return
-            f.unlink()
-            self.uploaded += 1
-            self.last_file, self.last_error = key, ""
-            print(f"offload: uploaded {key}", flush=True)
             if self.free_gb() >= floor:
                 return
 
@@ -217,6 +249,39 @@ if __name__ == "__main__":
     o.sweep()
     assert o.client.puts == [] and not o.last_error, o.info()
 
+    # Mirror: every closed segment ships and STAYS, with a marker beside it.
+    MIRROR = {"offload": dict(CFG["offload"], mirror=True)}
+    root, d = tree()
+    o = Offload(MIRROR, root)
+    o.client, o.client_creds, o.free_gb = FakeClient(), TRIPLE, lambda: 99.0
+    o.sweep()
+    assert o.client.puts == ["site1/cam1/seg-a.mkv", "site1/cam1/seg-b.mkv"], o.client.puts
+    assert (d / "seg-a.mkv").exists() and (d / "seg-b.mkv").exists(), "mirror deleted footage"
+    assert (d / "seg-a.mkv.uploaded").exists() and (d / "seg-b.mkv.uploaded").exists()
+    assert not (d / "seg-live.mkv.uploaded").exists(), "marked a segment still being written"
+    assert o.info()["mirrored"] == 2 and o.info()["mirror"] is True, o.info()
+    assert [f.name for f in o.finished()] == ["seg-a.mkv", "seg-b.mkv"], "markers listed as segments"
+
+    o.sweep()                                    # second sweep: nothing left to send
+    assert o.client.puts == ["site1/cam1/seg-a.mkv", "site1/cam1/seg-b.mkv"], o.client.puts
+
+    # Disk pressure on a mirrored node: delete what is already safe, never re-upload it.
+    seq = [0.0, 0.0, 99.0]                       # entry, after the mirror pass, after one delete
+    o.free_gb = lambda: seq.pop(0) if seq else 99.0
+    o.sweep()
+    assert o.client.puts == ["site1/cam1/seg-a.mkv", "site1/cam1/seg-b.mkv"], o.client.puts
+    assert not (d / "seg-a.mkv").exists() and not (d / "seg-a.mkv.uploaded").exists()
+    assert (d / "seg-b.mkv").exists(), "kept deleting past the floor"
+    assert o.uploaded == 2, "counted a delete as an upload"
+
+    # A failed mirror upload leaves no marker — the next sweep must try again.
+    root, d = tree()
+    o = Offload(MIRROR, root)
+    o.client, o.client_creds, o.free_gb = FakeClient(fail=True), TRIPLE, lambda: 99.0
+    o.sweep()
+    assert list(d.glob("*.uploaded")) == [], "marked a segment the bucket never got"
+    assert (d / "seg-a.mkv").exists() and o.uploaded == 0 and "boom" in o.last_error, o.info()
+
     # The merge: console creds fill the blanks, every field config.yaml sets wins.
     console = {"account_id": "acc", "access_key_id": "AK", "secret_access_key": "SK",
                "bucket": "console-bucket"}
@@ -271,4 +336,5 @@ if __name__ == "__main__":
     lone.sweep()
     assert "missing" in lone.last_error, lone.last_error
 
-    print("offload self-check ok: oldest-first, verified, deletes only after upload")
+    print("offload self-check ok: oldest-first, verified, mirrors without deleting, "
+          "deletes only after upload")

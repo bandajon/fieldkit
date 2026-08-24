@@ -33,6 +33,8 @@ offload:
   # leave a key blank rather than guessing it. `enabled` stays this node's own switch.
   bucket: ""             # empty = whatever the console supplies, else fieldkit-recordings
   min_free_gb: 20        # below this, the oldest finished segments upload and are then deleted
+  mirror: false          # true = back every finished segment up as it closes; local copies
+                         # still stay until min_free_gb needs the space
 
 # Ops console (optional). Leave this block out — or any field empty — and the node
 # never phones home; it is a self-contained site console, exactly as before.
