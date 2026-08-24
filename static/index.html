@@ -222,6 +222,10 @@
     <div id="reclist"></div>
     <details id="cfgbox">
       <summary>Edit config.yaml</summary>
+      <div class="acts">
+        <label class="res"><input type="checkbox" id="mirror"> back up recordings to cloud</label>
+        <span id="mirrornote" class="res"></span>
+      </div>
       <textarea id="cfgtext" spellcheck="false"></textarea>
       <div class="rowbtns">
         <button class="btn" id="cfgsave">Save config</button>
@@ -243,6 +247,7 @@
   </section>
   <section id="label">
     <h2 id="cnt-label"></h2>
+    <div id="l-who" class="res"></div>
     <div id="l-wrap" hidden></div>
     <div class="rowbtns" id="l-acts" hidden>
       <button class="btn" id="l-back">&larr; Back</button>
@@ -376,6 +381,11 @@ async function recPoll() {
   document.getElementById('diskbar').style.width = (used * 100).toFixed(0) + '%';
   document.getElementById('diskinfo').textContent =
     `${s.disk_free_gb} GB free of ${s.disk_total_gb} GB`;
+  const o = s.offload || {}, mir = document.getElementById('mirror');
+  mir.disabled = !o.enabled || !!o.status;   // status = why offload cannot run yet
+  mir.checked = !!o.mirror;
+  document.getElementById('mirrornote').textContent =
+    mir.disabled ? 'cloud backup needs offload credentials in config.yaml' : '';
   const cams = Object.entries(s.cameras);
   setCount('record', cams.length, 'configured');
   document.getElementById('reclist').innerHTML = cams.length === 0
@@ -399,6 +409,11 @@ async function recPoll() {
         </div>`;
       }).join('');
 }
+document.getElementById('mirror').onchange = async e => {
+  await post('/api/offload/mirror', {on: e.target.checked});
+  recPoll();
+};
+
 setInterval(() => { if (tab === 'record' && !document.hidden) recPoll(); }, 2000);
 
 // --- Cameras tab ---
@@ -756,26 +771,65 @@ let labClasses = [], labQueue = [], labBoxes = [], labTotal = 0,
     labApproved = {frames: 0, boxes: {}};
 let labAttrs = {}, labConstraints = {}, labDefaults = {}, labImplies = {}, labSel = -1;   // attribute vocab {head: [values]}; index of the selected box
 const labNote = t => document.getElementById('l-note').textContent = t;
-const labStats = () => document.getElementById('l-stats').textContent = labApproved.frames
-  ? `fine-tune set: ${labApproved.frames} frames · ` +
-    Object.entries(labApproved.boxes).map(([k, v]) => `${k} ${v}`).join(' · ')
-  : 'fine-tune set: empty — approve samples to grow it';
+const labNum = v => typeof v === 'number' ? v : (v && v.approve) || 0;   // {approve, discard} or a count
+const labStats = () => {
+  const el = document.getElementById('l-stats'), a = labAssign;
+  el.textContent = (labApproved.frames
+    ? `fine-tune set: ${labApproved.frames} frames · ` +
+      Object.entries(labApproved.boxes).map(([k, v]) => `${k} ${v}`).join(' · ')
+    : 'fine-tune set: empty — approve samples to grow it')
+    + (labWho && labProg   // .res is pre-line, so the team line lands under it
+       ? `\ntoday: you ${labNum((labProg.by_who || {})[labWho])} · team ${labNum(labProg.total)}` : '');
+  if (a) el.innerHTML += `\nassignment: ${esc(a.class)} · ` +
+    `<b style="color:${clsColor(labClasses.indexOf(a.class))}">${a.done}/${a.min}</b>`;
+};
 const boxCls = b =>
   `box${b.cls >= labClasses.length ? ' gone' : ''}${b.cy - b.h / 2 < 0.05 ? ' in' : ''}`;
 // Same golden-angle formula as detect.py's palette(): server boxes and UI chips agree.
 const clsColor = i => `hsl(${(i * 137.508) % 360} 85% 55%)`;
 
+const WHO_RE = /^[a-z0-9][a-z0-9_-]{0,23}$/;
+let labWho = localStorage.fieldkit_who || '', labAsked = false, labProg = null, labRev = false;
+let labAssign = null;
+
+function labAskWho() {
+  for (;;) {
+    const v = prompt('Your name (lowercase, for the labeling record):');
+    if (v === null) return labWho;            // cancel keeps solo mode — the server allows no who
+    const w = v.trim().toLowerCase();
+    if (WHO_RE.test(w)) return localStorage.fieldkit_who = w;
+  }
+}
+
+function labWhoShow() {
+  document.getElementById('l-who').textContent = labWho ? `labeling as ${labWho} (change)` : 'solo mode (set name)';
+}
+document.getElementById('l-who').onclick = () => { labWho = labAskWho(); labWhoShow(); labLoad(); };
+
+addEventListener('hashchange', () => { if (tab === 'label') labLoad(); });
+
 async function labLoad() {
+  labRev = location.hash === '#review';   // same tool, same taxonomy, different source
+  if (!labAsked) { labAsked = true; if (!labWho) labWho = labAskWho(); }
+  labWhoShow();
+  // Slices are claimed per handle, so who rides on the fetch as well as the writes.
+  const who = labWho ? `?who=${encodeURIComponent(labWho)}` : '';
+  if (labWho) fetch('/api/dataset/progress').then(r => r.json())
+    .then(p => { labProg = p; labStats(); }).catch(() => {});
   try {
-    const d = await (await fetch('/api/dataset/samples')).json();
-    labClasses = d.classes || [];
-    labQueue = d.pending || [];
-    labTotal = d.pending_total ?? labQueue.length;   // the list is capped at 100 per fetch
-    labApproved = d.approved || {frames: 0, boxes: {}};
-    labAttrs = d.attributes || {};
-    labConstraints = d.attr_constraints || {};
-    labDefaults = d.attr_defaults || {};
-    labImplies = d.attr_implies || {};
+    const r = await fetch((labRev ? '/api/dataset/review' : '/api/dataset/samples') + who);
+    if (r.status === 403) return labNote('your handle is not on the reviewer list');
+    const d = await r.json();
+    // Review serves one sample at a time; whatever the envelope omits keeps its current value.
+    labClasses = d.classes || labClasses;
+    labQueue = labRev ? (d.id ? [d] : []) : (d.pending || []);
+    labTotal = labRev ? labQueue.length : (d.pending_total ?? labQueue.length);
+    labApproved = d.approved || labApproved;
+    labAssign = d.assignment || null;
+    labAttrs = d.attributes || labAttrs;
+    labConstraints = d.attr_constraints || labConstraints;
+    labDefaults = d.attr_defaults || labDefaults;
+    labImplies = d.attr_implies || labImplies;
   } catch (e) {
     labNote('Could not load samples — is the server reachable?');
     return;
@@ -793,6 +847,9 @@ function labShow() {
   document.getElementById('l-acts').hidden = !s && !labDone.length;
   document.getElementById('l-back').disabled = !labDone.length;
   ['l-ok', 'l-skip', 'l-no'].forEach(id => document.getElementById(id).disabled = !s);
+  // Reviewers correct, they do not delete or rewind.
+  document.getElementById('l-ok').textContent = labRev ? 'Submit review' : 'Approve';
+  document.getElementById('l-no').hidden = document.getElementById('l-back').hidden = labRev;
   if (!s) {
     // The batch is done but more may wait on disk (the fetch is capped at 100).
     if (labTotal > 0) return labLoad();
@@ -808,8 +865,10 @@ function labShow() {
     return {...b, attrs: {...sug, ...confirmed}, touched,
             suggested: new Set(Object.keys(sug).filter(h => !touched.has(h)))};
   });
-  labNote(`${labTotal} remaining · tap a box to select it, set class and attributes below, ` +
-          `× to delete, drag to move, corner to resize, drag empty area to add a box`);
+  labNote(labRev
+    ? `reviewing ${s.curator || 'someone'}'s work — your corrections become the record`
+    : `${labTotal} remaining · tap a box to select it, set class and attributes below, ` +
+      `× to delete, drag to move, corner to resize, drag empty area to add a box`);
   wrap.innerHTML = `<img src="/api/dataset/image?id=${encodeURIComponent(s.id)}" alt="">` +
     labBoxes.map(boxHtml).join('');
   labSelect(-1);
@@ -1044,7 +1103,7 @@ function labDraw(e) {
 async function labSend(action) {
   const s = labQueue[0];
   if (!s) return;
-  const gap = action === 'approve' && labGap(labBoxes);
+  const gap = action !== 'discard' && labGap(labBoxes);   // a review becomes the record too
   if (gap) {
     labSelect(gap.i);   // open the offending box's strip right where the fix goes
     return labNote(`box ${gap.i + 1} (${gap.name}): missing ${gap.head} — ` +
@@ -1053,12 +1112,13 @@ async function labSend(action) {
   labNote('saving…');
   const {boxes, attrs} = labPayload(labBoxes);
   try {
-    const r = await post('/api/dataset/label', {id: s.id, action, boxes, attrs});
+    const r = await post('/api/dataset/label', {id: s.id, action, boxes, attrs, who: labWho});
     if (!r.ok) throw new Error('rejected');
   } catch (e) {
     labNote('Save failed — sample kept, tap again to retry.');
     return;
   }
+  if (labRev) return labLoad();   // no queue in review mode: pull the next one
   if (action === 'approve') {   // bumped locally; the next labLoad trues it up from disk
     labDone.push(s.id);         // approvals only — a discard is deleted server-side
     labApproved.frames++;
@@ -1072,10 +1132,11 @@ async function labSend(action) {
   labTotal = Math.max(0, labTotal - 1);   // skip leaves the total: the frame stays on disk
   labShow();
 }
-document.getElementById('l-ok').onclick = () => labSend('approve');
+document.getElementById('l-ok').onclick = () => labSend(labRev ? 'review' : 'approve');
 // Skipped samples stay pending and age out of the rolling capture buffer on their own;
 // Skip is for near-duplicates (parked vehicles) not worth a decision.
-document.getElementById('l-skip').onclick = () => { labQueue.shift(); labShow(); };
+document.getElementById('l-skip').onclick = () =>
+  labRev ? labLoad() : (labQueue.shift(), labShow());
 document.getElementById('l-no').onclick = () => labSend('discard');
 
 // Reopen the last approval to amend it. Undoes the optimistic stats bump the same way
@@ -1085,7 +1146,7 @@ document.getElementById('l-back').onclick = async () => {
   if (!id) return;
   let r;
   try {
-    r = await post('/api/dataset/label', {id, action: 'unapprove'});
+    r = await post('/api/dataset/label', {id, action: 'unapprove', who: labWho});
     if (!r.ok) throw new Error(r.detail || 'rejected');
   } catch (e) {
     labNote(String(e.message || e));   // id stays popped: it is not coming back

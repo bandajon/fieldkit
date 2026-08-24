@@ -5,12 +5,15 @@ import atexit
 import ipaddress
 import json
 import os
+import random
 import re
+import secrets
 import shutil
 import socket
 import subprocess
 import threading
-from datetime import datetime
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import uvicorn
@@ -37,6 +40,17 @@ CAM_NAME = re.compile(r"^[A-Za-z0-9_-]{1,32}$")   # becomes a directory name
 SAMPLE_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")  # becomes a file name — no dots, no separators
 SEGMENT_MAX = 660                                 # 600 s segments plus slack for a late finalise
 ATTR_VALUE = re.compile(r"^[a-z0-9][a-z0-9+._-]{0,31}$")   # digits and + are legal: axle configs
+WHO_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,23}$")         # labeller handle
+GOLD_RATE = float(os.environ.get("GOLD_RATE", 0.05))       # how often a check sample rides along
+REVIEWERS = [w.strip() for w in os.environ.get("REVIEWERS", "").split(",") if w.strip()]
+REVIEW_RATE = 0.10        # share of each curator's approvals an expert re-checks
+SAME_BOX = 0.6            # IoU at which a submitted box is "the same box" as the key's
+MATCH_BOX = 0.5           # looser pairing for two independent labellings of one frame
+MIN_SCORES = 3            # under this many scores, report no accuracy rather than a number
+GOLD_TOKENS = {}          # disguised id -> gold id; refilled from gold-served.jsonl after a restart
+CLAIM_TTL = 1800.0        # a slice someone walked away from frees itself after this
+CLAIMS = {}               # sample id -> (who, expiry); in memory only — a restart frees every slice
+CLAIMS_LOCK = threading.Lock()
 AXLE_GROUPS = re.compile(r"^\d+(\+\d+)+$")                 # 1+2+3 -> steer, drive, trailer axles
 # Attribute heads (spec: toll-taxonomy-attributes). Operator-editable in
 # dataset/attributes.yaml — append-only per head, ids positional like classes.txt.
@@ -193,6 +207,13 @@ def detect_start():
 def detect_stop():
     """Frees the GPU/CPU for training runs; Monitor falls back to raw snapshots."""
     return {"state": DETECT.stop()}
+
+
+@app.post("/api/offload/mirror")
+def offload_mirror(body: dict = Body(default={})):
+    """Keep-a-cloud-copy switch. null hands the decision back to config.yaml."""
+    OFFLOAD.set_mirror(body.get("on"))
+    return OFFLOAD.info()
 
 
 @app.get("/api/record/status")
@@ -592,8 +613,211 @@ def read_boxes(path):
     return boxes
 
 
+def valid_who(who):
+    """A labeller handle, or "" for solo use (no claims, no audit name)."""
+    if not who:
+        return ""
+    if not WHO_RE.match(who):
+        raise HTTPException(400, "who must be lowercase: a letter or digit, then letters, "
+                                 "digits, - or _ (max 24)")
+    return who
+
+
+def purge_claims():
+    """Drop expired claims. -> {sample id: who} still held."""
+    now = time.monotonic()
+    with CLAIMS_LOCK:
+        for sid in [s for s, (_, exp) in CLAIMS.items() if exp <= now]:
+            del CLAIMS[sid]
+        return {sid: w for sid, (w, _) in CLAIMS.items()}
+
+
+def hold(ids, who):
+    """Claim this slice for `who` (refreshing the TTL). -> how many they now hold."""
+    exp = time.monotonic() + CLAIM_TTL
+    with CLAIMS_LOCK:
+        CLAIMS.update({sid: (who, exp) for sid in ids})
+        return sum(1 for w, _ in CLAIMS.values() if w == who)
+
+
+def audit(who, sid, action, extra=None):
+    """One line per labelling decision. Fire and forget: the operator's work must not
+    fail because the log could not be written."""
+    append_line("audit.jsonl", {"who": who, "id": sid, "action": action, **(extra or {})})
+
+
+def read_lines(name):
+    """Tolerant reader for the append-only jsonl logs: a torn line is skipped, a
+    missing file is an empty log."""
+    rows = []
+    try:
+        lines = (DATASET / name).read_text().splitlines()
+    except OSError:
+        return rows
+    for line in lines:
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(r, dict):
+            rows.append(r)
+    return rows
+
+
+def append_line(name, row):
+    """Fire and forget, like audit(): scoring must never fail an operator's action."""
+    try:
+        with open(DATASET / name, "a") as f:
+            f.write(json.dumps({"ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                                **row}) + "\n")
+    except OSError:
+        pass
+
+
+def xyxy(b):
+    return (b["cx"] - b["w"] / 2, b["cy"] - b["h"] / 2, b["cx"] + b["w"] / 2, b["cy"] + b["h"] / 2)
+
+
+def match_boxes(a, b, floor):
+    """Greedy IoU pairing of two box lists. -> ({i: (j, iou)}, unmatched a, unmatched b).
+    ponytail: O(n²) over one frame's boxes — fine at ten boxes, revisit at a thousand."""
+    scored = sorted(((detect.iou(xyxy(x), xyxy(y)), i, j)
+                     for i, x in enumerate(a) for j, y in enumerate(b)), reverse=True)
+    pairs, taken = {}, set()
+    for v, i, j in scored:
+        if v >= floor and i not in pairs and j not in taken:
+            pairs[i] = (j, v)
+            taken.add(j)
+    return (pairs, [i for i in range(len(a)) if i not in pairs],
+            [j for j in range(len(b)) if j not in taken])
+
+
+def agreement(a_boxes, a_attrs, b_boxes, b_attrs):
+    """0..1 overlap of two labellings of one frame: each matched pair scores class
+    match, box tightness and attribute agreement; anything unmatched counts against."""
+    if not a_boxes and not b_boxes:
+        return 1.0
+    pairs, miss_a, miss_b = match_boxes(a_boxes, b_boxes, MATCH_BOX)
+    total = 0.0
+    for i, (j, v) in pairs.items():
+        parts = [1.0 if a_boxes[i]["cls"] == b_boxes[j]["cls"] else 0.0, v]
+        heads = a_attrs.get(str(i)) or {}
+        if heads:
+            theirs = b_attrs.get(str(j)) or {}
+            parts.append(sum(theirs.get(h) == val for h, val in heads.items()) / len(heads))
+        total += sum(parts) / len(parts)
+    return total / (len(pairs) + len(miss_a) + len(miss_b))
+
+
+def parse_boxes(body):
+    """Validated boxes from a label payload — one rule set for real samples, golds
+    and reviews alike."""
+    nclasses, out = len(dataset_classes()), []
+    for b in body.get("boxes") or []:   # an empty list is legal: every box removed = a negative sample
+        try:
+            cls = int(b["cls"])
+            cx, cy, w, h = (float(b[k]) for k in ("cx", "cy", "w", "h"))
+        except (KeyError, TypeError, ValueError):
+            raise HTTPException(400, f"malformed box: {b!r}")
+        if not 0 <= cls < nclasses or not all(0 <= v <= 1 for v in (cx, cy, w, h)):
+            raise HTTPException(400, f"box out of range: {b!r}")
+        out.append({"cls": cls, "cx": cx, "cy": cy, "w": w, "h": h})
+    return out
+
+
+def box_lines(boxes):
+    return "".join(" ".join([str(b["cls"])] + [f"{b[k]:.6f}" for k in ("cx", "cy", "w", "h")])
+                   + "\n" for b in boxes)
+
+
+def golds():
+    d = DATASET / "gold"
+    return sorted(p for p in d.iterdir() if (p / "perturbed.txt").is_file()) if d.is_dir() else []
+
+
+def gold_for(token):
+    """Gold directory behind a disguised id, or None. The served log is the memory
+    that survives a restart mid-session."""
+    if token not in GOLD_TOKENS:
+        GOLD_TOKENS.update({r["token"]: r["gold"] for r in read_lines("gold-served.jsonl")
+                            if r.get("token") and r.get("gold")})
+    d = DATASET / "gold" / (GOLD_TOKENS.get(token) or "")
+    return d if (d / "perturbed.txt").is_file() else None
+
+
+def pick_gold(who):
+    """A gold this labeller has not seen, disguised as an ordinary pending sample."""
+    seen = {r.get("gold") for r in read_lines("gold-served.jsonl") if r.get("who") == who}
+    fresh = [g for g in golds() if g.name not in seen]
+    if not fresh:
+        return None
+    g = random.choice(fresh)
+    token = "g-" + secrets.token_hex(4)
+    GOLD_TOKENS[token] = g.name
+    append_line("gold-served.jsonl", {"who": who, "token": token, "gold": g.name})
+    sample = {"id": token, "boxes": read_boxes(g / "perturbed.txt")}
+    attrs = read_attrs(g / "perturbed-attrs.json")
+    if attrs:
+        sample["attrs"] = attrs
+    return sample
+
+
+def score_gold(gold, boxes, attrs):
+    """-> (score, plants, fixed). A planted error counts as fixed when the box is back
+    where the key has it, with the key's class and the key's attributes; breaking a box
+    that was already right costs a quarter each."""
+    key, key_attrs = read_boxes(gold / "key.txt"), read_attrs(gold / "key-attrs.json")
+    try:
+        plants = json.loads((gold / "plant.json").read_text())
+    except (OSError, ValueError):
+        plants = []
+    planted = {int(p.get("box", -1)) for p in plants if isinstance(p, dict)}
+    pairs, _, _ = match_boxes(key, boxes, SAME_BOX)
+    fixed = damage = 0
+    for i, kb in enumerate(key):
+        j = pairs.get(i)
+        ok = bool(j is not None and boxes[j[0]]["cls"] == kb["cls"]
+                  and all((attrs.get(str(j[0])) or {}).get(h) == v
+                          for h, v in (key_attrs.get(str(i)) or {}).items()))
+        if i in planted:
+            fixed += ok
+        elif not ok:
+            damage += 1
+    score = (fixed / len(plants)) if plants else 1.0
+    return max(0.0, score - 0.25 * damage), len(plants), fixed
+
+
+def gold_label(token, who, action, body):
+    """A gold decision scores the labeller and touches no footage. The response is
+    byte-identical to a real one — a check sample nobody can spot is the point."""
+    gold = gold_for(token)
+    if gold is None or action not in ("approve", "discard"):
+        raise HTTPException(404, f"no pending sample {token!r}")
+    if action == "discard":
+        key = read_boxes(gold / "key.txt")
+        score, plants, fixed = (0.0 if key else 1.0), len(key), 0
+    else:
+        boxes = parse_boxes(body)
+        score, plants, fixed = score_gold(gold, boxes, valid_attrs(body.get("attrs"), len(boxes)))
+    append_line("scores.jsonl", {"kind": "gold", "who": who, "gold_id": gold.name,
+                                 "score": round(score, 3), "plants": plants, "fixed": fixed,
+                                 "action": action})
+    with CLAIMS_LOCK:
+        CLAIMS.pop(token, None)
+    return {"ok": True}
+
+
+def finish(who, sid, action, payload, extra=None):
+    audit(who, sid, action, extra)
+    with CLAIMS_LOCK:
+        CLAIMS.pop(sid, None)     # decided: back into everyone's pool
+    return payload
+
+
 @app.get("/api/dataset/samples")
-def dataset_samples():
+def dataset_samples(who: str = ""):
+    who = valid_who(who)
+    held = purge_claims()
     labels = DATASET / "pending" / "labels"
     pending = []
     for p in sorted(labels.glob("*.txt")) if labels.is_dir() else []:
@@ -609,25 +833,197 @@ def dataset_samples():
         except OSError:      # sample reviewed away mid-listing
             continue
     pending.sort(key=lambda t: t[0], reverse=True)
-    return {"classes": dataset_classes(), "attributes": attr_vocab(),
+    if who:      # everyone else's live slice is invisible, so two labellers never collide
+        pending = [t for t in pending if held.get(t[1]["id"], who) == who]
+    assigned = assignment(who) if who else None
+    if assigned and assigned["class"] in dataset_classes():
+        cid = dataset_classes().index(assigned["class"])
+        # Stable sort: the assigned class floats up, newest-first survives inside each
+        # half, and the general pool still follows so nobody runs out of work.
+        pending.sort(key=lambda t: not any(b["cls"] == cid for b in t[1]["boxes"]))
+    out = [s for _, s in pending[:100]]
+    body = {"classes": dataset_classes(), "attributes": attr_vocab(),
             "attr_constraints": attr_meta("constraints"), "attr_defaults": attr_meta("defaults"),
             "attr_implies": attr_meta("implies"), "approved": approved_counts(),
             # the list is capped for payload size; pending_total is the real pile
-            "pending_total": len(pending), "pending": [s for _, s in pending[:100]]}
+            "pending_total": len(pending), "pending": out}
+    if who:
+        if random.random() < GOLD_RATE:      # at most one check sample per response
+            gold = pick_gold(who)
+            if gold:
+                out.append(gold)
+        body["who"], body["claimed"] = who, hold([s["id"] for s in out], who)
+        if assigned:
+            body["assignment"] = assigned
+    return body
+
+
+def curators():
+    """{approved sample id: who approved it}, newest audit line wins."""
+    live = {p.stem for p in (DATASET / "approved" / "labels").glob("*.txt")}
+    out = {}
+    for r in read_lines("audit.jsonl"):
+        # Only an approval assigns credit: a review rewrites the labels but the sample
+        # stays the curator's work, and their score is what it is measuring.
+        if r.get("action") == "approve" and r.get("id") in live:
+            out[r["id"]] = r.get("who") or "anon"
+    return out
+
+
+def review_label(sid, who, body):
+    """The reviewer's version replaces the curator's: a re-check that leaves the worse
+    labels on disk would be an opinion, not QA."""
+    if not REVIEWERS:
+        raise HTTPException(400, "review is off on this node — set REVIEWERS to enable it")
+    if who not in REVIEWERS:
+        raise HTTPException(403, f"{who or 'anonymous'} is not a reviewer on this node")
+    lbl = sample_paths(sid, "approved")[1]
+    if not lbl.is_file():
+        raise HTTPException(404, f"{sid} is not in the approved set")
+    boxes = parse_boxes(body)
+    attrs = valid_attrs(body.get("attrs"), len(boxes))
+    curator = curators().get(sid, "anon")
+    score = agreement(read_boxes(lbl), read_attrs(attrs_path(sid, "approved")), boxes, attrs)
+    append_line("scores.jsonl", {"kind": "review", "who": curator, "reviewer": who,
+                                 "id": sid, "score": round(score, 3)})
+    lbl.write_text(box_lines(boxes))
+    dst_attrs = attrs_path(sid, "approved")
+    if attrs:
+        dst_attrs.parent.mkdir(parents=True, exist_ok=True)
+        dst_attrs.write_text(json.dumps(attrs))
+    else:
+        dst_attrs.unlink(missing_ok=True)
+    audit(who, sid, "review")
+    return {"ok": True, "curator": curator, "score": round(score, 3)}
+
+
+@app.get("/api/dataset/review")
+def dataset_review(who: str):
+    """The approved sample most in need of a second pair of eyes: whichever curator is
+    furthest below the review quota, one of their samples at random."""
+    who = valid_who(who)
+    if not REVIEWERS:
+        raise HTTPException(400, "review is off on this node — set REVIEWERS to enable it")
+    if who not in REVIEWERS:
+        raise HTTPException(403, f"{who or 'anonymous'} is not a reviewer on this node")
+    done = {}
+    for r in read_lines("scores.jsonl"):
+        if r.get("kind") == "review":
+            done[r.get("who")] = done.get(r.get("who"), 0) + 1
+    reviewed = {r.get("id") for r in read_lines("scores.jsonl") if r.get("kind") == "review"}
+    pool, approvals = {}, {}
+    for sid, curator in curators().items():
+        approvals[curator] = approvals.get(curator, 0) + 1
+        if curator != who and sid not in reviewed:
+            pool.setdefault(curator, []).append(sid)
+    if not pool:
+        raise HTTPException(404, "nothing to review yet")
+    curator = max(pool, key=lambda c: REVIEW_RATE * approvals[c] - done.get(c, 0))
+    sid = random.choice(pool[curator])
+    return {"id": sid, "curator": curator, "boxes": read_boxes(sample_paths(sid, "approved")[1]),
+            "attrs": read_attrs(attrs_path(sid, "approved"))}
+
+
+def assignments():
+    """{handle: {"class": ..., "min": n}} from dataset/assignments.yaml, hand-edited by
+    the operator like attributes.yaml. Missing or broken file = nobody is assigned."""
+    try:
+        v = yaml.safe_load((DATASET / "assignments.yaml").read_text())
+    except (yaml.YAMLError, OSError):
+        return {}
+    return {k: a for k, a in v.items() if isinstance(a, dict)} if isinstance(v, dict) else {}
+
+
+def assignment(who):
+    """This curator's quota and how far along they are, or None."""
+    a = assignments().get(who) or {}
+    name = str(a.get("class") or "")
+    if not name:
+        return None
+    done = sum(1 for r in read_lines("audit.jsonl") if r.get("who") == who
+               and r.get("assigned_hit") and r.get("assigned_class") == name)
+    try:
+        least = int(a.get("min") or 0)
+    except (TypeError, ValueError):
+        least = 0
+    return {"class": name, "min": least, "done": done}
+
+
+def assigned_extra(who, boxes):
+    """Stamp the audit line when an approval really contains the assigned class —
+    counting approvals alone would pay for frames that never had one."""
+    name = (assignments().get(who) or {}).get("class")
+    names = dataset_classes()
+    if name in names and any(b["cls"] == names.index(name) for b in boxes):
+        return {"assigned_hit": True, "assigned_class": name}
+    return None
+
+
+def quality(who):
+    """Gold and review scores for one curator. Under MIN_SCORES the mean says nothing,
+    so it is reported as null rather than as a number someone would act on."""
+    out = {}
+    for kind, count_key, acc_key in (("gold", "golds_seen", "accuracy"),
+                                     ("review", "reviews", "review_accuracy")):
+        vals = [r["score"] for r in read_lines("scores.jsonl")
+                if r.get("kind") == kind and r.get("who") == who
+                and isinstance(r.get("score"), (int, float))]
+        out[count_key] = len(vals)
+        out[acc_key] = round(sum(vals) / len(vals), 3) if len(vals) >= MIN_SCORES else None
+    return out
+
+
+@app.get("/api/dataset/progress")
+def dataset_progress():
+    """Who decided what, from audit.jsonl. ponytail: full scan per call — a week of ten
+    labellers is a few thousand lines; index it if a season's log ever gets slow."""
+    total, by_who, today = {"approve": 0, "discard": 0}, {}, {"approve": 0, "discard": 0}
+    day = datetime.now(timezone.utc).date().isoformat()
+    try:
+        lines = (DATASET / "audit.jsonl").read_text().splitlines()
+    except OSError:
+        lines = []
+    for line in lines:
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue                      # a torn line must not hide the rest of the log
+        if not isinstance(r, dict) or r.get("action") not in ("approve", "discard", "unapprove"):
+            continue
+        act = r["action"]
+        who = r.get("who") or "anon"
+        total[act] = total.get(act, 0) + 1
+        mine = by_who.setdefault(who, {"approve": 0, "discard": 0})
+        mine[act] = mine.get(act, 0) + 1
+        if str(r.get("ts", "")).startswith(day):
+            today[act] = today.get(act, 0) + 1
+    for w, stats in by_who.items():
+        stats.update(quality(w))
+        if assignment(w):
+            stats["assignment"] = assignment(w)
+    return {"total": total, "by_who": by_who, "today": today}
 
 
 @app.get("/api/dataset/image")
 def dataset_image(id: str):
-    img, _ = sample_paths(valid_sample_id(id))
-    if not img.is_file():
-        raise HTTPException(404, f"no pending sample {id!r}")
-    return FileResponse(img, media_type="image/jpeg")
+    sid = valid_sample_id(id)
+    gold = gold_for(sid) if sid.startswith("g-") else None
+    for img in ([gold / "image.jpg"] if gold else
+                [sample_paths(sid)[0], sample_paths(sid, "approved")[0]]):
+        if img.is_file():
+            return FileResponse(img, media_type="image/jpeg")
+    raise HTTPException(404, f"no pending sample {id!r}")
 
 
 @app.post("/api/dataset/label")
 def dataset_label(body: dict = Body(default={})):
     sid = valid_sample_id(body.get("id"))
+    who = valid_who(body.get("who"))
     action = body.get("action")
+    if sid.startswith("g-"):
+        return gold_label(sid, who, action, body)
+    if action == "review":
+        return review_label(sid, who, body)
     if action == "unapprove":
         src_img, src_lbl = sample_paths(sid, "approved")
         if not src_img.is_file():
@@ -647,7 +1043,8 @@ def dataset_label(body: dict = Body(default={})):
         suggest_path(sid).unlink(missing_ok=True)   # the sample was reviewed once already
         for p in (img, lbl):
             os.utime(p, None)   # front of the review queue, last in line for eviction
-        return {"ok": True, "id": sid, "boxes": read_boxes(lbl), "attrs": attrs}
+        return finish(who, sid, action,
+                      {"ok": True, "id": sid, "boxes": read_boxes(lbl), "attrs": attrs})
     if action not in ("approve", "discard"):
         raise HTTPException(400, "action must be 'approve', 'discard' or 'unapprove'")
     img, lbl = sample_paths(sid)
@@ -658,22 +1055,13 @@ def dataset_label(body: dict = Body(default={})):
         lbl.unlink(missing_ok=True)
         attrs_path(sid).unlink(missing_ok=True)
         suggest_path(sid).unlink(missing_ok=True)
-        return {"ok": True}
-    lines, nclasses = [], len(dataset_classes())
-    for b in body.get("boxes") or []:   # an empty list is legal: every box removed = a negative sample
-        try:
-            cls = int(b["cls"])
-            coords = [float(b[k]) for k in ("cx", "cy", "w", "h")]
-        except (KeyError, TypeError, ValueError):
-            raise HTTPException(400, f"malformed box: {b!r}")
-        if not 0 <= cls < nclasses or not all(0 <= v <= 1 for v in coords):
-            raise HTTPException(400, f"box out of range: {b!r}")
-        lines.append(" ".join([str(cls)] + [f"{v:.6f}" for v in coords]))
-    attrs = valid_attrs(body.get("attrs"), len(lines))
+        return finish(who, sid, action, {"ok": True})
+    boxes = parse_boxes(body)
+    attrs = valid_attrs(body.get("attrs"), len(boxes))
     dst_img, dst_lbl = sample_paths(sid, "approved")
     dst_img.parent.mkdir(parents=True, exist_ok=True)
     dst_lbl.parent.mkdir(parents=True, exist_ok=True)
-    dst_lbl.write_text("".join(l + "\n" for l in lines))   # the operator's edit wins over the model's guess
+    dst_lbl.write_text(box_lines(boxes))   # the operator's edit wins over the model's guess
     dst_attrs = attrs_path(sid, "approved")
     if attrs:
         dst_attrs.parent.mkdir(parents=True, exist_ok=True)
@@ -684,7 +1072,7 @@ def dataset_label(body: dict = Body(default={})):
     lbl.unlink(missing_ok=True)
     attrs_path(sid).unlink(missing_ok=True)
     suggest_path(sid).unlink(missing_ok=True)
-    return {"ok": True}
+    return finish(who, sid, action, {"ok": True}, assigned_extra(who, boxes))
 
 
 def valid_attrs(attrs, nboxes):

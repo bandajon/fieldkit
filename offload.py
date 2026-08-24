@@ -49,6 +49,14 @@ class Offload:
         self.uploaded = 0
         self.last_file = ""
         self.last_error = ""
+        self.mirror_override = None   # None: config.yaml decides. Set from the Record tab.
+
+    def set_mirror(self, on):
+        """Runtime toggle. None hands the decision back to config.yaml."""
+        self.mirror_override = None if on is None else bool(on)
+
+    def mirroring(self, o):
+        return self.mirror_override if self.mirror_override is not None else bool(o.get("mirror"))
 
     def opts(self):
         """Console creds under config.yaml: the operator wins every field they set.
@@ -74,7 +82,7 @@ class Offload:
     def info(self):
         o = self.opts()
         return {"enabled": bool(o.get("enabled")), "uploaded": self.uploaded,
-                "mirror": bool(o.get("mirror")),
+                "mirror": self.mirroring(o), "override": self.mirror_override,
                 "mirrored": len(list(self.rec_root.glob("*/*/*.mkv.uploaded"))),
                 "last_file": self.last_file, "last_error": self.last_error,
                 "status": self.cred_status(o)}
@@ -150,7 +158,7 @@ class Offload:
         if not o.get("enabled"):
             return
         floor = float(o.get("min_free_gb", 20))
-        mirror = bool(o.get("mirror"))
+        mirror = self.mirroring(o)
         below = self.free_gb() < floor
         if not (mirror or below):
             return
@@ -264,6 +272,18 @@ if __name__ == "__main__":
 
     o.sweep()                                    # second sweep: nothing left to send
     assert o.client.puts == ["site1/cam1/seg-a.mkv", "site1/cam1/seg-b.mkv"], o.client.puts
+
+    # Runtime toggle: the operator's switch outranks config.yaml, both ways.
+    root2, d2 = tree()
+    t = Offload(CFG, root2)                      # config.yaml says mirror: false
+    t.client, t.client_creds, t.free_gb = FakeClient(), TRIPLE, lambda: 99.0
+    t.set_mirror(True)
+    t.sweep()
+    assert (d2 / "seg-a.mkv").exists() and (d2 / "seg-a.mkv.uploaded").exists(), "override ignored"
+    assert t.info()["mirror"] is True and t.info()["override"] is True, t.info()
+    t.set_mirror(None)                           # back to whatever the file says
+    assert t.info()["mirror"] is False and t.info()["override"] is None, t.info()
+    assert Offload(MIRROR, root2).info()["mirror"] is True, "config still decides unoverridden"
 
     # Disk pressure on a mirrored node: delete what is already safe, never re-upload it.
     seq = [0.0, 0.0, 99.0]                       # entry, after the mirror pass, after one delete
