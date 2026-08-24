@@ -831,7 +831,10 @@ function labSelect(i) {
   const heads = b.cls >= labClasses.length || name === 'wheel' ? '' :
     Object.keys(labAttrs).map(head => {
       const vocab = labVocab(head, name, b.attrs[head], b.attrs);
-      if (!vocab.length) return '';   // a class can opt out of a head (axle-config on cars)
+      // Hide only when the CLASS opts out (constraint []). A row the cross-filter emptied
+      // (an axle count with no known config yet) stays visible with just its "+" — that is
+      // precisely the moment the operator needs to add the new configuration.
+      if (!labVocab(head, name, null).length) return '';
       return row(esc(head), vocab.map(([v, stale]) =>
         `<button class="btn${b.attrs[head] === v ? ' on' : ''}${stale ? ' halt' : ''}${
                   b.suggested.has(head) && b.attrs[head] === v ? ' sug' : ''}"
