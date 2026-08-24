@@ -1,0 +1,324 @@
+#!/usr/bin/env python3
+"""Curate dataset samples from recorded segments — the live capture pipeline, offline.
+
+  python ingest_video.py <file-or-dir> [...]   ingest local .mkv/.mp4 segments
+  python ingest_video.py pull <site>/<cam>     fetch missing segments from R2, then ingest
+  python ingest_video.py check <file>          probe one file, write nothing
+  python ingest_video.py                       self-check
+
+Same detector, same dedup, same dataset/pending layout as detect.py, so a sample from
+footage and a sample from the wire are indistinguishable on the Label tab.
+"""
+
+import io
+import subprocess
+import sys
+from collections import Counter
+from datetime import datetime, timezone
+from pathlib import Path
+
+import yaml
+
+import detect
+
+ROOT = Path(__file__).resolve().parent
+DATASET = ROOT / "dataset"
+STEM_TS = "%Y%m%d-%H%M%S"        # the recorder's segment names, and our sample stems
+INGEST_FPS = 1.0                 # recorded curation: dedup drops unchanged scenes anyway
+VIDEO = (".mkv", ".mp4")
+
+
+def config():
+    return yaml.safe_load((ROOT / "config.yaml").read_text()) or {}
+
+
+def record_root(cfg):
+    return ROOT / (cfg.get("record_dir") or "./recordings")
+
+
+def cam_and_start(path):
+    """(camera, start epoch) from the recorder's <site>/<cam>/YYYYMMDD-HHMMSS.mkv —
+    local wallclock, per its contract. Anything else falls back to the parent directory
+    name and the file's mtime, which is close enough to order samples by."""
+    path = Path(path)
+    try:
+        return path.parent.name, datetime.strptime(path.stem, STEM_TS).timestamp()
+    except ValueError:
+        print(f"  ! {path.name}: not a recorder segment name — using mtime")
+        return path.parent.name, path.stat().st_mtime
+
+
+def split_jpegs(stream):
+    """Every complete JPEG in a byte stream, in order — unlike detect.Reader, which
+    keeps only the newest frame because live inference cannot catch up."""
+    buf = b""
+    while True:
+        chunk = stream.read1(1 << 16)
+        if not chunk:
+            return
+        buf += chunk
+        while True:
+            i = buf.find(detect.SOI)
+            j = buf.find(detect.EOI, i + 2) if i >= 0 else -1
+            if j < 0:
+                break
+            yield buf[i:j + 2]
+            buf = buf[j + 2:]
+
+
+def frames(path, fps=INGEST_FPS):
+    """Decode one file to JPEGs at `fps`. Sequential, one ffmpeg, no threads."""
+    p = subprocess.Popen(
+        ["ffmpeg", "-nostdin", "-loglevel", "error", "-i", str(path),
+         "-vf", f"fps={fps}", "-f", "image2pipe", "-c:v", "mjpeg", "-q:v", "3", "-"],
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    try:
+        yield from split_jpegs(p.stdout)
+    finally:
+        p.kill()          # `check` reads one frame and walks away; don't leak the rest
+
+
+def detector(cfg):
+    """-> (fn(PIL image) -> [(cls, conf, box)], {class name: dataset id}).
+
+    predict(), not track(): unrelated segments have no continuity to carry, and
+    ByteTrack state across file boundaries would be noise.
+    """
+    from ultralytics import YOLO
+
+    weights = str(cfg.get("detect_weights", "") or "").strip()
+    if weights and not Path(weights).exists():
+        sys.exit(f"detect_weights not found: {weights}")
+    try:
+        import torch
+        dev = "mps" if torch.backends.mps.is_available() else "cpu"
+    except Exception:
+        dev = "cpu"
+    model = YOLO(weights or detect.WEIGHTS)
+    # Fine-tuned weights carry the operator's taxonomy and its positional ids; stock
+    # weights are COCO, filtered to the four classes detect.py counts.
+    lookup = dict(model.names) if weights else detect.CLASSES
+    extra = {} if weights else {"classes": list(detect.CLASSES)}
+    ids = ({n: i for i, n in lookup.items()} if weights else dict(detect.CLASS_IDS))
+
+    def run(img):
+        out = []
+        for r in model.predict(img, imgsz=detect.IMGSZ, conf=detect.CONF,
+                               agnostic_nms=True, device=dev, verbose=False, **extra):
+            for box, cid, conf in zip(r.boxes.xyxy.tolist(), r.boxes.cls.tolist(),
+                                      r.boxes.conf.tolist()):
+                cls = lookup.get(int(cid))
+                if cls:
+                    out.append((cls, float(conf), tuple(float(v) for v in box)))
+        return out
+
+    return run, ids
+
+
+class Sink:
+    """dataset/pending writer with the live capture's gates, measured in footage time:
+    no detections, an unchanged scene, or a too-recent sample and nothing lands."""
+
+    def __init__(self, dataset, ids):
+        self.images = Path(dataset) / "pending" / "images"
+        self.labels = Path(dataset) / "pending" / "labels"
+        for d in (self.images, self.labels):
+            d.mkdir(parents=True, exist_ok=True)
+        self.ids = ids
+        self.at = {}          # cam -> footage timestamp of its last capture
+        self.dets = {}        # cam -> its `shown`, for the scene comparison
+        self.written = Counter()
+
+    def offer(self, cam, ts, jpeg, shown, w, h):
+        # Cadence counts from the last real capture, not the last attempt: a scene that
+        # changes right after a skipped duplicate should be caught, not waited out.
+        if not shown or ts - self.at.get(cam, float("-inf")) < detect.CAPTURE_EVERY:
+            return False
+        if detect.same_scene(shown, self.dets.get(cam, [])):
+            return False
+        self.at[cam], self.dets[cam] = ts, shown
+        self._evict()
+        stem = f"{cam}-{datetime.fromtimestamp(ts, timezone.utc).strftime(STEM_TS)}"
+        lines = [f"{self.ids[cls]} {(x1 + x2) / 2 / w:.6f} {(y1 + y2) / 2 / h:.6f} "
+                 f"{(x2 - x1) / w:.6f} {(y2 - y1) / h:.6f}"
+                 for cls, _conf, (x1, y1, x2, y2) in shown if cls in self.ids]
+        (self.images / f"{stem}.jpg").write_bytes(jpeg)      # re-ingest overwrites: idempotent
+        (self.labels / f"{stem}.txt").write_text("\n".join(lines) + "\n")
+        self.written[cam] += 1
+        return True
+
+    def _evict(self):
+        """Same rolling window as live capture: at the cap the oldest pending sample goes."""
+        imgs = list(self.images.glob("*.jpg"))
+        if len(imgs) >= detect.DATASET_CAP:
+            oldest = min(imgs, key=lambda p: p.stat().st_mtime)
+            oldest.unlink()
+            (self.labels / f"{oldest.stem}.txt").unlink(missing_ok=True)
+
+
+def segments(args):
+    """Files from the paths given; a directory contributes its videos recursively."""
+    out = []
+    for a in args:
+        p = Path(a)
+        if p.is_dir():
+            out += sorted(f for f in p.rglob("*") if f.suffix.lower() in VIDEO)
+        elif p.suffix.lower() in VIDEO:
+            out.append(p)
+        else:
+            print(f"  ! {p}: not a video file, skipped")
+    return out
+
+
+def ingest(files, cfg):
+    from PIL import Image
+
+    run, ids = detector(cfg)
+    sink = Sink(DATASET, ids)
+    sampled = 0
+    for f in files:
+        cam, start = cam_and_start(f)
+        n = 0
+        before = sink.written[cam]
+        for n, jpeg in enumerate(frames(f), 1):
+            img = Image.open(io.BytesIO(jpeg)).convert("RGB")
+            ts = start + (n - 1) / INGEST_FPS
+            sink.offer(cam, ts, jpeg, run(img), img.width, img.height)
+        sampled += n
+        print(f"  {cam}/{f.name}: {n} frames -> {sink.written[cam] - before} samples",
+              flush=True)
+    print(f"\n{len(files)} file(s), {sampled} frames sampled at {INGEST_FPS} fps, "
+          f"{sum(sink.written.values())} samples written to {sink.images.parent}")
+    for cam, n in sorted(sink.written.items()):
+        print(f"  {cam}: {n}")
+    return sink
+
+
+def pull(prefix, cfg):
+    """Download the keys under <site>/<cam> we do not already have locally."""
+    o = cfg.get("offload") or {}
+    missing = [k for k in ("account_id", "access_key_id", "secret_access_key")
+               if not o.get(k)]
+    if missing:
+        sys.exit("config.yaml offload is missing: " + ", ".join(missing))
+    try:
+        import boto3
+    except ImportError:
+        sys.exit("pull needs boto3 — pip install boto3")
+    client = boto3.client(
+        "s3", endpoint_url=f"https://{o['account_id']}.r2.cloudflarestorage.com",
+        aws_access_key_id=o["access_key_id"],
+        aws_secret_access_key=o["secret_access_key"], region_name="auto")
+    bucket = o.get("bucket") or "fieldkit-recordings"
+    root, got = record_root(cfg), []
+    for page in client.get_paginator("list_objects_v2").paginate(Bucket=bucket,
+                                                                 Prefix=prefix.strip("/")):
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+            if not key.lower().endswith(VIDEO):
+                continue
+            dest = root / key
+            if dest.exists():
+                print(f"  = {key}")
+                continue
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            print(f"  v {key} ({obj['Size'] / 1e6:.0f} MB)", flush=True)
+            client.download_file(bucket, key, str(dest))
+            got.append(dest)
+    print(f"{len(got)} new file(s) under {root}")
+    return got
+
+
+def check(path, cfg):
+    from PIL import Image
+
+    path = Path(path)
+    cam, start = cam_and_start(path)
+    first, n = None, 0
+    for n, jpeg in enumerate(frames(path), 1):
+        first = first or jpeg
+    print(f"{path}\n  camera={cam} start={datetime.fromtimestamp(start).isoformat()}")
+    print(f"  frames at {INGEST_FPS} fps: {n}")
+    if first is None:
+        print("  no frames decoded — not a video, or ffmpeg could not read it")
+        return
+    run, _ids = detector(cfg)
+    img = Image.open(io.BytesIO(first)).convert("RGB")
+    shown = run(img)
+    print(f"  first frame {img.width}x{img.height}: {len(shown)} detection(s)")
+    for cls, conf, box in shown:
+        print(f"    {cls:<14} {conf:.0%}  {[round(v) for v in box]}")
+
+
+def selfcheck():
+    import tempfile
+
+    tmp = Path(tempfile.mkdtemp())
+    seg = tmp / "site1" / "katuba-north" / "20260819-151108.mkv"
+    seg.parent.mkdir(parents=True)
+    seg.write_bytes(b"")
+    cam, start = cam_and_start(seg)
+    assert cam == "katuba-north", cam
+    assert datetime.fromtimestamp(start).strftime(STEM_TS) == "20260819-151108", start
+
+    odd = tmp / "site1" / "cam9" / "clip.mkv"          # not a recorder name: mtime fallback
+    odd.parent.mkdir(parents=True)
+    odd.write_bytes(b"")
+    cam2, start2 = cam_and_start(odd)
+    assert cam2 == "cam9" and abs(start2 - odd.stat().st_mtime) < 1, (cam2, start2)
+
+    # Frame splitting: two whole JPEGs out of one stream, the trailing partial ignored.
+    stream = io.BytesIO(detect.SOI + b"one" + detect.EOI + detect.SOI + b"two"
+                        + detect.EOI + detect.SOI + b"half")
+    assert list(split_jpegs(stream)) == [detect.SOI + b"one" + detect.EOI,
+                                         detect.SOI + b"two" + detect.EOI]
+
+    # Capture gates, in footage time: cadence, then the unchanged scene, then a change.
+    sink = Sink(tmp / "dataset", dict(detect.CLASS_IDS))
+    car = [("car", 0.9, (10.0, 10.0, 60.0, 60.0))]
+    moved = [("car", 0.9, (300.0, 10.0, 350.0, 60.0))]
+    base = datetime(2026, 8, 19, 15, 11, 8, tzinfo=timezone.utc).timestamp()
+    assert not sink.offer("c", base, b"jpeg", [], 64, 64), "no detections, no sample"
+    assert sink.offer("c", base, b"jpeg", car, 64, 64)
+    assert not sink.offer("c", base + 5, b"jpeg", moved, 64, 64), "too soon"
+    assert not sink.offer("c", base + 40, b"jpeg", car, 64, 64), "unchanged scene"
+    assert sink.offer("c", base + 40, b"jpeg", moved, 64, 64)
+    assert sink.written["c"] == 2, sink.written
+
+    # Stems are UTC even though segment names are local wallclock.
+    stems = sorted(p.stem for p in sink.images.glob("*.jpg"))
+    assert stems == ["c-20260819-151108", "c-20260819-151148"], stems
+    label = (sink.labels / "c-20260819-151108.txt").read_text()
+    assert label == "0 0.546875 0.546875 0.781250 0.781250\n", label   # detect._capture's format
+
+    # Re-ingesting the same footage overwrites its own stems rather than duplicating.
+    sink2 = Sink(tmp / "dataset", dict(detect.CLASS_IDS))
+    assert sink2.offer("c", base, b"again", car, 64, 64)
+    assert len(list(sink.images.glob("*.jpg"))) == 2, "same stem, same file"
+    assert (sink.images / "c-20260819-151108.jpg").read_bytes() == b"again"
+
+    assert segments([str(tmp)]) == [odd, seg], segments([str(tmp)])
+    print("ingest_video self-check ok: segment names parsed, frames split, capture gated "
+          "in footage time, stems UTC and idempotent")
+
+
+if __name__ == "__main__":
+    args = sys.argv[1:]
+    if not args:
+        selfcheck()
+    elif args[0] == "pull":
+        if len(args) != 2:
+            sys.exit("usage: ingest_video.py pull <site>/<cam>")
+        cfg = config()
+        got = pull(args[1], cfg)
+        if got:
+            ingest(got, cfg)
+    elif args[0] == "check":
+        if len(args) != 2:
+            sys.exit("usage: ingest_video.py check <file>")
+        check(args[1], config())
+    else:
+        files = segments(args)
+        if not files:
+            sys.exit("nothing to ingest")
+        ingest(files, config())
