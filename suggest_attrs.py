@@ -12,11 +12,20 @@ saved. Re-runnable — anything already suggested or already labelled is skipped
 import base64
 import io
 import json
+import signal
 import sys
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+
+# Background launches (nohup/&) have SIGINT ignored at the OS level, so Ctrl-C-grace
+# must also answer SIGTERM: plain `kill` finishes the current sample and stops.
+def _term(*_):
+    raise KeyboardInterrupt
+
+
+signal.signal(signal.SIGTERM, _term)
 
 import yaml
 from PIL import Image
