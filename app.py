@@ -134,7 +134,8 @@ def detect_snapshot(ip, user, password):
 
 DETECT = detect.Detector(CONFIG.get("cameras", []), detect_snapshot, CONFIG,
                          creds_fn=lambda ip: cam_creds(ip), dataset_dir=DATASET,
-                         counts_dir=ROOT / "counts")   # one JSON per day: the durable tallies
+                         counts_dir=ROOT / "counts",   # one JSON per day: the durable tallies
+                         events_dir=ROOT / "events")   # per-vehicle records + evidence crops
 DETECT.start()   # no-op unless the optional detection deps are installed
 
 

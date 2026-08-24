@@ -9,11 +9,12 @@ FieldKit runs. Design: docs/superpowers/specs/2026-08-19-video-feed-and-labeling
 
 import io
 import json
+import shutil
 import subprocess
 import threading
 import time
 from collections import Counter
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from statistics import median
 
@@ -49,6 +50,7 @@ IDLE_WAIT = 0.2          # no new frames anywhere: don't spin
 SETTLED = 5.0            # a reader that survives this long resets its backoff
 MAX_BACKOFF = 30.0
 SAVE_EVERY = 60.0        # persist the day's tallies at most this often
+EVENTS_KEEP_DAYS = 30    # crops age out; the jsonl lines are tiny and stay
 CAPTURE_EVERY = 10.0     # dataset samples per camera; dedup already skips unchanged scenes
 DATASET_CAP = 10000      # rolling buffer of the freshest unlabeled frames; ~2-3 GB of JPEGs.
                          # Sized for the fleet goal: 9 toll gates, >=10k contributed each,
@@ -92,6 +94,19 @@ def crop(img, box, pad=0.1):
     dx, dy = (x2 - x1) * pad, (y2 - y1) * pad
     return img.crop((max(0, x1 - dx), max(0, y1 - dy),
                      min(img.width, x2 + dx), min(img.height, y2 + dy)))
+
+
+def jpeg_crop(img, box, quality=80):
+    buf = io.BytesIO()
+    crop(img, box).save(buf, "JPEG", quality=quality)
+    return buf.getvalue()
+
+
+def letter_of(name):
+    """Toll letter from a taxonomy class: "e-heavy" -> "E". Classes outside the
+    lettered scheme ("motorcycle", "wheel") have none."""
+    head = name.split("-")[0]
+    return head.upper() if len(head) == 1 and "-" in name else None
 
 
 def x_clusters(centres, width, gap=1.5):
@@ -333,12 +348,13 @@ class Reader:
 
 class Detector:
     def __init__(self, cameras, snapshot_fn, cfg, creds_fn=None, dataset_dir=None,
-                 counts_dir=None):
+                 counts_dir=None, events_dir=None):
         self.cams = [dict(c) for c in (cameras or [])]
         self.snapshot = snapshot_fn     # unused here: app.py's frame() fallback while a reader is down
         self.creds_fn = creds_fn        # ip -> (user, password); else the cam dict's own
         self.dataset_dir = Path(dataset_dir) if dataset_dir else None
         self.counts_dir = Path(counts_dir) if counts_dir else None
+        self.events_dir = Path(events_dir) if events_dir else None
         self.dirty = False              # a tally moved since the last write
         self.backend = str(cfg.get("detect_backend", "cpu") or "cpu").strip().lower()
         self.hef_path = cfg.get("hef_path", "")   # hailo model; read here, used once that backend lands
@@ -555,6 +571,7 @@ class Detector:
         self._set("running", "")
         self._dataset_init()      # may re-key totals from classes.txt, so restore after it
         self._restore()
+        self._prune_events()
         seen_seq = {}
         saved = time.monotonic()
         while not self.stopping.is_set():
@@ -603,6 +620,7 @@ class Detector:
             self.tracks = {}
             self.recent = {}
         self._save(closing)      # the closing day's final word, before anyone counts again
+        self._prune_events()
 
     def _track(self, name, dets, img=None):
         """Count by ByteTrack id, one count per id, into its majority class.
@@ -638,21 +656,28 @@ class Detector:
                 if t is None:
                     t = ids[tid] = {"votes": Counter(), "label": cls, "hits": 0,
                                     "counted_as": None, "last_seen": now,
-                                    "axles": 0, "best": (0.0, None), "attrs": {}}
+                                    "first_seen": now, "counted_at": 0.0,
+                                    "axles": 0, "best": (0.0, None), "attrs": {},
+                                    "front": None, "rear": None}
                 t["votes"][cls] += 1
                 t["hits"] += 1
                 t["last_seen"] = now
                 t["box"] = box                    # resting place, for the recount guard
                 t["label"] = label_of(t)
                 t["axles"] = max(t["axles"], axles.get(i, 0))
-                # Best crop only until the id counts — attributes are classified once, at
-                # that moment, so cropping afterwards would be work nobody reads.
-                if self.attrs and img is not None and t["counted_as"] is None:
-                    area = (box[2] - box[0]) * (box[3] - box[1])
-                    if area > t["best"][0]:
-                        buf = io.BytesIO()
-                        crop(img, box).save(buf, "JPEG", quality=80)
-                        t["best"] = (area, buf.getvalue())
+                # Evidence: approach (first sighting), best (largest), departure (last).
+                # ponytail: three ~30 KB jpegs per live track held in memory until it
+                # expires. Upgrade path: spool them to the events dir as they are taken.
+                if (self.attrs or self.events_dir) and img is not None:
+                    shot = t["front"] = t["front"] or jpeg_crop(img, box)
+                    if t["counted_as"] is None:
+                        # Attributes are classified once, at the count, so the best crop
+                        # stops moving there — cropping past it is work nobody reads.
+                        area = (box[2] - box[0]) * (box[3] - box[1])
+                        if area > t["best"][0]:
+                            t["best"] = (area, shot if t["hits"] == 1 else jpeg_crop(img, box))
+                    elif self.events_dir and not t.get("ghost"):
+                        t["rear"] = jpeg_crop(img, box)
                 # Votes and labels stay internal; only what leaves here is renamed.
                 disp = self.display[t["label"]]
                 if t["counted_as"] is None:
@@ -671,6 +696,7 @@ class Detector:
                         else:
                             t["attrs"] = self._classify(t)
                             t["counted_as"] = disp
+                            t["counted_at"] = time.time()
                             self.totals[disp] += 1
                             self._bump(disp, t["attrs"], 1)
                 elif t["counted_as"] != disp and not t.get("ghost"):
@@ -690,8 +716,56 @@ class Detector:
                 if t["counted_as"] and t.get("box"):
                     self.recent.setdefault(name, []).append(
                         (t["counted_as"], t["box"], now + RECOUNT_GUARD))
+                self._event(name, t)
             self.visible[name] = Counter(live)
         return shown
+
+    def _event(self, name, t):
+        """One line per counted vehicle, written when its track expires — the vehicle's
+        story (dwell, departure aspect) is only complete then. Caller holds the lock.
+
+        A ghost writes nothing: it is the same vehicle continuing, and its event was
+        already written when the first track of that vehicle expired.
+        """
+        if not self.events_dir or not t["counted_as"] or t.get("ghost"):
+            return
+        when = datetime.fromtimestamp(t["counted_at"])
+        day = when.strftime("%Y-%m-%d")
+        eid = f"{name}-{int(t['counted_at'] * 1000)}"
+        blobs = {tag: b for tag, b in (("front", t["front"]), ("best", t["best"][1]),
+                                       ("rear", t["rear"])) if b}
+        crops = {tag: f"crops/{day}/{eid}-{tag}.jpg" for tag in blobs}
+        doc = {"id": eid, "ts": when.isoformat(timespec="seconds"), "camera": name,
+               "class": t["counted_as"], "letter": letter_of(t["counted_as"]),
+               "attrs": t["attrs"],
+               "axles_source": ("wheels" if t["axles"] >= 2 else
+                                "classifier" if t["attrs"] else None),
+               "hits": t["hits"],
+               # Sighting to sighting: the expiry timeout is our latency, not the vehicle's.
+               "dwell_s": round(t["last_seen"] - t["first_seen"], 1),
+               "crops": crops}
+        try:
+            (self.events_dir / "crops" / day).mkdir(parents=True, exist_ok=True)
+            for tag, blob in blobs.items():
+                (self.events_dir / crops[tag]).write_bytes(blob)
+            with (self.events_dir / f"{day}.jsonl").open("a") as f:
+                f.write(json.dumps(doc) + "\n")
+        except OSError as e:              # a full disk loses evidence, not detection
+            self.events_dir = None
+            self.error = f"events off: {e}"
+
+    def _prune_events(self):
+        """Drop crop directories past the retention window. The jsonl files stay."""
+        if not self.events_dir:
+            return
+        cutoff = (date.today() - timedelta(days=EVENTS_KEEP_DAYS)).isoformat()
+        try:
+            for d in (self.events_dir / "crops").glob("*"):
+                if d.is_dir() and d.name < cutoff:      # ISO dates sort lexicographically
+                    shutil.rmtree(d)
+        except OSError as e:
+            with self.lock:
+                self.error = f"event crops not pruned: {e}"
 
     def _classify(self, t):
         """Attributes for an id at the moment it counts. Caller holds the lock.
@@ -1084,6 +1158,10 @@ if __name__ == "__main__":
     assert fresh_start.totals["bus"] == 0, "a torn file starts the day fresh, never crashes"
     assert not (books / f"{date.today().isoformat()}.tmp").exists(), "no tmp left behind"
 
+    assert letter_of("e-heavy") == "E" and letter_of("a-small") == "A"
+    assert letter_of("motorcycle") is None and letter_of("wheel") is None
+    assert letter_of("mini-bus-long") is None, "only a single-letter prefix is a toll letter"
+
     # Axles from wheels. Gaps of 2 and 1 px are the same axle seen doubled; 38-40 px
     # gaps are separate axles, so these six wheels are 4 axles.
     assert x_clusters([10, 12, 50, 90, 130, 131], 8) == 4
@@ -1142,6 +1220,60 @@ if __name__ == "__main__":
     n.start()
     n.thread.join(timeout=3)
     assert n.info()["state"] == "error" and "/nope/attrs.pt" in n.info()["error"], n.info()
+
+    # Vehicle events: one durable record per counted vehicle, written at expiry with
+    # its three evidence crops.
+    if jpeg:
+        from PIL import Image
+        ev = Path(tempfile.mkdtemp())
+        d = fresh(events_dir=ev)
+        d.display = dict(d.display, truck="e-heavy")
+        d.totals["e-heavy"] = 0
+        d.attrs = lambda pil: {"type": "articulated", "axles": "2", "cargo": "mineral"}
+        pic = Image.new("RGB", (300, 200))
+        for _ in range(2):                       # counts on the 2nd, with 4 wheel axles
+            d._track("c", [("truck", 0.9, VEH, 1)] + six, pic)
+        d._track("c", [("truck", 0.9, VEH, 1)], pic)      # a departure aspect
+        t = d.tracks["c"][1]
+        assert t["front"] and t["rear"] and t["best"][1], t.keys()
+        t["first_seen"] -= 30
+        t["last_seen"] -= 20                     # 10 s of dwell, then the tracker drops it
+        d._track("c", [])
+        day = date.today().isoformat()
+        lines = (ev / f"{day}.jsonl").read_text().splitlines()
+        assert len(lines) == 1, lines
+        e = json.loads(lines[0])
+        assert e["camera"] == "c" and e["class"] == "e-heavy" and e["letter"] == "E", e
+        assert e["id"].startswith("c-") and e["ts"][:10] == day, e
+        assert e["attrs"]["axles"] == "4" and e["axles_source"] == "wheels", e
+        assert e["hits"] == 3 and e["dwell_s"] == 10.0, e
+        assert sorted(e["crops"]) == ["best", "front", "rear"], e["crops"]
+        for rel in e["crops"].values():
+            assert (ev / rel).read_bytes().startswith(SOI), rel
+
+        # A ghost is the same vehicle continuing: no second event, no second crop set.
+        for _ in range(2):
+            d._track("c", [("truck", 0.9, VEH, 2)], pic)
+        assert d.tracks["c"][2]["ghost"], d.tracks["c"][2]
+        d.tracks["c"][2]["last_seen"] -= 20
+        d._track("c", [])
+        assert len((ev / f"{day}.jsonl").read_text().splitlines()) == 1, "ghosts write nothing"
+        assert len(list((ev / "crops" / day).glob("*.jpg"))) == 3, "one vehicle, three crops"
+
+        # Retention drops old crop days and leaves today's alone.
+        old = ev / "crops" / "2000-01-01"
+        old.mkdir()
+        (old / "x.jpg").write_bytes(b"x")
+        d._prune_events()
+        assert not old.exists() and (ev / "crops" / day).is_dir()
+
+        # Feature off: a counted track expires with no directory and no complaint.
+        off = fresh()
+        for _ in range(2):
+            off._track("c", [("truck", 0.9, VEH, 1)], pic)
+        off.tracks["c"][1]["last_seen"] -= 20
+        off._track("c", [])
+        assert off.info()["error"] == "", off.info()
 
     # Fine-tuned weights: the model's own names are the taxonomy, end to end.
     import sys
