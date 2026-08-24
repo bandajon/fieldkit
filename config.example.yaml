@@ -9,6 +9,10 @@ cameras:                 # cameras recorded directly over RTSP
     ip: 192.168.1.112
     user: admin
     password: ""
+    # Optional per-camera measurement config (events gain direction + speed):
+    # travel: {axis: y, neg: northbound, pos: southbound}
+    # speed_lines: {a: 0.55, b: 0.75, metres: 25}   # two reference lines on the travel
+    #                                               # axis (normalized) + real distance
 
 site: site1              # this node's site name; recordings land in <record_dir>/<site>/<cam>/
 record_dir: ./recordings # root for ffmpeg segment recordings

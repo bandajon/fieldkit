@@ -51,6 +51,8 @@ SETTLED = 5.0            # a reader that survives this long resets its backoff
 MAX_BACKOFF = 30.0
 SAVE_EVERY = 60.0        # persist the day's tallies at most this often
 EVENTS_KEEP_DAYS = 30    # crops age out; the jsonl lines are tiny and stay
+DIRECTION_MIN = 0.03     # displacement under this fraction of the frame is not travel
+SPEED_MIN, SPEED_MAX = 1.0, 160.0        # outside: a tracking artifact, not a vehicle
 CAPTURE_EVERY = 10.0     # dataset samples per camera; dedup already skips unchanged scenes
 DATASET_CAP = 10000      # rolling buffer of the freshest unlabeled frames; ~2-3 GB of JPEGs.
                          # Sized for the fleet goal: 9 toll gates, >=10k contributed each,
@@ -487,6 +489,51 @@ class Detector:
         otherwise re-insert the state it just cleaned up. Caller holds the lock."""
         return any(c["name"] == name for c in self.cams)
 
+    def _cam(self, name):
+        """The camera's config entry — travel and speed_lines ride along on it.
+        Caller holds the lock."""
+        return next((c for c in self.cams if c["name"] == name), {})
+
+    def _cross(self, t, cam, prev, now):
+        """Stamp the time the centre passes each reference line, in whichever order it
+        meets them. Caller holds the lock.
+
+        ponytail: the stamp is the frame's time, so each line carries up to one frame
+        interval of error — ~±0.25 s at 4 fps, ~10% on a 25 m gap at 60 km/h. Upgrade
+        path: interpolate the crossing between the two frames that straddle it.
+        """
+        lines = cam.get("speed_lines") or {}
+        if prev is None or not lines:
+            return
+        i = 0 if (cam.get("travel") or {}).get("axis") == "x" else 1
+        for tag in ("a", "b"):
+            if tag in t["cross"] or lines.get(tag) is None:
+                continue
+            edge = float(lines[tag]) * t["dim"][i]
+            if (prev[i] - edge) * (t["c"][i] - edge) <= 0:
+                t["cross"][tag] = now
+
+    def _direction(self, t, cam):
+        """Which way it travelled, from end-to-end displacement along the camera's axis."""
+        travel = cam.get("travel") or {}
+        if not travel or not t["first_c"] or not t["c"]:
+            return None
+        i = 0 if travel.get("axis") == "x" else 1
+        moved = t["c"][i] - t["first_c"][i]
+        if abs(moved) < DIRECTION_MIN * (t["dim"][i] or 1):
+            return None                   # parked, or tracker jitter around one spot
+        return travel.get("pos") if moved > 0 else travel.get("neg")
+
+    def _speed(self, t, cam):
+        """km/h between the two reference lines, or None when the run is not credible."""
+        lines = cam.get("speed_lines") or {}
+        if len(t["cross"]) < 2 or not lines.get("metres"):
+            return None
+        gap = abs(t["cross"]["b"] - t["cross"]["a"])
+        kph = round(float(lines["metres"]) / gap * 3.6, 1) if gap else 0.0
+        # Outside these is a tracking artifact — an id swap, or both lines in one frame.
+        return kph if SPEED_MIN <= kph <= SPEED_MAX else None
+
     def _url(self, cam):
         u, p = cam.get("user", ""), cam.get("password", "")
         if self.creds_fn:
@@ -645,6 +692,7 @@ class Detector:
             if not self._known(name):
                 return shown
             ids = self.tracks.setdefault(name, {})
+            cam = self._cam(name)
             live = []
             shown += [(self.display.get(c, c), cf, b) for c, cf, b, _t in wheels]
             for i, (cls, conf, box, tid) in enumerate(dets):
@@ -658,11 +706,17 @@ class Detector:
                                     "counted_as": None, "last_seen": now,
                                     "first_seen": now, "counted_at": 0.0,
                                     "axles": 0, "best": (0.0, None), "attrs": {},
-                                    "front": None, "rear": None}
+                                    "front": None, "rear": None,
+                                    "first_c": None, "c": None, "cross": {}, "dim": (0, 0)}
                 t["votes"][cls] += 1
                 t["hits"] += 1
                 t["last_seen"] = now
                 t["box"] = box                    # resting place, for the recount guard
+                prev, t["c"] = t["c"], ((box[0] + box[2]) / 2, (box[1] + box[3]) / 2)
+                t["first_c"] = t["first_c"] or t["c"]
+                if img is not None:
+                    t["dim"] = (img.width, img.height)
+                    self._cross(t, cam, prev, now)
                 t["label"] = label_of(t)
                 t["axles"] = max(t["axles"], axles.get(i, 0))
                 # Evidence: approach (first sighting), best (largest), departure (last).
@@ -729,6 +783,7 @@ class Detector:
         """
         if not self.events_dir or not t["counted_as"] or t.get("ghost"):
             return
+        cam = self._cam(name)
         when = datetime.fromtimestamp(t["counted_at"])
         day = when.strftime("%Y-%m-%d")
         eid = f"{name}-{int(t['counted_at'] * 1000)}"
@@ -743,6 +798,7 @@ class Detector:
                "hits": t["hits"],
                # Sighting to sighting: the expiry timeout is our latency, not the vehicle's.
                "dwell_s": round(t["last_seen"] - t["first_seen"], 1),
+               "direction": self._direction(t, cam), "speed_kph": self._speed(t, cam),
                "crops": crops}
         try:
             (self.events_dir / "crops" / day).mkdir(parents=True, exist_ok=True)
@@ -1274,6 +1330,31 @@ if __name__ == "__main__":
         off.tracks["c"][1]["last_seen"] -= 20
         off._track("c", [])
         assert off.info()["error"] == "", off.info()
+
+    # Direction and speed from the camera's own reference lines.
+    if jpeg:
+        TRAVEL = {"name": "c", "ip": "10.0.0.1", "user": "u", "password": "",
+                  "travel": {"axis": "y", "neg": "northbound", "pos": "southbound"},
+                  "speed_lines": {"a": 0.55, "b": 0.75, "metres": 25}}
+        sp = Path(tempfile.mkdtemp())
+        d = Detector([TRAVEL], nosnap, {}, events_dir=sp)
+        pic = Image.new("RGB", (300, 200))            # lines land at y=110 and y=150
+        for y in (100.0, 115.0, 160.0, 190.0):
+            d._track("c", [("truck", 0.9, (100.0, y - 10, 140.0, y + 10), 1)], pic)
+        t = d.tracks["c"][1]
+        assert set(t["cross"]) == {"a", "b"}, t["cross"]
+        t["cross"] = {"a": 10.0, "b": 11.5}           # 25 m in 1.5 s = 60 km/h
+        t["last_seen"] -= 20
+        d._track("c", [])
+        e = json.loads((sp / f"{date.today().isoformat()}.jsonl").read_text().splitlines()[0])
+        assert e["speed_kph"] == 60.0 and e["direction"] == "southbound", e
+
+        moved = {"first_c": (0.0, 160.0), "c": (0.0, 100.0), "dim": (300, 200)}
+        assert d._direction(moved, TRAVEL) == "northbound", "sign picks the label"
+        assert d._direction({**moved, "c": (0.0, 157.0)}, TRAVEL) is None, "jitter is not travel"
+        assert d._direction(moved, {}) is None and d._speed(t, {}) is None   # unconfigured
+        assert d._speed({"cross": {"a": 1.0}}, TRAVEL) is None, "one line proves nothing"
+        assert d._speed({"cross": {"a": 1.0, "b": 1.05}}, TRAVEL) is None, "1800 kph: artifact"
 
     # Fine-tuned weights: the model's own names are the taxonomy, end to end.
     import sys
