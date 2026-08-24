@@ -885,7 +885,7 @@ function labDefault(b) {
 }
 
 document.getElementById('l-attrs').onclick = e => {
-  const t = e.target.closest('[data-head], [data-cls]'), b = labBoxes[labSel];
+  const t = e.target.closest('[data-head], [data-cls], [data-add]'), b = labBoxes[labSel];
   if (!t || !b) return;
   const head = t.dataset.head;
   if (t.dataset.add) return labAddValue(t.dataset.add, labClasses[b.cls]);
