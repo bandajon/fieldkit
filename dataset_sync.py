@@ -246,7 +246,9 @@ def selfcheck():
     assert got == 7, got                          # everything under the prefix
     assert (dst / "approved" / "images" / "a.jpg").read_bytes() == b"aaa"
     assert (dst / "pending" / "images" / "b.jpg").exists()
-    assert pull(cl, "buck", "curation/", dst) == (0, 7), "already local, left alone"
+    # Same asymmetry on the way back: samples already here are left alone, config is
+    # re-read every pass so an edit made on the other node cannot hide behind its length.
+    assert pull(cl, "buck", "curation/", dst) == (1, 6), "samples left alone, config re-read"
 
     # --ledgers: the fast daily harvest skips the pending pile it seeded itself.
     day = Path(tempfile.mkdtemp())
