@@ -84,19 +84,34 @@ def walk(root, names):
             yield n, p
 
 
+WORKERS = 8
+
+
+def transfer(fn, items, verb):
+    """Run fn(local, key) over items on a small thread pool; -> count done."""
+    from concurrent.futures import ThreadPoolExecutor
+    done = 0
+    with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+        for _ in ex.map(lambda it: fn(*it), items):
+            done += 1
+            if done % PROGRESS == 0:
+                print(f"  {verb} {done}...", flush=True)
+    return done
+
+
 def push(cl, bucket, prefix=PREFIX, root=DATASET, names=PUSH):
     """Upload what curation needs. Same name and same size is assumed the same file:
     these are write-once samples, never edited in place."""
     have = remote(cl, bucket, prefix)
-    sent = skipped = 0
+    todo, skipped = [], 0
     for rel, f in walk(Path(root), names):
         if have.get(prefix + rel) == f.stat().st_size:
             skipped += 1
-            continue
-        cl.upload_file(str(f), bucket, prefix + rel)
-        sent += 1
-        if sent % PROGRESS == 0:
-            print(f"  pushed {sent}...", flush=True)
+        else:
+            todo.append((f, prefix + rel))
+    # Thousands of small files over a home uplink: latency-bound, so parallel
+    # transfers are the whole speed-up. boto3 clients are thread-safe for this.
+    sent = transfer(lambda f, key: cl.upload_file(str(f), bucket, key), todo, "pushed")
     print(f"push: {sent} uploaded, {skipped} already there ({prefix} on {bucket})")
     return sent, skipped
 
@@ -104,7 +119,7 @@ def push(cl, bucket, prefix=PREFIX, root=DATASET, names=PUSH):
 def pull(cl, bucket, prefix=PREFIX, root=DATASET, names=None):
     """Download the curation instance's work. names limits it to the daily harvest."""
     root = Path(root)
-    got = skipped = 0
+    todo, skipped = [], 0
     for key, size in sorted(remote(cl, bucket, prefix).items()):
         rel = key[len(prefix):]
         if not rel or (names and not rel.startswith(tuple(names))):
@@ -114,10 +129,8 @@ def pull(cl, bucket, prefix=PREFIX, root=DATASET, names=None):
             skipped += 1
             continue
         dest.parent.mkdir(parents=True, exist_ok=True)
-        cl.download_file(bucket, key, str(dest))
-        got += 1
-        if got % PROGRESS == 0:
-            print(f"  pulled {got}...", flush=True)
+        todo.append((dest, key))
+    got = transfer(lambda dest, key: cl.download_file(bucket, key, str(dest)), todo, "pulled")
     print(f"pull: {got} downloaded, {skipped} already local (-> {root})")
     return got, skipped
 
