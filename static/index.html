@@ -159,6 +159,12 @@
   #l-ex .crop { position:relative; flex:0 0 72px; height:72px; overflow:hidden;
                 background:#000; border:1px solid var(--line); border-radius:4px; }
   #l-ex .crop img { position:absolute; max-width:none; }
+  /* Search hits: one tappable row per frame, its class chips saying what is in it. */
+  #l-sres .btn { display:flex; width:100%; margin-bottom:6px; gap:8px; flex-wrap:wrap;
+                 align-items:center; justify-content:flex-start; text-align:left;
+                 font:400 14px/1 var(--mono); }
+  #l-sres i, #l-sres .res { margin:0; }
+  #l-sres .chip { padding-right:10px; }
   .box .x { position:absolute; right:-3px; top:-3px; width:24px; height:24px; background:var(--c);
             border:2px solid #000; border-radius:3px; color:#000; cursor:pointer;
             font:700 16px/20px var(--mono); text-align:center; }
@@ -260,9 +266,11 @@
     <div id="l-wrap" hidden></div>
     <div class="rowbtns" id="l-acts" hidden>
       <button class="btn" id="l-back">&larr; Back</button>
+      <button class="btn" id="l-toq" hidden>&larr; Back to queue</button>
       <button class="btn go" id="l-ok">Approve</button>
       <button class="btn" id="l-skip">Skip</button>
       <button class="btn halt" id="l-no">Discard</button>
+      <button class="btn halt" id="l-rej" hidden>Reject</button>
     </div>
     <div id="l-attrs" hidden></div>
     <div id="l-ex" hidden></div>
@@ -287,6 +295,7 @@
         <button class="btn go" id="l-gen">Generate token</button>
       </div>
       <div id="l-roster"></div>
+      <div class="res" id="l-hold-help" hidden>probation: this curator's work waits in a holding area until a supervisor releases it in review — it never reaches the training set before that.</div>
       <div class="acts" id="l-assign" hidden>
         <select id="l-acur"></select>
         <select id="l-acls"></select>
@@ -294,6 +303,17 @@
         <button class="btn go" id="l-aset">Assign</button>
         <button class="btn" id="l-aclr">Clear</button>
       </div>
+      <div class="acts" id="l-search" hidden>
+        <select id="l-scls"></select>
+        <select id="l-swho"></select>
+        <select id="l-stree">
+          <option value="approved">approved</option>
+          <option value="holding">holding</option>
+          <option value="pending">pending</option>
+        </select>
+        <button class="btn go" id="l-sgo">Search</button>
+      </div>
+      <div id="l-sres"></div>
     </details>
     <div id="l-stats" class="res"></div>
     <div id="l-note" class="res"></div>
@@ -847,6 +867,10 @@ let labIdle = null;                 // pending re-check while the queue is empty
 let labAuthErr = false;             // last load was refused, not empty
 const IDLE_RECHECK = 60000;
 let labAssign = null;
+// A frame opened from the supervisor's search sits in the editor exactly like a review does:
+// one sample, no queue behind it, and Submit review writes the correction back.
+let labOpened = null;               // {id, tree}, or null when the queue is what is on screen
+const labOne = () => labRev || !!labOpened;
 
 function labAskWho() {
   for (;;) {
@@ -887,6 +911,7 @@ addEventListener('hashchange', () => { if (tab === 'label') labLoad(); });
 
 async function labLoad() {
   labRev = location.hash === '#review';   // same tool, same taxonomy, different source
+  labOpened = null;                       // loading the queue IS the way back out of a search hit
   labWhoShow();
   // Slices are claimed per handle, so who rides on the fetch as well as the writes.
   const who = labWho ? `?who=${encodeURIComponent(labWho)}` : '';
@@ -948,10 +973,14 @@ function labShow() {
   // The row survives an empty queue while Back can still reopen the last approval.
   document.getElementById('l-acts').hidden = !s && !labDone.length;
   document.getElementById('l-back').disabled = !labDone.length;
-  ['l-ok', 'l-skip', 'l-no'].forEach(id => document.getElementById(id).disabled = !s);
+  ['l-ok', 'l-skip', 'l-no', 'l-rej'].forEach(id => document.getElementById(id).disabled = !s);
   // Reviewers correct, they do not delete or rewind.
-  document.getElementById('l-ok').textContent = labRev ? 'Submit review' : 'Approve';
-  document.getElementById('l-no').hidden = document.getElementById('l-back').hidden = labRev;
+  document.getElementById('l-ok').textContent = labOne() ? 'Submit review' : 'Approve';
+  document.getElementById('l-no').hidden = document.getElementById('l-back').hidden = labOne();
+  document.getElementById('l-toq').hidden = !labOpened;
+  // Reject exists only where holding does: a supervisor's review or search hit. A curator's own
+  // queue carries no held flag, so the button never appears for them even if one leaked through.
+  document.getElementById('l-rej').hidden = !(labOne() && s && s.held);
   if (!s) {
     // The batch is done but more may wait on disk (the fetch is capped at 100).
     if (labTotal > 0) return labLoad();
@@ -975,8 +1004,13 @@ function labShow() {
     return {...b, attrs: {...sug, ...confirmed}, touched,
             suggested: new Set(Object.keys(sug).filter(h => !touched.has(h)))};
   });
-  labNote(labRev
-    ? `reviewing ${s.curator || 'someone'}'s work — your corrections become the record`
+  labNote(labOpened
+    ? `open: ${labOpened.id} from ${labOpened.tree} — Submit review saves your corrections back, ` +
+      `Back to queue leaves it as it is`
+    : labRev
+    ? (s.held
+       ? `held — ${s.curator || 'someone'}'s work, release or reject`
+       : `reviewing ${s.curator || 'someone'}'s work — your corrections become the record`)
     : `${labTotal} remaining · tap a box to select it, set class and attributes below, ` +
       `× to delete, drag to move, corner to resize, drag empty area to add a box`);
   wrap.innerHTML = '<img alt="">' +
@@ -1279,7 +1313,9 @@ function labDraw(e) {
 async function labSend(action) {
   const s = labQueue[0];
   if (!s) return;
-  const gap = action !== 'discard' && labGap(labBoxes);   // a review becomes the record too
+  // A review becomes the record too, so it is held to the same bar — but a discard keeps
+  // nothing and a reject hands the frame back untouched, so neither has anything to complete.
+  const gap = !['discard', 'reject'].includes(action) && labGap(labBoxes);
   if (gap) {
     labSelect(gap.i);   // open the offending box's strip right where the fix goes
     return labNote(`box ${gap.i + 1} (${gap.name}): missing ${gap.head} — ` +
@@ -1294,7 +1330,7 @@ async function labSend(action) {
     labNote('Save failed — sample kept, tap again to retry.');
     return;
   }
-  if (labRev) return labLoad();   // no queue in review mode: pull the next one
+  if (labOne()) return labLoad();   // no queue behind this one: go back for the next
   if (action === 'approve') {   // bumped locally; the next labLoad trues it up from disk
     labDone.push(s.id);         // approvals only — a discard is deleted server-side
     labApproved.frames++;
@@ -1308,12 +1344,15 @@ async function labSend(action) {
   labTotal = Math.max(0, labTotal - 1);   // skip leaves the total: the frame stays on disk
   labShow();
 }
-document.getElementById('l-ok').onclick = () => labSend(labRev ? 'review' : 'approve');
+document.getElementById('l-ok').onclick = () => labSend(labOne() ? 'review' : 'approve');
 // Skipped samples stay pending and age out of the rolling capture buffer on their own;
 // Skip is for near-duplicates (parked vehicles) not worth a decision.
 document.getElementById('l-skip').onclick = () =>
-  labRev ? labLoad() : (labQueue.shift(), labShow());
+  labOne() ? labLoad() : (labQueue.shift(), labShow());
 document.getElementById('l-no').onclick = () => labSend('discard');
+// Reject returns a held frame to the queue for its curator to redo — the opposite of Submit.
+document.getElementById('l-rej').onclick = () => labSend('reject');
+document.getElementById('l-toq').onclick = () => labLoad();
 
 // Reopen the last approval to amend it. Undoes the optimistic stats bump the same way
 // labSend applied it; the next labLoad trues both up from disk.
@@ -1435,7 +1474,7 @@ document.getElementById('l-team').ontoggle = e => { if (e.target.open) labRoster
 
 // Roster and assignments arrive from two endpoints but draw as one list, so the last
 // roster payload is kept to redraw against fresh assignments without refetching it.
-let labTeam = null, labAssigns = {};
+let labTeam = null, labAssigns = {}, labTrust = {};   // handle -> trusted; absent means probation
 const labAssignTag = h => {
   const a = labAssigns[h], i = a ? labClasses.indexOf(a.class) : -1;
   return a ? `<i class="res">\u2014</i><b style="color:${i < 0 ? 'var(--fg)' : clsColor(i)}">${esc(a.class)}</b>`
@@ -1445,22 +1484,34 @@ const labAssignTag = h => {
 
 async function labRoster() {
   const r = await labFetch('/api/dataset/curators');
-  if (r.ok) { labRosterShow(await r.json()); labAssignLoad(); }   // 403 = not signed in: form stays
+  if (!r.ok) return;                     // 403 = not signed in: the sign-in form stays
+  const d = await r.json();
+  const t = await labFetch('/api/dataset/trust');   // drawn on the same rows, so fetched with them
+  if (t.ok) labTrust = (await t.json()).trusted || {};
+  labRosterShow(d);
+  labAssignLoad();
 }
 
 function labRosterShow(d) {
   labTeam = d;
   document.getElementById('l-signin').hidden = true;
   document.getElementById('l-team-add').hidden = false;
-  labFill(document.getElementById('l-acur'),
-          Object.keys(d.curators).map(h => `<option>${esc(h)}</option>`).join(''));
+  const handles = Object.keys(d.curators).map(h => `<option>${esc(h)}</option>`).join('');
+  labFill(document.getElementById('l-acur'), handles);
+  labFill(document.getElementById('l-swho'), '<option value="">any curator</option>' + handles);
   // Tokens are made to be read out and handed over, so they are shown, not masked.
+  // .toggle so the trust button lights when it is on, the way every other state chip here does —
+  // .halt is reserved for the one destructive control on the row.
   document.getElementById('l-roster').innerHTML = Object.entries(d.curators).map(([h, t]) =>
-    `<div class="acts"><b>${esc(h)}</b>${labAssignTag(h)}` +
+    `<div class="acts toggle"><b>${esc(h)}</b>${labAssignTag(h)}` +
     `<code data-copy="${esc(t)}">${esc(t)}</code>` +
+    // A supervisor's own work is never held, so there is no state to flip for one.
     (d.reviewers.includes(h) ? '<i class="res">supervisor</i>'
-                             : `<button class="btn halt" data-drop="${esc(h)}">remove</button>`) +
+                             : `<button class="btn${labTrust[h] ? ' on' : ''}" data-trust="${esc(h)}"
+                                 >${labTrust[h] ? 'trusted' : 'probation'}</button>` +
+                               `<button class="btn halt" data-drop="${esc(h)}">remove</button>`) +
     '</div>').join('');
+  document.getElementById('l-hold-help').hidden = false;
 }
 
 document.getElementById('l-in').onclick = async () => {
@@ -1493,7 +1544,17 @@ document.getElementById('l-gen').onclick = async () => {
 };
 
 document.getElementById('l-roster').onclick = async e => {
-  const c = e.target.closest('[data-copy]'), b = e.target.closest('[data-drop]');
+  const c = e.target.closest('[data-copy]'), b = e.target.closest('[data-drop]'),
+        t = e.target.closest('[data-trust]');
+  if (t) {
+    const h = t.dataset.trust, on = !labTrust[h];
+    const d = await post('/api/dataset/trust', {handle: h, trusted: on});
+    if (d.detail) return labNote(String(d.detail));
+    labTrust = d.trusted || {};
+    labNote(on ? `${h}: trusted — their work goes straight into the set`
+               : `${h}: on probation — their work waits in holding until you release it`);
+    return labRosterShow(labTeam);
+  }
   if (c) {
     // clipboard is https-only; the local console over http reads it off the screen instead
     navigator.clipboard
@@ -1521,15 +1582,22 @@ async function labAssignLoad() {
   if (r.ok) labAssignShow(await r.json());
 }
 
+// Categories then classes: what a slice can be aimed at, and equally what a search can ask for.
+let labCats = [];
+const labTargets = () =>
+  '<optgroup label="Categories">' +
+  labCats.map(c => `<option value="${esc(c)}">Category ${esc(c)}</option>`).join('') +
+  '</optgroup><optgroup label="Classes">' +
+  labClasses.map(n => `<option>${esc(n)}</option>`).join('') + '</optgroup>';
+
 function labAssignShow(d) {
   labAssigns = d.assignments || {};
   labClasses = d.classes || labClasses;      // same list labLoad reads; keeps the colours in step
-  labFill(document.getElementById('l-acls'),
-    '<optgroup label="Categories">' +
-    (d.categories || []).map(c => `<option value="${esc(c)}">Category ${esc(c)}</option>`).join('') +
-    '</optgroup><optgroup label="Classes">' +
-    labClasses.map(n => `<option>${esc(n)}</option>`).join('') + '</optgroup>');
+  labCats = d.categories || labCats;
+  labFill(document.getElementById('l-acls'), labTargets());
+  labFill(document.getElementById('l-scls'), '<option value="">any class</option>' + labTargets());
   document.getElementById('l-assign').hidden = false;
+  document.getElementById('l-search').hidden = false;
   if (labTeam) labRosterShow(labTeam);       // the roster line carries the assignment
 }
 
@@ -1551,6 +1619,60 @@ document.getElementById('l-aset').onclick = () => {
 document.getElementById('l-aclr').onclick = () => {
   const handle = document.getElementById('l-acur').value;
   if (handle) labAssignPost({handle, clear: true});
+};
+
+// --- Supervisor: find a frame again ---
+// Every filter is optional, so an empty target and curator mean "everything in this tree".
+const SEARCH_LIMIT = 50;
+
+document.getElementById('l-sgo').onclick = async () => {
+  const tree = document.getElementById('l-stree').value;
+  const q = new URLSearchParams({target: document.getElementById('l-scls').value,
+                                 who: document.getElementById('l-swho').value,
+                                 tree, limit: SEARCH_LIMIT});
+  const el = document.getElementById('l-sres');
+  el.textContent = 'searching…';
+  let d;
+  try {
+    const r = await labFetch('/api/dataset/search?' + q);
+    if (!r.ok) throw new Error(`search failed (${r.status})`);
+    d = await r.json();
+  } catch (e) {
+    el.textContent = String(e.message || e);
+    return;
+  }
+  const hits = d.results || [];
+  if (!hits.length) return el.textContent = 'nothing matched';
+  // The chips are the point of the row: one glance says whether this frame is worth opening.
+  el.innerHTML = hits.map(s => {
+    const names = [...new Set((s.boxes || []).map(b => labClasses[b.cls]).filter(Boolean))];
+    return `<button class="btn" data-open="${esc(s.id)}" data-tree="${esc(s.tree || tree)}">` +
+      `<b>${esc(s.id)}</b><i class="res">${esc(s.curator || '—')}</i>` +
+      names.map(n => `<span class="chip" style="--c:${clsColor(labClasses.indexOf(n))}"
+        >${esc(n)}</span>`).join('') + '</button>';
+  }).join('') +
+  (d.total > hits.length ? `<div class="res">showing ${hits.length} of ${d.total}</div>` : '');
+};
+
+// A hit opens in the ordinary editor — same boxes, same gestures, same Submit.
+document.getElementById('l-sres').onclick = async e => {
+  const b = e.target.closest('[data-open]');
+  if (!b) return;
+  const {open: id, tree} = b.dataset;
+  let s;
+  try {
+    const r = await labFetch(`/api/dataset/sample?id=${encodeURIComponent(id)}` +
+                             `&tree=${encodeURIComponent(tree)}`);
+    if (!r.ok) throw new Error(`sample not loaded (${r.status})`);
+    s = await r.json();
+  } catch (err) {
+    return labNote(String(err.message || err));
+  }
+  clearTimeout(labIdle);        // the empty-queue re-check would pull this frame out from under
+  labOpened = {id, tree};
+  labQueue = [{...s, id, boxes: s.boxes || []}];   // the id we asked for is the one that answered
+  labShow();
+  document.getElementById('l-wrap').scrollIntoView();   // the editor is a screen away from here
 };
 
 // --- Review tab ---

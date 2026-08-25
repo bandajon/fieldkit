@@ -23,8 +23,15 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 DATASET = ROOT / "dataset"
 MIN_SCORES = 3        # same honesty rule as the Progress panel
-COLUMNS = ("curator", "approvals", "discards", "golds_seen", "gold_accuracy",
-           "reviews", "review_accuracy", "quality")
+COLUMNS = ("curator", "approvals", "discards", "held", "released", "golds_seen",
+           "gold_accuracy", "reviews", "review_accuracy", "quality")
+
+
+def blank():
+    """held: approvals that landed in the holding pen instead of the training set.
+    released: how many of those a reviewer has since cleared. The gap is work nobody
+    has proved yet — pay for it at your own risk."""
+    return {"approvals": 0, "discards": 0, "held": 0, "released": 0, "gold": [], "review": []}
 
 
 def rows(name, since):
@@ -57,15 +64,21 @@ def main():
     since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat(timespec="seconds")
     people = {}
     for r in rows("audit.jsonl", since):
-        if r.get("action") not in ("approve", "discard"):
+        act = r.get("action")
+        if act == "review" and r.get("released"):
+            # A release credits the CURATOR whose held work cleared, not the reviewer.
+            people.setdefault(r.get("curator") or "anon", blank())["released"] += 1
+            continue
+        if act not in ("approve", "discard"):
             continue          # a reviewer's own audit lines are not curation work
-        p = people.setdefault(r.get("who") or "anon",
-                              {"approvals": 0, "discards": 0, "gold": [], "review": []})
-        p["approvals" if r["action"] == "approve" else "discards"] += 1
+        p = people.setdefault(r.get("who") or "anon", blank())
+        p["approvals" if act == "approve" else "discards"] += 1
+        if r.get("held"):
+            p["held"] += 1
     for r in rows("scores.jsonl", since):
         who, kind = r.get("who") or "anon", r.get("kind")
         if kind in ("gold", "review") and isinstance(r.get("score"), (int, float)):
-            people.setdefault(who, {"approvals": 0, "discards": 0, "gold": [], "review": []})
+            people.setdefault(who, blank())
             people[who][kind].append(r["score"])
 
     table = []
@@ -74,6 +87,7 @@ def main():
         both = [v for v in (gold, review) if v is not None]
         quality = round(sum(both) / len(both), 3) if both else None   # equal weight when both exist
         table.append({"curator": who, "approvals": p["approvals"], "discards": p["discards"],
+                      "held": p["held"], "released": p["released"],
                       "golds_seen": len(p["gold"]), "gold_accuracy": gold,
                       "reviews": len(p["review"]), "review_accuracy": review,
                       "quality": quality})
@@ -81,10 +95,11 @@ def main():
         sys.exit(f"no labelling logged in the last {days} day(s)")
 
     print(f"last {days} day(s), since {since}\n")
-    print(f"{'curator':<16}{'appr':>6}{'disc':>6}{'golds':>7}{'gold acc':>22}"
-          f"{'reviews':>9}{'review acc':>22}{'quality':>22}")
+    print(f"{'curator':<16}{'appr':>6}{'disc':>6}{'held':>6}{'rel':>6}{'golds':>7}"
+          f"{'gold acc':>22}{'reviews':>9}{'review acc':>22}{'quality':>22}")
     for t in table:
-        print(f"{t['curator']:<16}{t['approvals']:>6}{t['discards']:>6}{t['golds_seen']:>7}"
+        print(f"{t['curator']:<16}{t['approvals']:>6}{t['discards']:>6}{t['held']:>6}"
+              f"{t['released']:>6}{t['golds_seen']:>7}"
               f"{show(t['gold_accuracy']):>22}{t['reviews']:>9}"
               f"{show(t['review_accuracy']):>22}{show(t['quality']):>22}")
 

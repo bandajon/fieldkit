@@ -31,9 +31,10 @@ PREFIX = "curation/"
 PROGRESS = 200
 # What a curation instance needs to start work...
 PUSH = ("pending/images", "pending/labels", "pending/attrs", "pending/suggest", "gold",
-        "classes.txt", "attributes.yaml", "curators.yaml", "assignments.yaml")
+        "classes.txt", "attributes.yaml", "curators.yaml", "assignments.yaml", "trusted.yaml")
 # ...the small part of that a node must have IN HAND before it can serve anything...
-CONFIG = ("curators.yaml", "classes.txt", "attributes.yaml", "assignments.yaml", "gold")
+CONFIG = ("curators.yaml", "classes.txt", "attributes.yaml", "assignments.yaml",
+          "trusted.yaml", "gold")
 # ...and what it produces: the daily harvest.
 LEDGERS = ("approved/images", "approved/labels", "approved/attrs",
            "audit.jsonl", "scores.jsonl", "gold-served.jsonl")

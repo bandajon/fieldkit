@@ -559,9 +559,10 @@ def write_classes(classes):
 
 
 def label_files():
-    """Every label file in both trees. ponytail: full scan per class edit — the
-    dataset caps at ~500 pending samples; index them if that ever changes."""
-    for tree in ("pending", "approved"):
+    """Every label file in every tree — held work included, or a class rename would
+    leave stale ids in it. ponytail: full scan per class edit — the dataset caps at
+    ~500 pending samples; index them if that ever changes."""
+    for tree in ("pending", "holding", "approved"):
         d = DATASET / tree / "labels"
         if d.is_dir():
             yield from d.glob("*.txt")
@@ -679,6 +680,27 @@ def curators():
     if not isinstance(v, dict):
         return {}
     return {str(k): str(t) for k, t in v.items() if t not in (None, "")}
+
+
+TRUSTED = "trusted.yaml"   # {handle: true}; syncs like the roster, see dataset_sync.CONFIG
+
+
+def trusted():
+    """{handle: true} from dataset/trusted.yaml — who has proved they can label without
+    a second pair of eyes. Missing, unreadable or empty = NOBODY is trusted, which is the
+    right default for a node that has just been handed a new team."""
+    try:
+        v = yaml.safe_load((DATASET / TRUSTED).read_text())
+    except (yaml.YAMLError, OSError):
+        return {}
+    return {str(k): True for k, t in v.items() if t} if isinstance(v, dict) else {}
+
+
+def holds(who):
+    """Does this handle's approval go to the holding pen instead of the training set?
+    Only on a node that HAS reviewers: with nobody able to release it, held work would be
+    stranded forever, so a solo or open node keeps behaving exactly as it did."""
+    return bool(REVIEWERS) and who not in REVIEWERS and not trusted().get(who)
 
 
 SUPERVISORS = "supervisors.yaml"   # {handle: "salt:hash"}; in no sync list, so it never leaves
@@ -976,9 +998,10 @@ def dataset_samples(who: str = "", x_curator_token: str = Header("")):
     return body
 
 
-def sample_curators():
-    """{approved sample id: who approved it}, newest audit line wins."""
-    live = {p.stem for p in (DATASET / "approved" / "labels").glob("*.txt")}
+def sample_curators(tree="approved"):
+    """{sample id live in `tree`: who approved it}, newest audit line wins. Held work is
+    read the same way — the approve line is what says whose frame it is."""
+    live = {p.stem for p in (DATASET / tree / "labels").glob("*.txt")}
     out = {}
     for r in read_lines("audit.jsonl"):
         # Only an approval assigns credit: a review rewrites the labels but the sample
@@ -1024,6 +1047,23 @@ def dataset_examples(target: str = "", limit: int = 6, x_curator_token: str = He
     return {"target": target, "examples": out[:limit]}
 
 
+TREES = ("pending", "holding", "approved")
+
+
+def valid_tree(tree):
+    """A tree name lands in a filesystem path: one of ours, never a caller's."""
+    if tree not in TREES:
+        raise HTTPException(400, f"tree must be one of: {', '.join(TREES)}")
+    return tree
+
+
+def envelope(sid, tree, curator):
+    """One sample as the editor wants it, wherever it currently lives."""
+    return {"id": sid, "curator": curator, "tree": tree,
+            "boxes": read_boxes(sample_paths(sid, tree)[1]),
+            "attrs": read_attrs(attrs_path(sid, tree))}
+
+
 def require_reviewer(who):
     """Reviewer powers need both: a proven handle, and REVIEWERS naming it."""
     if not REVIEWERS:
@@ -1035,33 +1075,59 @@ def require_reviewer(who):
 
 def review_label(sid, who, body):
     """The reviewer's version replaces the curator's: a re-check that leaves the worse
-    labels on disk would be an opinion, not QA."""
+    labels on disk would be an opinion, not QA. The same act RELEASES a held sample —
+    reviewed and moved into the training set in one move, scored exactly as any review."""
     require_reviewer(who)
-    lbl = sample_paths(sid, "approved")[1]
-    if not lbl.is_file():
-        raise HTTPException(404, f"{sid} is not in the approved set")
+    tree = "holding" if sample_paths(sid, "holding")[1].is_file() else "approved"
+    src_img, lbl = sample_paths(sid, tree)
+    # A held label with no image beside it would become an approved label with no image:
+    # a corrupt training pair, so refuse it rather than write half a sample.
+    if not lbl.is_file() or (tree == "holding" and not src_img.is_file()):
+        raise HTTPException(404, f"{sid} is not in the {tree} set")
     boxes = parse_boxes(body)
     attrs = valid_attrs(body.get("attrs"), len(boxes))
-    curator = sample_curators().get(sid, "anon")
-    score = agreement(read_boxes(lbl), read_attrs(attrs_path(sid, "approved")), boxes, attrs)
+    curator = sample_curators(tree).get(sid, "anon")
+    score = agreement(read_boxes(lbl), read_attrs(attrs_path(sid, tree)), boxes, attrs)
     append_line("scores.jsonl", {"kind": "review", "who": curator, "reviewer": who,
                                  "id": sid, "score": round(score, 3)})
-    lbl.write_text(box_lines(boxes))
+    dst_img, dst_lbl = sample_paths(sid, "approved")
+    dst_lbl.parent.mkdir(parents=True, exist_ok=True)
+    dst_lbl.write_text(box_lines(boxes))
     dst_attrs = attrs_path(sid, "approved")
     if attrs:
         dst_attrs.parent.mkdir(parents=True, exist_ok=True)
         dst_attrs.write_text(json.dumps(attrs))
     else:
         dst_attrs.unlink(missing_ok=True)
-    audit(who, sid, "review")
-    return {"ok": True, "curator": curator, "score": round(score, 3)}
+    if tree == "holding":      # the approved copy is written first: never lose the only one
+        dst_img.parent.mkdir(parents=True, exist_ok=True)
+        src_img.rename(dst_img)
+        lbl.unlink(missing_ok=True)
+        attrs_path(sid, "holding").unlink(missing_ok=True)
+    # The curator rides on the line: it is THEIR work that cleared, and progress and
+    # payroll credit the release to them, not to the reviewer who signed it off.
+    audit(who, sid, "review",
+          {"released": True, "curator": curator} if tree == "holding" else None)
+    return {"ok": True, "curator": curator, "score": round(score, 3),
+            "released": tree == "holding"}
 
 
 @app.get("/api/dataset/review")
 def dataset_review(who: str, x_curator_token: str = Header("")):
-    """The approved sample most in need of a second pair of eyes: whichever curator is
+    """Held work FIRST, oldest first: an unproven curator's frames are the queue, and
+    nobody's morning should wait behind a randomly drawn re-check. Once the pen is empty,
+    the approved sample most in need of a second pair of eyes: whichever curator is
     furthest below the review quota, one of their samples at random."""
     who = require_reviewer(check_token(valid_who(who), x_curator_token))
+    try:      # FIFO by the moment the approval wrote the label into holding
+        pen = sorted((DATASET / "holding" / "labels").glob("*.txt"),
+                     key=lambda f: f.stat().st_mtime)
+    except OSError:      # released mid-listing: fall through to the sampled review
+        pen = []
+    if pen:
+        sid = pen[0].stem
+        return {**envelope(sid, "holding", sample_curators("holding").get(sid, "anon")),
+                "held": True}
     done = {}
     for r in read_lines("scores.jsonl"):
         if r.get("kind") == "review":
@@ -1076,8 +1142,54 @@ def dataset_review(who: str, x_curator_token: str = Header("")):
         raise HTTPException(404, "nothing to review yet")
     curator = max(pool, key=lambda c: REVIEW_RATE * approvals[c] - done.get(c, 0))
     sid = random.choice(pool[curator])
-    return {"id": sid, "curator": curator, "boxes": read_boxes(sample_paths(sid, "approved")[1]),
-            "attrs": read_attrs(attrs_path(sid, "approved"))}
+    return {**envelope(sid, "approved", curator), "held": False}
+
+
+@app.get("/api/dataset/search")
+def dataset_search(target: str = "", who: str = "", tree: str = "approved", limit: int = 50,
+                   x_curator_token: str = Header("")):
+    """Every frame holding a class or a whole toll category, newest first — the way back
+    to work already filed, for a supervisor spot-checking a class or cleaning up after one
+    curator. `total` is the whole match, `results` the page of it.
+
+    ponytail: full scan of the tree per call, the same ceiling approved_counts() and
+    label_files() already live with; index the labels if the dataset outgrows it."""
+    require_reviewer(token_who(x_curator_token))
+    tree, who = valid_tree(tree), valid_who(who)
+    names = dataset_classes()
+    ids = {names.index(c) for c in target_classes(target)}
+    if not ids:
+        raise HTTPException(400, f"no class or category {target!r} — pick one of: "
+                                 f"{', '.join(categories() + names)}")
+    by = sample_curators(tree)
+    try:
+        rows = sorted((DATASET / tree / "labels").glob("*.txt"),
+                      key=lambda f: f.stat().st_mtime, reverse=True)
+    except OSError:      # a sample moved mid-listing: fewer results beats an error
+        rows = []
+    hits = []
+    for f in rows:
+        curator = by.get(f.stem, "anon")
+        if who and curator != who:
+            continue
+        try:
+            boxes = read_boxes(f)
+        except OSError:
+            continue
+        if any(b["cls"] in ids for b in boxes):
+            hits.append({"id": f.stem, "curator": curator, "tree": tree, "boxes": boxes,
+                         "attrs": read_attrs(attrs_path(f.stem, tree))})
+    return {"results": hits[:max(1, min(limit, 200))], "total": len(hits)}
+
+
+@app.get("/api/dataset/sample")
+def dataset_sample(id: str, tree: str = "approved", x_curator_token: str = Header("")):
+    """One sample's envelope, so a searched frame loads straight into the editor."""
+    require_reviewer(token_who(x_curator_token))
+    sid, tree = valid_sample_id(id), valid_tree(tree)
+    if not sample_paths(sid, tree)[1].is_file():
+        raise HTTPException(404, f"no {tree} sample {id!r}")
+    return envelope(sid, tree, sample_curators(tree).get(sid, "anon"))
 
 
 # ---- The cloud round-trip. A curation node runs on a container volume, not on a
@@ -1263,6 +1375,31 @@ def curators_edit(body: dict = Body(default={}), x_curator_token: str = Header("
     return {"curators": roster, "reviewers": REVIEWERS, "pushed": push_roster()}
 
 
+@app.get("/api/dataset/trust")
+def trust_list(x_curator_token: str = Header("")):
+    require_reviewer(token_who(x_curator_token))
+    return {"trusted": trusted()}
+
+
+@app.post("/api/dataset/trust")
+def trust_edit(body: dict = Body(default={}), x_curator_token: str = Header("")):
+    """Take a curator off probation, or put them back on it. Published in the same breath
+    as the write, same reason as the roster: sync pulls this file back down every couple
+    of minutes, so an edit that is not pushed is an edit that gets overwritten."""
+    me = require_reviewer(token_who(x_curator_token))
+    handle = valid_who(str(body.get("handle") or "").strip().lower())
+    if handle not in curators():
+        raise HTTPException(404, f"{handle or 'anonymous'} is not in curators.yaml")
+    roster, ok = trusted(), bool(body.get("trusted"))
+    if ok:
+        roster[handle] = True
+    else:
+        roster.pop(handle, None)
+    write_yaml(TRUSTED, roster)
+    audit(me, handle, "trust" if ok else "untrust")
+    return {"trusted": roster, "pushed": push_file(TRUSTED)}
+
+
 @app.post("/api/dataset/upload_video")
 async def dataset_upload_video(request: Request, name: str, x_curator_token: str = Header("")):
     """Field staff contribute footage with the token they already label with. Streamed to
@@ -1409,6 +1546,11 @@ def dataset_progress():
     labellers is a few thousand lines; index it if a season's log ever gets slow."""
     total, by_who, today = {"approve": 0, "discard": 0}, {}, {"approve": 0, "discard": 0}
     day = datetime.now(timezone.utc).date().isoformat()
+
+    def tally(handle):
+        return by_who.setdefault(handle or "anon",
+                                 {"approve": 0, "discard": 0, "held": 0, "released": 0})
+
     try:
         lines = (DATASET / "audit.jsonl").read_text().splitlines()
     except OSError:
@@ -1418,13 +1560,20 @@ def dataset_progress():
             r = json.loads(line)
         except ValueError:
             continue                      # a torn line must not hide the rest of the log
-        if not isinstance(r, dict) or r.get("action") not in ("approve", "discard", "unapprove"):
+        if not isinstance(r, dict):
             continue
-        act = r["action"]
-        who = r.get("who") or "anon"
+        act = r.get("action")
+        if act == "review" and r.get("released"):
+            # Credited to the CURATOR: it is their work that cleared, not the reviewer's.
+            tally(r.get("curator"))["released"] += 1
+            continue
+        if act not in ("approve", "discard", "unapprove"):
+            continue
         total[act] = total.get(act, 0) + 1
-        mine = by_who.setdefault(who, {"approve": 0, "discard": 0})
+        mine = tally(r.get("who"))
         mine[act] = mine.get(act, 0) + 1
+        if r.get("held"):                 # an approval that landed in the pen, not the set
+            mine["held"] += 1
         if str(r.get("ts", "")).startswith(day):
             today[act] = today.get(act, 0) + 1
     for w, stats in by_who.items():
@@ -1439,10 +1588,35 @@ def dataset_image(id: str):
     sid = valid_sample_id(id)
     gold = gold_for(sid) if sid.startswith("g-") else None
     for img in ([gold / "image.jpg"] if gold else
-                [sample_paths(sid)[0], sample_paths(sid, "approved")[0]]):
+                [sample_paths(sid, t)[0] for t in TREES]):
         if img.is_file():
             return FileResponse(img, media_type="image/jpeg")
     raise HTTPException(404, f"no pending sample {id!r}")
+
+
+def send_back(sid, tree):
+    """Move a sample out of a finished tree and back into pending, labels and attrs with
+    it. -> {"boxes", "attrs"} as they landed. The one path back: unapprove walks an
+    approved sample out, reject walks a held one out."""
+    src_img, src_lbl = sample_paths(sid, tree)
+    if not src_img.is_file():
+        raise HTTPException(404, f"{sid} is not in the {tree} set")
+    img, lbl = sample_paths(sid)
+    img.parent.mkdir(parents=True, exist_ok=True)
+    lbl.parent.mkdir(parents=True, exist_ok=True)
+    src_img.rename(img)
+    lbl.write_text(src_lbl.read_text() if src_lbl.is_file() else "")
+    src_lbl.unlink(missing_ok=True)
+    src_attrs, attrs_dst = attrs_path(sid, tree), attrs_path(sid)
+    attrs = read_attrs(src_attrs)
+    if attrs:
+        attrs_dst.parent.mkdir(parents=True, exist_ok=True)
+        attrs_dst.write_text(json.dumps(attrs))
+    src_attrs.unlink(missing_ok=True)
+    suggest_path(sid).unlink(missing_ok=True)   # the sample was labelled once already
+    for f in (img, lbl):
+        os.utime(f, None)   # front of the review queue, last in line for eviction
+    return {"boxes": read_boxes(lbl), "attrs": attrs}
 
 
 @app.post("/api/dataset/label")
@@ -1455,28 +1629,17 @@ def dataset_label(body: dict = Body(default={}), x_curator_token: str = Header("
     if action == "review":
         return review_label(sid, who, body)
     if action == "unapprove":
-        src_img, src_lbl = sample_paths(sid, "approved")
-        if not src_img.is_file():
-            raise HTTPException(404, f"{sid} is not in the approved set")
-        img, lbl = sample_paths(sid)
-        img.parent.mkdir(parents=True, exist_ok=True)
-        lbl.parent.mkdir(parents=True, exist_ok=True)
-        src_img.rename(img)
-        lbl.write_text(src_lbl.read_text() if src_lbl.is_file() else "")
-        src_lbl.unlink(missing_ok=True)
-        src_attrs, attrs_dst = attrs_path(sid, "approved"), attrs_path(sid)
-        attrs = read_attrs(src_attrs)
-        if attrs:
-            attrs_dst.parent.mkdir(parents=True, exist_ok=True)
-            attrs_dst.write_text(json.dumps(attrs))
-        src_attrs.unlink(missing_ok=True)
-        suggest_path(sid).unlink(missing_ok=True)   # the sample was reviewed once already
-        for p in (img, lbl):
-            os.utime(p, None)   # front of the review queue, last in line for eviction
+        return finish(who, sid, action, {"ok": True, "id": sid, **send_back(sid, "approved")})
+    if action == "reject":
+        # Not approve-or-discard, so dataset_sync.consumed() stops calling this sample
+        # finished and it comes round again — that IS the mechanism of a reject.
+        require_reviewer(who)
+        curator = sample_curators("holding").get(sid, "anon")     # before the files move
         return finish(who, sid, action,
-                      {"ok": True, "id": sid, "boxes": read_boxes(lbl), "attrs": attrs})
+                      {"ok": True, "id": sid, "curator": curator, **send_back(sid, "holding")},
+                      {"curator": curator})
     if action not in ("approve", "discard"):
-        raise HTTPException(400, "action must be 'approve', 'discard' or 'unapprove'")
+        raise HTTPException(400, "action must be 'approve', 'discard', 'unapprove' or 'reject'")
     img, lbl = sample_paths(sid)
     if not img.is_file():
         raise HTTPException(404, f"no pending sample {sid!r}")
@@ -1488,11 +1651,15 @@ def dataset_label(body: dict = Body(default={}), x_curator_token: str = Header("
         return finish(who, sid, action, {"ok": True})
     boxes = parse_boxes(body)
     attrs = valid_attrs(body.get("attrs"), len(boxes))
-    dst_img, dst_lbl = sample_paths(sid, "approved")
+    # Unproven work goes to the holding pen, not the training set: everything that reads
+    # approved/ — counts, examples, gold, payroll — then ignores it until a reviewer
+    # releases it, which is the whole point of probation.
+    tree = "holding" if holds(who) else "approved"
+    dst_img, dst_lbl = sample_paths(sid, tree)
     dst_img.parent.mkdir(parents=True, exist_ok=True)
     dst_lbl.parent.mkdir(parents=True, exist_ok=True)
     dst_lbl.write_text(box_lines(boxes))   # the operator's edit wins over the model's guess
-    dst_attrs = attrs_path(sid, "approved")
+    dst_attrs = attrs_path(sid, tree)
     if attrs:
         dst_attrs.parent.mkdir(parents=True, exist_ok=True)
         dst_attrs.write_text(json.dumps(attrs))
@@ -1502,7 +1669,10 @@ def dataset_label(body: dict = Body(default={}), x_curator_token: str = Header("
     lbl.unlink(missing_ok=True)
     attrs_path(sid).unlink(missing_ok=True)
     suggest_path(sid).unlink(missing_ok=True)
-    return finish(who, sid, action, {"ok": True}, assigned_extra(who, boxes))
+    extra = assigned_extra(who, boxes) or {}
+    if tree == "holding":
+        extra["held"] = True
+    return finish(who, sid, action, {"ok": True, "held": tree == "holding"}, extra)
 
 
 def valid_attrs(attrs, nboxes):
