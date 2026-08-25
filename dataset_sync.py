@@ -111,7 +111,7 @@ def push(cl, bucket, prefix=PREFIX, root=DATASET, names=PUSH):
     have = remote(cl, bucket, prefix)
     todo, skipped = [], 0
     for rel, f in walk(Path(root), names):
-        if have.get(prefix + rel) == f.stat().st_size:
+        if have.get(prefix + rel) == f.stat().st_size and not always(rel):
             skipped += 1
         else:
             todo.append((f, prefix + rel))
@@ -120,6 +120,13 @@ def push(cl, bucket, prefix=PREFIX, root=DATASET, names=PUSH):
     sent = transfer(lambda f, key: cl.upload_file(str(f), bucket, key), todo, "pushed")
     print(f"push: {sent} uploaded, {skipped} already there ({prefix} on {bucket})")
     return sent, skipped
+
+
+def always(rel):
+    """Config is compared by name and size like everything else, and a one-character edit
+    — "2" to "3" in a default — keeps the size identical, so the change would never move.
+    These files are a few KB: send them every pass and let content decide, not length."""
+    return rel.split("/", 1)[0] in CONFIG or rel in CONFIG
 
 
 def have(dest, size):
@@ -174,7 +181,7 @@ def pull(cl, bucket, prefix=PREFIX, root=DATASET, names=None):
         if not rel or (names and not rel.startswith(tuple(names))):
             continue
         dest = root / rel
-        if have(dest, size):
+        if have(dest, size) and not always(rel):
             skipped += 1
             continue
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -220,7 +227,12 @@ def selfcheck():
     assert push(cl, "buck", "curation/", src) == (3, 0)
     assert sorted(cl.objects) == ["curation/classes.txt", "curation/pending/images/a.jpg",
                                   "curation/pending/images/b.jpg"], sorted(cl.objects)
-    assert push(cl, "buck", "curation/", src) == (0, 3), "same size, same file, no re-upload"
+    # Samples are write-once, so same name and size means skip; config is re-sent every
+    # pass because a one-character edit does not change its length.
+    assert push(cl, "buck", "curation/", src) == (1, 2), "samples skip, config always moves"
+    (src / "classes.txt").write_text("van\n")        # same size, different content
+    push(cl, "buck", "curation/", src)
+    assert cl.objects["curation/classes.txt"] == b"van\n", "a same-size config edit must propagate"
     (src / "classes.txt").write_text("car\ntruck\n")
     assert push(cl, "buck", "curation/", src) == (1, 2), "a changed file goes again"
 
