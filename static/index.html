@@ -151,6 +151,14 @@
   #l-attrs [data-cls] { border-color:var(--c); }
   #l-attrs .rm { border-style:dashed; color:var(--dim); }
   #l-attrs .btn.sug { border-style:dashed; }   /* proposed by the VLM, not yet confirmed */
+  /* Examples: a square window on a frame scaled and offset until the example's box fills it.
+     Own class, not .tile — that one forces 16/9 on its img and would fight the crop. */
+  #l-ex { display:flex; align-items:center; gap:6px; overflow-x:auto; margin-bottom:8px; }
+  #l-ex[hidden] { display:none; }
+  #l-ex i { margin:0; flex:0 0 auto; font-style:normal; }
+  #l-ex .crop { position:relative; flex:0 0 72px; height:72px; overflow:hidden;
+                background:#000; border:1px solid var(--line); border-radius:4px; }
+  #l-ex .crop img { position:absolute; max-width:none; }
   .box .x { position:absolute; right:-3px; top:-3px; width:24px; height:24px; background:var(--c);
             border:2px solid #000; border-radius:3px; color:#000; cursor:pointer;
             font:700 16px/20px var(--mono); text-align:center; }
@@ -257,6 +265,7 @@
       <button class="btn halt" id="l-no">Discard</button>
     </div>
     <div id="l-attrs" hidden></div>
+    <div id="l-ex" hidden></div>
     <div class="acts" id="l-classes"></div>
     <div class="acts">
       <input id="l-new" placeholder="new label e.g. excavator">
@@ -278,6 +287,13 @@
         <button class="btn go" id="l-gen">Generate token</button>
       </div>
       <div id="l-roster"></div>
+      <div class="acts" id="l-assign" hidden>
+        <select id="l-acur"></select>
+        <select id="l-acls"></select>
+        <input id="l-amin" type="number" min="0" step="10" value="200" style="flex:0 0 90px">
+        <button class="btn go" id="l-aset">Assign</button>
+        <button class="btn" id="l-aclr">Clear</button>
+      </div>
     </details>
     <div id="l-stats" class="res"></div>
     <div id="l-note" class="res"></div>
@@ -974,7 +990,7 @@ function labSelect(i) {
   document.querySelectorAll('#l-wrap .box').forEach(d => d.classList.toggle('sel', +d.dataset.i === i));
   const el = document.getElementById('l-attrs'), b = labBoxes[i];
   el.hidden = !b || b.del;
-  if (el.hidden) return;
+  if (el.hidden) return labExShow('');
   // A box the operator never opens contributes nothing, so defaults land on first selection.
   if (!b.seen) {
     b.seen = true;
@@ -1000,22 +1016,32 @@ function labSelect(i) {
       `<button class="btn${b.cls === j ? ' on' : ''}" style="--c:${clsColor(j)}" data-cls="${j}"
         >${esc(n)}</button>`).join('') +
       `<button class="btn rm${b.cls >= labClasses.length ? ' on' : ''}"
-                data-cls="${labClasses.length}">remove</button>`) + heads;
+                data-cls="${labClasses.length}">remove</button>` +
+      (name ? `<button class="btn rm${labExFor === name ? ' on' : ''}"
+                data-ex="${esc(name)}">examples</button>` : '')) + heads;
+  // Only on a class change: labSelect reruns on every attribute tap, and a reopen refetches frames.
+  if (labExFor && labExFor !== name) labExShow(name || '');
 }
 
 // Values allowed for one head given the box's class, each flagged stale or not. Constraints are
 // guidance, so a value the box already carries always renders even when now disallowed —
 // re-classing a tagged box must never silently drop its label. Tapping it clears it as usual.
 function labVocab(head, name, cur, attrs) {
-  let allowed = (labConstraints[name] || {})[head] || labAttrs[head] || [];
+  const base = (labConstraints[name] || {})[head] || labAttrs[head] || [];
+  let allowed = base, off = false;
   if (head === 'axle-config' && attrs && attrs.axles) {
     // Only configurations consistent with the chosen axle count. Each preset already
     // declares its count in the implies map, so this derives rather than duplicates;
     // values with no declared count ("other") always stay.
     const imp = labImplies['axle-config'] || {};
-    allowed = allowed.filter(v => !(imp[v] || {}).axles || imp[v].axles === attrs.axles);
+    allowed = base.filter(v => !(imp[v] || {}).axles || imp[v].axles === attrs.axles);
+    // Invariant: a head the class allows is visible, and visible means required — only the
+    // class may waive it, by giving the head an empty constraint list. So a count filter that
+    // matches nothing hands back the class's whole list, every value flagged as disagreeing,
+    // rather than an empty row whose requirement labGap can no longer see.
+    if (!allowed.length) { allowed = base; off = true; }
   }
-  const out = allowed.map(v => [v, false]);
+  const out = allowed.map(v => [v, off]);
   if (cur && !allowed.includes(cur)) out.push([cur, true]);
   return out;
 }
@@ -1038,10 +1064,65 @@ function labDefault(b) {
   labFill(b, def);
 }
 
+// --- Examples: what an approved class actually looks like ---
+// The strip lives outside #l-attrs because labSelect rewrites that on every tap. Only the
+// coordinates are cached: blobs are per-open so a session of browsing cannot pile them up.
+let labExFor = '', labExCache = {}, labExUrls = [];
+
+// Pure: the frame is sized so the box's longer side fills the square tile, then slid until the
+// box centre is the tile centre. Percentages, so the tile's size stays in the CSS alone.
+function labCrop(b, ar) {
+  const w = 100 / Math.max(b.w, b.h / ar);
+  return {w, left: 50 - b.cx * w, top: 50 - b.cy * w / ar};
+}
+
+async function labExLoad(img, id) {
+  // Same blob dance as labImage(), but its single-slot revoke would drop the frame being labelled.
+  const r = await labFetch(`/api/dataset/image?id=${encodeURIComponent(id)}`);
+  if (r.ok) labExUrls.push(img.src = URL.createObjectURL(await r.blob()));
+}
+
+async function labExShow(target) {
+  const el = document.getElementById('l-ex');
+  labExUrls.splice(0).forEach(URL.revokeObjectURL);   // six leaked object URLs per open otherwise
+  labExFor = target;
+  el.hidden = !target;
+  el.innerHTML = target ? `<i class="res">${esc(target)}</i>` : '';
+  if (!target) return;
+  let d;
+  try {
+    d = labExCache[target] || (labExCache[target] = await labFetch(
+      `/api/dataset/examples?target=${encodeURIComponent(target)}&limit=6`)
+      .then(r => r.ok ? r.json() : Promise.reject(new Error(`examples not loaded (${r.status})`))));
+  } catch (e) {
+    return labNote(String(e.message || e));
+  }
+  if (labExFor !== target) return;        // class changed while the list was in flight
+  const ex = d.examples || [];
+  if (!ex.length)
+    return el.insertAdjacentHTML('beforeend',
+      `<i class="res">no approved examples yet for ${esc(target)}</i>`);
+  for (const b of ex) {
+    const crop = document.createElement('div'), img = new Image();
+    crop.className = 'crop';
+    crop.title = b.class || target;
+    // Only the decoded frame knows its aspect ratio, so the placing waits for it.
+    img.onload = () => {
+      const c = labCrop(b, img.naturalWidth / img.naturalHeight || 1);
+      Object.assign(img.style, {width: `${c.w}%`, left: `${c.left}%`, top: `${c.top}%`});
+    };
+    crop.append(img);
+    el.append(crop);
+    labExLoad(img, b.id);
+  }
+}
+
 document.getElementById('l-attrs').onclick = e => {
-  const t = e.target.closest('[data-head], [data-cls], [data-add]'), b = labBoxes[labSel];
+  const t = e.target.closest('[data-head], [data-cls], [data-add], [data-ex]'),
+        b = labBoxes[labSel];
   if (!t || !b) return;
   const head = t.dataset.head;
+  if (t.dataset.ex) return labExShow(labExFor === t.dataset.ex ? '' : t.dataset.ex);
   if (t.dataset.add) return labAddValue(t.dataset.add, labClasses[b.cls]);
   if (t.dataset.cls !== undefined) {
     b.cls = +t.dataset.cls;
@@ -1352,17 +1433,31 @@ document.getElementById('l-vid').onchange = async e => {
 // Only on open: the roster is the supervisor's business, not something every labLoad fetches.
 document.getElementById('l-team').ontoggle = e => { if (e.target.open) labRoster(); };
 
+// Roster and assignments arrive from two endpoints but draw as one list, so the last
+// roster payload is kept to redraw against fresh assignments without refetching it.
+let labTeam = null, labAssigns = {};
+const labAssignTag = h => {
+  const a = labAssigns[h], i = a ? labClasses.indexOf(a.class) : -1;
+  return a ? `<i class="res">\u2014</i><b style="color:${i < 0 ? 'var(--fg)' : clsColor(i)}">${esc(a.class)}</b>`
+             + `<i class="res">\u00b7 ${a.done}/${a.min}</i>`
+           : '<i class="res">\u2014 unassigned</i>';
+};
+
 async function labRoster() {
   const r = await labFetch('/api/dataset/curators');
-  if (r.ok) labRosterShow(await r.json());   // 403 = not signed in: the form stays put
+  if (r.ok) { labRosterShow(await r.json()); labAssignLoad(); }   // 403 = not signed in: form stays
 }
 
 function labRosterShow(d) {
+  labTeam = d;
   document.getElementById('l-signin').hidden = true;
   document.getElementById('l-team-add').hidden = false;
+  labFill(document.getElementById('l-acur'),
+          Object.keys(d.curators).map(h => `<option>${esc(h)}</option>`).join(''));
   // Tokens are made to be read out and handed over, so they are shown, not masked.
   document.getElementById('l-roster').innerHTML = Object.entries(d.curators).map(([h, t]) =>
-    `<div class="acts"><b>${esc(h)}</b><code data-copy="${esc(t)}">${esc(t)}</code>` +
+    `<div class="acts"><b>${esc(h)}</b>${labAssignTag(h)}` +
+    `<code data-copy="${esc(t)}">${esc(t)}</code>` +
     (d.reviewers.includes(h) ? '<i class="res">supervisor</i>'
                              : `<button class="btn halt" data-drop="${esc(h)}">remove</button>`) +
     '</div>').join('');
@@ -1409,6 +1504,53 @@ document.getElementById('l-roster').onclick = async e => {
   if (!b || !confirm(`Remove ${b.dataset.drop}? Their token stops working.`)) return;
   const d = await post('/api/dataset/curators', {action: 'remove', handle: b.dataset.drop});
   d.detail ? labNote(String(d.detail)) : labRosterShow(d);
+};
+
+// --- Supervisor: who is labelling what ---
+// Refilling a <select> drops its selection; keep it where the option survived, else fall to the
+// first, since value='' on an option-less select leaves the box blank.
+function labFill(sel, html) {
+  const keep = sel.value;
+  sel.innerHTML = html;
+  sel.value = keep;
+  if (sel.selectedIndex < 0) sel.selectedIndex = 0;
+}
+
+async function labAssignLoad() {
+  const r = await labFetch('/api/dataset/assign');
+  if (r.ok) labAssignShow(await r.json());
+}
+
+function labAssignShow(d) {
+  labAssigns = d.assignments || {};
+  labClasses = d.classes || labClasses;      // same list labLoad reads; keeps the colours in step
+  labFill(document.getElementById('l-acls'),
+    '<optgroup label="Categories">' +
+    (d.categories || []).map(c => `<option value="${esc(c)}">Category ${esc(c)}</option>`).join('') +
+    '</optgroup><optgroup label="Classes">' +
+    labClasses.map(n => `<option>${esc(n)}</option>`).join('') + '</optgroup>');
+  document.getElementById('l-assign').hidden = false;
+  if (labTeam) labRosterShow(labTeam);       // the roster line carries the assignment
+}
+
+async function labAssignPost(body) {
+  const d = await post('/api/dataset/assign', body);
+  if (d.detail) return labNote(String(d.detail));
+  labAssignShow(d);
+  labNote(body.clear ? `${body.handle}: assignment cleared`
+                     : `${body.handle}: ${body.class} \u00b7 ${body.min}`);
+}
+
+document.getElementById('l-aset').onclick = () => {
+  const handle = document.getElementById('l-acur').value,
+        cls = document.getElementById('l-acls').value;
+  if (handle && cls) labAssignPost({handle, class: cls,
+    min: Math.max(0, Math.round(+document.getElementById('l-amin').value) || 0)});
+};
+
+document.getElementById('l-aclr').onclick = () => {
+  const handle = document.getElementById('l-acur').value;
+  if (handle) labAssignPost({handle, clear: true});
 };
 
 // --- Review tab ---

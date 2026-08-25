@@ -59,6 +59,11 @@ recordings already on disk are kept.
 never land in a commit. `config.example.yaml` is the tracked, commented
 reference — read that one to learn the schema.
 
+Once a camera is on the network, set its image/exposure parameters per
+[`docs/CAMERA_TUNING.md`](docs/CAMERA_TUNING.md) — wrong defaults (1/6 s
+shutter floor, gain 100) turn night-time vehicles into undetectable light
+streaks.
+
 ### Field networking checklist
 
 Learned the hard way. Check these before blaming the software:
@@ -241,6 +246,7 @@ thereafter.
 | `record_dir` | FieldKit | Root for ffmpeg segment recordings. Created on demand. |
 | `go2rtc_binary` | FieldKit | Absolute path to the go2rtc binary. Empty means the Monitor tab stays on snapshots. FieldKit never downloads it. |
 | `camera_defaults` | FieldKit | Credentials the discovery sweep tries against cameras that are not yet in `cameras`. |
+| `detect_backend` | FieldKit | Which detector runs the Monitor overlay: `cpu` (ultralytics, the default) or `hailo` for the site AI servers. An unknown value fails loudly rather than falling back — a silent swap would change what the counts mean. |
 | `offload` | FieldKit | Optional Cloudflare R2 upload when the recording drive runs low. Off unless `offload.enabled` is true — see [Cloud offload](#cloud-offload-optional). |
 | `ops` | FieldKit | Optional ops console enrolment: `url`, `token`, `hive`. Absent or empty means the node never phones home — see [Joining a hive](#joining-a-hive-optional). |
 

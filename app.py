@@ -952,11 +952,12 @@ def dataset_samples(who: str = "", x_curator_token: str = Header("")):
     if who:      # everyone else's live slice is invisible, so two labellers never collide
         pending = [t for t in pending if held.get(t[1]["id"], who) == who]
     assigned = assignment(who) if who else None
-    if assigned and assigned["class"] in dataset_classes():
-        cid = dataset_classes().index(assigned["class"])
-        # Stable sort: the assigned class floats up, newest-first survives inside each
+    if assigned and assigned["classes"]:
+        names = dataset_classes()
+        ids = {names.index(c) for c in assigned["classes"]}
+        # Stable sort: the assigned classes float up, newest-first survives inside each
         # half, and the general pool still follows so nobody runs out of work.
-        pending.sort(key=lambda t: not any(b["cls"] == cid for b in t[1]["boxes"]))
+        pending.sort(key=lambda t: not any(b["cls"] in ids for b in t[1]["boxes"]))
     out = [s for _, s in pending[:100]]
     body = {"classes": dataset_classes(), "attributes": attr_vocab(),
             "attr_constraints": attr_meta("constraints"), "attr_defaults": attr_meta("defaults"),
@@ -985,6 +986,42 @@ def sample_curators():
         if r.get("action") == "approve" and r.get("id") in live:
             out[r["id"]] = r.get("who") or "anon"
     return out
+
+
+@app.get("/api/dataset/examples")
+def dataset_examples(target: str = "", limit: int = 6, x_curator_token: str = Header("")):
+    """What a class or a whole category actually looks like, from frames a SUPERVISOR
+    approved — an unsure curator gets the standard, not somebody's guess. Any curator may
+    ask: they are the audience.
+
+    Coordinates, never crops: the curation container ships without Pillow on purpose, and
+    the browser already fetches the whole frame for /api/dataset/image, so it crops there.
+    Handing back boxes is what keeps this endpoint dependency-free."""
+    token_who(x_curator_token)
+    limit = max(1, min(limit, 24))
+    names = dataset_classes()
+    ids = {names.index(c) for c in target_classes(target)}
+    labels = DATASET / "approved" / "labels"
+    if not ids or not labels.is_dir():
+        return {"target": target, "examples": []}
+    by = sample_curators()      # {approved id: who approved it}, live approvals only
+    try:
+        rows = sorted(labels.glob("*.txt"), key=lambda p: p.stat().st_mtime, reverse=True)
+    except OSError:             # a sample unapproved mid-listing: no examples beats an error
+        rows = []
+    # Stable sort, the same trick the assigned-class steering uses: supervisor-approved
+    # float up, newest-first survives inside each half, and the rest top the list up —
+    # one pass over unique files, so no frame can appear in both halves.
+    rows.sort(key=lambda p: by.get(p.stem) not in REVIEWERS)
+    out = []
+    for p in rows:
+        # one example per matching box: two lorries in a frame are two references
+        out += [{"id": p.stem, "class": names[b["cls"]],
+                 **{k: b[k] for k in ("cx", "cy", "w", "h")}}
+                for b in read_boxes(p) if b["cls"] in ids]
+        if len(out) >= limit:
+            break
+    return {"target": target, "examples": out[:limit]}
 
 
 def require_reviewer(who):
@@ -1177,15 +1214,20 @@ def dataset_login(body: dict = Body(default={}), x_curator_token: str = Header("
     return {"who": who, "token": token}
 
 
-def push_roster():
-    """Publish curators.yaml on its own. Best effort: the edit is already on disk and the
-    supervisor can press Sync now if the bucket was unreachable."""
+def push_file(name):
+    """Publish one config file on its own — curators.yaml, assignments.yaml. Best effort:
+    the edit is already on disk and the supervisor can press Sync now if the bucket was
+    unreachable."""
     try:
         ds, cl, bucket = r2()
-        ds.push(cl, bucket, names=("curators.yaml",))
+        ds.push(cl, bucket, names=(name,))
         return True
     except Exception:
         return False
+
+
+def push_roster():
+    return push_file("curators.yaml")
 
 
 @app.get("/api/dataset/curators")
@@ -1255,29 +1297,96 @@ def assignments():
     return {k: a for k, a in v.items() if isinstance(a, dict)} if isinstance(v, dict) else {}
 
 
+def target_classes(target):
+    """The classes an assignment target covers. One character is a toll CATEGORY —
+    every class whose name starts with that letter and a dash (a-small, a-motorcycle
+    are category A). Anything else is one exact class name. Unknown target: []."""
+    t = str(target or "").strip().lower()
+    names = dataset_classes()
+    if len(t) == 1:
+        return [c for c in names if c.lower().startswith(t + "-")]
+    return [c for c in names if c.lower() == t]
+
+
+def categories(names=None):
+    """The category letters classes.txt actually has, A first. `wheel` has no dash and
+    so belongs to none."""
+    return sorted({c[0].upper() for c in (dataset_classes() if names is None else names)
+                   if c[1:2] == "-"})
+
+
 def assignment(who):
-    """This curator's quota and how far along they are, or None."""
+    """This curator's quota and how far along they are, or None. `class` is the target as
+    written — a class name or a category letter — and `classes` is what it covers."""
     a = assignments().get(who) or {}
     name = str(a.get("class") or "")
     if not name:
         return None
+    # The TARGET is what gets stamped and counted (see assigned_extra), so a category
+    # tallies every class under it and the count stays honest when the target changes.
     done = sum(1 for r in read_lines("audit.jsonl") if r.get("who") == who
                and r.get("assigned_hit") and r.get("assigned_class") == name)
     try:
         least = int(a.get("min") or 0)
     except (TypeError, ValueError):
         least = 0
-    return {"class": name, "min": least, "done": done}
+    return {"class": name, "min": least, "done": done, "classes": target_classes(name)}
 
 
 def assigned_extra(who, boxes):
     """Stamp the audit line when an approval really contains the assigned class —
     counting approvals alone would pay for frames that never had one."""
-    name = (assignments().get(who) or {}).get("class")
+    target = (assignments().get(who) or {}).get("class")
     names = dataset_classes()
-    if name in names and any(b["cls"] == names.index(name) for b in boxes):
-        return {"assigned_hit": True, "assigned_class": name}
+    ids = {names.index(c) for c in target_classes(target)}
+    if ids and any(b["cls"] in ids for b in boxes):
+        return {"assigned_hit": True, "assigned_class": target}
     return None
+
+
+def assign_state():
+    """ponytail: assignment() rescans audit.jsonl per handle — same ceiling as
+    /progress, index the log if either ever gets slow."""
+    return {"assignments": {w: a for w in assignments() if (a := assignment(w))},
+            "classes": dataset_classes(), "categories": categories()}
+
+
+@app.get("/api/dataset/assign")
+def assign_list(x_curator_token: str = Header("")):
+    require_reviewer(token_who(x_curator_token))
+    return assign_state()
+
+
+@app.post("/api/dataset/assign")
+def assign_edit(body: dict = Body(default={}), x_curator_token: str = Header("")):
+    """Give a curator a class or a whole toll category, then publish assignments.yaml in
+    the same breath — same reason as the roster: sync_both pulls it back down every couple
+    of minutes, so an edit that is not pushed is an edit that gets overwritten."""
+    me = require_reviewer(token_who(x_curator_token))
+    handle = valid_who(str(body.get("handle") or "").strip().lower())
+    if handle not in curators():
+        raise HTTPException(404, f"{handle or 'anonymous'} is not in curators.yaml")
+    entries = assignments()
+    action, extra = "assign-clear", None
+    if body.get("clear"):
+        entries.pop(handle, None)
+    else:
+        target = str(body.get("class") or "").strip()
+        target = target.upper() if len(target) == 1 else target
+        if not target_classes(target):
+            raise HTTPException(400, f"no class or category {target!r} — pick one of: "
+                                     f"{', '.join(categories() + dataset_classes())}")
+        try:
+            least = int(body.get("min") or 0)
+        except (TypeError, ValueError):
+            raise HTTPException(400, "min must be a whole number")
+        if least < 0:
+            raise HTTPException(400, "min must be 0 or more")
+        action = "assign"
+        entries[handle] = extra = {"class": target, "min": least}
+    write_yaml("assignments.yaml", entries)
+    audit(me, handle, action, extra)
+    return {**assign_state(), "pushed": push_file("assignments.yaml")}
 
 
 def quality(who):

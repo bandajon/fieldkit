@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Give a curator a class to hunt for, and put it in front of them.
 
-  python assign.py <handle> <class> <min>   assign, upload, refresh the instance
+  python assign.py <handle> <class|CATEGORY> <min>   assign, upload, refresh
+  ...where a single letter is a toll category: E covers e-heavy and e-plant
   python assign.py --clear <handle>         drop the assignment, same round-trip
   python assign.py --list                   local table + each curator's live progress
   python assign.py                          usage + self-check
@@ -36,6 +37,15 @@ def classes():
         return []
 
 
+def target_classes(cls, names):
+    """Same rule as app.target_classes: one character is a toll category (every
+    `<letter>-*` class), anything else is one exact class name."""
+    t = str(cls or "").strip().lower()
+    if len(t) == 1:
+        return [c for c in names if c.lower().startswith(t + "-")]
+    return [c for c in names if c.lower() == t]
+
+
 def curators():
     """{handle: token}. A missing or broken roster is empty, not fatal: assignments are
     the operator's business, and the instance is the one that checks tokens."""
@@ -63,8 +73,12 @@ def save(entries, path=FILE):
 
 def assign(who, cls, least, path=FILE, names=None):
     names = names if names is not None else classes()
-    if cls not in names:
-        sys.exit(f"no class {cls!r} — pick one of: {', '.join(names) or '(no classes.txt)'}")
+    covers = target_classes(cls, names)
+    if not covers:
+        cats = sorted({c[0].upper() for c in names if c[1:2] == "-"})
+        sys.exit(f"no class or category {cls!r} — pick one of: "
+                 f"{', '.join(cats + names) or '(no classes.txt)'}")
+    cls = cls.upper() if len(cls) == 1 else cls
     roster = curators()
     if not roster:
         print(f"! no roster at {DATASET / 'curators.yaml'} — assigning {who} anyway")
@@ -72,7 +86,8 @@ def assign(who, cls, least, path=FILE, names=None):
         print(f"! {who} is not in curators.yaml — they cannot log in until they are")
     entries = load(path)
     entries[who] = {"class": cls, "min": least}
-    print(f"{who} -> {cls} (min {least})")
+    print(f"{who} -> {cls} (min {least})"
+          + (f" = {', '.join(covers)}" if covers != [cls] else ""))
     return save(entries, path)
 
 
@@ -178,6 +193,12 @@ def selfcheck():
         "class": "b-light", "min": 200}, "a second assign replaces, never appends"
     assert set(load(tmp)) == {"curator01", "curator02"}
 
+    # A category letter is stored upper-case and covers every class under it.
+    assert assign("curator01", "e", 5, tmp, names)["curator01"] == {"class": "E", "min": 5}
+    assert target_classes("E", names + ["e-plant", "wheel"]) == ["e-heavy", "e-plant"]
+    assert not target_classes("z", names) and not target_classes("", names)
+
+    assign("curator01", "b-light", 200, tmp, names)
     assert set(clear("curator01", tmp)) == {"curator02"}
     assert load(tmp) == {"curator02": {"class": "b-light", "min": 10}}, load(tmp)
     try:
@@ -197,8 +218,8 @@ def selfcheck():
         with patch.dict(os.environ, {"CURATION_TOKEN": "env-tok", "REVIEWERS": "jonah"}):
             assert admin_token(roster) == "env-tok", "CURATION_TOKEN wins"
 
-    print("assign self-check ok: unknown class rejected, entries replace and clear, "
-          "unknown handle warns, admin token resolves")
+    print("assign self-check ok: unknown target rejected, category letters cover their "
+          "classes, entries replace and clear, unknown handle warns, admin token resolves")
 
 
 if __name__ == "__main__":

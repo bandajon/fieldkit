@@ -451,6 +451,54 @@ check("mac normalisation", macs)
 check("go2rtc absent without a binary", live_absent)
 check("hostnet pick_iface", hostnet_pick_iface)
 check("hostnet addressing", hostnet_addressing)
+def supervisor_tokens():
+    """The one security path worth a test: who may set the password, who may mint tokens."""
+    import tempfile
+    import app
+
+    def refused(code, fn):
+        try:
+            fn()
+        except app.HTTPException as e:
+            assert e.status_code == code, f"wanted {code}, got {e.status_code}: {e.detail}"
+            return
+        raise AssertionError(f"expected {code}, call succeeded")
+
+    keep = (app.DATASET, app.REVIEWERS, app.push_roster)
+    with tempfile.TemporaryDirectory() as d:
+        try:
+            app.DATASET, app.REVIEWERS = Path(d), ["jonah"]
+            app.push_roster = lambda: True            # no bucket in a test
+            app.write_yaml("curators.yaml", {"jonah": "tok-jonah"})
+            pw = "hunter2hunter2"
+
+            # First sign-in must prove itself with the token, or the internet claims it.
+            refused(401, lambda: app.dataset_login({"who": "jonah", "password": pw}, ""))
+            assert app.dataset_login({"who": "jonah", "password": pw},
+                                     "tok-jonah")["token"] == "tok-jonah"
+            # Set: the password alone works now, a wrong one never does, and it is not stored raw.
+            assert app.dataset_login({"who": "jonah", "password": pw}, "")["token"] == "tok-jonah"
+            refused(401, lambda: app.dataset_login({"who": "jonah", "password": "nope-nope-nope"}, ""))
+            assert pw not in (Path(d) / app.SUPERVISORS).read_text()
+            # Only a supervisor, and only a real handle.
+            refused(403, lambda: app.dataset_login({"who": "curator01", "password": pw}, ""))
+
+            # Minting: a curator gets a short unguessable token, and the roster is what changed.
+            out = app.curators_edit({"handle": "curator01"}, "tok-jonah")
+            tok = out["curators"]["curator01"]
+            assert 12 <= len(tok) <= 24, tok
+            assert app.curators()["curator01"] == tok
+            assert app.curators_edit({"handle": "curator02"}, "tok-jonah")["curators"]["curator02"] != tok
+            # A curator cannot mint, and a supervisor cannot be deleted out from under REVIEWERS.
+            refused(403, lambda: app.curators_edit({"handle": "curator03"}, tok))
+            refused(400, lambda: app.curators_edit({"action": "remove", "handle": "jonah"},
+                                                   "tok-jonah"))
+            assert "curator01" not in app.curators_edit(
+                {"action": "remove", "handle": "curator01"}, "tok-jonah")["curators"]
+        finally:
+            app.DATASET, app.REVIEWERS, app.push_roster = keep
+
+
 check("hostnet arp parser", hostnet_arp_parser)
 check("scan auto-joins once", scan_auto_joins_once)
 check("hostnet jetson (naming, no-carrier, bootstrap)", hostnet_jetson)
@@ -468,6 +516,7 @@ check("recorder.add_camera", recorder_add_camera)
 check("recorder timed stop", recorder_timed_stop)
 check("record start validates hours", record_start_hours)
 check("README documents every config key", readme_documents_config)
+check("supervisor password + token minting", supervisor_tokens)
 
 print(f"\n{'FAILED: ' + ', '.join(FAILS) if FAILS else 'all passed'}")
 sys.exit(1 if FAILS else 0)
