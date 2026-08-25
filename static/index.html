@@ -266,6 +266,19 @@
       <button class="btn" id="l-sync">Sync now</button>
       <input id="l-vid" type="file" accept="video/*">
     </div>
+    <details id="l-team">
+      <summary>Supervisor</summary>
+      <div class="acts" id="l-signin">
+        <input id="l-sup" placeholder="handle" autocomplete="username">
+        <input id="l-pw" type="password" placeholder="password" autocomplete="current-password">
+        <button class="btn go" id="l-in">Sign in</button>
+      </div>
+      <div class="acts" id="l-team-add" hidden>
+        <input id="l-newcur" placeholder="new curator handle">
+        <button class="btn go" id="l-gen">Generate token</button>
+      </div>
+      <div id="l-roster"></div>
+    </details>
     <div id="l-stats" class="res"></div>
     <div id="l-note" class="res"></div>
   </section>
@@ -814,6 +827,8 @@ const clsColor = i => `hsl(${(i * 137.508) % 360} 85% 55%)`;
 
 const WHO_RE = /^[a-z0-9][a-z0-9_-]{0,23}$/;
 let labWho = localStorage.fieldkit_who || '', labAsked = false, labProg = null, labRev = false;
+let labIdle = null;                 // pending re-check while the queue is empty
+const IDLE_RECHECK = 60000;
 let labAssign = null;
 
 function labAskWho() {
@@ -879,6 +894,7 @@ async function labLoad() {
     labNote('Could not load samples — is the server reachable?');
     return;
   }
+  clearTimeout(labIdle);
   labStats();
   labChips();
   labShow();
@@ -898,7 +914,12 @@ function labShow() {
   if (!s) {
     // The batch is done but more may wait on disk (the fetch is capped at 100).
     if (labTotal > 0) return labLoad();
-    return labNote('No samples waiting — detection captures one when the scene changes.');
+    // An empty queue is usually temporary: a curation node pulls new work from the bucket
+    // every couple of minutes, and this tab is the only one, so nothing else would ever
+    // trigger another load. Re-check on a timer instead of making people reload the page.
+    clearTimeout(labIdle);
+    labIdle = setTimeout(labLoad, IDLE_RECHECK);
+    return labNote('No samples waiting — checking again shortly.');
   }
   // Sidecar attrs are keyed by the sample's own box order, so hydrate before anything filters.
   // Hydrated values count as touched: they were set deliberately in an earlier pass.
@@ -1296,6 +1317,69 @@ document.getElementById('l-vid').onchange = async e => {
   }
   e.target.disabled = false;
   e.target.value = '';               // picking the same file again must still fire change
+};
+
+// --- Supervisor: a password in, curator tokens out ---
+// Only on open: the roster is the supervisor's business, not something every labLoad fetches.
+document.getElementById('l-team').ontoggle = e => { if (e.target.open) labRoster(); };
+
+async function labRoster() {
+  const r = await labFetch('/api/dataset/curators');
+  if (r.ok) labRosterShow(await r.json());   // 403 = not signed in: the form stays put
+}
+
+function labRosterShow(d) {
+  document.getElementById('l-signin').hidden = true;
+  document.getElementById('l-team-add').hidden = false;
+  // Tokens are made to be read out and handed over, so they are shown, not masked.
+  document.getElementById('l-roster').innerHTML = Object.entries(d.curators).map(([h, t]) =>
+    `<div class="acts"><b>${esc(h)}</b><code data-copy="${esc(t)}">${esc(t)}</code>` +
+    (d.reviewers.includes(h) ? '<i class="res">supervisor</i>'
+                             : `<button class="btn halt" data-drop="${esc(h)}">remove</button>`) +
+    '</div>').join('');
+}
+
+document.getElementById('l-in').onclick = async () => {
+  const who = document.getElementById('l-sup').value.trim().toLowerCase(),
+        pw = document.getElementById('l-pw');
+  // Not post(): a wrong password is a 401, and post() answers a 401 with the token prompt.
+  const r = await fetch('/api/dataset/login', {method: 'POST',
+    body: JSON.stringify({who, password: pw.value}),
+    headers: {'Content-Type': 'application/json', ...labHdr()}});
+  const d = await r.json();
+  if (!r.ok) return labNote(String(d.detail || 'sign-in failed'));
+  localStorage.fieldkit_who = labWho = d.who;
+  localStorage.fieldkit_token = labTok = d.token;
+  pw.value = '';
+  labWhoShow();
+  labNote(`signed in as ${d.who}`);
+  labLoad();          // the reviewer flag flips: Sync now / Upload video appear
+  labRoster();
+};
+
+document.getElementById('l-gen').onclick = async () => {
+  const el = document.getElementById('l-newcur'), handle = el.value.trim().toLowerCase();
+  if (!handle) return;
+  const d = await post('/api/dataset/curators', {handle});
+  if (d.detail) return labNote(String(d.detail));
+  el.value = '';
+  labRosterShow(d);
+  labNote(d.pushed ? `${handle}: ${d.curators[handle]} — hand this pair over privately`
+                   : 'token made, but the roster did not reach the bucket — press Sync now');
+};
+
+document.getElementById('l-roster').onclick = async e => {
+  const c = e.target.closest('[data-copy]'), b = e.target.closest('[data-drop]');
+  if (c) {
+    // clipboard is https-only; the local console over http reads it off the screen instead
+    navigator.clipboard
+      ? navigator.clipboard.writeText(c.dataset.copy).then(() => labNote('token copied'))
+      : labNote('no clipboard on this connection — read the token off the screen');
+    return;
+  }
+  if (!b || !confirm(`Remove ${b.dataset.drop}? Their token stops working.`)) return;
+  const d = await post('/api/dataset/curators', {action: 'remove', handle: b.dataset.drop});
+  d.detail ? labNote(String(d.detail)) : labRosterShow(d);
 };
 
 // --- Review tab ---
