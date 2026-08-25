@@ -828,6 +828,7 @@ const clsColor = i => `hsl(${(i * 137.508) % 360} 85% 55%)`;
 const WHO_RE = /^[a-z0-9][a-z0-9_-]{0,23}$/;
 let labWho = localStorage.fieldkit_who || '', labAsked = false, labProg = null, labRev = false;
 let labIdle = null;                 // pending re-check while the queue is empty
+let labAuthErr = false;             // last load was refused, not empty
 const IDLE_RECHECK = 60000;
 let labAssign = null;
 
@@ -877,6 +878,14 @@ async function labLoad() {
   try {
     const r = await labFetch((labRev ? '/api/dataset/review' : '/api/dataset/samples') + who);
     if (r.status === 403) return labNote('your handle is not on the reviewer list');
+    // A 401 read as an empty response is the cruellest possible lie: it tells someone
+    // whose token is wrong that there is no work, and both fixes are on this screen.
+    if (r.status === 401) {
+      labAuthErr = true;
+      labQueue = []; labTotal = 0;
+      return labShow();
+    }
+    labAuthErr = false;
     const d = await r.json();
     // Review serves one sample at a time; whatever the envelope omits keeps its current value.
     labClasses = d.classes || labClasses;
@@ -918,6 +927,9 @@ function labShow() {
     // every couple of minutes, and this tab is the only one, so nothing else would ever
     // trigger another load. Re-check on a timer instead of making people reload the page.
     clearTimeout(labIdle);
+    if (labAuthErr)
+      return labNote('Not signed in. Open Supervisor below to sign in with your password, '
+                     + 'or press (change) beside your name to enter your curator token.');
     labIdle = setTimeout(labLoad, IDLE_RECHECK);
     return labNote('No samples waiting — checking again shortly.');
   }
