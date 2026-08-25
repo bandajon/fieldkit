@@ -94,6 +94,7 @@
 
   .acts { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-bottom:8px; }
   .acts .btn { flex:1 1 120px; }
+  .acts[hidden] { display:none; }   /* display:flex above outranks the UA [hidden] rule */
   input, select, textarea { min-height:48px; padding:0 12px; font-size:15px; color:var(--fg);
                             background:transparent; border:1px solid var(--line); border-radius:4px; }
   input:focus, select:focus, textarea:focus { outline:none; border-color:var(--fg); }
@@ -261,6 +262,10 @@
       <input id="l-new" placeholder="new label e.g. excavator">
       <button class="btn" id="l-add">Add label</button>
     </div>
+    <div class="acts" id="l-admin" hidden>
+      <button class="btn" id="l-sync">Sync now</button>
+      <input id="l-vid" type="file" accept="video/*">
+    </div>
     <div id="l-stats" class="res"></div>
     <div id="l-note" class="res"></div>
   </section>
@@ -304,9 +309,26 @@ document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
   if (tab === 'review') revInit();
 });
 
+let statusTimer = null, curation = false;
+// The curation deployment 404s every /api/ path outside /api/dataset/, so a 404 here is not a
+// missing route: there is no device console on this node at all, only the labelling tool.
+function labelOnly() {
+  if (curation) return;              // idempotent: any poll may be the one that detects it
+  curation = true;
+  clearInterval(statusTimer);        // the rail was the only thing polling
+  document.getElementById('status').style.display = 'none';   // #status outranks [hidden]
+  for (const t of ['cameras', 'record', 'monitor', 'review']) {
+    document.querySelector(`nav [data-tab=${t}]`).hidden = true;
+    document.getElementById(t).hidden = true;
+  }
+  document.querySelector('nav [data-tab=label]').click();      // reuses the tab handler
+}
+
 async function refreshStatus() {
   try {
-    const s = await (await fetch('/api/status')).json();
+    const r = await fetch('/api/status');
+    if (r.status === 404) return labelOnly();
+    const s = await r.json();
     document.getElementById('s-host').textContent = s.hostname;
     document.getElementById('s-ips').textContent = s.ips.join(' ') || 'none';
     hostIps = s.ips;
@@ -323,7 +345,7 @@ async function refreshStatus() {
   }
 }
 refreshStatus();
-setInterval(refreshStatus, 5000);
+statusTimer = setInterval(refreshStatus, 5000);
 
 // --- Record tab ---
 const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
@@ -851,6 +873,8 @@ async function labLoad() {
     labConstraints = d.attr_constraints || labConstraints;
     labDefaults = d.attr_defaults || labDefaults;
     labImplies = d.attr_implies || labImplies;
+    // /api/dataset/review 403s a non-reviewer, so reaching it is proof enough on its own.
+    document.getElementById('l-admin').hidden = !(d.reviewer || labRev);
   } catch (e) {
     labNote('Could not load samples — is the server reachable?');
     return;
@@ -1243,6 +1267,35 @@ document.getElementById('l-add').onclick = async () => {
 };
 document.getElementById('l-new').onkeydown = e => {
   if (e.key === 'Enter') document.getElementById('l-add').click();
+};
+
+// Reviewer-only. The server's sync is not instant, so one delayed read reports what arrived
+// rather than a poll loop.
+document.getElementById('l-sync').onclick = async () => {
+  labNote('syncing…');
+  try {
+    const r = await post('/api/dataset/refresh', {});
+    if (r.detail) return labNote(String(r.detail));
+  } catch (e) { return labNote(String(e.message || e)); }
+  setTimeout(async () => { await labLoad(); labNote(`synced · ${labTotal} pending`); }, 4000);
+};
+
+document.getElementById('l-vid').onchange = async e => {
+  const f = e.target.files[0];
+  if (!f) return;
+  e.target.disabled = true;          // a full clip takes minutes: no second pick mid-flight
+  labNote(`uploading ${f.name}…`);
+  try {
+    // Raw body, not FormData: the server reads the request stream straight to disk.
+    const r = await fetch(`/api/dataset/upload_video?name=${encodeURIComponent(f.name)}`,
+                          {method: 'POST', body: f, headers: labHdr()});
+    const d = await r.json().catch(() => ({}));
+    labNote(r.ok ? `uploaded ${d.key || f.name}` : String(d.detail || r.status));
+  } catch (err) {
+    labNote(`upload failed — ${err.message || err}`);
+  }
+  e.target.disabled = false;
+  e.target.value = '';               // picking the same file again must still fire change
 };
 
 // --- Review tab ---
