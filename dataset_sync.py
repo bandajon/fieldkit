@@ -2,13 +2,16 @@
 """Seed a cloud curation instance from the local dataset, and harvest its output.
 
   python dataset_sync.py push [--prefix curation-test/]   local dataset -> bucket
-  python dataset_sync.py pull [--ledgers]                 bucket -> local dataset
+  python dataset_sync.py pull [--ledgers|--config]        bucket -> local dataset
   python dataset_sync.py                                  self-check
 
 Credentials come from OFFLOAD_ACCOUNT_ID / OFFLOAD_ACCESS_KEY_ID /
 OFFLOAD_SECRET_ACCESS_KEY / OFFLOAD_BUCKET when set — Railway has no config.yaml —
 otherwise from config.yaml's offload block, the same R2 bucket offload.py uploads to.
 --prefix redirects both directions at once, for trying things somewhere harmless.
+--config fetches only what a curation node must have in hand before it starts: it
+refuses to boot without curators.yaml, so that one file is worth waiting for at
+startup while the samples stream in behind it.
 
 ponytail: sync without delete, deliberately. Push seeds, pull harvests, and neither
 side ever removes the other's files; real two-way sync needs tombstones and conflict
@@ -28,6 +31,8 @@ PROGRESS = 200
 # What a curation instance needs to start work...
 PUSH = ("pending/images", "pending/labels", "pending/attrs", "pending/suggest", "gold",
         "classes.txt", "attributes.yaml", "curators.yaml", "assignments.yaml")
+# ...the small part of that a node must have IN HAND before it can serve anything...
+CONFIG = ("curators.yaml", "classes.txt", "attributes.yaml", "assignments.yaml", "gold")
 # ...and what it produces: the daily harvest.
 LEDGERS = ("approved/images", "approved/labels", "approved/attrs",
            "audit.jsonl", "scores.jsonl", "gold-served.jsonl")
@@ -116,6 +121,21 @@ def push(cl, bucket, prefix=PREFIX, root=DATASET, names=PUSH):
     return sent, skipped
 
 
+def have(dest, size):
+    """Is the local copy already good? Same size is the same file for a write-once
+    sample. A .jsonl here is append-only, so a local copy LONGER than the remote is
+    newer work — downloading the remote's older snapshot over it would delete lines
+    nobody can get back, which is exactly what a node syncing while ten people append
+    would do on every pass.
+
+    ponytail: longer-wins is not a merge. Two nodes appending to one ledger still need
+    tombstones and conflict rules — the same thing this module deliberately isn't."""
+    if not dest.exists():
+        return False
+    n = dest.stat().st_size
+    return n == size or (n > size and dest.suffix == ".jsonl")
+
+
 def pull(cl, bucket, prefix=PREFIX, root=DATASET, names=None):
     """Download the curation instance's work. names limits it to the daily harvest."""
     root = Path(root)
@@ -125,7 +145,7 @@ def pull(cl, bucket, prefix=PREFIX, root=DATASET, names=None):
         if not rel or (names and not rel.startswith(tuple(names))):
             continue
         dest = root / rel
-        if dest.exists() and dest.stat().st_size == size:
+        if have(dest, size):
             skipped += 1
             continue
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -193,6 +213,18 @@ def selfcheck():
     assert not (day / "pending").exists(), "ledger harvest pulled the seed back down"
     assert (day / "audit.jsonl").exists() and (day / "approved" / "labels" / "a.txt").exists()
 
+    # --config: the handful of files a node needs before it can answer at all.
+    cfg = Path(tempfile.mkdtemp())
+    assert pull(cl, "buck", "curation/", cfg, CONFIG) == (1, 0)
+    assert (cfg / "classes.txt").exists() and not (cfg / "pending").exists()
+
+    # An append-only ledger is never overwritten by a shorter remote copy: the node
+    # appends between its push and its pull, and those lines are the team's work.
+    (day / "audit.jsonl").write_text('{}\n{"kind": "approve"}\n')
+    grown = (day / "audit.jsonl").stat().st_size
+    pull(cl, "buck", "curation/", day, LEDGERS)
+    assert (day / "audit.jsonl").stat().st_size == grown, "pull truncated a growing ledger"
+
     # Nothing is ever removed: a file only one side has survives both directions.
     (dst / "pending" / "images" / "local-only.jpg").write_bytes(b"keep")
     pull(cl, "buck", "curation/", dst)
@@ -210,8 +242,9 @@ def selfcheck():
             os.environ.pop(k, None) if v is None else os.environ.update({k: v})
     assert creds()["bucket"], "a bucket name is always resolvable"
 
-    print("dataset_sync self-check ok: push skips unchanged, pull harvests, --ledgers "
-          "filters, neither side deletes, env creds win")
+    print("dataset_sync self-check ok: push skips unchanged, pull harvests, --ledgers and "
+          "--config filter, a growing ledger survives a pull, neither side deletes, env "
+          "creds win")
 
 
 if __name__ == "__main__":
@@ -221,7 +254,7 @@ if __name__ == "__main__":
         i = args.index("--prefix")
         prefix = args.pop(i + 1).rstrip("/") + "/"
         args.pop(i)
-    ledgers = "--ledgers" in args
+    names = LEDGERS if "--ledgers" in args else CONFIG if "--config" in args else None
     args = [a for a in args if not a.startswith("-")]
     if not args:
         selfcheck()
@@ -230,6 +263,6 @@ if __name__ == "__main__":
         push(client(o), o["bucket"], prefix)
     elif args[0] == "pull":
         o = creds()
-        pull(client(o), o["bucket"], prefix, names=LEDGERS if ledgers else None)
+        pull(client(o), o["bucket"], prefix, names=names)
     else:
         sys.exit(__doc__)

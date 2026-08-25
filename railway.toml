@@ -1,11 +1,12 @@
 # Railway config-as-code for the CURATION service (FIELDKIT_MODE=curation).
 # The dataset lives on a persistent volume mounted at /data; the repo's
-# dataset/ path is a symlink to it, seeded from R2 on every boot (pull skips
-# what is already local, so restarts are cheap).
+# dataset/ path is a symlink to it. Boot pulls ONLY the config (the roster must
+# exist before a curation node will start); the samples stream in from the
+# server's own background sync, so the service is answering within seconds.
 [build]
 builder = "RAILPACK"
 
 [deploy]
-startCommand = "mkdir -p /data/dataset && rm -rf dataset && ln -s /data/dataset dataset && python dataset_sync.py pull && python app.py"
+startCommand = "mkdir -p /data/dataset && rm -rf dataset && ln -s /data/dataset dataset && python dataset_sync.py pull --config && python app.py"
 healthcheckPath = "/"
 restartPolicyType = "ON_FAILURE"

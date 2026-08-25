@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """FieldKit — on-site capture & extraction console. Run: python app.py"""
 
+import asyncio
 import atexit
 import hmac
 import ipaddress
@@ -13,6 +14,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from datetime import datetime, timezone
@@ -20,7 +22,7 @@ from pathlib import Path
 
 import uvicorn
 import yaml
-from fastapi import Body, FastAPI, Header, HTTPException
+from fastapi import Body, FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
@@ -49,6 +51,11 @@ GOLD_RATE = float(os.environ.get("GOLD_RATE", 0.05))       # how often a check s
 CURATION = os.environ.get("FIELDKIT_MODE", "console") == "curation"
 REVIEWERS = [w.strip() for w in os.environ.get("REVIEWERS", "").split(",") if w.strip()]
 REVIEW_RATE = 0.10        # share of each curator's approvals an expert re-checks
+SYNC_EVERY = 120.0        # curation node -> R2: how often the ledgers are harvested
+MAX_UPLOAD = 500 * 1024**2                                 # ceiling on one uploaded video
+UPLOAD_NAME = re.compile(r"^[A-Za-z0-9._-]{1,80}$")        # becomes part of an R2 key
+REFRESH = {"running": False, "started_at": None, "last_result": None, "last_error": None}
+REFRESH_LOCK = threading.Lock()
 SAME_BOX = 0.6            # IoU at which a submitted box is "the same box" as the key's
 MATCH_BOX = 0.5           # looser pairing for two independent labellings of one frame
 MIN_SCORES = 3            # under this many scores, report no accuracy rather than a number
@@ -671,6 +678,20 @@ def check_token(who, token):
     return who
 
 
+def token_who(token):
+    """The handle this token belongs to, for endpoints that act on the caller instead of
+    on a handle the caller names — nobody can spend someone else's identity here. Open
+    mode (no roster) has no names to give: "anon". The curation middleware proves only
+    that a token is *someone's*; this says whose."""
+    known = curators()
+    if not known:
+        return "anon"
+    who = next((h for h, t in known.items() if hmac.compare_digest(t, str(token or ""))), "")
+    if not who:
+        raise HTTPException(401, "unknown curator or bad token")
+    return who
+
+
 def valid_who(who):
     """A labeller handle, or "" for solo use (no claims, no audit name)."""
     if not who:
@@ -903,6 +924,7 @@ def dataset_samples(who: str = "", x_curator_token: str = Header("")):
     body = {"classes": dataset_classes(), "attributes": attr_vocab(),
             "attr_constraints": attr_meta("constraints"), "attr_defaults": attr_meta("defaults"),
             "attr_implies": attr_meta("implies"), "approved": approved_counts(),
+            "reviewer": who in REVIEWERS,
             # the list is capped for payload size; pending_total is the real pile
             "pending_total": len(pending), "pending": out}
     if who:
@@ -928,13 +950,19 @@ def sample_curators():
     return out
 
 
-def review_label(sid, who, body):
-    """The reviewer's version replaces the curator's: a re-check that leaves the worse
-    labels on disk would be an opinion, not QA."""
+def require_reviewer(who):
+    """Reviewer powers need both: a proven handle, and REVIEWERS naming it."""
     if not REVIEWERS:
         raise HTTPException(400, "review is off on this node — set REVIEWERS to enable it")
     if who not in REVIEWERS:
         raise HTTPException(403, f"{who or 'anonymous'} is not a reviewer on this node")
+    return who
+
+
+def review_label(sid, who, body):
+    """The reviewer's version replaces the curator's: a re-check that leaves the worse
+    labels on disk would be an opinion, not QA."""
+    require_reviewer(who)
     lbl = sample_paths(sid, "approved")[1]
     if not lbl.is_file():
         raise HTTPException(404, f"{sid} is not in the approved set")
@@ -959,12 +987,7 @@ def review_label(sid, who, body):
 def dataset_review(who: str, x_curator_token: str = Header("")):
     """The approved sample most in need of a second pair of eyes: whichever curator is
     furthest below the review quota, one of their samples at random."""
-    # Reviewer powers need both: the handle on REVIEWERS and its token proven.
-    who = check_token(valid_who(who), x_curator_token)
-    if not REVIEWERS:
-        raise HTTPException(400, "review is off on this node — set REVIEWERS to enable it")
-    if who not in REVIEWERS:
-        raise HTTPException(403, f"{who or 'anonymous'} is not a reviewer on this node")
+    who = require_reviewer(check_token(valid_who(who), x_curator_token))
     done = {}
     for r in read_lines("scores.jsonl"):
         if r.get("kind") == "review":
@@ -981,6 +1004,102 @@ def dataset_review(who: str, x_curator_token: str = Header("")):
     sid = random.choice(pool[curator])
     return {"id": sid, "curator": curator, "boxes": read_boxes(sample_paths(sid, "approved")[1]),
             "attrs": read_attrs(attrs_path(sid, "approved"))}
+
+
+# ---- The cloud round-trip. A curation node runs on a container volume, not on a
+# backup: its work exists only once it reaches R2, and new work only arrives from there.
+
+def r2():
+    """(dataset_sync, client, bucket). Imported here, not at module scope: a console node
+    needs neither boto3 nor credentials to serve its Label tab."""
+    import dataset_sync
+    try:
+        o = dataset_sync.creds()
+        return dataset_sync, dataset_sync.client(o), o["bucket"]
+    except SystemExit as e:      # exiting is right for the CLI, wrong inside a request
+        raise HTTPException(503, str(e))
+
+
+def sync_both(ds, cl, bucket):
+    """Our work up, everything else down. -> (uploaded, downloaded). Both directions skip
+    on same-name-same-size, so a steady state is one listing and a pile of stat calls."""
+    sent, _ = ds.push(cl, bucket, names=ds.LEDGERS)
+    got, _ = ds.pull(cl, bucket)
+    return sent, got
+
+
+def sync_loop():
+    """This node's whole sync engine, and the reason boot is not allowed to block on a
+    9,000-object download: the first pass streams the dataset in while the server is
+    already up and answering, and every pass after that publishes the team's approvals
+    and picks up whatever the operator has staged — new samples within two minutes, no
+    redeploy, no manual step.
+
+    ponytail: one full LIST of the prefix per pass — fine at thousands of files, wants a
+    manifest at millions — and a manual refresh can overlap a pass, which costs duplicate
+    downloads and nothing else."""
+    while True:
+        try:
+            sync_both(*r2())
+        except Exception as e:   # a failed pass is a retry in SYNC_EVERY, never a dead server
+            print(f"dataset sync failed: {e}", flush=True)
+        time.sleep(SYNC_EVERY)
+
+
+def stamp():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def refresh_now():
+    """The same pass the loop runs, now instead of within two minutes."""
+    try:
+        sent, got = sync_both(*r2())
+        REFRESH["last_result"] = {"pushed": sent, "pulled": got, "at": stamp()}
+    except Exception as e:
+        REFRESH["last_error"] = str(e)
+    finally:
+        REFRESH["running"] = False
+
+
+@app.post("/api/dataset/refresh")
+def dataset_refresh(x_curator_token: str = Header("")):
+    """Run the periodic sync right now: the operator's lever when two minutes is too long."""
+    require_reviewer(token_who(x_curator_token))
+    with REFRESH_LOCK:
+        if REFRESH["running"]:
+            return {"running": True}      # one at a time: the second press is a no-op
+        REFRESH.update(running=True, started_at=stamp(), last_error=None)
+    threading.Thread(target=refresh_now, daemon=True).start()
+    return dict(REFRESH)
+
+
+@app.get("/api/dataset/refresh")
+def dataset_refresh_state():
+    return dict(REFRESH)
+
+
+@app.post("/api/dataset/upload_video")
+async def dataset_upload_video(request: Request, name: str, x_curator_token: str = Header("")):
+    """Field staff contribute footage with the token they already label with. Streamed to
+    a temp file in chunks: a phone-sized video must never be held in memory."""
+    who = token_who(x_curator_token)
+    name = os.path.basename(name or "")
+    if not UPLOAD_NAME.match(name):
+        raise HTTPException(400, "name must be 1-80 chars of letters, digits, '.', '_' or '-'")
+    _, cl, bucket = r2()
+    key = f"incoming/{who}/{datetime.now(timezone.utc):%Y%m%d-%H%M%S}-{name}"
+    with tempfile.NamedTemporaryFile() as tmp:       # deleted on every path out, 413 included
+        n = 0
+        async for chunk in request.stream():
+            n += len(chunk)
+            if n > MAX_UPLOAD:
+                raise HTTPException(413, f"upload is larger than {MAX_UPLOAD // 1024**2} MB")
+            tmp.write(chunk)
+        tmp.flush()
+        tmp.seek(0)
+        # to_thread: a 500 MB blocking PUT on the event loop would freeze every labeller.
+        await asyncio.to_thread(cl.upload_fileobj, tmp, bucket, key)
+    return {"ok": True, "key": key, "bytes": n}
 
 
 def assignments():
@@ -1390,6 +1509,9 @@ def config_remove_camera(body: dict = Body(default={})):
 if CURATION and not curators():
     sys.exit("FIELDKIT_MODE=curation needs dataset/curators.yaml with at least one "
              "handle: token — an internet-facing node must never run open")
+
+if CURATION:
+    threading.Thread(target=sync_loop, daemon=True).start()
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
