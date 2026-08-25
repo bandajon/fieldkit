@@ -172,13 +172,76 @@ def fetch(cl, bucket, dest, key):
         cl.download_file(bucket, key, str(dest))
 
 
+def consumed(root):
+    """Sample ids this node has already dealt with, from its own audit ledger.
+
+    A pending sample that was approved or discarded is GONE from pending locally, but
+    its original copy still sits in the bucket — so a plain pull downloads it straight
+    back and the labeller meets their own finished work again. The ledger is the record
+    of what happened to each sample and it syncs both ways, so both nodes agree. An
+    unapprove puts the sample back in the queue, hence last-action-wins rather than
+    "ever approved"."""
+    last = {}
+    try:
+        lines = (Path(root) / "audit.jsonl").read_text().splitlines()
+    except OSError:
+        return set()
+    for line in lines:
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        if r.get("id") and r.get("action"):
+            last[r["id"]] = r["action"]
+    return {i for i, a in last.items() if a in ("approve", "discard")}
+
+
+def sweep_consumed(root):
+    """Drop pending copies of samples this node already finished. A pull that ran before
+    the skip above existed left duplicates behind: the same frame sitting in pending AND
+    in approved, so it comes round again and gets labelled twice.
+
+    Deletion is deliberate but narrow — an approval must have its approved copy on disk
+    before its pending copy goes, so a half-finished move can never destroy the only copy.
+    A discard is already an instruction to destroy it."""
+    root = Path(root)
+    last = {}
+    try:
+        for line in (root / "audit.jsonl").read_text().splitlines():
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            if r.get("id") and r.get("action"):
+                last[r["id"]] = r["action"]
+    except OSError:
+        return 0
+    gone = 0
+    for sid, action in last.items():
+        if action == "approve" and not (root / "approved" / "labels" / f"{sid}.txt").exists():
+            continue                       # the approved copy is not there: leave it alone
+        if action not in ("approve", "discard"):
+            continue
+        for sub, ext in (("images", ".jpg"), ("labels", ".txt"),
+                         ("attrs", ".json"), ("suggest", ".json")):
+            f = root / "pending" / sub / f"{sid}{ext}"
+            if f.exists():
+                f.unlink()
+                gone += 1
+    return gone
+
+
 def pull(cl, bucket, prefix=PREFIX, root=DATASET, names=None):
     """Download the curation instance's work. names limits it to the daily harvest."""
     root = Path(root)
+    done = consumed(root)
     todo, skipped = [], 0
     for key, size in sorted(remote(cl, bucket, prefix).items()):
         rel = key[len(prefix):]
         if not rel or (names and not rel.startswith(tuple(names))):
+            continue
+        if rel.startswith("pending/") and Path(rel).stem in done:
+            skipped += 1                  # already labelled: do not hand it back
             continue
         dest = root / rel
         if have(dest, size) and not always(rel):
@@ -187,7 +250,9 @@ def pull(cl, bucket, prefix=PREFIX, root=DATASET, names=None):
         dest.parent.mkdir(parents=True, exist_ok=True)
         todo.append((dest, key))
     got = transfer(lambda dest, key: fetch(cl, bucket, dest, key), todo, "pulled")
-    print(f"pull: {got} downloaded, {skipped} already local (-> {root})")
+    swept = sweep_consumed(root)
+    print(f"pull: {got} downloaded, {skipped} already local"
+          + (f", {swept} finished copies cleared" if swept else "") + f" (-> {root})")
     return got, skipped
 
 
@@ -303,6 +368,30 @@ def selfcheck():
         for k, v in keep.items():
             os.environ.pop(k, None) if v is None else os.environ.update({k: v})
     assert creds()["bucket"], "a bucket name is always resolvable"
+
+    # A finished sample must never come back round. This is the bug that had one
+    # labeller approving the same frames twice: pending copies live on in the bucket.
+    back = Path(tempfile.mkdtemp())
+    cl2 = FakeS3({"curation/pending/images/s1.jpg": b"aaa",
+                  "curation/pending/labels/s1.txt": b"0 0.5 0.5 0.1 0.1\n",
+                  "curation/pending/images/s2.jpg": b"bbb",
+                  "curation/pending/labels/s2.txt": b"0 0.5 0.5 0.1 0.1\n"})
+    (back / "audit.jsonl").parent.mkdir(parents=True, exist_ok=True)
+    (back / "audit.jsonl").write_text(
+        '{"ts": "t", "who": "a", "id": "s1", "action": "approve"}\n')
+    (back / "approved" / "labels").mkdir(parents=True)
+    (back / "approved" / "labels" / "s1.txt").write_text("0 0.5 0.5 0.1 0.1\n")
+    pull(cl2, "buck", "curation/", back)
+    assert not (back / "pending" / "images" / "s1.jpg").exists(), "approved frame came back"
+    assert (back / "pending" / "images" / "s2.jpg").exists(), "untouched frame must arrive"
+
+    # An earlier pull left a duplicate behind; the sweep clears it, but only because the
+    # approved copy is really there.
+    (back / "pending" / "images" / "s1.jpg").write_bytes(b"aaa")
+    assert sweep_consumed(back) == 1
+    (back / "approved" / "labels" / "s1.txt").unlink()
+    (back / "pending" / "images" / "s1.jpg").write_bytes(b"aaa")
+    assert sweep_consumed(back) == 0, "no approved copy: the pending one is all there is"
 
     print("dataset_sync self-check ok: push skips unchanged, pull harvests, --ledgers and "
           "--config filter, ledgers merge instead of overwriting, neither side deletes, env "
