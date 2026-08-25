@@ -3,6 +3,7 @@
 
 import asyncio
 import atexit
+import hashlib
 import hmac
 import ipaddress
 import json
@@ -50,6 +51,18 @@ GOLD_RATE = float(os.environ.get("GOLD_RATE", 0.05))       # how often a check s
 # every one of them token-gated, and none of the camera/recorder/cloud machinery.
 CURATION = os.environ.get("FIELDKIT_MODE", "console") == "curation"
 REVIEWERS = [w.strip() for w in os.environ.get("REVIEWERS", "").split(",") if w.strip()]
+# Break-glass supervisor: PASSWORD in the environment beats the stored hash, so a
+# forgotten password is reset by editing one variable on the host instead of deleting
+# a file off a volume nobody can reach. The handle is a reviewer by definition — set
+# only SUPERVISOR and you are still in, whatever REVIEWERS says.
+SUPERVISOR = os.environ.get("SUPERVISOR", "").strip().lower()
+SUPERVISOR_PW = os.environ.get("PASSWORD", "")
+if SUPERVISOR and SUPERVISOR not in REVIEWERS:
+    REVIEWERS.append(SUPERVISOR)
+LOGIN_TRIES = 5           # failures before a handle is locked out
+LOGIN_LOCK = 60.0         # seconds it stays locked; a password endpoint faces the internet
+LOGINS = {}               # handle -> [failures, locked until]
+LOGINS_LOCK = threading.Lock()
 REVIEW_RATE = 0.10        # share of each curator's approvals an expert re-checks
 SYNC_EVERY = 120.0        # curation node -> R2: how often the ledgers are harvested
 MAX_UPLOAD = 500 * 1024**2                                 # ceiling on one uploaded video
@@ -196,7 +209,9 @@ if CURATION:
             if not path.startswith("/api/dataset/"):
                 return JSONResponse({"detail": "not found"}, status_code=404)
             token = request.headers.get("x-curator-token", "")
-            if not any(hmac.compare_digest(t, token) for t in curators().values()):
+            # /login is the one path in without a token: it proves the caller itself.
+            if path != "/api/dataset/login" and \
+                    not any(hmac.compare_digest(t, token) for t in curators().values()):
                 return JSONResponse({"detail": "unknown curator or bad token"}, status_code=401)
         return await call_next(request)
 
@@ -666,6 +681,28 @@ def curators():
     return {str(k): str(t) for k, t in v.items() if t not in (None, "")}
 
 
+SUPERVISORS = "supervisors.yaml"   # {handle: "salt:hash"}; in no sync list, so it never leaves
+
+
+def supervisors():
+    try:
+        v = yaml.safe_load((DATASET / SUPERVISORS).read_text())
+    except (yaml.YAMLError, OSError):
+        return {}
+    return v if isinstance(v, dict) else {}
+
+
+def pw_hash(password, salt):
+    """Stored salted and stretched: the volume this lands on outlives any one deploy."""
+    return hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt), 200_000).hex()
+
+
+def write_yaml(name, data):
+    f = DATASET / name
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(yaml.safe_dump(data, sort_keys=True))
+
+
 def check_token(who, token):
     """401 unless `who` proved their token. An unknown handle fails exactly like a wrong
     token — same words, same comparison — so this never confirms who exists."""
@@ -1076,6 +1113,112 @@ def dataset_refresh(x_curator_token: str = Header("")):
 @app.get("/api/dataset/refresh")
 def dataset_refresh_state():
     return dict(REFRESH)
+
+
+def login_guard(who):
+    """Refuse a handle that has just failed repeatedly. In memory on purpose: a restart
+    clearing the counter costs an attacker more than it costs the supervisor."""
+    with LOGINS_LOCK:
+        fails, until = LOGINS.get(who, (0, 0.0))
+        if fails >= LOGIN_TRIES and time.monotonic() < until:
+            raise HTTPException(429, f"too many attempts — wait {int(until - time.monotonic())}s")
+
+
+def login_result(who, ok):
+    with LOGINS_LOCK:
+        if ok:
+            LOGINS.pop(who, None)
+        else:
+            fails = LOGINS.get(who, (0, 0.0))[0] + 1
+            LOGINS[who] = (fails, time.monotonic() + LOGIN_LOCK)
+    if not ok:
+        raise HTTPException(401, "wrong password")
+
+
+@app.post("/api/dataset/login")
+def dataset_login(body: dict = Body(default={}), x_curator_token: str = Header("")):
+    """A supervisor trades a password for their curator token, so curators.yaml stays the
+    one source of identity and the browser goes on sending the same header as everyone.
+
+    The FIRST sign-in sets the password and must prove it is really them with the token
+    they already hold — otherwise the first stranger to find this endpoint claims the
+    account. That self-proving is why it is the one path the curation gate lets through."""
+    who = valid_who(str(body.get("who") or "").strip().lower())
+    password = str(body.get("password") or "")
+    if who not in REVIEWERS:
+        raise HTTPException(403, f"{who or 'anonymous'} is not a supervisor on this node")
+    if len(password) < 8:
+        raise HTTPException(400, "password must be at least 8 characters")
+    login_guard(who)
+    token = curators().get(who)
+    kept = supervisors()
+    if who == SUPERVISOR and SUPERVISOR_PW:
+        # The environment is the reset lever: it answers before any stored hash, and it
+        # works on a node where this handle has no token yet.
+        login_result(who, hmac.compare_digest(SUPERVISOR_PW, password))
+        if not token:
+            roster = curators()
+            token = roster[who] = secrets.token_urlsafe(9)
+            write_yaml("curators.yaml", roster)
+            push_roster()
+        return {"who": who, "token": token}
+    if not token:
+        raise HTTPException(404, f"{who} is not in curators.yaml yet")
+    if who in kept:
+        salt, want = str(kept[who]).split(":", 1)
+        login_result(who, hmac.compare_digest(want, pw_hash(password, salt)))
+    else:
+        if not hmac.compare_digest(token, str(x_curator_token or "")):
+            raise HTTPException(401, "first sign-in proves itself with your curator token — "
+                                     "send it once and the password replaces it after that")
+        salt = secrets.token_hex(16)
+        kept[who] = f"{salt}:{pw_hash(password, salt)}"
+        write_yaml(SUPERVISORS, kept)
+    return {"who": who, "token": token}
+
+
+def push_roster():
+    """Publish curators.yaml on its own. Best effort: the edit is already on disk and the
+    supervisor can press Sync now if the bucket was unreachable."""
+    try:
+        ds, cl, bucket = r2()
+        ds.push(cl, bucket, names=("curators.yaml",))
+        return True
+    except Exception:
+        return False
+
+
+@app.get("/api/dataset/curators")
+def curators_list(x_curator_token: str = Header("")):
+    require_reviewer(token_who(x_curator_token))
+    return {"curators": curators(), "reviewers": REVIEWERS}
+
+
+@app.post("/api/dataset/curators")
+def curators_edit(body: dict = Body(default={}), x_curator_token: str = Header("")):
+    """Mint or drop a curator, then publish the roster in the same breath: sync_both pulls
+    curators.yaml back down every couple of minutes, so an edit that is not pushed is an
+    edit that gets overwritten.
+
+    ponytail: best-effort push, and the pull skips on same-name-same-size — a sync pass
+    landing between the write and the push undoes it, and swapping a handle for another of
+    the exact same length would not propagate. The UI re-reads the roster so either shows
+    up; give the file a version counter if that ever stops being enough."""
+    me = require_reviewer(token_who(x_curator_token))
+    handle = valid_who(str(body.get("handle") or "").strip().lower())
+    if not handle:
+        raise HTTPException(400, "handle is required")
+    roster = curators()
+    if body.get("action") == "remove":
+        if handle in REVIEWERS:
+            raise HTTPException(400, f"{handle} is a supervisor — take them out of REVIEWERS first")
+        roster.pop(handle, None)
+    else:
+        # 12 characters, 72 bits: short enough to read down a phone line, still unguessable.
+        roster[handle] = secrets.token_urlsafe(9)
+    write_yaml("curators.yaml", roster)
+    audit(me, handle, "roster-" + (str(body.get("action") or "add")))
+    return {"curators": roster, "reviewers": REVIEWERS, "pushed": push_roster()}
 
 
 @app.post("/api/dataset/upload_video")
