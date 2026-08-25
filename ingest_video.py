@@ -3,6 +3,7 @@
 
   python ingest_video.py <file-or-dir> [...]   ingest local .mkv/.mp4 segments
   python ingest_video.py pull <site>/<cam>     fetch missing segments from R2, then ingest
+  python ingest_video.py incoming              ingest the R2 drop-box, then archive it
   python ingest_video.py check <file>          probe one file, write nothing
   python ingest_video.py                       self-check
 
@@ -11,6 +12,8 @@ footage and a sample from the wire are indistinguishable on the Label tab.
 """
 
 import io
+import os
+import re
 import subprocess
 import sys
 from collections import Counter
@@ -26,6 +29,9 @@ DATASET = ROOT / "dataset"
 STEM_TS = "%Y%m%d-%H%M%S"        # the recorder's segment names, and our sample stems
 INGEST_FPS = 1.0                 # recorded curation: dedup drops unchanged scenes anyway
 VIDEO = (".mkv", ".mp4")
+INCOMING = "incoming/"           # where /api/dataset/upload_video parks contributed footage
+DONE = "incoming-done/"          # ...and where it lands once ingested, so re-runs skip it
+CAM_CHARS = re.compile(r"[^A-Za-z0-9_-]")   # sample ids become filenames: no dots, no spaces
 
 
 def config():
@@ -170,23 +176,28 @@ def segments(args):
     return out
 
 
-def ingest(files, cfg):
+def ingest_one(f, run, sink, cam=None):
+    """One file through the detector and the gates -> (frames decoded, samples written).
+    `cam` names footage that never came from a recorder tree; it keys the dedup state, so
+    two unrelated files must never share one."""
     from PIL import Image
 
+    named, start = cam_and_start(f)
+    cam = cam or named
+    n, before = 0, sink.written[cam]
+    for n, jpeg in enumerate(frames(f), 1):
+        img = Image.open(io.BytesIO(jpeg)).convert("RGB")
+        ts = start + (n - 1) / INGEST_FPS
+        sink.offer(cam, ts, jpeg, run(img), img.width, img.height)
+    got = sink.written[cam] - before
+    print(f"  {cam}/{f.name}: {n} frames -> {got} samples", flush=True)
+    return n, got
+
+
+def ingest(files, cfg):
     run, ids = detector(cfg)
     sink = Sink(DATASET, ids)
-    sampled = 0
-    for f in files:
-        cam, start = cam_and_start(f)
-        n = 0
-        before = sink.written[cam]
-        for n, jpeg in enumerate(frames(f), 1):
-            img = Image.open(io.BytesIO(jpeg)).convert("RGB")
-            ts = start + (n - 1) / INGEST_FPS
-            sink.offer(cam, ts, jpeg, run(img), img.width, img.height)
-        sampled += n
-        print(f"  {cam}/{f.name}: {n} frames -> {sink.written[cam] - before} samples",
-              flush=True)
+    sampled = sum(ingest_one(f, run, sink)[0] for f in files)
     print(f"\n{len(files)} file(s), {sampled} frames sampled at {INGEST_FPS} fps, "
           f"{sum(sink.written.values())} samples written to {sink.images.parent}")
     for cam, n in sorted(sink.written.items()):
@@ -227,6 +238,55 @@ def pull(prefix, cfg):
             got.append(dest)
     print(f"{len(got)} new file(s) under {root}")
     return got
+
+
+def incoming(cfg):
+    """Drain the R2 drop-box: whatever /api/dataset/upload_video parked under incoming/,
+    oldest upload first. A key is archived only once its footage really decoded, so a
+    truncated or corrupt upload stays put and retries on the next run."""
+    import dataset_sync
+
+    o = dataset_sync.creds()
+    cl, bucket = dataset_sync.client(o), o["bucket"]
+    objs = []
+    for page in cl.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=INCOMING):
+        for obj in page.get("Contents", []):
+            if obj["Key"].lower().endswith(VIDEO):
+                objs.append(obj)
+            elif not obj["Key"].endswith("/"):
+                print(f"  ! {obj['Key']}: not {' or '.join(VIDEO)}, left in place")
+    if not objs:
+        print(f"nothing to ingest under {INCOMING} on {bucket}")
+        return
+    root = record_root(cfg) / "incoming"
+    root.mkdir(parents=True, exist_ok=True)
+    run, ids = detector(cfg)          # one model load for the whole drop-box
+    sink = Sink(DATASET, ids)
+    done = total = 0
+    # Upload time orders the queue: these names came off someone's phone and mean nothing.
+    for obj in sorted(objs, key=lambda x: x["LastModified"]):
+        key, dest = obj["Key"], root / Path(obj["Key"]).name
+        print(f"v {key} ({obj['Size'] / 1e6:.0f} MB)", flush=True)
+        try:
+            cl.download_file(bucket, key, str(dest))
+            # The upload is the only clock this footage has — cam_and_start falls back to
+            # mtime, so stamping it here is what dates the samples.
+            when = obj["LastModified"].timestamp()
+            os.utime(dest, (when, when))
+            # <cam>-YYYYmmdd-HHMMSS must stay a legal sample id: 64 chars, no dots.
+            n, got = ingest_one(dest, run, sink, cam=CAM_CHARS.sub("-", dest.stem)[:40])
+            if not n:
+                raise ValueError("no frames decoded — not a video, or a truncated upload")
+        except Exception as e:        # one bad upload must not strand the rest of the box
+            print(f"  ! {key}: {e}")
+            continue
+        cl.copy_object(Bucket=bucket, CopySource={"Bucket": bucket, "Key": key},
+                       Key=DONE + key[len(INCOMING):])
+        cl.delete_object(Bucket=bucket, Key=key)
+        done, total = done + 1, total + got
+    print(f"\n{done}/{len(objs)} file(s) ingested, {total} sample(s) written to "
+          f"{sink.images.parent}; archived under {DONE}")
+    print("run: python dataset_sync.py push   # send the new samples to the curation instance")
 
 
 def check(path, cfg):
@@ -298,8 +358,71 @@ def selfcheck():
     assert (sink.images / "c-20260819-151108.jpg").read_bytes() == b"again"
 
     assert segments([str(tmp)]) == [odd, seg], segments([str(tmp)])
+
+    # The drop-box: oldest upload first, and a key leaves incoming/ only once its footage
+    # really decoded. Mocked R2, mocked decode — no bucket, no ffmpeg, no model.
+    from datetime import timedelta
+    from unittest.mock import patch
+
+    import dataset_sync
+
+    class FakeS3:
+        """Enough R2 for the drop-box: list, download, copy, delete."""
+
+        def __init__(self, keys):
+            self.keys, self.copied = dict(keys), []
+
+        def get_paginator(self, _op):
+            return self
+
+        def paginate(self, Bucket, Prefix):
+            yield {"Contents": [{"Key": k, "Size": 1, "LastModified": t}
+                                for k, t in self.keys.items() if k.startswith(Prefix)]}
+
+        def download_file(self, Bucket, Key, path):
+            if "gone" in Key:
+                raise OSError("connection reset")      # a download that dies mid-flight
+            Path(path).write_bytes(b"x")
+
+        def copy_object(self, Bucket, CopySource, Key):
+            self.copied.append((CopySource["Key"], Key))
+
+        def delete_object(self, Bucket, Key):
+            del self.keys[Key]
+
+    t0 = datetime(2026, 8, 25, 9, 0, tzinfo=timezone.utc)
+    cl = FakeS3({"incoming/jonah/first.mp4": t0,
+                 "incoming/dead.mp4": t0 + timedelta(minutes=30),      # decodes to nothing
+                 "incoming/jonah/gone.mp4": t0 + timedelta(hours=1),   # download fails
+                 "incoming/curator02/my clip.v2.mp4": t0 + timedelta(hours=2),
+                 "incoming/notes.txt": t0})
+    seen = []
+
+    def fake_one(f, run, sink, cam=None):
+        seen.append((f.name, cam))
+        return (0, 0) if "dead" in f.name else (10, 2)
+
+    rec = tmp / "rec"
+    me = sys.modules[__name__]     # patching by module name would import a second copy
+    with patch.object(dataset_sync, "creds", lambda: {"bucket": "buck"}), \
+         patch.object(dataset_sync, "client", lambda o: cl), \
+         patch.object(me, "DATASET", tmp / "dataset"), \
+         patch.object(me, "detector", lambda cfg: (None, dict(detect.CLASS_IDS))), \
+         patch.object(me, "ingest_one", fake_one):
+        incoming({"record_dir": str(rec)})
+
+    assert seen == [("first.mp4", "first"), ("dead.mp4", "dead"),
+                    ("my clip.v2.mp4", "my-clip-v2")], seen      # oldest first, name made safe
+    assert cl.copied == [("incoming/jonah/first.mp4", "incoming-done/jonah/first.mp4"),
+                         ("incoming/curator02/my clip.v2.mp4",
+                          "incoming-done/curator02/my clip.v2.mp4")], cl.copied
+    assert sorted(cl.keys) == ["incoming/dead.mp4", "incoming/jonah/gone.mp4",
+                               "incoming/notes.txt"], sorted(cl.keys)
+    assert (rec / "incoming" / "my clip.v2.mp4").stat().st_mtime == (
+        t0 + timedelta(hours=2)).timestamp(), "samples must be dated by the upload"
+
     print("ingest_video self-check ok: segment names parsed, frames split, capture gated "
-          "in footage time, stems UTC and idempotent")
+          "in footage time, stems UTC and idempotent, drop-box archives only what ingested")
 
 
 if __name__ == "__main__":
@@ -313,6 +436,10 @@ if __name__ == "__main__":
         got = pull(args[1], cfg)
         if got:
             ingest(got, cfg)
+    elif args[0] == "incoming":
+        if len(args) != 1:
+            sys.exit("usage: ingest_video.py incoming")
+        incoming(config())
     elif args[0] == "check":
         if len(args) != 2:
             sys.exit("usage: ingest_video.py check <file>")
