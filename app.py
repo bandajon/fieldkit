@@ -2,6 +2,7 @@
 """FieldKit — on-site capture & extraction console. Run: python app.py"""
 
 import atexit
+import hmac
 import ipaddress
 import json
 import os
@@ -11,6 +12,7 @@ import secrets
 import shutil
 import socket
 import subprocess
+import sys
 import threading
 import time
 from datetime import datetime, timezone
@@ -18,8 +20,8 @@ from pathlib import Path
 
 import uvicorn
 import yaml
-from fastapi import Body, FastAPI, HTTPException
-from fastapi.responses import FileResponse, Response
+from fastapi import Body, FastAPI, Header, HTTPException
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 import camera
@@ -42,6 +44,9 @@ SEGMENT_MAX = 660                                 # 600 s segments plus slack fo
 ATTR_VALUE = re.compile(r"^[a-z0-9][a-z0-9+._-]{0,31}$")   # digits and + are legal: axle configs
 WHO_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,23}$")         # labeller handle
 GOLD_RATE = float(os.environ.get("GOLD_RATE", 0.05))       # how often a check sample rides along
+# FIELDKIT_MODE=curation: an internet-facing labelling server — dataset endpoints only,
+# every one of them token-gated, and none of the camera/recorder/cloud machinery.
+CURATION = os.environ.get("FIELDKIT_MODE", "console") == "curation"
 REVIEWERS = [w.strip() for w in os.environ.get("REVIEWERS", "").split(",") if w.strip()]
 REVIEW_RATE = 0.10        # share of each curator's approvals an expert re-checks
 SAME_BOX = 0.6            # IoU at which a submitted box is "the same box" as the key's
@@ -114,27 +119,8 @@ if not CONFIG_PATH.exists():      # first boot (and cloud deploys, where it is u
     print(f"created {CONFIG_PATH.name} from {EXAMPLE_PATH.name}", flush=True)
 
 load_config()
-REC = recorder.Recorder(CONFIG.get("cameras", []), record_dir(), CONFIG.get("site", "site1"),
-                        state_path=ROOT / "record_state.json")
-LIVE = live.Live(CONFIG.get("cameras", []), CONFIG.get("go2rtc_binary", ""), ROOT / "go2rtc.yaml")
-LIVE.start()   # no-op unless a binary is configured and present
-# A reboot or crash must not end a session on an unattended node: re-arm whatever
-# was recording when the process died (expired timers stay stopped).
-resumed = REC.resume()
-if resumed:
-    print(f"resumed recording after restart: {', '.join(resumed)}", flush=True)
-# Creds the ops console pushes: Hive writes this dict, Offload reads it. Deliberately
-# NOT in CONFIG — CONFIG is dumped back to config.yaml on every camera edit, and
-# load_config() clears it; either would put a pushed secret on disk or lose it.
-CONSOLE_CREDS = {}
-OFFLOAD = offload.Offload(CONFIG, record_dir(),   # holds CONFIG: config edits land live
-                          console_creds=CONSOLE_CREDS)
-OFFLOAD.start()   # no-op unless offload.enabled is set
-# lambda: record_status is a route defined further down, and the heartbeat sends its
-# body verbatim — the console sees exactly what the local Record tab does.
-HIVE = hive.Hive(CONFIG, REC, lambda: record_status(), camera.snapshot, local_ips,
-                 console_creds=CONSOLE_CREDS)
-HIVE.start()   # no-op unless config.yaml has an ops: block
+
+
 def detect_snapshot(ip, user, password):
     """cam_creds chain + short timeout: one dead camera must not stall the whole
     detection pass (camera.snapshot defaults to 8 s), and config-supplied IPs are
@@ -146,23 +132,66 @@ def detect_snapshot(ip, user, password):
     return camera.snapshot(ip, *cam_creds(ip), timeout=3)
 
 
-DETECT = detect.Detector(CONFIG.get("cameras", []), detect_snapshot, CONFIG,
-                         creds_fn=lambda ip: cam_creds(ip), dataset_dir=DATASET,
-                         counts_dir=ROOT / "counts",   # one JSON per day: the durable tallies
-                         events_dir=ROOT / "events")   # per-vehicle records + evidence crops
-DETECT.start()   # no-op unless the optional detection deps are installed
+# Creds the ops console pushes: Hive writes this dict, Offload reads it. Deliberately
+# NOT in CONFIG — CONFIG is dumped back to config.yaml on every camera edit, and
+# load_config() clears it; either would put a pushed secret on disk or lose it.
+CONSOLE_CREDS = {}
+if CURATION:
+    # A curation node has no cameras, no drive to fill and no console to phone: it
+    # serves the Label tab and its dataset, nothing else.
+    REC = LIVE = OFFLOAD = HIVE = DETECT = None
+else:
+    REC = recorder.Recorder(CONFIG.get("cameras", []), record_dir(), CONFIG.get("site", "site1"),
+                            state_path=ROOT / "record_state.json")
+    LIVE = live.Live(CONFIG.get("cameras", []), CONFIG.get("go2rtc_binary", ""),
+                     ROOT / "go2rtc.yaml")
+    LIVE.start()   # no-op unless a binary is configured and present
+    # A reboot or crash must not end a session on an unattended node: re-arm whatever
+    # was recording when the process died (expired timers stay stopped).
+    resumed = REC.resume()
+    if resumed:
+        print(f"resumed recording after restart: {', '.join(resumed)}", flush=True)
+    OFFLOAD = offload.Offload(CONFIG, record_dir(),   # holds CONFIG: config edits land live
+                              console_creds=CONSOLE_CREDS)
+    OFFLOAD.start()   # no-op unless offload.enabled is set
+    # lambda: record_status is a route defined further down, and the heartbeat sends its
+    # body verbatim — the console sees exactly what the local Record tab does.
+    HIVE = hive.Hive(CONFIG, REC, lambda: record_status(), camera.snapshot, local_ips,
+                     console_creds=CONSOLE_CREDS)
+    HIVE.start()   # no-op unless config.yaml has an ops: block
+    DETECT = detect.Detector(CONFIG.get("cameras", []), detect_snapshot, CONFIG,
+                             creds_fn=lambda ip: cam_creds(ip), dataset_dir=DATASET,
+                             counts_dir=ROOT / "counts",   # one JSON per day: the durable tallies
+                             events_dir=ROOT / "events")   # per-vehicle records + evidence crops
+    DETECT.start()   # no-op unless the optional detection deps are installed
 
 
 @atexit.register
 def _shutdown():
     """Children spawned in their own process group survive Ctrl-C; an orphaned ffmpeg
     would then fight the restarted app for the same segment paths."""
-    REC.shutdown()   # not stop(): a restart must not erase the sessions resume() re-arms
-    LIVE.stop()
-    DETECT.stop()
+    if REC:
+        REC.shutdown()   # not stop(): a restart must not erase the sessions resume() re-arms
+        LIVE.stop()
+        DETECT.stop()
 
 app = FastAPI(title="FieldKit")
 app.mount("/static", StaticFiles(directory=ROOT / "static"), name="static")
+
+if CURATION:
+    @app.middleware("http")
+    async def curation_gate(request, call_next):
+        """One gate for the whole curation deployment: the camera/recorder/cloud API
+        does not exist here, and every dataset call — reads included — needs a curator
+        token, because this node is on the public internet."""
+        path = request.url.path
+        if path.startswith("/api/"):
+            if not path.startswith("/api/dataset/"):
+                return JSONResponse({"detail": "not found"}, status_code=404)
+            token = request.headers.get("x-curator-token", "")
+            if not any(hmac.compare_digest(t, token) for t in curators().values()):
+                return JSONResponse({"detail": "unknown curator or bad token"}, status_code=401)
+        return await call_next(request)
 
 
 @app.get("/")
@@ -613,6 +642,35 @@ def read_boxes(path):
     return boxes
 
 
+def curators():
+    """{handle: token} from dataset/curators.yaml, hand-written by the operator.
+
+    THE CONTRACT: no file, unreadable file, or an empty one = OPEN MODE — handles are
+    taken at face value exactly as before, which is what a solo or trusted node wants.
+    The moment the file has one entry, every request naming a handle must prove it with
+    the X-Curator-Token header (see check_token). That header is the ONE mechanism: a
+    token in a query string would be copied into every access log."""
+    try:
+        v = yaml.safe_load((DATASET / "curators.yaml").read_text())
+    except (yaml.YAMLError, OSError):
+        return {}
+    if not isinstance(v, dict):
+        return {}
+    return {str(k): str(t) for k, t in v.items() if t not in (None, "")}
+
+
+def check_token(who, token):
+    """401 unless `who` proved their token. An unknown handle fails exactly like a wrong
+    token — same words, same comparison — so this never confirms who exists."""
+    known = curators()
+    if not who or not known:
+        return who
+    good = known.get(who) or secrets.token_hex(16)   # unknown handle: compare, never short-circuit
+    if not hmac.compare_digest(good, str(token or "")):
+        raise HTTPException(401, "unknown curator or bad token")
+    return who
+
+
 def valid_who(who):
     """A labeller handle, or "" for solo use (no claims, no audit name)."""
     if not who:
@@ -815,8 +873,8 @@ def finish(who, sid, action, payload, extra=None):
 
 
 @app.get("/api/dataset/samples")
-def dataset_samples(who: str = ""):
-    who = valid_who(who)
+def dataset_samples(who: str = "", x_curator_token: str = Header("")):
+    who = check_token(valid_who(who), x_curator_token)
     held = purge_claims()
     labels = DATASET / "pending" / "labels"
     pending = []
@@ -858,7 +916,7 @@ def dataset_samples(who: str = ""):
     return body
 
 
-def curators():
+def sample_curators():
     """{approved sample id: who approved it}, newest audit line wins."""
     live = {p.stem for p in (DATASET / "approved" / "labels").glob("*.txt")}
     out = {}
@@ -882,7 +940,7 @@ def review_label(sid, who, body):
         raise HTTPException(404, f"{sid} is not in the approved set")
     boxes = parse_boxes(body)
     attrs = valid_attrs(body.get("attrs"), len(boxes))
-    curator = curators().get(sid, "anon")
+    curator = sample_curators().get(sid, "anon")
     score = agreement(read_boxes(lbl), read_attrs(attrs_path(sid, "approved")), boxes, attrs)
     append_line("scores.jsonl", {"kind": "review", "who": curator, "reviewer": who,
                                  "id": sid, "score": round(score, 3)})
@@ -898,10 +956,11 @@ def review_label(sid, who, body):
 
 
 @app.get("/api/dataset/review")
-def dataset_review(who: str):
+def dataset_review(who: str, x_curator_token: str = Header("")):
     """The approved sample most in need of a second pair of eyes: whichever curator is
     furthest below the review quota, one of their samples at random."""
-    who = valid_who(who)
+    # Reviewer powers need both: the handle on REVIEWERS and its token proven.
+    who = check_token(valid_who(who), x_curator_token)
     if not REVIEWERS:
         raise HTTPException(400, "review is off on this node — set REVIEWERS to enable it")
     if who not in REVIEWERS:
@@ -912,7 +971,7 @@ def dataset_review(who: str):
             done[r.get("who")] = done.get(r.get("who"), 0) + 1
     reviewed = {r.get("id") for r in read_lines("scores.jsonl") if r.get("kind") == "review"}
     pool, approvals = {}, {}
-    for sid, curator in curators().items():
+    for sid, curator in sample_curators().items():
         approvals[curator] = approvals.get(curator, 0) + 1
         if curator != who and sid not in reviewed:
             pool.setdefault(curator, []).append(sid)
@@ -1016,9 +1075,9 @@ def dataset_image(id: str):
 
 
 @app.post("/api/dataset/label")
-def dataset_label(body: dict = Body(default={})):
+def dataset_label(body: dict = Body(default={}), x_curator_token: str = Header("")):
     sid = valid_sample_id(body.get("id"))
-    who = valid_who(body.get("who"))
+    who = check_token(valid_who(body.get("who")), x_curator_token)
     action = body.get("action")
     if sid.startswith("g-"):
         return gold_label(sid, who, action, body)
@@ -1326,6 +1385,11 @@ def config_remove_camera(body: dict = Body(default={})):
     # Recordings under <record_dir>/<site>/<name>/ are deliberately left on disk.
     return {"ok": True}
 
+
+# Module level, not under __main__: `uvicorn app:app` must refuse just as loudly.
+if CURATION and not curators():
+    sys.exit("FIELDKIT_MODE=curation needs dataset/curators.yaml with at least one "
+             "handle: token — an internet-facing node must never run open")
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))

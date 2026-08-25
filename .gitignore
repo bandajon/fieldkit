@@ -31,3 +31,4 @@ counts/
 bytetrack-fieldkit.yaml
 # per-vehicle event records + evidence crops — site data
 events/
+fieldkit-server.log

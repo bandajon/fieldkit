@@ -340,8 +340,10 @@ const setCount = (id, n, word) =>
   document.getElementById('cnt-' + id).textContent = n ? `${n} ${word}` : '';
 
 async function post(url, body) {
-  const r = await fetch(url, {method: 'POST', headers: {'Content-Type': 'application/json'},
-                              body: JSON.stringify(body)});
+  const send = () => fetch(url, {method: 'POST', body: JSON.stringify(body),
+                                 headers: {'Content-Type': 'application/json', ...labHdr()}});
+  let r = await send();
+  if (r.status === 401 && labAskTok()) r = await send();   // one retry with a freshly typed token
   return r.json();
 }
 
@@ -801,10 +803,29 @@ function labAskWho() {
   }
 }
 
+// The token is stored and sent, never rendered.
+let labTok = localStorage.fieldkit_token || '';
+const labHdr = () => labTok ? {'X-Curator-Token': labTok} : {};
+function labAskTok() {
+  const v = prompt('Your curator token (from the supervisor):');
+  return labTok = v === null ? '' : (localStorage.fieldkit_token = v.trim());
+}
+
+async function labFetch(url) {
+  let r = await fetch(url, {headers: labHdr()});
+  if (r.status === 401 && labAskTok()) r = await fetch(url, {headers: labHdr()});
+  return r;
+}
+
 function labWhoShow() {
   document.getElementById('l-who').textContent = labWho ? `labeling as ${labWho} (change)` : 'solo mode (set name)';
 }
-document.getElementById('l-who').onclick = () => { labWho = labAskWho(); labWhoShow(); labLoad(); };
+document.getElementById('l-who').onclick = () => {
+  labTok = localStorage.removeItem('fieldkit_token') || '';   // new handle, new token
+  labWho = labAskWho();
+  labWhoShow();
+  labLoad();
+};
 
 addEventListener('hashchange', () => { if (tab === 'label') labLoad(); });
 
@@ -814,10 +835,10 @@ async function labLoad() {
   labWhoShow();
   // Slices are claimed per handle, so who rides on the fetch as well as the writes.
   const who = labWho ? `?who=${encodeURIComponent(labWho)}` : '';
-  if (labWho) fetch('/api/dataset/progress').then(r => r.json())
+  if (labWho) labFetch('/api/dataset/progress').then(r => r.json())
     .then(p => { labProg = p; labStats(); }).catch(() => {});
   try {
-    const r = await fetch((labRev ? '/api/dataset/review' : '/api/dataset/samples') + who);
+    const r = await labFetch((labRev ? '/api/dataset/review' : '/api/dataset/samples') + who);
     if (r.status === 403) return labNote('your handle is not on the reviewer list');
     const d = await r.json();
     // Review serves one sample at a time; whatever the envelope omits keeps its current value.
