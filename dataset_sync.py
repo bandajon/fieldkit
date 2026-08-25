@@ -18,6 +18,7 @@ side ever removes the other's files; real two-way sync needs tombstones and conf
 rules, which is a different program nobody has asked for.
 """
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -122,18 +123,46 @@ def push(cl, bucket, prefix=PREFIX, root=DATASET, names=PUSH):
 
 
 def have(dest, size):
-    """Is the local copy already good? Same size is the same file for a write-once
-    sample. A .jsonl here is append-only, so a local copy LONGER than the remote is
-    newer work — downloading the remote's older snapshot over it would delete lines
-    nobody can get back, which is exactly what a node syncing while ten people append
-    would do on every pass.
+    """Is the local copy already good? Same size is the same file: these are write-once
+    samples, and a ledger of the same size holds the same lines. A ledger of a DIFFERENT
+    size is fetched and merged, not replaced — see merge_jsonl."""
+    return dest.exists() and dest.stat().st_size == size
 
-    ponytail: longer-wins is not a merge. Two nodes appending to one ledger still need
-    tombstones and conflict rules — the same thing this module deliberately isn't."""
-    if not dest.exists():
-        return False
-    n = dest.stat().st_size
-    return n == size or (n > size and dest.suffix == ".jsonl")
+
+def merge_jsonl(dest, extra):
+    """Fold `extra` into the append-only ledger at `dest`, keeping every line either
+    side had. Both sides write these: the curation instance records the team's work
+    while the operator's node records its own, so replacing one with the other drops a
+    week of somebody's history — and payroll is computed off exactly these files.
+
+    Exact-string dedup, because a byte-identical line IS the same record written once.
+    That makes ledger sync commutative — the union is the same whoever syncs first, so
+    both sides may push and pull whenever they like."""
+    lines, last = [], ""
+    for line in dict.fromkeys(dest.read_text().splitlines() + extra.read_text().splitlines()):
+        try:
+            r = json.loads(line)
+            last = (r.get("ts") if isinstance(r, dict) else None) or last
+        except ValueError:
+            pass          # a torn line inherits the stamp above it, so it stays put
+        lines.append((last, line))
+    lines.sort(key=lambda p: p[0])      # stable: one timestamp keeps the order read in
+    tmp = dest.with_name(dest.name + ".merging")
+    tmp.write_text("".join(f"{line}\n" for _, line in lines))
+    os.replace(tmp, dest)               # a torn ledger would be worse than a stale one
+
+
+def fetch(cl, bucket, dest, key):
+    """One object down. An existing ledger is merged; everything else is write-once."""
+    if dest.suffix == ".jsonl" and dest.exists():
+        extra = dest.with_name(dest.name + ".incoming")
+        cl.download_file(bucket, key, str(extra))
+        try:
+            merge_jsonl(dest, extra)
+        finally:
+            extra.unlink(missing_ok=True)
+    else:
+        cl.download_file(bucket, key, str(dest))
 
 
 def pull(cl, bucket, prefix=PREFIX, root=DATASET, names=None):
@@ -150,7 +179,7 @@ def pull(cl, bucket, prefix=PREFIX, root=DATASET, names=None):
             continue
         dest.parent.mkdir(parents=True, exist_ok=True)
         todo.append((dest, key))
-    got = transfer(lambda dest, key: cl.download_file(bucket, key, str(dest)), todo, "pulled")
+    got = transfer(lambda dest, key: fetch(cl, bucket, dest, key), todo, "pulled")
     print(f"pull: {got} downloaded, {skipped} already local (-> {root})")
     return got, skipped
 
@@ -225,6 +254,25 @@ def selfcheck():
     pull(cl, "buck", "curation/", day, LEDGERS)
     assert (day / "audit.jsonl").stat().st_size == grown, "pull truncated a growing ledger"
 
+    # Both sides append to a ledger, so pull merges it: local B,A and remote B,C come
+    # back as the union, by ts, with the duplicate B kept once and the torn line still
+    # sitting where it was found.
+    a = '{"ts": "2026-08-24T09:00:00+00:00", "who": "curator01", "action": "approve"}'
+    b = '{"ts": "2026-08-25T09:00:00+00:00", "who": "curator02", "action": "approve"}'
+    c = '{"ts": "2026-08-26T09:00:00+00:00", "who": "jonah", "action": "review"}'
+    torn = '{"ts": "2026-08-25T09:00:01+00:00", "who": "curat'
+    cl.objects["curation/audit.jsonl"] = f"{b}\n{c}\n".encode()
+    (day / "audit.jsonl").write_text(f"{b}\n{torn}\n{a}\n")
+    pull(cl, "buck", "curation/", day, LEDGERS)
+    assert (day / "audit.jsonl").read_text() == f"{a}\n{b}\n{torn}\n{c}\n", (
+        (day / "audit.jsonl").read_text())
+    assert not list(day.glob("*.incoming")), "the download side-file must not survive"
+
+    # A non-ledger is still replaced wholesale — merging is for append-only files only.
+    (day / "classes.txt").write_text("car\n")
+    pull(cl, "buck", "curation/", day, CONFIG)
+    assert (day / "classes.txt").read_text() == "car\ntruck\n", "a non-ledger must replace"
+
     # Nothing is ever removed: a file only one side has survives both directions.
     (dst / "pending" / "images" / "local-only.jpg").write_bytes(b"keep")
     pull(cl, "buck", "curation/", dst)
@@ -243,7 +291,7 @@ def selfcheck():
     assert creds()["bucket"], "a bucket name is always resolvable"
 
     print("dataset_sync self-check ok: push skips unchanged, pull harvests, --ledgers and "
-          "--config filter, a growing ledger survives a pull, neither side deletes, env "
+          "--config filter, ledgers merge instead of overwriting, neither side deletes, env "
           "creds win")
 
 
