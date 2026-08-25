@@ -850,17 +850,19 @@ function labAskTok() {
 }
 
 async function labFetch(url) {
-  let r = await fetch(url, {headers: labHdr()});
-  if (r.status === 401 && labAskTok()) r = await fetch(url, {headers: labHdr()});
-  return r;
+  // Deliberately no prompt on a 401: arriving at a labelling site and being met by a
+  // modal demanding a token is hostile to the curator who has not been given one yet
+  // and absurd for the supervisor holding a password. labLoad names both ways in.
+  return fetch(url, {headers: labHdr()});
 }
 
 function labWhoShow() {
-  document.getElementById('l-who').textContent = labWho ? `labeling as ${labWho} (change)` : 'solo mode (set name)';
+  document.getElementById('l-who').textContent = labWho ? `labeling as ${labWho} (change)` : 'not signed in (set name and token)';
 }
 document.getElementById('l-who').onclick = () => {
   labTok = localStorage.removeItem('fieldkit_token') || '';   // new handle, new token
   labWho = labAskWho();
+  if (labWho) labAskTok();          // a handle without its token cannot fetch anything
   labWhoShow();
   labLoad();
 };
@@ -869,7 +871,6 @@ addEventListener('hashchange', () => { if (tab === 'label') labLoad(); });
 
 async function labLoad() {
   labRev = location.hash === '#review';   // same tool, same taxonomy, different source
-  if (!labAsked) { labAsked = true; if (!labWho) labWho = labAskWho(); }
   labWhoShow();
   // Slices are claimed per handle, so who rides on the fetch as well as the writes.
   const who = labWho ? `?who=${encodeURIComponent(labWho)}` : '';
