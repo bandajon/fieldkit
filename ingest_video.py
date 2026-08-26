@@ -151,8 +151,7 @@ class Sink:
             return False
         self.at[cam], self.dets[cam] = ts, shown
         self._evict()
-        stem = "-".join(x for x in (self.gate, cam,
-                                    datetime.fromtimestamp(ts, timezone.utc).strftime(STEM_TS)) if x)
+        stem = detect.sample_stem(self.gate, cam, ts)
         lines = [f"{self.ids[cls]} {(x1 + x2) / 2 / w:.6f} {(y1 + y2) / 2 / h:.6f} "
                  f"{(x2 - x1) / w:.6f} {(y2 - y1) / h:.6f}"
                  for cls, _conf, (x1, y1, x2, y2) in shown if cls in self.ids]
@@ -353,17 +352,20 @@ def selfcheck():
     assert sink.offer("c", base + 40, b"jpeg", moved, 64, 64)
     assert sink.written["c"] == 2, sink.written
 
-    # Stems are UTC even though segment names are local wallclock.
+    # Stems are UTC even though segment names are local wallclock, and the seconds are
+    # floored to the capture interval so a node re-ingesting footage lands on the same id
+    # the node that filmed it minted live. Captures are >= CAPTURE_EVERY apart, so the
+    # flooring can never fold two of one node's own samples together: :08 and :48 stay two.
     stems = sorted(p.stem for p in sink.images.glob("*.jpg"))
-    assert stems == ["c-20260819-151108", "c-20260819-151148"], stems
-    label = (sink.labels / "c-20260819-151108.txt").read_text()
+    assert stems == ["c-20260819-151100", "c-20260819-151140"], stems
+    label = (sink.labels / "c-20260819-151100.txt").read_text()
     assert label == "0 0.546875 0.546875 0.781250 0.781250\n", label   # detect._capture's format
 
     # Re-ingesting the same footage overwrites its own stems rather than duplicating.
     sink2 = Sink(tmp / "dataset", dict(detect.CLASS_IDS))
     assert sink2.offer("c", base, b"again", car, 64, 64)
     assert len(list(sink.images.glob("*.jpg"))) == 2, "same stem, same file"
-    assert (sink.images / "c-20260819-151108.jpg").read_bytes() == b"again"
+    assert (sink.images / "c-20260819-151100.jpg").read_bytes() == b"again"
 
     assert segments([str(tmp)]) == [odd, seg], segments([str(tmp)])
 

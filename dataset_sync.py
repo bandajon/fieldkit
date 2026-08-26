@@ -108,19 +108,36 @@ def transfer(fn, items, verb):
 
 def push(cl, bucket, prefix=PREFIX, root=DATASET, names=PUSH):
     """Upload what curation needs. Same name and same size is assumed the same file:
-    these are write-once samples, never edited in place."""
+    these are write-once samples, never edited in place. Pending samples go further —
+    see once(): an id already in the bucket is left exactly as it is, so two nodes
+    watching one camera contribute one frame between them rather than two."""
     have = remote(cl, bucket, prefix)
     todo, skipped = [], 0
     for rel, f in walk(Path(root), names):
-        if have.get(prefix + rel) == f.stat().st_size and not always(rel):
+        key = prefix + rel
+        if always(rel) or key not in have:
+            todo.append((f, key))
+        elif once(rel) or have[key] == f.stat().st_size:
             skipped += 1
         else:
-            todo.append((f, prefix + rel))
+            todo.append((f, key))
     # Thousands of small files over a home uplink: latency-bound, so parallel
     # transfers are the whole speed-up. boto3 clients are thread-safe for this.
     sent = transfer(lambda f, key: cl.upload_file(str(f), bucket, key), todo, "pushed")
     print(f"push: {sent} uploaded, {skipped} already there ({prefix} on {bucket})")
     return sent, skipped
+
+
+def once(rel):
+    """Pending samples are written once and never replaced, whoever holds the newer copy.
+
+    Two nodes watching one camera now mint the same id for the same moment (see
+    detect.sample_stem), so their frames meet on one key — near-identical pictures of the
+    same vehicle, a second or two apart. Either is a fine sample and the first one there
+    is the copy every curator sees. Uploading the other over it would swap the image out
+    from under whoever is mid-label, leaving their boxes describing a frame that is gone.
+    So for pending, the key existing at all is reason enough to leave it be."""
+    return rel.startswith("pending/")
 
 
 def always(rel):
@@ -393,6 +410,23 @@ def selfcheck():
     (back / "approved" / "labels" / "s1.txt").unlink()
     (back / "pending" / "images" / "s1.jpg").write_bytes(b"aaa")
     assert sweep_consumed(back) == 0, "no approved copy: the pending one is all there is"
+
+    # Two nodes, one camera. The box at the gate and a laptop re-ingesting that same
+    # footage see the same vehicle two seconds apart on clocks that never agreed.
+    import detect
+    box_id = detect.sample_stem("RDA-TG-KTB", "katuba-north", 1787000702.4)
+    mac_id = detect.sample_stem("RDA-TG-KTB", "katuba-north", 1787000700.0)
+    assert box_id == mac_id, (box_id, mac_id)     # one moment, one id, one curation task
+
+    two, at_gate, at_desk = FakeS3(), Path(tempfile.mkdtemp()), Path(tempfile.mkdtemp())
+    for where, frame in ((at_gate, b"live off the sub-stream"), (at_desk, b"decoded")):
+        (where / "pending" / "images").mkdir(parents=True)
+        (where / "pending" / "images" / f"{box_id}.jpg").write_bytes(frame)
+    assert push(two, "buck", "curation/", at_gate) == (1, 0)
+    # Different bytes AND a different length, so the size check alone would send it again
+    # and a curator mid-label would watch the picture change under their boxes.
+    assert push(two, "buck", "curation/", at_desk) == (0, 1), "second node overwrote the first"
+    assert two.objects[f"curation/pending/images/{box_id}.jpg"] == b"live off the sub-stream"
 
     print("dataset_sync self-check ok: push skips unchanged, pull harvests, --ledgers and "
           "--config filter, ledgers merge instead of overwriting, neither side deletes, env "

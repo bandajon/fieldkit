@@ -90,6 +90,23 @@ def same_scene(a, b, iou_min=0.85):
     return True
 
 
+def sample_stem(gate, cam, ts):
+    """The sample id two nodes independently agree on for one moment on one camera.
+
+    The box at the gate and a laptop re-ingesting that same footage watch the same
+    vehicles on clocks that never line up. Stamping the id with each node's own instant
+    mints two ids for one frame, and a curator gets paid twice to label the same truck.
+    Flooring to the capture interval makes the id a property of the moment rather than
+    of who happened to notice it, so the second node's copy lands on the first one's key
+    and the two collapse into one.
+
+    A node cannot collide with itself here: CAPTURE_EVERY is also the minimum spacing
+    between its own captures, so consecutive samples always fall in different buckets."""
+    step = int(CAPTURE_EVERY) or 1
+    at = datetime.fromtimestamp(int(ts // step) * step, timezone.utc)
+    return "-".join(x for x in (gate, cam, at.strftime("%Y%m%d-%H%M%S")) if x)
+
+
 def crop(img, box, pad=0.1):
     """Box crop with a little context — a tight crop cuts the wheels off a truck."""
     x1, y1, x2, y2 = box
@@ -912,8 +929,7 @@ class Detector:
                 (pending / "labels" / f"{oldest.stem}.txt").unlink(missing_ok=True)
             # The gate id rides in the sample name: a frame that reaches a shared queue
             # from one of nine sites has to say which one without a lookup.
-            stem = "-".join(x for x in (self.gate, name,
-                                        datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')) if x)
+            stem = sample_stem(self.gate, name, time.time())
             lines = [f"{self.display_ids[cls]} {(x1 + x2) / 2 / w:.6f} {(y1 + y2) / 2 / h:.6f} "
                      f"{(x2 - x1) / w:.6f} {(y2 - y1) / h:.6f}"
                      for cls, _conf, (x1, y1, x2, y2) in shown if cls in self.display_ids]
