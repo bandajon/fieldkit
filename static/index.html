@@ -857,6 +857,12 @@ setInterval(monTick, 1000);   // 1 fps, and monTick no-ops when the tab is hidde
 // hidden so it stays tappable back to car, and dropped from the POST.
 let labLastCls = 0;
 let labDone = [];   // ids approved this session, newest last — the Back button's stack
+// classes.txt is positional: a class's index IS the YOLO id written into every stored
+// label file and into the trained model's head, so the array is never reordered. This is
+// the view — [name, id] pairs in A-to-F order, which is how a curator reads the strip.
+const labSorted = () =>
+  labClasses.map((n, i) => [n, i]).sort((a, b) => a[0].localeCompare(b[0]));
+
 let labClasses = [], labQueue = [], labBoxes = [], labTotal = 0,
     labApproved = {frames: 0, boxes: {}};
 let labAttrs = {}, labConstraints = {}, labDefaults = {}, labImplies = {}, labSel = -1;   // attribute vocab {head: [values]}; index of the selected box
@@ -1063,7 +1069,7 @@ function labSelect(i) {
           >${esc(v)}</button>`).join('') +
         `<button class="btn rm" data-add="${esc(head)}">+</button>`);
     }).join('');
-  el.innerHTML = row('class', labClasses.map((n, j) =>
+  el.innerHTML = row('class', labSorted().map(([n, j]) =>
       `<button class="btn${b.cls === j ? ' on' : ''}" style="--c:${clsColor(j)}" data-cls="${j}"
         >${esc(n)}</button>`).join('') +
       `<button class="btn rm${b.cls >= labClasses.length ? ' on' : ''}"
@@ -1396,7 +1402,7 @@ document.getElementById('l-back').onclick = async () => {
 };
 
 function labChips() {
-  document.getElementById('l-classes').innerHTML = labClasses.map((n, i) =>
+  document.getElementById('l-classes').innerHTML = labSorted().map(([n, i]) =>
     `<span class="chip" style="--c:${clsColor(i)}">${esc(n)}
        <button data-act="rename" data-i="${i}" title="rename">&#9998;</button>
        <button data-act="remove" data-i="${i}" title="remove">&times;</button></span>`).join('');
@@ -1603,9 +1609,9 @@ async function labAssignLoad() {
 let labCats = [];
 const labTargets = () =>
   '<optgroup label="Categories">' +
-  labCats.map(c => `<option value="${esc(c)}">Category ${esc(c)}</option>`).join('') +
+  [...labCats].sort().map(c => `<option value="${esc(c)}">Category ${esc(c)}</option>`).join('') +
   '</optgroup><optgroup label="Classes">' +
-  labClasses.map(n => `<option>${esc(n)}</option>`).join('') + '</optgroup>';
+  labSorted().map(([n]) => `<option>${esc(n)}</option>`).join('') + '</optgroup>';
 
 function labAssignShow(d) {
   labAssigns = d.assignments || {};
