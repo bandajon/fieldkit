@@ -1,12 +1,18 @@
-# Railway config-as-code for the CURATION service (FIELDKIT_MODE=curation).
-# The dataset lives on a persistent volume mounted at /data; the repo's
-# dataset/ path is a symlink to it. Boot pulls ONLY the config (the roster must
-# exist before a curation node will start); the samples stream in from the
-# server's own background sync, so the service is answering within seconds.
+# Railway config-as-code. NOTE: this file is applied to EVERY service built from
+# this repo, not only the curation one, so nothing here may assume a volume at
+# /data or R2 credentials in the environment — a service without them still has
+# to boot and answer, or its healthcheck kills the deploy.
+#
+# Hence the sequencing below. The dataset lives on a persistent volume mounted at
+# /data and the repo's dataset/ path is a symlink to it; boot pulls ONLY the config
+# (a curation node wants its roster before it serves) and the samples stream in
+# from the server's own background sync, so the service answers within seconds.
+# Every step is allowed to fail: a node that cannot reach R2 says so on its Status
+# tab, which is far more use than a container that never started.
 [build]
 builder = "RAILPACK"
 
 [deploy]
-startCommand = "mkdir -p /data/dataset && rm -rf dataset && ln -s /data/dataset dataset && python dataset_sync.py pull --config && python app.py"
+startCommand = "{ mkdir -p /data/dataset && rm -rf dataset && ln -s /data/dataset dataset; } || echo 'boot: no /data volume — using the repo dataset dir'; python dataset_sync.py pull --config || echo 'boot: no dataset pulled — serving what is already here'; exec python app.py"
 healthcheckPath = "/"
 restartPolicyType = "ON_FAILURE"
