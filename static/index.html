@@ -865,7 +865,8 @@ const labSorted = () =>
 
 let labClasses = [], labQueue = [], labBoxes = [], labTotal = 0,
     labApproved = {frames: 0, boxes: {}};
-let labAttrs = {}, labConstraints = {}, labDefaults = {}, labImplies = {}, labSel = -1;   // attribute vocab {head: [values]}; index of the selected box
+let labAttrs = {}, labConstraints = {}, labDefaults = {}, labImplies = {},
+    labRestricts = {}, labSel = -1;   // attribute vocab {head: [values]}; index of the selected box
 const labNote = t => document.getElementById('l-note').textContent = t;
 const labNum = v => typeof v === 'number' ? v : (v && v.approve) || 0;   // {approve, discard} or a count
 const labStats = () => {
@@ -962,6 +963,7 @@ async function labLoad() {
     labConstraints = d.attr_constraints || labConstraints;
     labDefaults = d.attr_defaults || labDefaults;
     labImplies = d.attr_implies || labImplies;
+    labRestricts = d.attr_restricts || labRestricts;
     // /api/dataset/review 403s a non-reviewer, so reaching it is proof enough on its own.
     document.getElementById('l-admin').hidden = !(d.reviewer || labRev);
   } catch (e) {
@@ -1086,18 +1088,27 @@ function labSelect(i) {
 function labVocab(head, name, cur, attrs) {
   const base = (labConstraints[name] || {})[head] || labAttrs[head] || [];
   let allowed = base, off = false;
+  // A sibling attribute can narrow this head to the only answers that can be true: a
+  // tanker carries liquid, so cargo offers one option instead of eleven. Declared in
+  // attributes.yaml `restricts` and deliberately NOT read off `implies` — implies means
+  // "assume this unless told otherwise", which is a far weaker claim than "nothing else
+  // is possible", and an articulated truck really can have five axles or seven.
+  for (const h in (attrs || {})) {
+    const only = h !== head && ((labRestricts[h] || {})[attrs[h]] || {})[head];
+    if (only) allowed = allowed.filter(v => only.includes(v));
+  }
   if (head === 'axle-config' && attrs && attrs.axles) {
     // Only configurations consistent with the chosen axle count. Each preset already
     // declares its count in the implies map, so this derives rather than duplicates;
     // values with no declared count ("other") always stay.
     const imp = labImplies['axle-config'] || {};
-    allowed = base.filter(v => !(imp[v] || {}).axles || imp[v].axles === attrs.axles);
-    // Invariant: a head the class allows is visible, and visible means required — only the
-    // class may waive it, by giving the head an empty constraint list. So a count filter that
-    // matches nothing hands back the class's whole list, every value flagged as disagreeing,
-    // rather than an empty row whose requirement labGap can no longer see.
-    if (!allowed.length) { allowed = base; off = true; }
+    allowed = allowed.filter(v => !(imp[v] || {}).axles || imp[v].axles === attrs.axles);
   }
+  // Invariant: a head the class allows is visible, and visible means required — only the
+  // class may waive it, by giving the head an empty constraint list. So a filter above that
+  // matches nothing hands back the class's whole list, every value flagged as disagreeing,
+  // rather than an empty row whose requirement labGap can no longer see.
+  if (!allowed.length && base.length) { allowed = base; off = true; }
   const out = allowed.map(v => [v, off]);
   if (cur && !allowed.includes(cur)) out.push([cur, true]);
   return out;

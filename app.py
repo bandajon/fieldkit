@@ -1006,7 +1006,8 @@ def dataset_samples(who: str = "", x_curator_token: str = Header("")):
     out = [s for _, s in pending[:100]]
     body = {"classes": dataset_classes(), "attributes": attr_vocab(),
             "attr_constraints": attr_meta("constraints"), "attr_defaults": attr_meta("defaults"),
-            "attr_implies": attr_meta("implies"), "approved": approved_counts(),
+            "attr_implies": attr_meta("implies"),
+            "attr_restricts": attr_meta("restricts"), "approved": approved_counts(),
             "reviewer": who in REVIEWERS,
             # the list is capped for payload size; pending_total is the real pile
             "pending_total": len(pending), "pending": out}

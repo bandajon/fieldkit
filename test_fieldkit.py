@@ -499,6 +499,32 @@ def supervisor_tokens():
             app.DATASET, app.REVIEWERS, app.push_roster = keep
 
 
+def attr_restricts_are_real():
+    """Every restricts rule must name a head and values the vocabulary actually has.
+
+    A typo fails silently and expensively: labVocab filters the row down to nothing,
+    hits its empty-list guard, hands back the class's whole list, and the curator sees
+    all eleven cargo options with no sign the rule was ever meant to fire."""
+    import app
+    cfg = yaml.safe_load((app.DATASET / "attributes.yaml").read_text()) or {}
+    vocab = {k: v for k, v in cfg.items() if isinstance(v, list)}
+    seen = 0
+    for head, values in (cfg.get("restricts") or {}).items():
+        assert head in vocab, f"restricts names unknown head {head!r}"
+        for value, narrows in values.items():
+            assert value in vocab[head], f"restricts: {head} has no value {value!r}"
+            for target, only in narrows.items():
+                assert target in vocab, f"restricts {head}/{value} narrows unknown head {target!r}"
+                assert target != head, f"restricts {head}/{value} narrows its own head"
+                only = [only] if isinstance(only, str) else only
+                assert only, f"restricts {head}/{value}/{target} is empty"
+                for v in only:
+                    assert v in vocab[target], \
+                        f"restricts {head}/{value}/{target}: {v!r} is not a {target}"
+                seen += 1
+    assert seen, "no restrict rules — the tanker/cargo rule should be one of them"
+
+
 check("hostnet arp parser", hostnet_arp_parser)
 check("scan auto-joins once", scan_auto_joins_once)
 check("hostnet jetson (naming, no-carrier, bootstrap)", hostnet_jetson)
@@ -517,6 +543,7 @@ check("recorder timed stop", recorder_timed_stop)
 check("record start validates hours", record_start_hours)
 check("README documents every config key", readme_documents_config)
 check("supervisor password + token minting", supervisor_tokens)
+check("attribute restrict rules are real", attr_restricts_are_real)
 
 print(f"\n{'FAILED: ' + ', '.join(FAILS) if FAILS else 'all passed'}")
 sys.exit(1 if FAILS else 0)
