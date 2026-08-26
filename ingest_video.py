@@ -38,6 +38,13 @@ def config():
     return yaml.safe_load((ROOT / "config.yaml").read_text()) or {}
 
 
+def gate_id(cfg):
+    """The RDA toll gate id this node sits at, or "" — it prefixes every sample name so a
+    frame arriving in a shared queue says which of nine gates it came from."""
+    return str((cfg.get("offload") or {}).get("toll_gate_id")
+               or cfg.get("toll_gate_id") or "").strip()
+
+
 def record_root(cfg):
     return ROOT / (cfg.get("record_dir") or "./recordings")
 
@@ -125,12 +132,12 @@ class Sink:
     """dataset/pending writer with the live capture's gates, measured in footage time:
     no detections, an unchanged scene, or a too-recent sample and nothing lands."""
 
-    def __init__(self, dataset, ids):
+    def __init__(self, dataset, ids, gate=""):
         self.images = Path(dataset) / "pending" / "images"
         self.labels = Path(dataset) / "pending" / "labels"
         for d in (self.images, self.labels):
             d.mkdir(parents=True, exist_ok=True)
-        self.ids = ids
+        self.ids, self.gate = ids, gate
         self.at = {}          # cam -> footage timestamp of its last capture
         self.dets = {}        # cam -> its `shown`, for the scene comparison
         self.written = Counter()
@@ -144,7 +151,8 @@ class Sink:
             return False
         self.at[cam], self.dets[cam] = ts, shown
         self._evict()
-        stem = f"{cam}-{datetime.fromtimestamp(ts, timezone.utc).strftime(STEM_TS)}"
+        stem = "-".join(x for x in (self.gate, cam,
+                                    datetime.fromtimestamp(ts, timezone.utc).strftime(STEM_TS)) if x)
         lines = [f"{self.ids[cls]} {(x1 + x2) / 2 / w:.6f} {(y1 + y2) / 2 / h:.6f} "
                  f"{(x2 - x1) / w:.6f} {(y2 - y1) / h:.6f}"
                  for cls, _conf, (x1, y1, x2, y2) in shown if cls in self.ids]
@@ -196,7 +204,7 @@ def ingest_one(f, run, sink, cam=None):
 
 def ingest(files, cfg):
     run, ids = detector(cfg)
-    sink = Sink(DATASET, ids)
+    sink = Sink(DATASET, ids, gate_id(cfg))
     sampled = sum(ingest_one(f, run, sink)[0] for f in files)
     print(f"\n{len(files)} file(s), {sampled} frames sampled at {INGEST_FPS} fps, "
           f"{sum(sink.written.values())} samples written to {sink.images.parent}")
@@ -206,7 +214,7 @@ def ingest(files, cfg):
 
 
 def pull(prefix, cfg):
-    """Download the keys under <site>/<cam> we do not already have locally."""
+    """Download the keys under <toll gate>/<cam> we do not already have locally."""
     o = cfg.get("offload") or {}
     missing = [k for k in ("account_id", "access_key_id", "secret_access_key")
                if not o.get(k)]
@@ -261,7 +269,7 @@ def incoming(cfg):
     root = record_root(cfg) / "incoming"
     root.mkdir(parents=True, exist_ok=True)
     run, ids = detector(cfg)          # one model load for the whole drop-box
-    sink = Sink(DATASET, ids)
+    sink = Sink(DATASET, ids, gate_id(cfg))
     done = total = 0
     # Upload time orders the queue: these names came off someone's phone and mean nothing.
     for obj in sorted(objs, key=lambda x: x["LastModified"]):

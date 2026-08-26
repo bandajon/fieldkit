@@ -39,7 +39,7 @@ Unassigned curators get newest-first work, so nobody is ever idle.
 Frames are made where the detector lives (this Mac), never in the cloud
 container — it deliberately ships without torch.
 
-    python ingest_video.py pull katuba/katuba-north   # mirrored site footage
+    python ingest_video.py pull RDA-TG-KTB/katuba-north   # mirrored site footage
     python ingest_video.py ~/clips/                   # any local video
     python ingest_video.py incoming                   # videos uploaded from the UI
     python dataset_sync.py push                       # publish the new samples
@@ -65,7 +65,7 @@ honesty matters when the number decides a payment.
 
 ## Daily rhythm
 
-    morning:  python ingest_video.py pull <site>/<cam> && python dataset_sync.py push
+    morning:  python ingest_video.py pull <toll-gate-id>/<cam> && python dataset_sync.py push
     anytime:  #review on the site, a few samples per curator
     evening:  python dataset_sync.py pull --ledgers
     friday:   python payroll_report.py 7

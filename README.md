@@ -243,6 +243,7 @@ thereafter.
 | `cameras[].ip` | FieldKit | Camera address. |
 | `cameras[].user` / `cameras[].password` | FieldKit | RTSP and ISAPI credentials for that camera. |
 | `site` | FieldKit | This node's site name. Recordings land in `<record_dir>/<site>/<cam>/`. |
+| `toll_gate_id` | FieldKit | RDA gate id (e.g. `RDA-TG-KTB`). Keys everything written to R2 — recordings as `<gate>/<cam>/<segment>.mkv`, sample ids as `<gate>-<cam>-<time>`. Empty falls back to `site`; local disk is unaffected either way. |
 | `record_dir` | FieldKit | Root for ffmpeg segment recordings. Created on demand. |
 | `go2rtc_binary` | FieldKit | Absolute path to the go2rtc binary. Empty means the Monitor tab stays on snapshots. FieldKit never downloads it. |
 | `camera_defaults` | FieldKit | Credentials the discovery sweep tries against cameras that are not yet in `cameras`. |

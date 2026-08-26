@@ -167,10 +167,24 @@ class Offload:
         self.client_creds = creds     # rotated creds rebuild rather than reuse this
         return self.client
 
+    def storage_key(self, f):
+        """Where a segment lives in the bucket: <toll gate>/<camera>/<segment>.mkv.
+
+        The local tree is named for the operator's convenience; the bucket is named for
+        the authority that has to find things in it later, which is the RDA toll gate id
+        (RDA-TG-KTB and friends). Falls back to the local site name when no gate id is
+        configured, which is what every node did before this existed."""
+        gate = str(self.opts().get("toll_gate_id")
+                   or self.cfg.get("toll_gate_id") or "").strip()
+        parts = list(f.parts[-3:])                    # <site>/<cam>/<segment>.mkv
+        if gate:
+            parts[0] = gate
+        return "/".join(parts)
+
     def _put(self, client, bucket, f):
         """Upload one segment. -> False with last_error set on any failure — network,
         credentials, checksum mismatch — so the local copy always survives it."""
-        key = "/".join(f.parts[-3:])                  # <site>/<cam>/<segment>.mkv
+        key = self.storage_key(f)
         try:
             with open(f, "rb") as body:
                 client.put_object(Bucket=bucket, Key=key, Body=body,

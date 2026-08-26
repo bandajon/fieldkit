@@ -359,6 +359,7 @@ class Detector:
         self.events_dir = Path(events_dir) if events_dir else None
         self.dirty = False              # a tally moved since the last write
         self.backend = str(cfg.get("detect_backend", "cpu") or "cpu").strip().lower()
+        self.gate = str(cfg.get("toll_gate_id") or "").strip()
         self.hef_path = cfg.get("hef_path", "")   # hailo model; read here, used once that backend lands
         # Fine-tuned weights bring their own taxonomy: model.names replaces the COCO four.
         self.weights = str(cfg.get("detect_weights", "") or "").strip()
@@ -909,7 +910,10 @@ class Detector:
                 oldest = min(imgs, key=lambda p: p.stat().st_mtime)
                 oldest.unlink()
                 (pending / "labels" / f"{oldest.stem}.txt").unlink(missing_ok=True)
-            stem = f"{name}-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
+            # The gate id rides in the sample name: a frame that reaches a shared queue
+            # from one of nine sites has to say which one without a lookup.
+            stem = "-".join(x for x in (self.gate, name,
+                                        datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')) if x)
             lines = [f"{self.display_ids[cls]} {(x1 + x2) / 2 / w:.6f} {(y1 + y2) / 2 / h:.6f} "
                      f"{(x2 - x1) / w:.6f} {(y2 - y1) / h:.6f}"
                      for cls, _conf, (x1, y1, x2, y2) in shown if cls in self.display_ids]

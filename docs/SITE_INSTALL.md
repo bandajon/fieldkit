@@ -20,9 +20,10 @@ footage does not need it.
 Copy `config.example.yaml` to `config.yaml` and set:
 
 ```yaml
-site: chunga              # MUST be unique across sites: it is the storage path
+site: katuba              # local disk only: <record_dir>/<site>/<cam>/
+toll_gate_id: RDA-TG-KTB  # the RDA gate id. Everything in the bucket is keyed by this.
 cameras:
-  - name: chunga-north    # MUST be globally unique: sample ids are <camera>-<time>
+  - name: katuba-north    # MUST be globally unique: sample ids are <gate>-<camera>-<time>
     ip: 192.168.1.77
     user: admin
     password: "..."
@@ -37,6 +38,29 @@ offload:
   secret_access_key: "..."
   bucket: fieldkit-recordings
 ```
+
+### `site` vs `toll_gate_id`
+
+Two names because they answer to two different people. `site` is for whoever is
+standing at the box — it names a directory on that machine's disk and nothing
+else. `toll_gate_id` is for whoever opens the bucket six months from now with an
+RDA gate code in hand, so every remote key carries it:
+
+| | key |
+|---|---|
+| recording | `RDA-TG-KTB/katuba-north/20260826-071500.mkv` |
+| training frame | `curation/pending/images/RDA-TG-KTB-katuba-north-20260826-071500.jpg` |
+| pulling it back | `python ingest_video.py pull RDA-TG-KTB/katuba-north` |
+
+Leave `toll_gate_id` empty and remote keys fall back to `site`, exactly as nodes
+behaved before the key existed. Objects already uploaded under the old prefix stay
+where they are — this changes new writes only, so a gate that gets its id late has
+footage under both names.
+
+The nine gate ids (`LAURETTA_INTEGRATION_GUIDE.md`): `RDA-TG-ABM` Abraham Mokola,
+`RDA-TG-CHW` Chongwe, `RDA-TG-CKS` Chingola-Kasumbalesa, `RDA-TG-KFL` Kafulafuta,
+`RDA-TG-KTB` Katuba, `RDA-TG-LMB` Lusaka-Mumbwa, `RDA-TG-MCS` Michael Chilufya
+Sata, `RDA-TG-MYB` Manyumbi, `RDA-TG-SHM` Shimabala.
 
 Camera names are not cosmetic. Recordings land in `<record_dir>/<site>/<camera>/`
 and every training frame is named `<camera>-<timestamp>`, so two sites sharing a
