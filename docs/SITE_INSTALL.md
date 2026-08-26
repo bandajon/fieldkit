@@ -42,6 +42,32 @@ Camera names are not cosmetic. Recordings land in `<record_dir>/<site>/<camera>/
 and every training frame is named `<camera>-<timestamp>`, so two sites sharing a
 camera name would collide in the bucket and in the dataset.
 
+## Carry the taxonomy with you
+
+`dataset/` is not in the repo, so a fresh clone knows nothing about your classes.
+Copy three things onto each box (a USB stick or `scp` — they are small):
+
+    dataset/classes.txt           # the class list, positional and authoritative
+    dataset/attributes.yaml       # vocabularies, constraints, defaults
+    dataset/train_runs/<run>/weights/best.pt   # ~6 MB, the fine-tuned model
+
+then point at the model in config.yaml:
+
+```yaml
+detect_backend: cpu
+detect_weights: /home/<user>/fieldkit/dataset/weights/best.pt
+```
+
+A box without them still works and still contributes: detection falls back to
+the stock model, whose four classes land on positions 0-3 of your list — car,
+motorcycle, bus and truck line up with `a-small`, `a-motorcycle`, `c-bus` and
+`e-heavy` exactly, because those positions are where the taxonomy grew from. Its
+proposals are simply coarser: it will never suggest `b-light` or `d-medium`, and
+your curators will correct more boxes than they otherwise would.
+
+Nothing a node captures can corrupt the shared taxonomy: a node uploads frames
+and labels only, never its config.
+
 ## Mirror costs a thousand times what contribute costs
 
 Measured from real segments: ten minutes of 1080p is ~317 MB, so mirroring one
