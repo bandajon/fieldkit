@@ -156,6 +156,19 @@ def detect_snapshot(ip, user, password):
 # NOT in CONFIG — CONFIG is dumped back to config.yaml on every camera edit, and
 # load_config() clears it; either would put a pushed secret on disk or lose it.
 CONSOLE_CREDS = {}
+
+# The switches the ops console may throw on a node, by name — so the hive command
+# channel drives them without importing app internals. Each takes one bool (mirror and
+# contribute also take None: back to config.yaml). Lambdas, not bound methods: on a
+# curation node these objects are None and nothing here is ever called — and that
+# same deferral is why this sits ABOVE the block that builds them: Hive captures
+# the dict at construction, so this name has to exist by then. Keep it here.
+CONTROLS = {
+    "mirror": lambda on: OFFLOAD.set_mirror(on),
+    "contribute": lambda on: OFFLOAD.set_contribute(on),
+    "detect": lambda on: DETECT.start() if on else DETECT.stop(),
+}
+
 if CURATION:
     # A curation node has no cameras, no drive to fill and no console to phone: it
     # serves the Label tab and its dataset, nothing else.
@@ -176,8 +189,10 @@ else:
     OFFLOAD.start()   # no-op unless offload.enabled is set
     # lambda: record_status is a route defined further down, and the heartbeat sends its
     # body verbatim — the console sees exactly what the local Record tab does.
+    # CONTROLS' entries are lambdas: OFFLOAD and DETECT below them resolve when the
+    # console actually throws a switch, long after this module finished loading.
     HIVE = hive.Hive(CONFIG, REC, lambda: record_status(), camera.snapshot, local_ips,
-                     console_creds=CONSOLE_CREDS)
+                     console_creds=CONSOLE_CREDS, controls=CONTROLS)
     HIVE.start()   # no-op unless config.yaml has an ops: block
     DETECT = detect.Detector(CONFIG.get("cameras", []), detect_snapshot, CONFIG,
                              creds_fn=lambda ip: cam_creds(ip), dataset_dir=DATASET,
@@ -264,6 +279,14 @@ def detect_stop():
 def offload_mirror(body: dict = Body(default={})):
     """Keep-a-cloud-copy switch. null hands the decision back to config.yaml."""
     OFFLOAD.set_mirror(body.get("on"))
+    return OFFLOAD.info()
+
+
+@app.post("/api/offload/contribute")
+def offload_contribute(body: dict = Body(default={})):
+    """Hand this node's captured samples to the shared labelling queue. null hands the
+    decision back to config.yaml."""
+    OFFLOAD.set_contribute(body.get("on"))
     return OFFLOAD.info()
 
 

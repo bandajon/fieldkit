@@ -3,7 +3,7 @@
 import assert from 'node:assert/strict';
 import { mark, state } from './store.js';
 import { fleetView, expanded, row } from './fleet.js';
-import { hiveView, cameraView } from './hive.js';
+import { hiveView, cameraView, needsConfirm } from './hive.js';
 import { liveUrl } from './render.js';
 import { forecast, summary, gate, tray, dismiss, reopen } from './actions.js';
 import { sortAlerts, alertRank } from './pages.js';
@@ -30,6 +30,7 @@ const kalambo = {
     node('kalambo', 'fk-old-07', { state: 'revoked', sort: 0, issues: ['revoked'] }),
     node('kalambo', 'fk-kal-02', {
       state: 'offline', sort: 1, issues: ['offline'], last_seen: NOW - 2520,
+      offload: { mirror: false, contribute: true },
       cameras: [cam('cam1'), cam('cam2', { snapshot_age: null })],
     }),
     node('kalambo', 'fk-kal-03', {
@@ -41,7 +42,8 @@ const kalambo = {
       disks: [
         { path: '/srv/recordings', free_gb: 42, total_gb: 1000, hours_left: 4.2 },
       ],
-      offload: { enabled: true, uploaded: 411, last_file: 'x/20260808T1340_cam4.mkv', last_error: null },
+      offload: { enabled: true, uploaded: 411, last_file: 'x/20260808T1340_cam4.mkv',
+                 last_error: null, mirror: true, contribute: false },
       cameras: [
         cam('cam5', { until: NOW + 14280 }),
         cam('cam6', { coverage_pct: 88.4, gaps: [[NOW - 40000, NOW - 33000]] }),
@@ -130,6 +132,23 @@ assert.equal((cameraView(doc, 'kalambo', 'fk-bb-01', 'cam6', NOW, () => {})
   .match(/<i class="[^"]*" title="/g) || []).length, 24, 'coverage renders 24 hour cells');
 assert.match(hive, /UNTIL STOPPED/);
 assert.match(hiveView(doc, 'nope', NOW), /NO HIVE NOPE/);
+
+// node switches: lit chip = on, and the label carries the cost, not just the action
+assert.match(hive, /data-switch="kalambo\/fk-bb-01"\s+data-what="mirror"\s+data-on="true" class="on"/);
+assert.match(hive, /UPLOAD RECORDINGS \(HEAVY\) · ON/);
+assert.match(hive, /CONTRIBUTE FRAMES \(LIGHT\) · OFF/);
+assert.match(hive, /title="roughly 45 GB per camera per day, on a metered link"/);
+// an offline node keeps its switches — the command waits in desired state and lands on
+// reconnect, exactly like start/stop — and shows the last state it reported, not a guess
+assert.match(hive, /data-switch="kalambo\/fk-kal-02"\s+data-what="mirror"\s+data-on="false" class=""/);
+assert.match(hive, /CONTRIBUTE FRAMES \(LIGHT\) · ON/);
+// a node that reported no switch state renders no chips: unknown is never drawn as OFF
+assert.equal((hive.match(/data-switch=/g) || []).length, 4, 'only reported switches render');
+// spending money asks first; stopping the spend, and the cheap switch, never do
+assert.equal(needsConfirm('mirror', true), true);
+assert.equal(needsConfirm('mirror', false), false);
+assert.equal(needsConfirm('contribute', true), false);
+assert.equal(needsConfirm('contribute', false), false);
 
 // the live URL prefers the tailnet address, falls back to the first, and encodes the camera
 assert.equal(liveUrl({ ips: ['192.168.8.4', '100.84.2.11'] }, 'cam4'),

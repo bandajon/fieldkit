@@ -44,6 +44,9 @@ CLEAR_TICKS = 2
 RETAIN_S = 86400            # cleared alerts, and replayable heartbeats
 NAME = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")   # hive/node land in dict keys and URLs
 
+SWITCHES = ("mirror", "contribute", "detect")   # node-wide on/off; carry `on`, not cams
+ACTIONS = ("start", "stop") + SWITCHES
+
 # Worst first. A node's dot and its sort position both come from issues[0].
 SEVERITY = ["revoked", "offline", "not recording", "heartbeat only",
             "disk low", "clock drift", "link degraded"]
@@ -54,7 +57,7 @@ CONFIG = {}
 LOCK = threading.RLock()
 NODES = {}          # "hive/node" -> node record (see blank_node)
 TOKENS = {}         # token id -> {id, hive, sha256, created, state}
-DESIRED = {}        # "hive/node" -> command frame, until that node acks it
+DESIRED = {}        # slot(key, action) -> command frame, until that node acks it
 TICKETS = {}        # ticket id -> ticket
 ALERTS = {}         # "hive/node/cond" -> alert
 SNAPS = {}          # "hive/node/cam" -> {"jpeg": bytes, "ts": float}
@@ -324,14 +327,16 @@ def fleet():
       "ips": [...], "versions": {...}, "version_diverged": bool,
       "disks": [{"path", "free_gb", "total_gb", "hours_left": float|null}],
       "worst_hours": float|null, "write_gb_h": float|null,
-      "offload": {"enabled", "uploaded", "last_file", "last_error"},
+      "offload": {"enabled", "uploaded", "last_file", "last_error",
+                  "mirror": bool, "contribute": bool},   # the node's two switches
       "cameras": [{"name", "state", "until", "minutes", "restarts", "coverage_pct",
                    "gaps": [[start, end], ...], "snapshot_age": seconds|null,
                    "log": [...]}],                     # worst first
       "ticket": "0142"|null,    # a command this node has not acked in time
     }
 
-    ticket = {"id", "action", "scope", "cams", "hours", "issued", "state": active|done,
+    ticket = {"id", "action", "scope", "cams", "hours", "on": bool|null,
+              "issued", "state": active|done,
               "rows": {"hive/node": {"node", "hive", "state": waiting|acked|failed|
                                      offline|escalated, "lag": seconds|null,
                                      "error", "applied": [...]}}}
@@ -456,6 +461,17 @@ def sweeper():
 TERMINAL = ("acked", "failed", "superseded")   # row states that will never change again
 
 
+def slot(key, action):
+    """Which pending-frame slot a command occupies. start/stop share one — the newest
+    wins, as before — and each switch gets its own, so flipping mirror on an offline
+    node never discards its queued start. NAME bars "#" from a hive or node name."""
+    return f"{key}#{action}" if action in SWITCHES else key
+
+
+def _slots(key):
+    return [s for s in DESIRED if s == key or s.startswith(key + "#")]
+
+
 def send(key, frame):
     """Queue a frame for a connected node. False if it isn't connected."""
     c = CONNS.get(key)
@@ -475,11 +491,12 @@ def _finish(t):
         del TICKETS[old["id"]]
 
 
-def supersede(key, tid):
-    """A newer command for this node means the older one will never be acked — retire
+def supersede(key, tid, action):
+    """A newer command in the same slot means the older one will never be acked — retire
     that row instead of leaving it to escalate into an alert nobody can action."""
     for t in list(TICKETS.values()):        # _finish may delete from TICKETS
-        if t["state"] != "active" or t["id"] == tid:
+        if t["state"] != "active" or t["id"] == tid \
+                or slot(key, t["action"]) != slot(key, action):
             continue
         row = t["rows"].get(key)
         if row and row["state"] not in TERMINAL:
@@ -499,12 +516,13 @@ def escalate(ts):
                 ESCALATED[key] = t["id"]
     # Re-send from DESIRED, not the ticket frame: two overlapping commands to one node
     # must retry the newest, or a stale start can undo the stop that followed it.
-    for key, frame in DESIRED.items():
+    for s, frame in DESIRED.items():
+        key = s.split("#", 1)[0]
         if CONNS.get(key):
             send(key, frame)            # until acked; the node side is idempotent
 
 
-def issue(action, scope, cams, hours):
+def issue(action, scope, cams, hours, on=None):
     """Create a ticket, fan out to connected nodes, store desired state for the rest."""
     with LOCK:
         targets = [k for k, n in NODES.items()
@@ -517,32 +535,35 @@ def issue(action, scope, cams, hours):
         tid = f"{SEQ[0]:04d}"
         frame = {"type": "command", "cmd_id": tid, "action": action,
                  "cams": cams, "hours": hours}
+        if on is not None:
+            frame["on"] = on          # switches only: a start/stop frame is unchanged
         rows = {}
         for k in targets:
-            supersede(k, tid)           # this frame replaces whatever was pending
-            DESIRED[k] = frame          # cleared on ack, so a reconnect re-delivers it
+            supersede(k, tid, action)   # this frame replaces its own slot, nothing else
+            DESIRED[slot(k, action)] = frame   # cleared on ack: a reconnect re-delivers it
             n = NODES[k]
             rows[k] = {"hive": n["hive"], "node": n["node"], "lag": None,
                        "error": "", "applied": [],
                        "state": "waiting" if send(k, frame) else "offline"}
         _write_json("desired.json", DESIRED)
         t = TICKETS[tid] = {"id": tid, "action": action, "scope": scope, "cams": cams,
-                            "hours": hours, "issued": now(), "state": "active",
+                            "hours": hours, "on": on, "issued": now(), "state": "active",
                             "frame": frame, "rows": rows}
     audit("command", ticket=tid, action=action, scope=scope, cams=cams, hours=hours,
-          nodes=sorted(rows))
+          on=on, nodes=sorted(rows))
     publish()
     return t
 
 
 def deliver(key):
-    """Reconnect: re-send whatever this node never acked, and un-park its ticket row."""
-    frame = DESIRED.get(key)
-    if not frame or not send(key, frame):
-        return
-    row = (TICKETS.get(frame["cmd_id"]) or {"rows": {}})["rows"].get(key)
-    if row and row["state"] == "offline":
-        row["state"] = "waiting"
+    """Reconnect: re-send everything this node never acked, and un-park its ticket rows."""
+    for s in _slots(key):
+        frame = DESIRED[s]
+        if not send(key, frame):
+            return
+        row = (TICKETS.get(frame["cmd_id"]) or {"rows": {}})["rows"].get(key)
+        if row and row["state"] == "offline":
+            row["state"] = "waiting"
 
 
 def on_ack(key, msg):
@@ -555,10 +576,11 @@ def on_ack(key, msg):
         row["lag"] = round(now() - t["issued"], 2)
         row["error"] = msg.get("error") or ""
         row["applied"] = msg.get("applied") or []
-        # Only the ack for the CURRENT desired command clears it — an ack for a
-        # superseded ticket must not erase a newer, still-undelivered command.
-        if (DESIRED.get(key) or {}).get("cmd_id") == msg.get("cmd_id"):
-            DESIRED.pop(key, None)
+        # Only the ack for the CURRENT desired command in that slot clears it — an ack
+        # for a superseded ticket must not erase a newer, still-undelivered command.
+        s = slot(key, t["action"])
+        if (DESIRED.get(s) or {}).get("cmd_id") == msg.get("cmd_id"):
+            DESIRED.pop(s, None)
         _write_json("desired.json", DESIRED)
         ESCALATED.pop(key, None)
         _finish(t)
@@ -570,7 +592,8 @@ def on_ack(key, msg):
 def forget(key, purge_history):
     with LOCK:
         NODES.pop(key, None)
-        DESIRED.pop(key, None)
+        for s in _slots(key):
+            del DESIRED[s]
         ESCALATED.pop(key, None)
         _write_json("desired.json", DESIRED)
         for k in [k for k in SNAPS if k.startswith(key + "/")]:
@@ -773,8 +796,11 @@ def api_snapshot(hive: str, node: str, cam: str):
 @app.post("/api/command")
 def api_command(body: dict = Body(default={})):
     action = body.get("action")
-    if action not in ("start", "stop"):
-        raise HTTPException(400, "action must be 'start' or 'stop'")
+    if action not in ACTIONS:
+        raise HTTPException(400, "action must be one of " + ", ".join(ACTIONS))
+    on = body.get("on")
+    if action in SWITCHES and not isinstance(on, bool):
+        raise HTTPException(400, f"{action} needs on: true or on: false")
     hours = body.get("hours")
     if hours is not None:
         try:
@@ -789,7 +815,8 @@ def api_command(body: dict = Body(default={})):
     scope = body.get("scope") or {}
     if not isinstance(scope, dict):
         raise HTTPException(400, "scope must be an object with optional hive and node")
-    return issue(action, {k: scope[k] for k in ("hive", "node") if scope.get(k)}, cams, hours)
+    return issue(action, {k: scope[k] for k in ("hive", "node") if scope.get(k)}, cams,
+                 hours, on if action in SWITCHES else None)
 
 
 @app.get("/api/tickets")

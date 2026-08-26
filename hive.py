@@ -30,6 +30,7 @@ MAX_GAPS = 50            # oldest dropped first
 MAX_SNAPSHOT = 60_000    # bytes; a bigger still is skipped for this round
 MAX_BACKOFF = 60.0
 REVOKED_SLEEP = 3600     # a revoked node must not hammer the console
+SWITCHES = ("mirror", "contribute", "detect")   # node-wide on/off, from app.py CONTROLS
 
 
 def git_sha():
@@ -92,12 +93,16 @@ def enrolled(cfg):
 
 
 class Hive:
-    def __init__(self, cfg, rec, record_status, snapshot, ips, console_creds=None):
+    def __init__(self, cfg, rec, record_status, snapshot, ips, console_creds=None,
+                 controls=None):
         self.cfg = cfg                  # the live CONFIG dict: edits land without a reload
         # Console-pushed creds live in their own dict, shared with Offload — never in
         # cfg, which app.py writes back to config.yaml whenever a camera is edited.
         self.console_creds = {} if console_creds is None else console_creds
         self.rec = rec
+        # app.py's CONTROLS: {"mirror"|"contribute"|"detect": fn(bool)}. Absent means
+        # this build has no such switch — apply() then says so instead of crashing.
+        self.controls = controls or {}
         self.record_status = record_status
         self.snapshot = snapshot
         self.ips = ips
@@ -152,6 +157,12 @@ class Hive:
     def heartbeat(self, with_snapshots):
         o = self.opts()
         rec = self.record_status()
+        # offload.info() reports `mirror`; `contribute` is the sibling switch in the
+        # same config block and is not in that dict yet. setdefault, so the day
+        # offload.info() does report it — override included — the real value wins.
+        if isinstance(rec.get("offload"), dict):
+            rec["offload"].setdefault(
+                "contribute", bool((self.cfg.get("offload") or {}).get("contribute")))
         lines = [f"{n} {line}" for n, c in rec.get("cameras", {}).items()
                  for line in c.get("log", [])]
         self.seq += 1
@@ -168,25 +179,33 @@ class Hive:
     # --- commands ---
 
     def apply(self, cmd):
-        """Same recorder calls the local Record tab makes. Idempotent: the
-        console re-sends an unacked command when a node reconnects."""
+        """The same calls the local UI makes — recorder start/stop, plus the
+        node-wide switches in `controls`. Idempotent: the console re-sends an
+        unacked command when a node reconnects."""
         cmd_id, action = cmd.get("cmd_id", ""), cmd.get("action")
         cams = cmd.get("cams") or None
+        on = bool(cmd.get("on"))
         ack = {"type": "ack", "cmd_id": cmd_id, "ok": True, "applied": [], "error": ""}
         try:
             if action == "start":
                 self.rec.start(cams, hours=cmd.get("hours"))
             elif action == "stop":
                 self.rec.stop(cams)
+            elif action in SWITCHES:
+                if action not in self.controls:
+                    raise ValueError(f"this node has no {action} switch")
+                self.controls[action](on)
             else:
                 raise ValueError(f"unknown action {action!r}")
         except Exception as e:
             ack.update(ok=False, error=f"{type(e).__name__}: {e}")
             self.log.append(f"{time.strftime('%H:%M:%S')} ops {action} failed: {e}")
             return ack
-        # Names this node does not have are silently skipped by the recorder —
-        # the ack must report what actually moved, not what was asked for.
-        ack["applied"] = sorted(n for n in (cams or self.rec.cams) if n in self.rec.cams)
+        # The ack reports what actually moved, not what was asked for: names this node
+        # does not have are silently skipped by the recorder, and a switch is node-wide,
+        # so it names the state it moved to instead of a camera list.
+        ack["applied"] = (["on" if on else "off"] if action in SWITCHES else
+                          sorted(n for n in (cams or self.rec.cams) if n in self.rec.cams))
         self.log.append(f"{time.strftime('%H:%M:%S')} ops {action} "
                         f"{', '.join(ack['applied']) or '(none)'} [{cmd_id}]")
         print(f"hive: {action} from console: {ack['applied']}", flush=True)
@@ -390,6 +409,55 @@ if __name__ == "__main__":
     bad = ws.sent[3]
     assert bad["ok"] is False and "unknown action" in bad["error"], bad
 
+    # Node-wide switches. Without a controls dict — an old node, or a build compiled
+    # without the feature — the ack names what this node cannot do instead of crashing,
+    # and the recorder is never touched on the way past.
+    ws = FakeWS([{"type": "command", "cmd_id": "0145", "action": "mirror", "on": True}])
+    try:
+        h._session(ws)
+    except Done:
+        pass
+    nope = ws.sent[1]
+    assert nope["ok"] is False and "no mirror switch" in nope["error"], nope
+    assert rec.calls[-1] == ("stop", None), rec.calls
+
+    flipped = []
+    hs = Hive(CFG, rec, status, no_snapshot, list,
+              controls={"mirror": lambda on: flipped.append(("mirror", on)),
+                        "contribute": lambda on: flipped.append(("contribute", on))})
+    ws = FakeWS([{"type": "command", "cmd_id": "0146", "action": "mirror", "on": True},
+                 {"type": "command", "cmd_id": "0147", "action": "contribute", "on": False},
+                 {"type": "command", "cmd_id": "0148", "action": "detect", "on": True}])
+    try:
+        hs._session(ws)
+    except Done:
+        pass
+    assert flipped == [("mirror", True), ("contribute", False)], flipped
+    acks = [m for m in ws.sent if m["type"] == "ack"]
+    assert acks[0] == {"type": "ack", "cmd_id": "0146", "ok": True,
+                       "applied": ["on"], "error": ""}, acks[0]
+    assert acks[1]["applied"] == ["off"], acks[1]
+    # A switch this build lacks is a missing control, never "unknown action".
+    assert acks[2]["ok"] is False and "no detect switch" in acks[2]["error"], acks[2]
+    assert "mirror on" in hs.log[0] and hs.log[0].endswith("[0146]"), list(hs.log)
+
+    # Both switch states must reach the console on the beat. `mirror` already rides in
+    # the record status; `contribute` is filled in from config — but never invented on a
+    # node that reports no offload block at all, and never over a real reported value.
+    def off_status():
+        return dict(status(), offload={"enabled": True, "mirror": True})
+
+    beat = Hive(dict(CFG, offload={"contribute": True}), rec, off_status, no_snapshot,
+                list).heartbeat(False)
+    assert beat["record"]["offload"] == {"enabled": True, "mirror": True,
+                                         "contribute": True}, beat["record"]["offload"]
+    assert "offload" not in Hive(CFG, rec, status, no_snapshot,
+                                 list).heartbeat(False)["record"], "invented an offload block"
+    beat = Hive(dict(CFG, offload={"contribute": True}), rec,
+                lambda: dict(status(), offload={"contribute": False}),
+                no_snapshot, list).heartbeat(False)
+    assert beat["record"]["offload"]["contribute"] is False, beat["record"]["offload"]
+
     # Console-pushed creds land in the overlay, never in CONFIG, and are never acked.
     CFG["offload"] = {"enabled": True, "bucket": "operator-bucket"}   # from config.yaml
     overlay = {}
@@ -438,5 +506,5 @@ if __name__ == "__main__":
     assert h.state == "REVOKED" and len(ws.sent) == 1, (h.state, ws.sent)
     assert h.info()["configured"] and h.info()["last_beat"] > 0, h.info()
 
-    print("hive self-check ok: coverage arithmetic, command dispatch, offload creds, "
-          "off without config")
+    print("hive self-check ok: coverage arithmetic, command dispatch, node switches, "
+          "offload creds, off without config")

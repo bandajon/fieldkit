@@ -2,7 +2,7 @@
 import { state, connect, clock } from './store.js';
 import { nav, rollup, paintThumbs, thumbTick, paintLive, bust } from './render.js';
 import { fleetView, expanded, folds } from './fleet.js';
-import { hiveView, cameraView, crumb } from './hive.js';
+import { hiveView, cameraView, crumb, switchClick } from './hive.js';
 import { confirm, tray, dismiss, reopen } from './actions.js';
 import { alertsView, auditView, enrollView, enrollClick, logTail } from './pages.js';
 
@@ -61,6 +61,7 @@ document.addEventListener('click', e => {
     const [hive, node] = (d.stop || d.startnode).split('/');
     return confirm(d.stop ? 'stop' : 'start', { hive, node }, d.cam ? [d.cam] : null);
   }
+  if (d && d.switch) return switchClick(b, draw);
   if (d && d.log) return logTail(...d.log.split('/'));
   if (d && d.dismiss) { dismiss(d.dismiss); return draw(); }
   if (d && d.tickets !== undefined) { reopen(); return draw(); }

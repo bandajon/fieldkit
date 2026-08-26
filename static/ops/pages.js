@@ -107,7 +107,7 @@ function showToken(r, note) {
 }
 
 /** Yes/no on the design system rather than window.confirm, because the copy matters. */
-function ask(title, body, danger) {
+export function ask(title, body, danger) {
   return new Promise(res => {
     const d = modal(`<div class="dialog"><h4 class="dialog-title ${danger ? 'bad' : ''}">${
       esc(title)}</h4><div class="dialog-body"><p class="say">${body}</p></div>

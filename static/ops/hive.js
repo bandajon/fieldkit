@@ -1,11 +1,59 @@
 // Hive drill-down — the same nodes, one tier closer: full camera cards.
 import {
   esc, dot, dur, frame, stub, drives, offload, coverage, thumb, timers, link, hhmm, hm,
-  liveUrl, cached,
+  liveUrl, cached, modal, post,
 } from './render.js';
+import { ask } from './pages.js';
 
 export const crumb = (hive, rest = '') =>
   `<span class="band-crumb"><a href="/" data-link>FLEET</a> › <b>${esc(hive.toUpperCase())}</b>${rest}</span>`;
+
+// The two node-wide switches, in the console's existing chip idiom — lit is on. Each
+// label carries what the switch COSTS, not just what it does: that is the decision an
+// operator is actually making, and they make it from a phone without a price list.
+const SWITCH = {
+  mirror: ['UPLOAD RECORDINGS (HEAVY)', 'roughly 45 GB per camera per day, on a metered link'],
+  contribute: ['CONTRIBUTE FRAMES (LIGHT)', 'under 90 MB per day for the whole site'],
+};
+
+const UPLOAD_COST = 'Every finished segment is copied to the cloud as it closes — roughly '
+  + '<b>45 GB per camera per day</b> on a metered link. Contributing training frames is '
+  + 'under 90 MB a day for a whole site; this is not that.';
+
+/** Only a switch the node actually reported renders — a state we do not know is not
+ *  drawn as OFF. Offline nodes keep theirs: the command waits and lands on reconnect. */
+function switches(n) {
+  const o = n.offload || {};
+  const chips = Object.entries(SWITCH)
+    .filter(([k]) => typeof o[k] === 'boolean')
+    .map(([k, [label, cost]]) => `<button data-switch="${esc(n.key)}" data-what="${k}"
+      data-on="${o[k]}" class="${o[k] ? 'on' : ''}" title="${esc(cost)}">${label} · ${
+      o[k] ? 'ON' : 'OFF'}</button>`).join('');
+  return chips ? `<span class="chips">${chips}</span>` : '';
+}
+
+/** Only the expensive direction asks: turning uploads ON spends real money on someone
+ *  else's metered link. Turning them off, or contributing frames, gets no ceremony. */
+export const needsConfirm = (what, on) => what === 'mirror' && on;
+
+/**
+ * Flip one switch. The chip does not move until the node's next heartbeat says it did —
+ * the ticket tray carries the pending command, exactly as it does for start/stop.
+ */
+export async function switchClick(t, redraw) {
+  const [hive, node] = t.dataset.switch.split('/');
+  const on = t.dataset.on !== 'true';
+  if (needsConfirm(t.dataset.what, on) && !await ask('Turn on uploads', UPLOAD_COST, true))
+    return;
+  try {
+    await post('/api/command', { action: t.dataset.what, scope: { hive, node }, on });
+  } catch (e) {
+    modal(`<div class="dialog"><h4 class="dialog-title bad">FAILED</h4>
+      <div class="dialog-body"><p class="say">${esc(e.message || e)}</p></div>
+      <div class="dialog-actions"><button class="btn btn-ghost" data-close>Close</button></div></div>`);
+  }
+  redraw(true);
+}
 
 function card(n, cam, now) {
   const t = cam.until
@@ -30,7 +78,8 @@ function node(n, now) {
     <span class="stack">${drives(n)}</span>
     <span class="stack">${offload(n)}</span>
     <span class="stack">${link(n, now)}</span>
-    <span class="hd-act"><button class="btn btn-ghost" data-log="${esc(n.key)}">Log tail</button>
+    <span class="hd-act">${switches(n)}
+      <button class="btn btn-ghost" data-log="${esc(n.key)}">Log tail</button>
       <button class="btn btn-ghost" data-startnode="${esc(n.key)}">Start node</button>
       <button class="btn btn-ghost btn-danger" data-stop="${esc(n.key)}">Stop node</button></span>
   </div>`;

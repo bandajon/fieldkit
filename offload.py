@@ -2,6 +2,14 @@
 """Optional Cloudflare R2 offload: upload the oldest finished segments, then delete them.
 
 Idle unless config.yaml sets offload.enabled — a self-hosting node never talks to a cloud.
+
+offload.recycle picks which footage a full drive loses. Off (the default), a segment is
+only ever deleted after a verified upload, so a drive that fills with nowhere to send its
+footage stops recording — loudly, on purpose. On, the oldest finished segments are deleted
+unsent once the drive is below min_free_gb, and recording never stops: the node becomes a
+ring buffer. That is the whole trade — lose the oldest footage, or lose the newest. A site
+on a metered link cannot afford to ship ~317 MB per camera every ten minutes, so it
+chooses to lose the oldest, deliberately.
 """
 
 import base64
@@ -20,6 +28,9 @@ FINISHED = SEGMENT_SECONDS + 60
 SWEEP_SECONDS = 60
 CRED_KEYS = ("account_id", "access_key_id", "secret_access_key")
 AWAITING = "offload enabled — awaiting credentials from console"
+# What a node contributes to the shared labelling queue: what detect.py captured, and
+# nothing else. dataset_sync's default prefix is where the curation node already looks.
+SAMPLES = ("pending/images", "pending/labels", "pending/attrs")
 
 
 def marker(f):
@@ -50,6 +61,8 @@ class Offload:
         self.last_file = ""
         self.last_error = ""
         self.mirror_override = None   # None: config.yaml decides. Set from the Record tab.
+        self.contributed = 0
+        self.contribute_override = None
 
     def set_mirror(self, on):
         """Runtime toggle. None hands the decision back to config.yaml."""
@@ -57,6 +70,20 @@ class Offload:
 
     def mirroring(self, o):
         return self.mirror_override if self.mirror_override is not None else bool(o.get("mirror"))
+
+    def set_contribute(self, on):
+        """Runtime toggle. None hands the decision back to config.yaml."""
+        self.contribute_override = None if on is None else bool(on)
+
+    def contributing(self, o):
+        return (self.contribute_override if self.contribute_override is not None
+                else bool(o.get("contribute")))
+
+    def pending_samples(self):
+        """Captured and not yet handed over — one label file per sample. Cheap enough
+        for a status poll: detect.py caps what lives in pending."""
+        import dataset_sync
+        return len(list((dataset_sync.DATASET / "pending" / "labels").glob("*.txt")))
 
     def opts(self):
         """Console creds under config.yaml: the operator wins every field they set.
@@ -76,6 +103,8 @@ class Offload:
         missing = [k for k in CRED_KEYS if not o.get(k)]
         if not (o.get("enabled") and missing):
             return ""
+        if o.get("recycle") and not (self.mirroring(o) or self.contributing(o)):
+            return ""     # sends nothing by design: not misconfigured, not waiting
         return (AWAITING if enrolled(self.cfg)
                 else "offload enabled but config is missing: " + ", ".join(missing))
 
@@ -84,6 +113,10 @@ class Offload:
         return {"enabled": bool(o.get("enabled")), "uploaded": self.uploaded,
                 "mirror": self.mirroring(o), "override": self.mirror_override,
                 "mirrored": len(list(self.rec_root.glob("*/*/*.mkv.uploaded"))),
+                "recycle": bool(o.get("recycle")),
+                "contribute": self.contributing(o),
+                "contribute_override": self.contribute_override,
+                "contributed": self.contributed, "pending_samples": self.pending_samples(),
                 "last_file": self.last_file, "last_error": self.last_error,
                 "status": self.cred_status(o)}
 
@@ -151,22 +184,47 @@ class Offload:
         print(f"offload: uploaded {key}", flush=True)
         return True
 
+    def _contribute(self, client, bucket):
+        """Hand this node's captured samples to the shared curation prefix. Every failure
+        is swallowed: the samples stay on disk and the next sweep tries again."""
+        try:
+            import dataset_sync
+            sent, _ = dataset_sync.push(client, bucket, names=SAMPLES,
+                                        root=dataset_sync.DATASET)
+        except Exception as e:
+            self.last_error = f"contribute: {e}"
+            print(f"offload: {self.last_error}", flush=True)
+            return
+        self.contributed += sent
+
     def sweep(self):
-        """One pass: mirror everything unsent (if mirroring), then upload oldest-first
-        until the drive is back above the floor."""
+        """One pass: mirror everything unsent (if mirroring), upload oldest-first until
+        the drive is back above the floor, then contribute what the cameras captured."""
         o = self.opts()
         if not o.get("enabled"):
             return
         floor = float(o.get("min_free_gb", 20))
-        mirror = self.mirroring(o)
+        mirror, contribute = self.mirroring(o), self.contributing(o)
+        recycle = bool(o.get("recycle"))
         below = self.free_gb() < floor
-        if not (mirror or below):
+        if not (mirror or contribute or below):
             return
-        client = self._get_client(o)
-        if client is None:
+        # A recycling node may have no bucket at all — only mirror, contribute and the
+        # upload-to-free-space pass need a client, and the ring buffer must turn either way.
+        client = self._get_client(o) if (mirror or contribute or not recycle) else None
+        if client is None and not recycle:
             return
         bucket = o.get("bucket") or "fieldkit-recordings"
-        if mirror:
+        self._recordings(client, bucket, floor, mirror, below, recycle)
+        # Deliberately independent of the footage passes above: a segment upload that
+        # failed must not keep samples off the labelling queue, or the other way round.
+        # pending_samples() first so an idle node never lists the bucket to send nothing.
+        if contribute and self.pending_samples():
+            self._contribute(client, bucket)
+
+    def _recordings(self, client, bucket, floor, mirror, below, recycle=False):
+        """The footage passes. Every early return means "keep it local, retry next sweep"."""
+        if mirror and client is not None:
             for f in self.finished():
                 if marker(f).exists():
                     continue
@@ -181,6 +239,9 @@ class Offload:
                 marker(f).unlink()            # marker first: a crash here re-uploads, never orphans
                 f.unlink()
                 print(f"offload: freed {'/'.join(f.parts[-3:])} (mirrored)", flush=True)
+            elif recycle:                     # the ring buffer: gone, and never sent
+                f.unlink()
+                print(f"offload: recycled {'/'.join(f.parts[-3:])} (not uploaded)", flush=True)
             elif self._put(client, bucket, f):
                 f.unlink()
             else:
@@ -194,9 +255,10 @@ if __name__ == "__main__":
     import tempfile
 
     class FakeClient:
-        """Records puts and checks the checksum the way R2 does."""
+        """Records puts and checks the checksum the way R2 does. The list/upload_file
+        half is what dataset_sync.push drives."""
         def __init__(self, fail=False):
-            self.puts, self.fail = [], fail
+            self.puts, self.fail, self.objects = [], fail, {}
 
         def put_object(self, **kw):
             if self.fail:
@@ -205,6 +267,19 @@ if __name__ == "__main__":
             assert kw["ChecksumSHA256"] == base64.b64encode(
                 hashlib.sha256(body).digest()).decode(), "checksum did not match the body"
             self.puts.append(kw["Key"])
+
+        def get_paginator(self, _op):
+            return self
+
+        def paginate(self, Bucket, Prefix):
+            yield {"Contents": [{"Key": k, "Size": s} for k, s in self.objects.items()
+                                if k.startswith(Prefix)]}
+
+        def upload_file(self, path, Bucket, Key):
+            if self.fail:
+                raise RuntimeError("boom")
+            self.objects[Key] = Path(path).stat().st_size
+            self.puts.append(Key)
 
     def tree():
         """Two closed segments (older one first) plus the one ffmpeg is still writing."""
@@ -356,5 +431,121 @@ if __name__ == "__main__":
     lone.sweep()
     assert "missing" in lone.last_error, lone.last_error
 
+    # ---- contribute: the node hands its own captured samples to the labelling queue.
+    import dataset_sync
+    samples = Path(tempfile.mkdtemp())
+    (samples / "pending" / "images").mkdir(parents=True)
+    (samples / "pending" / "labels").mkdir(parents=True)
+    (samples / "pending" / "images" / "s1.jpg").write_bytes(b"jpeg")
+    (samples / "pending" / "labels" / "s1.txt").write_text("0 0.5 0.5 0.1 0.1\n")
+    (samples / "approved").mkdir()                    # not ours to send: curation owns it
+    (samples / "approved" / "old.jpg").write_bytes(b"x")
+    dataset_sync.DATASET = samples                    # where detect.py drops them
+
+    # Off (the default): a healthy disk with samples waiting still sends nothing.
+    root, d = tree()
+    c = Offload(CFG, root)
+    c.client, c.client_creds, c.free_gb = FakeClient(), TRIPLE, lambda: 99.0
+    c.sweep()
+    assert c.client.puts == [] and c.info()["contribute"] is False, c.info()
+    assert c.info()["pending_samples"] == 1, c.info()
+
+    # On: samples go to the curation prefix, footage does not, and the count is cumulative.
+    c.set_contribute(True)
+    c.sweep()
+    # sorted: contribution runs on a thread pool, so arrival order is not a fact
+    assert sorted(c.client.puts) == ["curation/pending/images/s1.jpg",
+                                     "curation/pending/labels/s1.txt"], c.client.puts
+    assert c.info()["contributed"] == 2 and c.info()["contribute_override"] is True, c.info()
+    assert (samples / "pending" / "images" / "s1.jpg").exists(), "contribute deleted a sample"
+
+    c.sweep()                                   # already in the bucket: nothing re-sent
+    assert c.info()["contributed"] == 2, c.info()
+    (samples / "pending" / "images" / "s2.jpg").write_bytes(b"jpeg2")
+    (samples / "pending" / "labels" / "s2.txt").write_text("1 0.5 0.5 0.2 0.2\n")
+    c.sweep()                                   # only the new sample moves
+    assert sorted(c.client.puts[-2:]) == ["curation/pending/images/s2.jpg",
+                                          "curation/pending/labels/s2.txt"], c.client.puts
+    assert c.info()["contributed"] == 4, c.info()
+
+    # config.yaml decides when the operator has not: contribute: true needs no console.
+    c.set_contribute(None)
+    assert c.info()["contribute"] is False and c.info()["contribute_override"] is None, c.info()
+    assert Offload({"offload": dict(CFG["offload"], contribute=True)},
+                   root).info()["contribute"] is True, "config key ignored"
+
+    # A push that blows up keeps every sample and leaves the sweep alive to retry.
+    bad = Offload({"offload": dict(CFG["offload"], contribute=True)}, root)
+    bad.client, bad.client_creds, bad.free_gb = FakeClient(fail=True), TRIPLE, lambda: 99.0
+    bad.sweep()                                 # must not raise
+    assert bad.info()["contributed"] == 0 and "boom" in bad.last_error, bad.info()
+    assert (samples / "pending" / "labels" / "s1.txt").exists(), "a failed push deleted a sample"
+    assert bad.info()["pending_samples"] == 2, bad.info()
+
+    # An empty pending pile never lists the bucket at all.
+    for f in (samples / "pending").rglob("*.jpg"):
+        f.unlink()
+    for f in (samples / "pending" / "labels").glob("*.txt"):
+        f.unlink()
+    quiet = Offload({"offload": dict(CFG["offload"], contribute=True)}, root)
+    quiet.client, quiet.client_creds, quiet.free_gb = FakeClient(), TRIPLE, lambda: 99.0
+    quiet.sweep()
+    assert quiet.client.puts == [] and quiet.info()["pending_samples"] == 0, quiet.info()
+
+    # ---- recycle: on a metered link the drive is a ring buffer, not an upload queue.
+    RECYCLE = {"offload": dict(CFG["offload"], recycle=True)}
+
+    # On: below the floor the oldest goes, unsent, and the newest stays.
+    root, d = tree()
+    r = Offload(RECYCLE, root)
+    seq = [0.0, 99.0]                            # empty at entry, healthy after one delete
+    r.client, r.client_creds = FakeClient(), TRIPLE
+    r.free_gb = lambda: seq.pop(0) if seq else 99.0
+    r.sweep()
+    assert r.client.puts == [], "recycle uploaded a segment"
+    assert not (d / "seg-a.mkv").exists(), "the oldest survived a full drive"
+    assert (d / "seg-b.mkv").exists(), "recycled past the floor"
+    assert (d / "seg-live.mkv").exists(), "deleted a segment ffmpeg is still writing"
+    assert r.uploaded == 0 and r.info()["recycle"] is True, r.info()
+
+    # Off (the default): a full drive with a dead link keeps every frame and says why.
+    root, d = tree()
+    n = Offload(CFG, root)
+    n.client, n.client_creds, n.free_gb = FakeClient(fail=True), TRIPLE, lambda: 0.0
+    n.sweep()
+    assert sorted(f.name for f in d.glob("*.mkv")) == ["seg-a.mkv", "seg-b.mkv", "seg-live.mkv"]
+    assert n.info()["recycle"] is False and "boom" in n.last_error, n.info()
+
+    # Either way a mirrored segment is reclaimed the same: marker first, never re-uploaded.
+    for cfg in (MIRROR, {"offload": dict(MIRROR["offload"], recycle=True)}):
+        root, d = tree()
+        m = Offload(cfg, root)
+        seq = [99.0, 0.0, 99.0]                  # entry, after the mirror pass, after a delete
+        m.client, m.client_creds = FakeClient(), TRIPLE
+        m.free_gb = lambda: seq.pop(0) if seq else 99.0
+        m.sweep()
+        assert m.client.puts == ["site1/cam1/seg-a.mkv", "site1/cam1/seg-b.mkv"], m.client.puts
+        assert not (d / "seg-a.mkv").exists() and not (d / "seg-a.mkv.uploaded").exists()
+        assert (d / "seg-b.mkv").exists() and (d / "seg-b.mkv.uploaded").exists()
+
+    # No credentials at all is a valid recycling node — the ring buffer still has to turn,
+    # and nothing is waiting on the console, so the Status tab stays quiet.
+    root, d = tree()
+    lte = Offload({"offload": {"enabled": True, "min_free_gb": 10, "recycle": True}}, root)
+    seq = [0.0, 99.0]
+    lte.free_gb = lambda: seq.pop(0) if seq else 99.0
+    lte.sweep()
+    assert not (d / "seg-a.mkv").exists(), "no creds, no recycling, disk fills forever"
+    assert (d / "seg-b.mkv").exists() and not lte.info()["status"], lte.info()
+    # Mirroring one is a different thing: it IS waiting on creds, and it must still recycle.
+    both = Offload({"offload": {"enabled": True, "min_free_gb": 10, "recycle": True,
+                                "mirror": True}}, root)
+    seq2 = [0.0, 99.0]
+    both.free_gb = lambda: seq2.pop(0) if seq2 else 99.0
+    both.sweep()
+    assert "missing" in both.info()["status"], both.info()
+    assert not (d / "seg-b.mkv").exists(), "a mirroring node stopped recycling"
+
     print("offload self-check ok: oldest-first, verified, mirrors without deleting, "
-          "deletes only after upload")
+          "deletes only after upload, contributes samples without losing one, "
+          "recycles the oldest instead of shipping it")

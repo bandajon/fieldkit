@@ -241,6 +241,12 @@
         <label class="res"><input type="checkbox" id="mirror"> back up recordings to cloud</label>
         <span id="mirrornote" class="res"></span>
       </div>
+      <div class="acts">
+        <label class="res"><input type="checkbox" id="contrib"> contribute training images to the shared dataset</label>
+        <span id="contribnote" class="res"></span>
+      </div>
+      <div class="res">Captured frames are uploaded for the labelling team; recordings are unaffected either way.</div>
+      <div id="contribstats" class="res"></div>
       <textarea id="cfgtext" spellcheck="false"></textarea>
       <div class="rowbtns">
         <button class="btn" id="cfgsave">Save config</button>
@@ -459,6 +465,13 @@ async function recPoll() {
   mir.checked = !!o.mirror;
   document.getElementById('mirrornote').textContent =
     mir.disabled ? 'cloud backup needs offload credentials in config.yaml' : '';
+  const con = document.getElementById('contrib');
+  con.disabled = mir.disabled;               // same credentials gate the uploads
+  con.checked = !!o.contribute;
+  document.getElementById('contribnote').textContent =
+    con.disabled ? 'contributing needs offload credentials in config.yaml' : '';
+  document.getElementById('contribstats').textContent =
+    `${o.contributed || 0} uploaded \u00b7 ${o.pending_samples || 0} waiting`;
   const cams = Object.entries(s.cameras);
   setCount('record', cams.length, 'configured');
   document.getElementById('reclist').innerHTML = cams.length === 0
@@ -484,6 +497,10 @@ async function recPoll() {
 }
 document.getElementById('mirror').onchange = async e => {
   await post('/api/offload/mirror', {on: e.target.checked});
+  recPoll();
+};
+document.getElementById('contrib').onchange = async e => {
+  await post('/api/offload/contribute', {on: e.target.checked});
   recPoll();
 };
 
