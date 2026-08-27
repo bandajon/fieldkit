@@ -125,6 +125,12 @@ def promote_attrs(candidate, champion):
         and candidate["mean_acc"] > champion["mean_acc"]
 
 
+def local_path(key):
+    """Where a bucket segment lands while it is being sampled: the same <site>/<cam>/
+    <segment> shape as the bucket, because the camera's name is read off the path."""
+    return VIDEOS / key
+
+
 def gate_of(prefix):
     """The RDA gate id for a bucket prefix. The importer resolves events by gate, so a
     prefix with no mapping is passed through — a gate already named for itself is right,
@@ -260,21 +266,33 @@ def ingest_pass():
         cfg = ingest_video.config()
         if CHAMPION.is_file():
             cfg["detect_weights"] = str(CHAMPION)   # the loop's own model pre-labels
-        VIDEOS.mkdir(parents=True, exist_ok=True)
         files = []
         for key in todo:
-            dest = VIDEOS / key.replace("/", "__")
+            # Mirror the bucket's <site>/<cam>/<segment> on disk: the sampler names the
+            # camera after the parent directory, exactly as it does for a recorder's own
+            # tree. One flat folder had every camera sampling as "loop-videos" — one shared
+            # dedup clock, and stems that could collide across cameras.
+            dest = local_path(key)
+            dest.parent.mkdir(parents=True, exist_ok=True)
             print(f"  v {key}", flush=True)
             cl.download_file(bucket, key, str(dest))
             files.append(dest)
+        stems, written = [], 0
         try:
-            sink = ingest_video.ingest(files, cfg)
+            # One sampling run per gate: the sink stamps every stem with the gate id.
+            by_gate = {}
+            for f in files:
+                by_gate.setdefault(gate_of(f.relative_to(VIDEOS).parts[0]), []).append(f)
+            for gate, fs in by_gate.items():
+                sink = ingest_video.ingest(fs, {**cfg, "toll_gate_id": gate})
+                stems += sink.stems
+                written += sum(sink.written.values())
         finally:
             shutil.rmtree(VIDEOS, ignore_errors=True)  # sampled: the footage stays in the bucket
         if ATTRS_CHAMPION.is_file():
-            suggest(sink.stems)      # pushed with the samples: PENDING covers pending/suggest
+            suggest(stems)           # pushed with the samples: PENDING covers pending/suggest
         s["ingested"] = (s["ingested"] + todo)[-REMEMBER:]
-        s["last_ingest"] = {"at": now(), "segments": len(todo), "samples": sum(sink.written.values())}
+        s["last_ingest"] = {"at": now(), "segments": len(todo), "samples": written}
         save_state(s)
         sent, _ = ds.push(cl, bucket, names=PENDING)
         print(f"{now()} ingest: {s['last_ingest']['samples']} samples written, {sent} files pushed", flush=True)
@@ -338,7 +356,8 @@ def classify_pass():
                        {"name": cam_name})
             # The recorder's own filename is the footage clock: keep it, or cam_and_start
             # falls back to mtime and every event is stamped with the download.
-            video, out = VIDEOS / seg, Path(tempfile.mkdtemp())
+            video, out = local_path(key), Path(tempfile.mkdtemp())
+            video.parent.mkdir(parents=True, exist_ok=True)
             try:
                 print(f"  v {key}", flush=True)
                 cl.download_file(bucket, key, str(video))
@@ -617,6 +636,8 @@ def selfcheck():
     assert promote_attrs({"mean_acc": 0.88}, {"mean_acc": 0.87})
     assert not promote_attrs({"mean_acc": 0.87}, {"mean_acc": 0.87}), "a tie is not an improvement"
     assert not promote_attrs(None, {"mean_acc": 0.87}), "no report, no promotion"
+    assert local_path("site1/cam3/20260827-100000.mkv").parent.name == "cam3", \
+        "the camera must be the parent directory, or every camera samples as one"
     assert gate_of("site1") == "RDA-TG-KTB", "the Katuba box still calls itself site1"
     assert gate_of("RDA-TG-KTB") == "RDA-TG-KTB", "a gate already named for itself"
     # Newest segment first, across cameras, so the portal gets current traffic first.
