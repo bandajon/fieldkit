@@ -543,3 +543,10 @@ frames; every model is scored on them, and the score lands in
 with the next. The file is synced through the bucket as config, so every training
 machine holds the same list; the frames stay in `approved/` and still serve as
 examples on the Label tab. `train_attrs.py` follows the same rule.
+
+## The self-improving loop
+
+`selfloop.py` on the always-on training machine samples frames from mirrored
+recordings for curation, trains once 1,000 new curated frames have accumulated,
+scores each run on the reference set, and promotes a run to champion only when it
+beats the last one. See `docs/SELF_LOOP.md`.
