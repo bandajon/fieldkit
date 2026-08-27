@@ -74,8 +74,36 @@ MATCH_BOX = 0.5           # looser pairing for two independent labellings of one
 MIN_SCORES = 3            # under this many scores, report no accuracy rather than a number
 GOLD_TOKENS = {}          # disguised id -> gold id; refilled from gold-served.jsonl after a restart
 CLAIM_TTL = 1800.0        # a slice someone walked away from frees itself after this
-CLAIMS = {}               # sample id -> (who, expiry); in memory only — a restart frees every slice
+CLAIMS = {}               # sample id -> (who, expiry as wall-clock); mirrored to claims.json
 CLAIMS_LOCK = threading.Lock()
+
+
+def claims_path():
+    return DATASET / "claims.json"
+
+
+def load_claims():
+    """Claims outlive the process. A redeploy mid-shift used to forget every slice, and the
+    first curator to reload was handed the newest hundred frames — the very ones a
+    colleague still had open — so both labelled them and the slower submit bounced."""
+    try:
+        raw = json.loads(claims_path().read_text())
+    except (OSError, ValueError):
+        return {}
+    now = time.time()
+    return {sid: (who, exp) for sid, (who, exp) in raw.items() if exp > now}
+
+
+def save_claims():
+    """Caller holds CLAIMS_LOCK. The file is only the restart safety net: if it cannot be
+    written the in-memory claims still keep this process's curators apart."""
+    try:
+        claims_path().write_text(json.dumps(CLAIMS))
+    except OSError as e:
+        print(f"claims: not persisted ({e})", flush=True)
+
+
+CLAIMS.update(load_claims())
 AXLE_GROUPS = re.compile(r"^\d+(\+\d+)+$")                 # 1+2+3 -> steer, drive, trailer axles
 # Attribute heads (spec: toll-taxonomy-attributes). Operator-editable in
 # dataset/attributes.yaml — append-only per head, ids positional like classes.txt.
@@ -786,18 +814,22 @@ def valid_who(who):
 
 def purge_claims():
     """Drop expired claims. -> {sample id: who} still held."""
-    now = time.monotonic()
+    now = time.time()
     with CLAIMS_LOCK:
-        for sid in [s for s, (_, exp) in CLAIMS.items() if exp <= now]:
+        expired = [s for s, (_, exp) in CLAIMS.items() if exp <= now]
+        for sid in expired:
             del CLAIMS[sid]
+        if expired:
+            save_claims()
         return {sid: w for sid, (w, _) in CLAIMS.items()}
 
 
 def hold(ids, who):
     """Claim this slice for `who` (refreshing the TTL). -> how many they now hold."""
-    exp = time.monotonic() + CLAIM_TTL
+    exp = time.time() + CLAIM_TTL
     with CLAIMS_LOCK:
         CLAIMS.update({sid: (who, exp) for sid in ids})
+        save_claims()
         return sum(1 for w, _ in CLAIMS.values() if w == who)
 
 
@@ -965,6 +997,7 @@ def gold_label(token, who, action, body):
                                  "action": action})
     with CLAIMS_LOCK:
         CLAIMS.pop(token, None)
+        save_claims()
     return {"ok": True}
 
 
@@ -972,6 +1005,7 @@ def finish(who, sid, action, payload, extra=None):
     audit(who, sid, action, extra)
     with CLAIMS_LOCK:
         CLAIMS.pop(sid, None)     # decided: back into everyone's pool
+        save_claims()
     return payload
 
 
@@ -1921,6 +1955,27 @@ def config_add_camera(body: dict = Body(default={})):
     CONFIG_PATH.write_text(yaml.safe_dump(CONFIG, sort_keys=False))
     apply_cameras()
     return {"ok": True, "added": True, "name": name}
+
+
+@app.get("/api/config/site")
+def config_site():
+    return {"site": CONFIG.get("site", "site1")}
+
+
+@app.post("/api/config/site")
+def config_site_set(body: dict = Body(default={})):
+    """Name the site from the phone. The name is a directory and a storage prefix, so the
+    camera-name rule applies; and it cannot change under a running recorder, which was
+    handed its output path when it started and would carry on writing to the old one."""
+    name = (body.get("site") or "").strip()
+    if not CAM_NAME.match(name):
+        raise HTTPException(400, "site must be 1-32 chars of letters, digits, - or _")
+    if any(s.get("desired") for s in REC.st.values()):
+        raise HTTPException(400, "a camera is recording — stop it first")
+    CONFIG["site"] = REC.site = name
+    CONFIG_PATH.write_text(yaml.safe_dump(CONFIG, sort_keys=False))
+    # Segments already on disk stay under the old folder — only new ones land here.
+    return {"ok": True, "site": name}
 
 
 @app.post("/api/config/rename_camera")

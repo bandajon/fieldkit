@@ -210,6 +210,7 @@
 <main>
   <section id="cameras" class="on">
     <h2 id="cnt-cameras"></h2>
+    <div class="res" id="site-line"></div>
     <div class="rowbtns"><button class="btn go" id="scan">Scan LAN</button></div>
     <div id="scaninfo" class="res"></div>
     <div id="preview" hidden>
@@ -541,6 +542,26 @@ const loadConfigured = async () => {
   try { configured = await (await fetch('/api/cameras')).json(); } catch (e) {}
 };
 loadConfigured();
+
+// The site names the folder every recording lands in and the prefix it is uploaded
+// under, so it is the first thing to set on a new box — and "site1" is the example
+// file talking, not a choice anyone made.
+async function siteShow() {
+  let s = {};
+  try { s = await (await fetch('/api/config/site')).json(); } catch (e) { return; }
+  const el = document.getElementById('site-line');
+  el.innerHTML = `Site: <b>${esc(s.site || '?')}</b> ` +
+    `<button class="btn quiet" id="site-ren">Rename</button>` +
+    (s.site === 'site1' ? ' <i>— the example name: give this box its real one</i>' : '');
+  document.getElementById('site-ren').onclick = async () => {
+    const nn = (prompt(`Rename site ${s.site} to:\n(recordings already on disk keep the old folder name)`, s.site) || '').trim();
+    if (!nn || nn === s.site) return;
+    const r = await post('/api/config/site', {site: nn});
+    if (!r.ok) return alert(r.detail || 'rename failed');
+    siteShow();
+  };
+}
+siteShow();
 const nextCamName = () => {
   const used = new Set(configured.map(c => c.name));
   for (let n = 1; ; n++) if (!used.has('cam' + n)) return 'cam' + n;
@@ -594,7 +615,7 @@ function renderDevs() {
           <button class="btn" data-act="preview">Preview</button>
           <button class="btn" data-act="rtsp">Test RTSP</button>
           <button class="btn" data-act="synctime">Sync time</button>
-          <input data-role="camname" placeholder="name (e.g. gate)">
+          <input data-role="camname" placeholder="camera name (e.g. north-gate)">
           ${configured.some(c => c.ip === d.ip) ? ''
             : '<button class="btn" data-act="add">Add to config</button>'}
         </div>
@@ -1359,8 +1380,18 @@ async function labSend(action) {
   const {boxes, attrs} = labPayload(labBoxes);
   try {
     const r = await post('/api/dataset/label', {id: s.id, action, boxes, attrs, who: labWho});
-    if (!r.ok) throw new Error('rejected');
+    if (!r.ok) throw new Error(r.detail || 'rejected');
   } catch (e) {
+    // Finished by someone else while it was open here (a synced approval, or a slice
+    // handed out twice across a restart): there is nothing left to save, so say so and
+    // move on rather than offer a retry that can never succeed.
+    if (/no pending sample/.test(String(e.message))) {
+      labNote('Already curated by someone else — skipped.');
+      if (labOne()) return labLoad();
+      labQueue.shift();
+      labTotal = Math.max(0, labTotal - 1);
+      return labShow();
+    }
     labNote('Save failed — sample kept, tap again to retry.');
     return;
   }

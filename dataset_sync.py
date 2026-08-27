@@ -214,14 +214,18 @@ def consumed(root):
     return {i for i, a in last.items() if a in ("approve", "discard")}
 
 
-def sweep_consumed(root):
-    """Drop pending copies of samples this node already finished. A pull that ran before
-    the skip above existed left duplicates behind: the same frame sitting in pending AND
-    in approved, so it comes round again and gets labelled twice.
+def sweep_consumed(root, in_bucket=()):
+    """Drop pending copies of samples that are finished — here or on any other node.
 
-    Deletion is deliberate but narrow — an approval must have its approved copy on disk
-    before its pending copy goes, so a half-finished move can never destroy the only copy.
-    A discard is already an instruction to destroy it."""
+    The ledger merges both ways, so an approval made on the curation instance reaches the
+    operator's laptop within a sync; but the FILES of a held approval sit in that
+    instance's holding/ tree, which never syncs, and the old rule ("only sweep once the
+    approved copy is on disk") left the laptop's pending copy alive. Every probationary
+    curator's frame therefore came round again for whoever labelled locally.
+
+    Deletion stays deliberate: a pending copy goes only when some other copy is known to
+    exist — approved/ or holding/ here, or the original still in the bucket (`in_bucket`,
+    the pending stems the last listing saw). A discard is already an order to destroy."""
     root = Path(root)
     last = {}
     try:
@@ -236,10 +240,12 @@ def sweep_consumed(root):
         return 0
     gone = 0
     for sid, action in last.items():
-        if action == "approve" and not (root / "approved" / "labels" / f"{sid}.txt").exists():
-            continue                       # the approved copy is not there: leave it alone
         if action not in ("approve", "discard"):
             continue
+        if action == "approve" and sid not in in_bucket and not any(
+                (root / tree / "labels" / f"{sid}.txt").exists()
+                for tree in ("approved", "holding")):
+            continue                       # no other copy anywhere we can see: leave it
         for sub, ext in (("images", ".jpg"), ("labels", ".txt"),
                          ("attrs", ".json"), ("suggest", ".json")):
             f = root / "pending" / sub / f"{sid}{ext}"
@@ -254,7 +260,8 @@ def pull(cl, bucket, prefix=PREFIX, root=DATASET, names=None):
     root = Path(root)
     done = consumed(root)
     todo, skipped = [], 0
-    for key, size in sorted(remote(cl, bucket, prefix).items()):
+    listing = remote(cl, bucket, prefix)
+    for key, size in sorted(listing.items()):
         rel = key[len(prefix):]
         if not rel or (names and not rel.startswith(tuple(names))):
             continue
@@ -268,7 +275,8 @@ def pull(cl, bucket, prefix=PREFIX, root=DATASET, names=None):
         dest.parent.mkdir(parents=True, exist_ok=True)
         todo.append((dest, key))
     got = transfer(lambda dest, key: fetch(cl, bucket, dest, key), todo, "pulled")
-    swept = sweep_consumed(root)
+    swept = sweep_consumed(root, {Path(k).stem for k in listing
+                                  if k.startswith(prefix + "pending/images/")})
     print(f"pull: {got} downloaded, {skipped} already local"
           + (f", {swept} finished copies cleared" if swept else "") + f" (-> {root})")
     return got, skipped
@@ -410,6 +418,23 @@ def selfcheck():
     (back / "approved" / "labels" / "s1.txt").unlink()
     (back / "pending" / "images" / "s1.jpg").write_bytes(b"aaa")
     assert sweep_consumed(back) == 0, "no approved copy: the pending one is all there is"
+
+    # s2 is approved on the OTHER node by a curator on probation: its files went to that
+    # node's holding/, which never syncs, so nothing of it lands here but the audit line.
+    # The bucket still holds the original, so this copy is not the last one — it goes,
+    # and s2 stops coming round for whoever labels on this node.
+    (back / "audit.jsonl").write_text(
+        '{"ts": "t", "who": "a", "id": "s1", "action": "approve"}\n'
+        '{"ts": "t", "who": "curator03", "id": "s2", "action": "approve", "held": true}\n')
+    assert (back / "pending" / "images" / "s2.jpg").exists()
+    pull(cl2, "buck", "curation/", back)
+    assert not (back / "pending" / "images" / "s2.jpg").exists(), "held elsewhere, still queued here"
+    assert not (back / "pending" / "labels" / "s2.txt").exists()
+    # ...and a held approval made HERE counts the same way, holding/ being a real copy.
+    (back / "holding" / "labels").mkdir(parents=True)
+    (back / "holding" / "labels" / "s2.txt").write_text("0 0.5 0.5 0.1 0.1\n")
+    (back / "pending" / "images" / "s2.jpg").write_bytes(b"bbb")
+    assert sweep_consumed(back) == 1, "a holding copy is proof enough"
 
     # Two nodes, one camera. The box at the gate and a laptop re-ingesting that same
     # footage see the same vehicle two seconds apart on clocks that never agreed.

@@ -560,6 +560,67 @@ def search_lists_the_pen():
             app.DATASET, app.REVIEWERS = keep
 
 
+def claims_survive_restart():
+    """A slice held when the process dies is still held when it comes back."""
+    import tempfile, json, time
+    import app
+
+    keep = app.DATASET
+    with tempfile.TemporaryDirectory() as d:
+        try:
+            app.DATASET = Path(d)
+            with app.CLAIMS_LOCK:
+                app.CLAIMS.clear()
+            assert app.hold(["x1", "x2"], "curator01") == 2
+            with app.CLAIMS_LOCK:
+                app.CLAIMS.clear()                  # the restart
+            app.CLAIMS.update(app.load_claims())
+            assert app.purge_claims() == {"x1": "curator01", "x2": "curator01"}, app.CLAIMS
+            app.finish("curator01", "x1", "approve", {})
+            with app.CLAIMS_LOCK:
+                app.CLAIMS.clear()
+            app.CLAIMS.update(app.load_claims())
+            assert app.purge_claims() == {"x2": "curator01"}, "a decided frame stayed claimed"
+            # An expired claim does not come back from the file.
+            (Path(d) / "claims.json").write_text(json.dumps({"x9": ["curator02", time.time() - 1]}))
+            assert app.load_claims() == {}
+        finally:
+            with app.CLAIMS_LOCK:
+                app.CLAIMS.clear()
+            app.DATASET = keep
+
+
+def site_rename():
+    """Naming the box: validated like a camera name, refused under a running recorder,
+    and the recorder's own path follows the config."""
+    import tempfile
+    import app
+
+    keep = (app.CONFIG, app.CONFIG_PATH, app.REC.site)
+    with tempfile.TemporaryDirectory() as d:
+        try:
+            app.CONFIG, app.CONFIG_PATH = dict(app.CONFIG, site="site1"), Path(d) / "config.yaml"
+            for bad in ("", "a b", "x" * 33, "katuba/north"):
+                try:
+                    app.config_site_set({"site": bad})
+                    raise AssertionError(f"accepted {bad!r}")
+                except app.HTTPException as e:
+                    assert e.status_code == 400, e.detail
+            assert app.config_site_set({"site": "katuba"}) == {"ok": True, "site": "katuba"}
+            assert app.REC.site == "katuba" and app.config_site()["site"] == "katuba"
+            assert "site: katuba" in app.CONFIG_PATH.read_text()
+            app.REC.st["fake"] = {"desired": True}
+            try:
+                app.config_site_set({"site": "elsewhere"})
+                raise AssertionError("renamed under a running recorder")
+            except app.HTTPException as e:
+                assert e.status_code == 400 and "recording" in e.detail
+            finally:
+                del app.REC.st["fake"]
+        finally:
+            app.CONFIG, app.CONFIG_PATH, app.REC.site = keep
+
+
 check("hostnet arp parser", hostnet_arp_parser)
 check("scan auto-joins once", scan_auto_joins_once)
 check("hostnet jetson (naming, no-carrier, bootstrap)", hostnet_jetson)
@@ -580,6 +641,8 @@ check("README documents every config key", readme_documents_config)
 check("supervisor password + token minting", supervisor_tokens)
 check("attribute restrict rules are real", attr_restricts_are_real)
 check("search with no class lists the pen", search_lists_the_pen)
+check("claims survive a restart", claims_survive_restart)
+check("site rename", site_rename)
 
 print(f"\n{'FAILED: ' + ', '.join(FAILS) if FAILS else 'all passed'}")
 sys.exit(1 if FAILS else 0)
