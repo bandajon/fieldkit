@@ -311,7 +311,7 @@
         <button class="btn" id="l-aclr">Clear</button>
       </div>
       <div class="acts" id="l-search" hidden>
-        <select id="l-scls"></select>
+        <select id="l-scls" multiple size="6" title="cmd/ctrl-click for more than one"></select>
         <select id="l-swho"></select>
         <select id="l-stree">
           <option value="approved">approved</option>
@@ -1709,7 +1709,10 @@ const SEARCH_LIMIT = 50;
 
 document.getElementById('l-sgo').onclick = async () => {
   const tree = document.getElementById('l-stree').value;
-  const q = new URLSearchParams({target: document.getElementById('l-scls').value,
+  // Several classes or categories at once: frames holding any of them. "any class"
+  // among the picks means no class filter at all.
+  const picked = [...document.getElementById('l-scls').selectedOptions].map(o => o.value);
+  const q = new URLSearchParams({target: picked.includes('') ? '' : picked.join(','),
                                  who: document.getElementById('l-swho').value,
                                  tree, limit: SEARCH_LIMIT});
   const el = document.getElementById('l-sres');

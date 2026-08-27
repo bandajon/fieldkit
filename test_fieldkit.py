@@ -549,6 +549,7 @@ def search_lists_the_pen():
             whole = s()
             assert whole["total"] == 3 and whole["by_curator"] == {"curator01": 1, "curator02": 2}, whole
             assert s(target="E")["total"] == 2, "a category still narrows"
+            assert s(target="A,E")["total"] == 3 and s(target="a-small,e-heavy")["total"] == 3, "several terms union"
             assert s(who="curator01")["total"] == 1, "a curator still narrows"
             assert s(target="e-heavy", who="curator01")["total"] == 0
             try:
