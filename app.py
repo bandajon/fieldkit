@@ -607,6 +607,7 @@ def write_classes(classes):
     f = DATASET / "classes.txt"
     f.parent.mkdir(parents=True, exist_ok=True)   # detection may never have run on this node
     f.write_text("".join(c + "\n" for c in classes))
+    publish("classes.txt")
 
 
 def label_files():
@@ -1405,6 +1406,15 @@ def push_roster():
     return push_file("curators.yaml")
 
 
+def publish(name):
+    """The taxonomy the team labels against is the taxonomy the model trains on. The
+    curation instance is the official tool, so a class or a value added there has to
+    reach the bucket, or the laptop harvesting for training reads ids that mean
+    something else. Only the curation instance publishes: a site box or the laptop
+    editing its own copy is not an authority, and classes.txt ids are positional."""
+    return push_file(name) if CURATION else False
+
+
 @app.get("/api/dataset/curators")
 def curators_list(x_curator_token: str = Header("")):
     require_reviewer(token_who(x_curator_token))
@@ -1883,6 +1893,7 @@ def dataset_attr_value(body: dict = Body(default={})):
             if got:
                 implies[value] = got
         (DATASET / "attributes.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False))
+        publish("attributes.yaml")
     return {"ok": True, "attributes": attr_vocab(), "attr_implies": attr_meta("implies")}
 
 
