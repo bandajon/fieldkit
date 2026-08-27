@@ -693,6 +693,38 @@ console.log('  js rules ok');
     print(r.stdout.strip())
 
 
+def assign_targets():
+    """A target names one class, a category, several of either, or all of them."""
+    import tempfile
+    import app
+
+    keep = (app.DATASET, app.REVIEWERS, app.push_file)
+    with tempfile.TemporaryDirectory() as d:
+        try:
+            app.DATASET, app.REVIEWERS, app.push_file = Path(d), ["jonah"], lambda n: True
+            app.write_yaml("curators.yaml", {"jonah": "tok-jonah", "curator01": "tok-1"})
+            (Path(d) / "classes.txt").write_text("a-small\na-motorcycle\nc-bus\ne-heavy\ne-plant\nz-emergency\n")
+            tc = app.target_classes
+            assert tc("A") == ["a-small", "a-motorcycle"]
+            assert tc("A,C") == ["a-small", "a-motorcycle", "c-bus"]
+            assert tc("e-heavy, a-small") == ["a-small", "e-heavy"], "classes.txt order, not typed order"
+            assert tc("all") == ["a-small", "a-motorcycle", "c-bus", "e-heavy", "e-plant", "z-emergency"]
+            assert tc("zzz") == [] and tc("") == []
+            assert tc("A,zzz") == ["a-small", "a-motorcycle"], "an unknown term covers nothing"
+            ok = app.assign_edit({"handle": "curator01", "class": "a,c,e-plant", "min": 50}, "tok-jonah")
+            assert ok["assignments"]["curator01"]["class"] == "A,C,e-plant", ok["assignments"]
+            assert ok["assignments"]["curator01"]["classes"] == ["a-small", "a-motorcycle", "c-bus", "e-plant"]
+            assert app.assign_edit({"handle": "curator01", "class": "ALL"}, "tok-jonah")["assignments"]["curator01"]["class"] == "all"
+            for bad in ("A,zzz", "", "zzz"):
+                try:
+                    app.assign_edit({"handle": "curator01", "class": bad}, "tok-jonah")
+                    raise AssertionError(f"accepted {bad!r}")
+                except app.HTTPException as e:
+                    assert e.status_code == 400, e.detail
+        finally:
+            app.DATASET, app.REVIEWERS, app.push_file = keep
+
+
 check("hostnet arp parser", hostnet_arp_parser)
 check("scan auto-joins once", scan_auto_joins_once)
 check("hostnet jetson (naming, no-carrier, bootstrap)", hostnet_jetson)
@@ -716,6 +748,7 @@ check("search with no class lists the pen", search_lists_the_pen)
 check("claims survive a restart", claims_survive_restart)
 check("site rename", site_rename)
 check("label strip rules (one-tap emergency, implies)", label_strip_rules)
+check("assignment targets (several, all)", assign_targets)
 
 print(f"\n{'FAILED: ' + ', '.join(FAILS) if FAILS else 'all passed'}")
 sys.exit(1 if FAILS else 0)

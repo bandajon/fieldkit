@@ -1507,15 +1507,26 @@ def assignments():
     return {k: a for k, a in v.items() if isinstance(a, dict)} if isinstance(v, dict) else {}
 
 
+def target_parts(target):
+    """A target is one or more comma-separated terms: "A", "e-heavy", "A,C,e-plant"."""
+    return [p.strip() for p in str(target or "").split(",") if p.strip()]
+
+
 def target_classes(target):
-    """The classes an assignment target covers. One character is a toll CATEGORY —
-    every class whose name starts with that letter and a dash (a-small, a-motorcycle
-    are category A). Anything else is one exact class name. Unknown target: []."""
-    t = str(target or "").strip().lower()
+    """The classes an assignment target covers, in classes.txt order. Each term is one
+    toll CATEGORY letter — every class named `<letter>-*` (a-small, a-motorcycle are
+    category A) — or one exact class name; "all" is every class that has a category.
+    Terms are unioned, unknown terms cover nothing."""
     names = dataset_classes()
-    if len(t) == 1:
-        return [c for c in names if c.lower().startswith(t + "-")]
-    return [c for c in names if c.lower() == t]
+    out = []
+    for t in (p.lower() for p in target_parts(target)):
+        if t == "all":
+            out += [c for c in names if "-" in c]
+        elif len(t) == 1:
+            out += [c for c in names if c.lower().startswith(t + "-")]
+        else:
+            out += [c for c in names if c.lower() == t]
+    return [c for c in names if c in set(out)]
 
 
 def categories(names=None):
@@ -1581,11 +1592,14 @@ def assign_edit(body: dict = Body(default={}), x_curator_token: str = Header("")
     if body.get("clear"):
         entries.pop(handle, None)
     else:
-        target = str(body.get("class") or "").strip()
-        target = target.upper() if len(target) == 1 else target
-        if not target_classes(target):
-            raise HTTPException(400, f"no class or category {target!r} — pick one of: "
+        # Stored as written, normalised term by term: a letter upper-cased, "all" lower.
+        parts = [p.upper() if len(p) == 1 else p.lower() if p.lower() == "all" else p
+                 for p in target_parts(body.get("class"))]
+        bad = next((p for p in parts if not target_classes(p)), None)
+        if bad is not None or not parts:
+            raise HTTPException(400, f"no class or category {bad!r} — pick one of: all, "
                                      f"{', '.join(categories() + dataset_classes())}")
+        target = ",".join(dict.fromkeys(parts))
         try:
             least = int(body.get("min") or 0)
         except (TypeError, ValueError):

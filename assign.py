@@ -38,12 +38,17 @@ def classes():
 
 
 def target_classes(cls, names):
-    """Same rule as app.target_classes: one character is a toll category (every
-    `<letter>-*` class), anything else is one exact class name."""
-    t = str(cls or "").strip().lower()
-    if len(t) == 1:
-        return [c for c in names if c.lower().startswith(t + "-")]
-    return [c for c in names if c.lower() == t]
+    """Same rule as app.target_classes: each comma-separated term is a toll category
+    letter (every `<letter>-*` class), one exact class name, or "all"."""
+    out = []
+    for t in (p.strip().lower() for p in str(cls or "").split(",") if p.strip()):
+        if t == "all":
+            out += [c for c in names if "-" in c]
+        elif len(t) == 1:
+            out += [c for c in names if c.lower().startswith(t + "-")]
+        else:
+            out += [c for c in names if c.lower() == t]
+    return [c for c in names if c in set(out)]
 
 
 def curators():

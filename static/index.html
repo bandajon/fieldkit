@@ -305,7 +305,7 @@
       <div class="res" id="l-hold-help" hidden>probation: this curator's work waits in a holding area until a supervisor releases it in review — it never reaches the training set before that.</div>
       <div class="acts" id="l-assign" hidden>
         <select id="l-acur"></select>
-        <select id="l-acls"></select>
+        <select id="l-acls" multiple size="6" title="cmd/ctrl-click for more than one"></select>
         <input id="l-amin" type="number" min="0" step="10" value="200" style="flex:0 0 90px">
         <button class="btn go" id="l-aset">Assign</button>
         <button class="btn" id="l-aclr">Clear</button>
@@ -899,7 +899,8 @@ const labStats = () => {
     + (labWho && labProg   // .res is pre-line, so the team line lands under it
        ? `\ntoday: you ${labNum((labProg.by_who || {})[labWho])} · team ${labNum(labProg.total)}` : '');
   if (a) el.innerHTML += `\nassignment: ${esc(a.class)} · ` +
-    `<b style="color:${clsColor(labClasses.indexOf(a.class))}">${a.done}/${a.min}</b>`;
+    `<b style="color:${labClasses.includes(a.class) ? clsColor(labClasses.indexOf(a.class)) : 'var(--fg)'}"
+      >${a.done}/${a.min}</b>`;
 };
 const boxCls = b =>
   `box${b.cls >= labClasses.length ? ' gone' : ''}${b.cy - b.h / 2 < 0.05 ? ' in' : ''}`;
@@ -1077,8 +1078,8 @@ function labSelect(i) {
     if (!Object.keys(b.attrs).length) labDefault(b);
   }
   const name = labClasses[b.cls], row = (l, chips) => `<div class="acts toggle"><i class="res">${l}</i>${chips}</div>`;
-  // Removed boxes and wheels take no attributes; their class row stays so either can be undone.
-  const heads = b.cls >= labClasses.length || name === 'wheel' ? '' :
+  // A removed box takes no attributes; its class row stays so the removal can be undone.
+  const heads = b.cls >= labClasses.length ? '' :
     Object.keys(labAttrs).map(head => {
       const vocab = labVocab(head, name, b.attrs[head], b.attrs);
       // Hide only when the CLASS opts out (constraint []). A row the cross-filter emptied
@@ -1255,7 +1256,7 @@ document.getElementById('l-attrs').onclick = e => {
 function labGap(all) {
   for (let i = 0; i < all.length; i++) {
     const b = all[i], name = labClasses[b.cls];
-    if (b.del || b.cls >= labClasses.length || name === 'wheel') continue;
+    if (b.del || b.cls >= labClasses.length) continue;
     for (const head of Object.keys(labAttrs))
       if (!b.attrs[head] && labVocab(head, name, null, b.attrs).length) return {i, head, name};
   }
@@ -1673,7 +1674,8 @@ function labAssignShow(d) {
   labAssigns = d.assignments || {};
   labClasses = d.classes || labClasses;      // same list labLoad reads; keeps the colours in step
   labCats = d.categories || labCats;
-  labFill(document.getElementById('l-acls'), labTargets());
+  labFill(document.getElementById('l-acls'),
+          '<option value="all">All classes</option>' + labTargets());
   labFill(document.getElementById('l-scls'), '<option value="">any class</option>' + labTargets());
   document.getElementById('l-assign').hidden = false;
   document.getElementById('l-search').hidden = false;
@@ -1690,7 +1692,8 @@ async function labAssignPost(body) {
 
 document.getElementById('l-aset').onclick = () => {
   const handle = document.getElementById('l-acur').value,
-        cls = document.getElementById('l-acls').value;
+        picked = [...document.getElementById('l-acls').selectedOptions].map(o => o.value),
+        cls = picked.includes('all') ? 'all' : picked.join(',');   // several terms, one target
   if (handle && cls) labAssignPost({handle, class: cls,
     min: Math.max(0, Math.round(+document.getElementById('l-amin').value) || 0)});
 };
