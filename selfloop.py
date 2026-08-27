@@ -180,13 +180,24 @@ class Lock:
     def __enter__(self):
         import time
         deadline = time.monotonic() + WAIT
-        while holder() is not None:
-            if time.monotonic() > deadline:
-                sys.exit(f"busy: {LOCK.read_text().strip()}")
-            time.sleep(15)
         LOCK.parent.mkdir(parents=True, exist_ok=True)
-        LOCK.write_text(f"{os.getpid()} {sys.argv[1:]} since {now()}")
-        return self
+        while True:
+            # O_EXCL makes the check and the take one step. The old check-then-write let
+            # two agents that woke in the same second both see it free and both proceed
+            # — ingest then deleted the download folder under a running classify pass.
+            try:
+                fd = os.open(LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError:
+                if holder() is None:
+                    LOCK.unlink(missing_ok=True)      # a dead process left it: take over
+                    continue                          # ...through O_EXCL, never around it
+                if time.monotonic() > deadline:
+                    sys.exit(f"busy: {LOCK.read_text().strip()}")
+                time.sleep(15)
+                continue
+            with os.fdopen(fd, "w") as f:
+                f.write(f"{os.getpid()} {sys.argv[1:]} since {now()}")
+            return self
 
     def __exit__(self, *_):
         LOCK.unlink(missing_ok=True)
@@ -288,7 +299,8 @@ def ingest_pass():
                 stems += sink.stems
                 written += sum(sink.written.values())
         finally:
-            shutil.rmtree(VIDEOS, ignore_errors=True)  # sampled: the footage stays in the bucket
+            for f in files:                # only what this pass downloaded; the folder is shared
+                f.unlink(missing_ok=True)  # sampled: the footage stays in the bucket
         if ATTRS_CHAMPION.is_file():
             suggest(stems)           # pushed with the samples: PENDING covers pending/suggest
         s["ingested"] = (s["ingested"] + todo)[-REMEMBER:]
@@ -580,6 +592,25 @@ def suggest_check():
                and v["axles"] in heads["axles"] for v in got.values()), got
 
 
+def lock_check():
+    """The lock is the only thing between two GPU jobs. A dead holder must be taken over;
+    a live one must be waited for; and the take must be atomic."""
+    import tempfile
+    from unittest.mock import patch
+    me = sys.modules[__name__]
+    tmp = Path(tempfile.mkdtemp()) / "loop.lock"
+    with patch.object(me, "LOCK", tmp), patch.object(me, "WAIT", 0):
+        tmp.write_text("999999999 ['ghost'] since never")   # no such pid: stale
+        with Lock():
+            assert tmp.read_text().startswith(str(os.getpid())), "stale lock not taken over"
+            try:
+                with Lock():
+                    raise AssertionError("a live lock was granted twice")
+            except SystemExit as e:
+                assert "busy" in str(e), e
+        assert not tmp.exists(), "lock not released"
+
+
 def publish_check():
     """The bucket layout the RDA importer reads is a contract: gate, day, one jsonl per
     segment, crops beside it. Nothing downstream is ours, so this is where a rename or a
@@ -650,6 +681,7 @@ def selfcheck():
     assert up == {"id": "c-1", "gate": "RDA-TG-KTB",
                   "crops": {"best": "crops/c-1-best.jpg"}}, up
     assert for_upload({"id": "q"}, "G")["crops"] == {}, "a crop-less event still uploads"
+    lock_check()
     publish_check()
     suggest_check()
     print("selfloop self-check ok: cameras found under any gate prefix, newest unsampled segments "
