@@ -1,6 +1,7 @@
 #!/bin/sh
 # Install the self-improving loop on this machine (macOS launchd, per-user, no sudo):
-# ingest every 4 hours, a training check every hour. Re-run to change intervals.
+# ingest every 4 hours, a training check every hour, classify every 10 minutes.
+# Re-run to change intervals.
 # launchd starts jobs with a bare PATH, so the venv's bin (ffmpeg/ffprobe live there on a
 # machine without Homebrew: pip install static-ffmpeg, then symlink) is put on it here.
 set -e
@@ -28,7 +29,8 @@ agent() {   # label, seconds, subcommand
 EOF
   launchctl bootout gui/$(id -u)/$1 2>/dev/null || true
   launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/$1.plist
-  echo "  $1: every $(( $2 / 3600 ))h -> selfloop.py $3 (log: loop-$3.log)"
+  echo "  $1: every $(( $2 / 60 ))m -> selfloop.py $3 (log: loop-$3.log)"
 }
 agent com.fieldkit.loop-ingest 14400 ingest
 agent com.fieldkit.loop-train   3600 train
+agent com.fieldkit.loop-classify 600 classify

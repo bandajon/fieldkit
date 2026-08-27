@@ -2,6 +2,7 @@
 """The self-improving loop, for the always-on training machine.
 
   python selfloop.py ingest        newest mirrored segments, every camera -> pending -> bucket
+  python selfloop.py classify      newest un-classified segments -> vehicle events -> bucket
   python selfloop.py train         pull the curated set; train once enough is new; promote if better
   python selfloop.py train --now   train now, threshold or not
   python selfloop.py status        where the loop stands
@@ -20,6 +21,10 @@ they were given until someone deploys models/champion.pt: promoting the pre-labe
 cheap to be wrong about, promoting a toll gate's detector is not. The attribute classifier
 rides the same pass on the same curated set — trained after the detector, promoted on its
 own mean val accuracy, and used by the next ingest to pre-fill attribute suggestions.
+
+Classify is the other direction: the same champion, run over the mirrored recordings, is
+what turns a gate that only records into a gate that reports. Its events go to the bucket
+for the RDA importer, ten to twenty minutes behind live.
 """
 import json
 import os
@@ -28,6 +33,7 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 ROOT = Path(__file__).resolve().parent
 DATASET = ROOT / "dataset"
@@ -43,6 +49,12 @@ MODELS = "models/"    # bucket prefix for published weights
 ATTR_MODELS = MODELS + "attrs/"
 SKIP = ("curation/", MODELS)
 PENDING = ("pending/images", "pending/labels", "pending/attrs", "pending/suggest")
+EVENTS = "fieldkit-events/"   # bucket prefix the RDA importer reads
+# The Katuba box still calls itself site1; anything already named RDA-TG-* is its own id.
+GATES = {"site1": "RDA-TG-KTB"}
+TZ = "Africa/Lusaka"          # the gates and this machine; segment names are local wallclock
+CLASSIFY_PER_PASS = 12        # ~10 min of footage per camera per pass, at 600 s segments
+REMEMBER_CLASSIFIED = 20000
 
 
 def now():
@@ -111,6 +123,32 @@ def promote_attrs(candidate, champion):
         return True
     return bool(candidate) and candidate.get("mean_acc") is not None \
         and candidate["mean_acc"] > champion["mean_acc"]
+
+
+def gate_of(prefix):
+    """The RDA gate id for a bucket prefix. The importer resolves events by gate, so a
+    prefix with no mapping is passed through — a gate already named for itself is right,
+    and a genuinely unknown one is better filed visibly wrong than silently dropped."""
+    return GATES.get(prefix, prefix)
+
+
+def pick_classify(keys, classified, per_pass=CLASSIFY_PER_PASS):
+    """The newest unclassified segments across every camera, newest first: the portal
+    wants today's traffic on screen, and the backlog drains whenever the gates are quiet.
+    Ordered by segment name, not by key — sorting whole keys would work one camera dry
+    before the other was touched."""
+    done = set(classified)
+    todo = [k for segs in cameras(keys).values() for k in segs if k not in done]
+    return sorted(todo, key=lambda k: (k.rsplit("/", 1)[1], k), reverse=True)[:per_pass]
+
+
+def for_upload(doc, gate):
+    """One event as the importer reads it: stamped with the gate it came from, and its
+    crop paths flattened — the bucket keeps one crops/ folder per day, not per day-inside-
+    a-day like the local events dir does."""
+    return {**doc, "gate": gate,
+            "crops": {tag: f"crops/{Path(rel).name}"
+                      for tag, rel in (doc.get("crops") or {}).items()}}
 
 
 # ---- the machinery ----
@@ -240,6 +278,87 @@ def ingest_pass():
         save_state(s)
         sent, _ = ds.push(cl, bucket, names=PENDING)
         print(f"{now()} ingest: {s['last_ingest']['samples']} samples written, {sent} files pushed", flush=True)
+
+
+def publish(cl, bucket, out, gate, seg, day):
+    """Send one segment's events and crops to fieldkit-events/<gate>/<YYYYMMDD>/, the
+    layout the RDA importer reads. -> events published."""
+    # A quiet segment still publishes an empty file: that is what marks it done, and it
+    # tells the importer the gate was watched and idle rather than never processed.
+    (out / f"{day}.jsonl").touch()
+    total = 0
+    for js in sorted(out.glob("*.jsonl")):      # a segment can straddle midnight
+        lines = [json.dumps(for_upload(json.loads(l), gate))
+                 for l in js.read_text().splitlines() if l.strip()]
+        total += len(lines)
+        where = f"{EVENTS}{gate}/{js.stem.replace('-', '')}"
+        cl.put_object(Bucket=bucket, Key=f"{where}/{seg}.jsonl",
+                      Body="".join(l + "\n" for l in lines).encode(),
+                      ContentType="application/json")
+        for crop in sorted((out / "crops" / js.stem).glob("*.jpg")):
+            cl.upload_file(str(crop), bucket, f"{where}/crops/{crop.name}")
+    return total
+
+
+def classify_pass():
+    """Vehicle events from the footage the gates mirror to the bucket.
+
+    The live pipeline already turns frames into counted vehicles; this runs that same
+    pipeline over the recordings instead of the wire, so a gate box that only records
+    still produces events. Ten to twenty minutes behind live, which the portal is happy
+    with — and the alternative is a second detector to keep in step with the first.
+    """
+    import tempfile
+
+    import detect
+    import ingest_video
+
+    if not CHAMPION.is_file():
+        print(f"{now()} classify: no detector at {CHAMPION} — nothing to classify", flush=True)
+        return
+    with Lock():
+        s = load_state()
+        _ds, cl, bucket = r2()
+        todo = pick_classify(list(bucket_keys(cl, bucket)), s.get("classified", []))
+        print(f"{now()} classify: {len(todo)} segment(s)", flush=True)
+        if not todo:
+            return
+        base, tz = ingest_video.config(), ZoneInfo(TZ)
+        VIDEOS.mkdir(parents=True, exist_ok=True)
+        done = events = 0
+        for key in todo:
+            prefix, cam_name, seg = key.split("/")
+            gate = gate_of(prefix)
+            cfg = {**base, "detect_weights": str(CHAMPION), "toll_gate_id": gate}
+            if ATTRS_CHAMPION.is_file():
+                cfg["attr_weights"] = str(ATTRS_CHAMPION)
+            # Heading rides on the camera's config entry; without one there is no
+            # direction on these events, which is right — it is never guessed.
+            cam = next((c for c in (base.get("cameras") or []) if c.get("name") == cam_name),
+                       {"name": cam_name})
+            # The recorder's own filename is the footage clock: keep it, or cam_and_start
+            # falls back to mtime and every event is stamped with the download.
+            video, out = VIDEOS / seg, Path(tempfile.mkdtemp())
+            try:
+                print(f"  v {key}", flush=True)
+                cl.download_file(bucket, key, str(video))
+                day = detect.classify_segment(video, cam, cfg, tz, out)
+                n = publish(cl, bucket, out, gate, Path(seg).stem, day)
+                # Recorded only once published: a segment that died mid-pass is retried
+                # next tick rather than lost, and re-running it rewrites the same keys.
+                s["classified"] = (s.get("classified", []) + [key])[-REMEMBER_CLASSIFIED:]
+                save_state(s)
+                done, events = done + 1, events + n
+                print(f"    {n} event(s) -> {EVENTS}{gate}/{day.replace('-', '')}/", flush=True)
+            except Exception as e:       # one bad segment must not strand the rest
+                print(f"  ! {key}: {e}", flush=True)
+            finally:
+                video.unlink(missing_ok=True)
+                shutil.rmtree(out, ignore_errors=True)
+        s["last_classify"] = {"at": now(), "segments": done, "events": events}
+        save_state(s)
+        print(f"{now()} classify: {done}/{len(todo)} segment(s), {events} event(s) published",
+              flush=True)
 
 
 def train_pass(force=False):
@@ -380,6 +499,8 @@ def status():
     print(f"last train:    {s.get('last_train')}")
     print(f"last attrs:    {s.get('last_attrs')}")
     print(f"last ingest:   {s.get('last_ingest')}  ({len(s.get('ingested', []))} segments remembered)")
+    print(f"last classify: {s.get('last_classify')}  "
+          f"({len(s.get('classified', []))} segments remembered)")
     if count is not None:
         gap = THRESHOLD - (count - s.get("trained_frames", 0))
         print(f"new frames:    {count} outside the reference set, {s.get('trained_frames', 0)} at the last run"
@@ -440,6 +561,42 @@ def suggest_check():
                and v["axles"] in heads["axles"] for v in got.values()), got
 
 
+def publish_check():
+    """The bucket layout the RDA importer reads is a contract: gate, day, one jsonl per
+    segment, crops beside it. Nothing downstream is ours, so this is where a rename or a
+    stray path separator has to be caught."""
+    import tempfile
+
+    class FakeS3:
+        def __init__(self):
+            self.put, self.sent = {}, []
+
+        def put_object(self, Bucket, Key, Body, ContentType=None):
+            self.put[Key] = Body
+
+        def upload_file(self, path, Bucket, Key):
+            self.sent.append(Key)
+
+    out = Path(tempfile.mkdtemp())
+    (out / "crops" / "2026-08-19").mkdir(parents=True)
+    (out / "crops" / "2026-08-19" / "c-123-best.jpg").write_bytes(b"jpeg")
+    (out / "2026-08-19.jsonl").write_text(
+        json.dumps({"id": "c-123", "class": "e-heavy",
+                    "crops": {"best": "crops/2026-08-19/c-123-best.jpg"}}) + "\n")
+    cl = FakeS3()
+    assert publish(cl, "buck", out, "RDA-TG-KTB", "20260819-151108", "2026-08-19") == 1
+    key = "fieldkit-events/RDA-TG-KTB/20260819/20260819-151108.jsonl"
+    assert list(cl.put) == [key], cl.put
+    doc = json.loads(cl.put[key].decode())
+    assert doc["gate"] == "RDA-TG-KTB" and doc["crops"] == {"best": "crops/c-123-best.jpg"}, doc
+    assert cl.sent == ["fieldkit-events/RDA-TG-KTB/20260819/crops/c-123-best.jpg"], cl.sent
+
+    # A segment with no vehicles still publishes, or it would be classified again forever.
+    quiet, cl = Path(tempfile.mkdtemp()), FakeS3()
+    assert publish(cl, "buck", quiet, "RDA-TG-KTB", "20260819-152108", "2026-08-19") == 0
+    assert cl.put == {"fieldkit-events/RDA-TG-KTB/20260819/20260819-152108.jsonl": b""}, cl.put
+
+
 def selfcheck():
     keys = ["curation/pending/images/x.jpg", "models/champion.pt",
             "site1/cam3/20260827-100000.mkv", "site1/cam3/20260827-101000.mkv", "site1/cam3/20260827-102000.mkv",
@@ -460,11 +617,25 @@ def selfcheck():
     assert promote_attrs({"mean_acc": 0.88}, {"mean_acc": 0.87})
     assert not promote_attrs({"mean_acc": 0.87}, {"mean_acc": 0.87}), "a tie is not an improvement"
     assert not promote_attrs(None, {"mean_acc": 0.87}), "no report, no promotion"
+    assert gate_of("site1") == "RDA-TG-KTB", "the Katuba box still calls itself site1"
+    assert gate_of("RDA-TG-KTB") == "RDA-TG-KTB", "a gate already named for itself"
+    # Newest segment first, across cameras, so the portal gets current traffic first.
+    got = pick_classify(keys, classified=["site1/cam3/20260827-102000.mkv"], per_pass=2)
+    assert got == ["site1/cam3/20260827-101000.mkv", "site1/cam3/20260827-100000.mkv"], got
+    assert pick_classify(keys, classified=[])[0].endswith("102000.mkv"), "newest first"
+    assert pick_classify(keys, classified=keys) == [], "everything classified: nothing to do"
+    up = for_upload({"id": "c-1", "crops": {"best": "crops/2026-08-19/c-1-best.jpg"}},
+                    "RDA-TG-KTB")
+    assert up == {"id": "c-1", "gate": "RDA-TG-KTB",
+                  "crops": {"best": "crops/c-1-best.jpg"}}, up
+    assert for_upload({"id": "q"}, "G")["crops"] == {}, "a crop-less event still uploads"
+    publish_check()
     suggest_check()
     print("selfloop self-check ok: cameras found under any gate prefix, newest unsampled segments "
           "picked per camera, training triggers on the cumulative threshold, promotion needs a "
           "strictly better reference score (detector) or mean val accuracy (attributes) unless "
-          "there is no comparable champion")
+          "there is no comparable champion, newest segments classified first under their "
+          "gate's id")
 
 
 if __name__ == "__main__":
@@ -473,6 +644,8 @@ if __name__ == "__main__":
         selfcheck()
     elif a[0] == "ingest":
         ingest_pass()
+    elif a[0] == "classify":
+        classify_pass()
     elif a[0] == "train":
         train_pass(force="--now" in a)
     elif a[0] == "status":

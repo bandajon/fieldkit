@@ -426,6 +426,11 @@ class Detector:
         self.counts_dir = Path(counts_dir) if counts_dir else None
         self.events_dir = Path(events_dir) if events_dir else None
         self.dirty = False              # a tally moved since the last write
+        # Clocks, as attributes so an offline pass can run the whole pipeline on footage
+        # time: an event must say when the vehicle passed the camera, not when we looked.
+        self.clock = time.monotonic     # elapsed time: expiry, dwell, speed, the guard
+        self.wall = time.time           # the stamp an event carries
+        self.tz = None                  # naive local, unless the footage's zone is known
         self.backend = str(cfg.get("detect_backend", "cpu") or "cpu").strip().lower()
         self.gate = str(cfg.get("toll_gate_id") or "").strip()
         self.hef_path = cfg.get("hef_path", "")   # hailo model; read here, used once that backend lands
@@ -761,7 +766,7 @@ class Detector:
         cross unseen. Upgrade path: per-camera fps tuning, or the Hailo backend so
         inference stops competing with the recorder for CPU.
         """
-        now = time.monotonic()
+        now = self.clock()
         shown = []
         wheels = [d for d in dets if d[0] == WHEEL]
         dets = [d for d in dets if d[0] != WHEEL]
@@ -828,7 +833,7 @@ class Detector:
                         else:
                             t["attrs"] = self._classify(t)
                             t["counted_as"] = disp
-                            t["counted_at"] = time.time()
+                            t["counted_at"] = self.wall()
                             self.totals[disp] += 1
                             self._bump(disp, t["attrs"], 1)
                 elif t["counted_as"] != disp and not t.get("ghost"):
@@ -846,15 +851,27 @@ class Detector:
                 shown.append((disp, conf, box, d + GATE_MARK.get(bound_of(cam, d), ""))
                              if d else (disp, conf, box))
             for tid in [i for i, t in ids.items() if now - t["last_seen"] > ID_EXPIRY]:
-                t = ids.pop(tid)
-                # Counted vehicles (ghosts included: a long stop chains through several
-                # track lives) leave their resting place behind for the recount guard.
-                if t["counted_as"] and t.get("box"):
-                    self.recent.setdefault(name, []).append(
-                        (t["counted_as"], t["box"], now + RECOUNT_GUARD))
-                self._event(name, t)
+                self._retire(name, ids.pop(tid), now)
             self.visible[name] = Counter(live)
         return shown
+
+    def _retire(self, name, t, now):
+        """A track's last rites. Counted vehicles (ghosts included: a long stop chains
+        through several track lives) leave their resting place behind for the recount
+        guard, then the event is written. Caller holds the lock."""
+        if t["counted_as"] and t.get("box"):
+            self.recent.setdefault(name, []).append(
+                (t["counted_as"], t["box"], now + RECOUNT_GUARD))
+        self._event(name, t)
+
+    def flush(self, name):
+        """Retire every track of this camera, counted or not — the end of a segment.
+        A vehicle still in frame on the last decoded frame never expires on its own, and
+        its event would otherwise die with the process that decoded the footage."""
+        now = self.clock()
+        with self.lock:
+            for t in list(self.tracks.pop(name, {}).values()):
+                self._retire(name, t, now)
 
     def _event(self, name, t):
         """One line per counted vehicle, written when its track expires — the vehicle's
@@ -867,7 +884,7 @@ class Detector:
             return
         cam = self._cam(name)
         d = self._direction(t, cam)
-        when = datetime.fromtimestamp(t["counted_at"])
+        when = datetime.fromtimestamp(t["counted_at"], tz=self.tz)
         day = when.strftime("%Y-%m-%d")
         eid = f"{name}-{int(t['counted_at'] * 1000)}"
         blobs = {tag: b for tag, b in (("front", t["front"]), ("best", t["best"][1]),
@@ -1007,6 +1024,33 @@ class Detector:
             self.last_boxes[name] = shown
         except OSError as e:
             self._set("running", f"dataset capture failed: {e}")
+
+
+def classify_segment(path, cam, cfg, tz, events_dir):
+    """One recorded segment through the live pipeline, offline -> the day it was filmed.
+
+    Same detector, same tracker, same counting, same events as the wire: only the clock
+    is different, so a gate box that merely records still yields vehicle events. Both
+    clocks come off the footage, which is what makes a re-run of the same segment produce
+    the same event ids instead of a second set stamped with today.
+    """
+    from PIL import Image
+
+    import ingest_video          # imports detect: keep the import inside the call
+
+    d = Detector([cam], None, cfg, events_dir=events_dir)
+    d.tz = tz
+    start = ingest_video.cam_and_start(path)[1]
+    at = [start]
+    d.clock = d.wall = lambda: at[0]
+    track = d._load()
+    name = cam["name"]
+    for i, jpeg in enumerate(ingest_video.frames(path, fps=FPS)):
+        at[0] = start + i / FPS
+        img = Image.open(io.BytesIO(jpeg)).convert("RGB")
+        d._track(name, track(name, img), img)
+    d.flush(name)                # the last frame's vehicles are events too
+    return datetime.fromtimestamp(start, tz=tz).strftime("%Y-%m-%d")
 
 
 if __name__ == "__main__":
@@ -1444,6 +1488,32 @@ if __name__ == "__main__":
         assert d._direction(moved, {}) is None and d._speed(t, {}) is None   # unconfigured
         assert d._speed({"cross": {"a": 1.0}}, TRAVEL) is None, "one line proves nothing"
         assert d._speed({"cross": {"a": 1.0, "b": 1.05}}, TRAVEL) is None, "1800 kph: artifact"
+
+    # The offline pass runs on footage time: a segment filmed last week must produce that
+    # week's ids and timestamps, and the vehicles still in frame when the footage runs out
+    # must still get their event. Both are what make a re-run idempotent instead of a
+    # second set of events stamped with today.
+    if jpeg:
+        from zoneinfo import ZoneInfo
+
+        CAT = ZoneInfo("Africa/Lusaka")
+        ft = Path(tempfile.mkdtemp())
+        base = datetime(2026, 8, 19, 15, 11, 8, tzinfo=CAT).timestamp()
+        at = [base]
+        d = fresh(events_dir=ft)
+        d.tz, d.clock, d.wall = CAT, lambda: at[0], lambda: at[0]
+        pic = Image.new("RGB", (300, 200))
+        for _ in range(2):                       # counts on the 2nd, still in frame after
+            d._track("c", [("truck", 0.9, VEH, 1)], pic)
+        assert d.tracks["c"], "the track is alive: nothing expired it"
+        d.flush("c")                             # the footage ends here
+        e = json.loads((ft / "2026-08-19.jsonl").read_text().splitlines()[0])
+        assert e["ts"] == "2026-08-19T15:11:08+02:00", e["ts"]   # offset, not naive local
+        assert e["id"] == f"c-{int(base * 1000)}", e["id"]       # footage epoch, not now
+        assert d.tracks.get("c", {}) == {}, d.tracks
+        assert d.recent["c"], "a flushed vehicle still arms the recount guard"
+        d.flush("c")                             # nothing left: flushing twice is harmless
+        assert len((ft / "2026-08-19.jsonl").read_text().splitlines()) == 1
 
     # Heading: the facing of the camera gives both the compass direction and the gate side.
     NORTH, SOUTH = {"name": "n", "heading": "north"}, {"name": "s", "heading": "south"}

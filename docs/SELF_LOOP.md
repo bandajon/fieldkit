@@ -10,6 +10,10 @@ curators approve ─► bucket ─► selfloop train (checked hourly)
         ─► better than the champion? ─► champion.pt (pre-labels the next ingest) + models/ in the bucket
         then train_attrs.py on the same set ─► better mean val accuracy across the heads?
         ─► attrs-champion.pt (suggests attributes on the next ingest) + models/attrs/ in the bucket
+bucket ─► selfloop classify (every 10 min)
+        newest un-classified segments ─► the LIVE pipeline on footage time (champion +
+        attrs champion + ByteTrack + the same counting) ─► one jsonl + crops per segment
+        ─► fieldkit-events/<gate>/<YYYYMMDD>/ ─► the RDA importer
 ```
 
 - `python selfloop.py status` — where it stands; `loop-ingest.log`, `loop-train.log` — what it did.
@@ -22,7 +26,16 @@ curators approve ─► bucket ─► selfloop train (checked hourly)
 - Ingest pre-fills `pending/suggest/<stem>.json` with the attrs champion's guesses, so
   curators correct attributes instead of typing them. A suggestion is never a record — the
   Label tab drops it the moment the sample is saved.
-- Change the cadence: edit `THRESHOLD` / `PER_CAM` in `selfloop.py`, intervals in
+- `python selfloop.py classify` — vehicle events from the mirrored recordings, so a gate
+  box that only records still reports. It runs the live detector, tracker and counting
+  over the footage with both clocks driven by the segment's own name, so an event says
+  when the vehicle passed, not when the pass ran, and re-running a segment rewrites the
+  same keys instead of double-counting. Events land 10–20 minutes behind live; a quiet
+  segment publishes an empty jsonl, which is what marks it done.
+- Direction and `bound` on those events need `heading:` on the camera in `config.yaml`
+  (see `config.example.yaml`). Without one the events are still complete, just undirected
+  — a heading is never guessed from the footage.
+- Change the cadence: edit `THRESHOLD` / `PER_CAM` / `CLASSIFY_PER_PASS` in `selfloop.py`, intervals in
   `install_loop.sh`, then `./install_loop.sh` again.
 
 `detect.attr_classifier()` is the one loader for `attrs.pt` — live detection, the offline
