@@ -238,7 +238,7 @@ thereafter.
 
 | Key | Read by | Meaning |
 | --- | --- | --- |
-| `cameras` | FieldKit | Cameras recorded directly over RTSP. |
+| `cameras` | FieldKit | Cameras recorded directly over RTSP. Per camera, `heading` (the compass direction it faces — north looks toward the toll gate, south away) gives each vehicle a direction of travel and a toward/away-from-gate relation; `gate_ahead` overrides which side the gate is on. |
 | `cameras[].name` | FieldKit | Short name. Used as the recording subdirectory and as the go2rtc stream name. |
 | `cameras[].ip` | FieldKit | Camera address. |
 | `cameras[].user` / `cameras[].password` | FieldKit | RTSP and ISAPI credentials for that camera. |

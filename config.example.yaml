@@ -10,7 +10,13 @@ cameras:                 # cameras recorded directly over RTSP
     user: admin
     password: ""
     # Optional per-camera measurement config (events gain direction + speed):
-    # travel: {axis: y, neg: northbound, pos: southbound}
+    # heading: north   # compass direction the camera FACES. north = it looks toward the
+    #                  # toll gate, south = away from it (Katuba); or put the word in the
+    #                  # camera name (katuba-north). Gives every vehicle its direction of
+    #                  # travel and whether it is heading toward or away from the gate.
+    # gate_ahead: true # override: is the gate in the camera's view direction? Defaults to
+    #                  # true for a north camera, false for a south one.
+    # travel: {axis: y, neg: northbound, pos: southbound}   # only if heading cannot say it
     # speed_lines: {a: 0.55, b: 0.75, metres: 25}   # two reference lines on the travel
     #                                               # axis (normalized) + real distance
 

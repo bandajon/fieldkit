@@ -66,6 +66,16 @@ Camera names are not cosmetic. Recordings land in `<record_dir>/<site>/<camera>/
 and every training frame is named `<camera>-<timestamp>`, so two sites sharing a
 camera name would collide in the bucket and in the dataset.
 
+### Camera heading
+
+`heading:` is the compass direction a camera *faces*. At Katuba a north camera looks
+toward the toll gate and a south camera looks away from it, so the heading alone says
+which way each vehicle travels — one receding up the frame goes the way the camera
+points — and whether it is heading `toward_gate` or `away_from_gate`. A camera named
+`katuba-north` gets it from its own name; `gate_ahead: true|false` overrides which side
+the gate is on. Until a heading is set, events carry no direction at all — the software
+never guesses one.
+
 ## Carry the taxonomy with you
 
 `dataset/` is not in the repo, so a fresh clone knows nothing about your classes.

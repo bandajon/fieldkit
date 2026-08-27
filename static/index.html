@@ -831,8 +831,13 @@ function monTick() {
     el.hidden = c.state !== 'running' && c.state !== 'starting';
     monBreak = c.breakdown || null;
     el.classList.toggle('more', !!monBreak);
+    // Directions are tallied per class; the pill has room only for the site-wide sum.
+    const dirs = {};
+    for (const m of Object.values(c.directions || {}))
+      for (const [k, v] of Object.entries(m)) if (k !== 'unknown') dirs[k] = (dirs[k] || 0) + v;
     if (!el.hidden) el.textContent =
       'today · ' + Object.entries(c.totals || {}).map(([k, v]) => `${k} ${v}`).join(' · ') +
+      Object.entries(dirs).map(([k, v]) => ` · ${k} ${v}`).join('') +
       (monBreak ? (monOpen ? ' ▾' : ' ▴') : '');
     monPanel();
   }).catch(() => {});

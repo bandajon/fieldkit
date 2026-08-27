@@ -207,6 +207,52 @@ def label_of(t):
     return t["label"] if t["votes"][t["label"]] == top else t["votes"].most_common(1)[0][0]
 
 
+HEADINGS = {"north": "northbound", "south": "southbound",
+            "east": "eastbound", "west": "westbound"}
+OPPOSITE = {"northbound": "southbound", "southbound": "northbound",
+            "eastbound": "westbound", "westbound": "eastbound"}
+GATE_MARK = {"toward_gate": " >gate", "away_from_gate": " <gate"}   # ASCII: the built-in overlay font has no arrows
+
+
+def heading_of(cam):
+    """The compass direction the camera FACES, from `heading` or from the camera's own
+    name (katuba-north). Nothing to read it from -> None, and direction stays unset:
+    an unknown heading is never guessed at."""
+    h = str(cam.get("heading") or "").strip().lower()
+    if h in HEADINGS:
+        return h
+    words = str(cam.get("name") or "").lower().replace("_", "-").replace(" ", "-").split("-")
+    return next((w for w in words if w in HEADINGS), None)
+
+
+def travel_of(cam):
+    """The travel axis and its two labels: an explicit `travel` wins, else the heading
+    gives one. Image y grows downward, so a vehicle receding toward the vanishing point
+    moves to smaller y (`neg`) and travels the way the camera points."""
+    if cam.get("travel"):
+        return cam["travel"]
+    h = heading_of(cam)
+    return {"axis": "y", "neg": HEADINGS[h], "pos": OPPOSITE[HEADINGS[h]]} if h else None
+
+
+def gate_ahead(cam):
+    """Is the toll gate in the camera's view direction? Katuba's convention: a north
+    camera looks toward the gate, a south camera away from it. An east/west camera says
+    nothing about the gate, so only `gate_ahead` in the config can place it."""
+    if "gate_ahead" in cam:
+        return bool(cam["gate_ahead"])
+    return {"north": True, "south": False}.get(heading_of(cam))
+
+
+def bound_of(cam, direction):
+    """Toward or away from the toll gate. A heading is what places the gate: an explicit
+    `travel` names the compass direction but leaves the gate's side unknown."""
+    ahead, h = gate_ahead(cam), heading_of(cam)
+    if not direction or ahead is None or not h or cam.get("travel"):
+        return None        # explicit travel labels are the operator's words, not compass points
+    return "toward_gate" if (direction == HEADINGS[h]) == ahead else "away_from_gate"
+
+
 def annotate(img, dets, quality=85):
     """Boxes + labels burnt into the frame; returns JPEG bytes. Matches the Label tab's
     look: translucent outlines and chips (alpha-composited), chip above the box flipping
@@ -390,6 +436,7 @@ class Detector:
         self.display_ids = dict(CLASS_IDS)          # operator's name -> dataset id
         self.totals = {n: 0 for n in CLASS_IDS}
         self.breakdown = {}   # category -> {head: Counter of attribute values}
+        self.directions = {}  # category -> Counter of travel direction
         self.tracks = {}      # camera name -> {track id: state}
         self.frames = {}      # camera name -> (annotated jpeg, wallclock ts)
         self.visible = {}     # camera name -> {class: count} on the latest frame
@@ -453,7 +500,8 @@ class Detector:
         holds the lock. Categories a reassignment emptied are dropped, not sent as {}."""
         return {"date": self.day, "totals": dict(self.totals),
                 "breakdown": {cat: {h: dict(c) for h, c in heads.items() if c}
-                              for cat, heads in self.breakdown.items() if any(heads.values())}}
+                              for cat, heads in self.breakdown.items() if any(heads.values())},
+                "directions": {cat: dict(c) for cat, c in self.directions.items() if c}}
 
     def counts(self):
         with self.lock:
@@ -499,6 +547,8 @@ class Detector:
                                     if k in self.totals})
                 self.breakdown = {cat: {h: Counter(c) for h, c in heads.items()}
                                   for cat, heads in doc["breakdown"].items()}
+                self.directions = {cat: Counter(c)
+                                   for cat, c in doc.get("directions", {}).items()}
         except (OSError, ValueError, TypeError, AttributeError, KeyError):
             pass          # torn or hand-edited: start the day fresh rather than crash
 
@@ -533,7 +583,7 @@ class Detector:
 
     def _direction(self, t, cam):
         """Which way it travelled, from end-to-end displacement along the camera's axis."""
-        travel = cam.get("travel") or {}
+        travel = travel_of(cam) or {}
         if not travel or not t["first_c"] or not t["c"]:
             return None
         i = 0 if travel.get("axis") == "x" else 1
@@ -541,6 +591,10 @@ class Detector:
         if abs(moved) < DIRECTION_MIN * (t["dim"][i] or 1):
             return None                   # parked, or tracker jitter around one spot
         return travel.get("pos") if moved > 0 else travel.get("neg")
+
+    def _bound(self, t, cam):
+        """Toward or away from the toll gate, for the direction it actually travelled."""
+        return bound_of(cam, self._direction(t, cam))
 
     def _speed(self, t, cam):
         """km/h between the two reference lines, or None when the run is not credible."""
@@ -682,6 +736,7 @@ class Detector:
             self.day = today
             self.totals = {d: 0 for d in self.display.values()}
             self.breakdown = {}
+            self.directions = {}
             self.tracks = {}
             self.recent = {}
         self._save(closing)      # the closing day's final word, before anyone counts again
@@ -780,7 +835,11 @@ class Detector:
                     self._bump(disp, t["attrs"], 1)
                     t["counted_as"] = disp
                 live.append(disp)
-                shown.append((disp, conf, box))
+                # A track has no direction until it has moved, so the chip gains one
+                # mid-life; before that it stays the plain class + confidence.
+                d = t["counted_as"] and self._direction(t, cam)
+                shown.append((disp, conf, box, d + GATE_MARK.get(bound_of(cam, d), ""))
+                             if d else (disp, conf, box))
             for tid in [i for i, t in ids.items() if now - t["last_seen"] > ID_EXPIRY]:
                 t = ids.pop(tid)
                 # Counted vehicles (ghosts included: a long stop chains through several
@@ -802,6 +861,7 @@ class Detector:
         if not self.events_dir or not t["counted_as"] or t.get("ghost"):
             return
         cam = self._cam(name)
+        d = self._direction(t, cam)
         when = datetime.fromtimestamp(t["counted_at"])
         day = when.strftime("%Y-%m-%d")
         eid = f"{name}-{int(t['counted_at'] * 1000)}"
@@ -816,8 +876,12 @@ class Detector:
                "hits": t["hits"],
                # Sighting to sighting: the expiry timeout is our latency, not the vehicle's.
                "dwell_s": round(t["last_seen"] - t["first_seen"], 1),
-               "direction": self._direction(t, cam), "speed_kph": self._speed(t, cam),
-               "crops": crops}
+               "direction": d, "bound": bound_of(cam, d),
+               "speed_kph": self._speed(t, cam), "crops": crops}
+        # Direction is only known once the track has moved, so it is tallied here, at the
+        # event, not at the count — _bump runs while the vehicle may still be standing.
+        self.directions.setdefault(t["counted_as"], Counter())[d or "unknown"] += 1
+        self.dirty = True
         try:
             (self.events_dir / "crops" / day).mkdir(parents=True, exist_ok=True)
             for tag, blob in blobs.items():
@@ -1375,6 +1439,18 @@ if __name__ == "__main__":
         assert d._direction(moved, {}) is None and d._speed(t, {}) is None   # unconfigured
         assert d._speed({"cross": {"a": 1.0}}, TRAVEL) is None, "one line proves nothing"
         assert d._speed({"cross": {"a": 1.0, "b": 1.05}}, TRAVEL) is None, "1800 kph: artifact"
+
+    # Heading: the facing of the camera gives both the compass direction and the gate side.
+    NORTH, SOUTH = {"name": "n", "heading": "north"}, {"name": "s", "heading": "south"}
+    d = fresh()
+    away = {"first_c": (640.0, 600.0), "c": (640.0, 200.0), "dim": (1280, 720)}   # receding
+    assert (d._direction(away, NORTH), d._bound(away, NORTH)) == ("northbound", "toward_gate")
+    assert (d._direction(away, SOUTH), d._bound(away, SOUTH)) == ("southbound", "away_from_gate")
+    near = {**away, "first_c": (640.0, 200.0), "c": (640.0, 600.0)}               # approaching
+    assert (d._direction(near, NORTH), d._bound(near, NORTH)) == ("southbound", "away_from_gate")
+    assert d._direction(away, {"name": "plain"}) is None, "no heading is never guessed"
+    assert d._bound(away, {"name": "plain"}) is None
+    assert d._direction(away, {"name": "katuba-south"}) == "southbound", "heading from the name"
 
     # Fine-tuned weights: the model's own names are the taxonomy, end to end.
     import sys
