@@ -6,6 +6,7 @@
   python selfloop.py train --now   train now, threshold or not
   python selfloop.py status        where the loop stands
   python selfloop.py adopt <run>   crown a run trained by hand (v2 was)
+  python selfloop.py adopt-attrs <run>   the same, for an attribute run
   python selfloop.py               self-check
 
 Two launchd agents call ingest every few hours and train every hour (docs/SELF_LOOP.md).
@@ -16,7 +17,9 @@ new frames sit outside the frozen reference set, train fine-tunes, scores the re
 the reference set, and promotes it to champion only if that score improved. The champion
 pre-labels the next ingest pass — the loop closes there. Site boxes keep whatever weights
 they were given until someone deploys models/champion.pt: promoting the pre-labeller is
-cheap to be wrong about, promoting a toll gate's detector is not.
+cheap to be wrong about, promoting a toll gate's detector is not. The attribute classifier
+rides the same pass on the same curated set — trained after the detector, promoted on its
+own mean val accuracy, and used by the next ingest to pre-fill attribute suggestions.
 """
 import json
 import os
@@ -32,10 +35,12 @@ STATE = DATASET / "loop-state.json"
 LOCK = DATASET / "loop.lock"
 VIDEOS = DATASET / "loop-videos"      # a segment lives here only while it is being sampled
 CHAMPION = DATASET / "champion.pt"
+ATTRS_CHAMPION = DATASET / "attrs-champion.pt"
 THRESHOLD = 1000      # new curated frames (outside the reference set) that earn a run
 PER_CAM = 6           # newest segments per camera per pass: coverage, not volume
 REMEMBER = 5000       # segment keys remembered as already sampled
 MODELS = "models/"    # bucket prefix for published weights
+ATTR_MODELS = MODELS + "attrs/"
 SKIP = ("curation/", MODELS)
 PENDING = ("pending/images", "pending/labels", "pending/attrs", "pending/suggest")
 
@@ -97,6 +102,17 @@ def promote(candidate, champion):
     return bool(candidate) and candidate.get("map50") is not None and candidate["map50"] > champion["map50"]
 
 
+def promote_attrs(candidate, champion):
+    """The same rule for the attribute classifier, on the mean val accuracy across its
+    heads: a hand-trained champion with no report to compare against loses to anything,
+    otherwise a run has to be strictly better. Mean, not per-head — the heads share one
+    backbone, so they are promoted or not as one model."""
+    if champion is None or champion.get("mean_acc") is None:
+        return True
+    return bool(candidate) and candidate.get("mean_acc") is not None \
+        and candidate["mean_acc"] > champion["mean_acc"]
+
+
 # ---- the machinery ----
 
 WAIT = 900            # seconds a pass waits for the lock before giving up on this tick
@@ -151,6 +167,49 @@ def new_frames():
     return sum(1 for p in (DATASET / "approved" / "labels").glob("*.txt") if p.stem not in ref)
 
 
+def suggest(stems):
+    """Pre-fill attribute suggestions for the samples this pass just wrote.
+
+    The champion's guess is a suggestion, never a record: the Label tab shows it greyed
+    and app.py deletes the sidecar the moment a curator saves the sample. That is the
+    whole point — correcting five taps is faster than typing five, and a wrong guess
+    costs a tap rather than a bad label.
+    """
+    import detect
+    import train_attrs
+    from PIL import Image
+    try:
+        import torch
+        dev = "mps" if torch.backends.mps.is_available() else "cpu"
+    except Exception:
+        dev = "cpu"
+    classify = detect.attr_classifier(str(ATTRS_CHAMPION), dev)   # the one loader, shared with live detection
+    out = DATASET / "pending" / "suggest"
+    out.mkdir(parents=True, exist_ok=True)
+    written = 0
+    for stem in stems:
+        js = out / f"{stem}.json"
+        if js.exists():        # suggested already, or a re-ingest of the same stem
+            continue
+        try:
+            img = Image.open(DATASET / "pending" / "images" / f"{stem}.jpg").convert("RGB")
+            lines = (DATASET / "pending" / "labels" / f"{stem}.txt").read_text().splitlines()
+            got = {}
+            # The key is the box's index as app.py counts them, which is its position
+            # among the well-formed lines — skipping a short row here and keeping it
+            # there would shift every suggestion after it onto the wrong vehicle.
+            for i, box in enumerate(b for b in map(str.split, lines) if len(b) == 5):
+                crop = train_attrs.crop_box(img, box[1:5])   # same padding the heads trained on
+                if crop is not None:
+                    got[str(i)] = classify(crop)
+            if got:
+                js.write_text(json.dumps(got, indent=1))
+                written += 1
+        except Exception as e:      # one unreadable sample must not cost the whole pass
+            print(f"  ! suggest {stem}: {e}", flush=True)
+    print(f"{now()} ingest: attributes suggested for {written} sample(s)", flush=True)
+
+
 def ingest_pass():
     import ingest_video
     with Lock():
@@ -174,6 +233,8 @@ def ingest_pass():
             sink = ingest_video.ingest(files, cfg)
         finally:
             shutil.rmtree(VIDEOS, ignore_errors=True)  # sampled: the footage stays in the bucket
+        if ATTRS_CHAMPION.is_file():
+            suggest(sink.stems)      # pushed with the samples: PENDING covers pending/suggest
         s["ingested"] = (s["ingested"] + todo)[-REMEMBER:]
         s["last_ingest"] = {"at": now(), "segments": len(todo), "samples": sum(sink.written.values())}
         save_state(s)
@@ -206,7 +267,37 @@ def train_pass(force=False):
         else:
             print(f"{now()} train: {run.name} scored {ev['map50'] if ev else 'n/a'} on the reference, "
                   f"champion stays at {s['champion']['map50']}", flush=True)
+        attrs_pass(s, cl, bucket)
         save_state(s)
+
+
+def attrs_pass(s, cl, bucket):
+    """Train and judge the attribute classifier on the same curated set, after the
+    detector. Not `all`: the reference frames trained the baseline and nothing since.
+    A failure here leaves the detector's result standing — the two models are promoted
+    independently, and a head that will not train is no reason to lose a good detector."""
+    import train_attrs
+
+    r = subprocess.run([sys.executable, str(ROOT / "train_attrs.py")], cwd=ROOT)
+    if r.returncode:
+        print(f"{now()} attrs: train_attrs.py failed ({r.returncode}); attrs champion untouched",
+              flush=True)
+        return
+    run = max(train_attrs.RUNS.glob("*/"), key=lambda p: p.stat().st_mtime)
+    rep = attrs_report(run)
+    s["last_attrs"] = {"at": now(), "run": run.name, "mean_acc": rep and rep["mean_acc"]}
+    if promote_attrs(rep, s.get("attrs_champion")):
+        crown_attrs(s, run, rep, cl, bucket)
+    else:
+        print(f"{now()} attrs: {run.name} scored {rep['mean_acc'] if rep else 'n/a'} mean val "
+              f"accuracy, attrs champion stays at {s['attrs_champion']['mean_acc']}", flush=True)
+
+
+def attrs_report(run):
+    try:
+        return json.loads((run / "report.json").read_text())
+    except (OSError, ValueError):
+        return None
 
 
 def run_eval(run):
@@ -232,6 +323,23 @@ def crown(s, run, frames, ev, cl, bucket):
           f"— published under {MODELS}", flush=True)
 
 
+def crown_attrs(s, run, rep, cl, bucket):
+    """Make this run the attribute champion: it suggests attributes on the next ingest
+    here, and models/attrs-champion.pt is the offer for whoever deploys `attr_weights`."""
+    weights = run / "attrs.pt"
+    shutil.copy2(weights, ATTRS_CHAMPION)
+    s["attrs_champion"] = {"run": run.name, "at": now(), "mean_acc": rep and rep["mean_acc"],
+                           "per_head_acc": rep and rep["per_head_acc"]}
+    for key in (f"{ATTR_MODELS}{run.name}/attrs.pt", f"{MODELS}attrs-champion.pt"):
+        cl.upload_file(str(weights), bucket, key)
+    if (run / "report.json").is_file():
+        cl.upload_file(str(run / "report.json"), bucket, f"{ATTR_MODELS}{run.name}/report.json")
+    cl.put_object(Bucket=bucket, Key=f"{MODELS}attrs-champion.json",
+                  Body=json.dumps(s["attrs_champion"]).encode())
+    print(f"{now()}: {run.name} is the attrs champion (mean val accuracy "
+          f"{rep['mean_acc'] if rep else 'n/a'}) — published under {ATTR_MODELS}", flush=True)
+
+
 def adopt(name):
     """Crown a run trained outside the loop — v2, trained by hand before the loop
     existed. No threshold, no comparison: the operator has decided."""
@@ -247,6 +355,20 @@ def adopt(name):
         save_state(s)
 
 
+def adopt_attrs(name):
+    """Crown an attribute run trained outside the loop — the baseline was. As with
+    adopt(): no comparison, the operator has decided."""
+    import train_attrs
+    run = train_attrs.RUNS / name
+    if not (run / "attrs.pt").is_file():
+        sys.exit(f"no attrs.pt under {run}")
+    with Lock():
+        s = load_state()
+        _ds, cl, bucket = r2()
+        crown_attrs(s, run, attrs_report(run), cl, bucket)
+        save_state(s)
+
+
 def status():
     s = load_state()
     try:
@@ -254,13 +376,68 @@ def status():
     except SystemExit:
         count = None
     print(f"champion:      {s.get('champion')}")
+    print(f"attrs champ:   {s.get('attrs_champion')}")
     print(f"last train:    {s.get('last_train')}")
+    print(f"last attrs:    {s.get('last_attrs')}")
     print(f"last ingest:   {s.get('last_ingest')}  ({len(s.get('ingested', []))} segments remembered)")
     if count is not None:
         gap = THRESHOLD - (count - s.get("trained_frames", 0))
         print(f"new frames:    {count} outside the reference set, {s.get('trained_frames', 0)} at the last run"
               f" — {'ready to train' if gap <= 0 else f'{gap} more before the next run'}")
     print(f"lock:          {LOCK.read_text().strip() if LOCK.exists() else 'free'}")
+
+
+def suggest_check():
+    """detect.attr_classifier() must load what train_attrs.py saves, and suggest() must
+    write the sidecar the Label tab reads. Untested, this pair rots silently — the loader
+    once rebuilt a different network and could not load a real checkpoint at all. Random
+    weights: only the shapes, the vocabulary and the file layout are under test here."""
+    import contextlib
+    import io
+    import tempfile
+    from unittest.mock import patch
+    try:
+        import torch
+        from torch import nn
+        from torchvision.models import mobilenet_v3_small
+        from PIL import Image
+    except ImportError as e:
+        print(f"  (suggest check skipped: {e})")
+        return
+
+    tmp = Path(tempfile.mkdtemp())
+    heads = {"type": ["car", "bus"], "axles": ["2", "3", "4"]}
+    m = mobilenet_v3_small(weights=None)
+    fc = nn.ModuleList([nn.Linear(576, len(v)) for v in heads.values()])
+    ckpt = tmp / "attrs.pt"
+    torch.save({"state_dict": {**{f"features.{k}": v for k, v in m.features.state_dict().items()},
+                               **{f"fc.{k}": v for k, v in fc.state_dict().items()}},
+                "heads": heads, "backbone": "mobilenet_v3_small", "input": 224}, ckpt)
+
+    pend = tmp / "dataset" / "pending"
+    (pend / "images").mkdir(parents=True)
+    (pend / "labels").mkdir(parents=True)
+    Image.new("RGB", (640, 480), "grey").save(pend / "images" / "gate-1.jpg")
+    # The short middle row is what app.py's reader skips: box "1" must be the third line.
+    (pend / "labels" / "gate-1.txt").write_text(
+        "0 0.5 0.5 0.2 0.3\n1 0.1 0.1\n1 0.1 0.1 0.05 0.05\n")
+
+    me = sys.modules[__name__]
+    # suggest() reports to the ingest log; here its chatter, the deliberate failure
+    # included, would drown the one line a self-check is supposed to print.
+    with patch.object(me, "DATASET", tmp / "dataset"), \
+         patch.object(me, "ATTRS_CHAMPION", ckpt), \
+         contextlib.redirect_stdout(io.StringIO()) as log:
+        suggest(["gate-1", "missing-stem"])       # a stem with no image must not stop the pass
+        got = json.loads((pend / "suggest" / "gate-1.json").read_text())
+        before = (pend / "suggest" / "gate-1.json").stat().st_mtime_ns
+        suggest(["gate-1"])                       # already suggested: left alone
+        assert (pend / "suggest" / "gate-1.json").stat().st_mtime_ns == before, "re-suggested"
+    assert "! suggest missing-stem" in log.getvalue(), log.getvalue()
+    assert "suggested for 1 sample" in log.getvalue(), log.getvalue()
+    assert list(got) == ["0", "1"], got           # keyed by label line, the box index
+    assert all(set(v) == set(heads) and v["type"] in heads["type"]
+               and v["axles"] in heads["axles"] for v in got.values()), got
 
 
 def selfcheck():
@@ -279,9 +456,15 @@ def selfcheck():
     assert promote({"map50": 0.5}, None) and promote({"map50": 0.1}, {"map50": None})
     assert promote({"map50": 0.71}, {"map50": 0.70}) and not promote({"map50": 0.70}, {"map50": 0.70})
     assert not promote(None, {"map50": 0.70}), "no score, no promotion"
+    assert promote_attrs({"mean_acc": 0.5}, None) and promote_attrs({"mean_acc": 0.1}, {"mean_acc": None})
+    assert promote_attrs({"mean_acc": 0.88}, {"mean_acc": 0.87})
+    assert not promote_attrs({"mean_acc": 0.87}, {"mean_acc": 0.87}), "a tie is not an improvement"
+    assert not promote_attrs(None, {"mean_acc": 0.87}), "no report, no promotion"
+    suggest_check()
     print("selfloop self-check ok: cameras found under any gate prefix, newest unsampled segments "
           "picked per camera, training triggers on the cumulative threshold, promotion needs a "
-          "strictly better reference score unless there is no comparable champion")
+          "strictly better reference score (detector) or mean val accuracy (attributes) unless "
+          "there is no comparable champion")
 
 
 if __name__ == "__main__":
@@ -296,5 +479,7 @@ if __name__ == "__main__":
         status()
     elif a[0] == "adopt" and len(a) == 2:
         adopt(a[1])
+    elif a[0] == "adopt-attrs" and len(a) == 2:
+        adopt_attrs(a[1])
     else:
         sys.exit(__doc__)

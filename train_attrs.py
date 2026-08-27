@@ -181,18 +181,22 @@ def train(heads, crops, targets, stems):
             preds.append(torch.stack([o.argmax(1).cpu() for o in forward(xv[i].to(dev))], 1))
     P = torch.cat(preds) if preds else torch.zeros((0, len(names)), dtype=torch.long)
     print()
+    accs, labelled, confusion = {}, {}, {}
     for j, n in enumerate(names):
         m = yv[:, j] >= 0
-        acc = float((P[m][:, j] == yv[m][:, j]).float().mean()) if int(m.sum()) else float("nan")
-        print(f"  {n:<8} val acc {acc:.1%}  ({int(m.sum())} labelled)")
+        labelled[n] = int(m.sum())
+        accs[n] = float((P[m][:, j] == yv[m][:, j]).float().mean()) if labelled[n] else None
+        print(f"  {n:<8} val acc {accs[n] if accs[n] is not None else float('nan'):.1%}"
+              f"  ({labelled[n]} labelled)")
     if "axles" in names:      # adjacent-bin confusion is the expected failure; show it
         j = names.index("axles")
         for v, label in enumerate(heads["axles"]):
             m = yv[:, j] == v
             if int(m.sum()):
-                dist = [f"{heads['axles'][p]}×{int((P[m][:, j] == p).sum())}"
-                        for p in P[m][:, j].unique().tolist()]
-                print(f"    true {label:<6} -> " + " ".join(dist))
+                dist = {heads["axles"][p]: int((P[m][:, j] == p).sum())
+                        for p in P[m][:, j].unique().tolist()}
+                confusion[label] = dist
+                print(f"    true {label:<6} -> " + " ".join(f"{k}×{c}" for k, c in dist.items()))
 
     run = RUNS / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     run.mkdir(parents=True, exist_ok=True)
@@ -201,6 +205,14 @@ def train(heads, crops, targets, stems):
                                **{f"fc.{k}": v for k, v in heads_fc.state_dict().items()}},
                 "heads": {n: heads[n] for n in names},
                 "backbone": "mobilenet_v3_small", "input": INPUT}, out)
+    # The printed report is for a human reading the log; this one is for selfloop.py,
+    # which promotes on mean_acc and quotes the confusion in its summary. A head nobody
+    # has labelled in the val split scores null rather than 0 — it was not tested.
+    ok = [a for a in accs.values() if a is not None]
+    (run / "report.json").write_text(json.dumps(
+        {"run": run.name, "per_head_acc": accs, "mean_acc": sum(ok) / len(ok) if ok else None,
+         "val_crops": len(xv), "labelled": labelled, "axles_confusion": confusion,
+         "baseline": BASELINE}, indent=1))
     print(f"\nattrs: {out}")
     print(f"to deploy: set attr_weights: {out} in config.yaml and restart FieldKit")
 

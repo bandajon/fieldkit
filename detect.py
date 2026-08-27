@@ -157,9 +157,15 @@ def attr_text(attrs):
 
 
 def attr_classifier(path, dev="cpu"):
-    """-> fn(PIL crop) -> {head: value}. Rebuilds train_attrs.py's model (mobilenet_v3_small
-    backbone + one linear head per attribute) around the saved vocab — the ModuleDict keys
-    below must stay in step with that script's module attributes."""
+    """-> fn(PIL crop) -> {head: value}. Rebuilds exactly what train_attrs.py saves:
+    mobilenet_v3_small's feature extractor, its average pool, and one 576-wide linear head
+    per attribute, stored as `features.*` and `fc.<i>.*` in the saved vocab's head order.
+    This used to rebuild a different network (1024-wide heads behind the stock classifier)
+    and could not load a real checkpoint at all — selfloop's suggest_check now loads one
+    in this exact format, so the two files cannot drift apart silently again.
+
+    The caller pads the crop (crop(): 10 %, the same context the heads trained on); the
+    resize to the training size happens here."""
     import torch
     from torchvision import models, transforms
 
@@ -167,15 +173,14 @@ def attr_classifier(path, dev="cpu"):
     # file as arbitrary code just because it sits in the operator's dataset directory.
     ck = torch.load(path, map_location=dev, weights_only=True)
     vocab = ck["heads"]
-    net = models.mobilenet_v3_small()
-    feats = net.classifier[3].in_features
-    net.classifier[3] = torch.nn.Identity()
-    model = torch.nn.ModuleDict({
-        "backbone": net,
-        "heads": torch.nn.ModuleDict({h: torch.nn.Linear(feats, len(v))
-                                      for h, v in vocab.items()})})
-    model.load_state_dict(ck["state_dict"])
-    model.eval().to(dev)
+    names = list(vocab)
+    m = models.mobilenet_v3_small(weights=None)          # every weight comes from the file
+    net = torch.nn.Sequential()
+    net.add_module("features", m.features)
+    net.add_module("fc", torch.nn.ModuleList([torch.nn.Linear(576, len(vocab[n])) for n in names]))
+    net.load_state_dict(ck["state_dict"])
+    net.eval().to(dev)
+    pool = m.avgpool
     size = ck.get("input", 224)
     prep = transforms.Compose([transforms.Resize((size, size)), transforms.ToTensor(),
                                transforms.Normalize([0.485, 0.456, 0.406],
@@ -183,8 +188,8 @@ def attr_classifier(path, dev="cpu"):
 
     def classify(pil):
         with torch.no_grad():
-            f = model["backbone"](prep(pil).unsqueeze(0).to(dev))
-            return {h: vocab[h][int(model["heads"][h](f).argmax())] for h in vocab}
+            f = pool(net.features(prep(pil).unsqueeze(0).to(dev))).flatten(1)
+            return {n: vocab[n][int(net.fc[j](f).argmax())] for j, n in enumerate(names)}
 
     return classify
 

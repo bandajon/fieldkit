@@ -141,6 +141,7 @@ class Sink:
         self.at = {}          # cam -> footage timestamp of its last capture
         self.dets = {}        # cam -> its `shown`, for the scene comparison
         self.written = Counter()
+        self.stems = []       # what this run wrote, in order: the caller pre-fills suggestions
 
     def offer(self, cam, ts, jpeg, shown, w, h):
         # Cadence counts from the last real capture, not the last attempt: a scene that
@@ -158,6 +159,7 @@ class Sink:
         (self.images / f"{stem}.jpg").write_bytes(jpeg)      # re-ingest overwrites: idempotent
         (self.labels / f"{stem}.txt").write_text("\n".join(lines) + "\n")
         self.written[cam] += 1
+        self.stems.append(stem)
         return True
 
     def _evict(self):
