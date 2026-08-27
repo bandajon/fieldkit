@@ -621,6 +621,78 @@ def site_rename():
             app.CONFIG, app.CONFIG_PATH, app.REC.site = keep
 
 
+def label_strip_rules():
+    """The Label tab's attribute rules, run in node against the real yaml and the real
+    functions cut out of index.html: one tap on z-emergency fills everything, a suggested
+    value yields to the operator's own tap, and every class's defaults obey its constraints."""
+    import shutil, subprocess, json
+    import app
+    cfg = yaml.safe_load((app.DATASET / "attributes.yaml").read_text()) or {}
+    vocab = {k: v for k, v in cfg.items() if isinstance(v, list)}
+    cons, defs = cfg.get("constraints") or {}, cfg.get("defaults") or {}
+    for cls, dd in defs.items():
+        for head, v in dd.items():
+            allowed = (cons.get(cls) or {}).get(head, vocab.get(head, []))
+            assert v in allowed, f"{cls}: default {head}={v!r} is not one of {allowed}"
+    z = defs.get("z-emergency") or {}
+    for head in vocab:
+        if (cons.get("z-emergency") or {}).get(head, vocab[head]):     # visible means required
+            assert head in z, f"z-emergency: no default for {head}, so it is not one tap"
+    if not shutil.which("node"):
+        print("  (node not installed: JS rules not run)")
+        return
+    src = (ROOT / "static" / "index.html").read_text()
+
+    def fn(name):
+        i = src.index(f"function {name}(")
+        return src[i:src.index("\n}\n", i) + 3]
+    js = "const labClasses=%s, labAttrs=%s, labConstraints=%s, labDefaults=%s, labImplies=%s, labRestricts=%s;\n" % (
+        json.dumps([l.strip() for l in (app.DATASET / "classes.txt").read_text().splitlines() if l.strip()]),
+        json.dumps(vocab), json.dumps(cons), json.dumps(defs), json.dumps(cfg.get("implies") or {}),
+        json.dumps(cfg.get("restricts") or {}))
+    js += src[src.index("const labLocked"):src.index("\n", src.index("const labLocked"))] + "\n"
+    js += "\n".join(fn(n) for n in ("labVocab", "labFill", "labDefault", "labGap"))
+    js += r"""
+const cls = n => labClasses.indexOf(n), Z = cls('z-emergency'), E = cls('e-heavy');
+const box = (c, attrs = {}, touched = [], suggested = []) =>
+  ({cls: c, attrs, touched: new Set(touched), suggested: new Set(suggested), del: false});
+const norm = x => x && typeof x === 'object' && !Array.isArray(x)
+  ? Object.fromEntries(Object.entries(x).sort()) : x;     // key order is not a difference
+const eq = (got, want, msg) => { const a = JSON.stringify(norm(got)), b = JSON.stringify(norm(want));
+  if (a !== b) { console.log('FAIL ' + msg + ': got ' + a + ' wanted ' + b); process.exit(1); } };
+const Zdef = {type: 'ambulance', axles: '2', trailers: '0', cargo: 'none', 'axle-config': '1+1'};
+
+let b = box(E); b.cls = Z; labDefault(b);
+eq(b.attrs, Zdef, 'fresh box, one tap'); eq(labGap([b]), null, 'nothing left to ask');
+
+b = box(E, {type: 'articulated', cargo: 'general', 'axle-config': '1+2+3', axles: '6', trailers: '1'},
+        ['axles'], ['type', 'cargo', 'axle-config']);
+b.cls = Z; labDefault(b);
+eq(b.attrs, Zdef, 'forbidden values drop whoever set them; a value nobody chose re-defaults');
+eq([...b.suggested], [], 'dropped suggestions are forgotten');
+
+b = box(E, {cargo: 'none', type: 'tanker'}, [], ['cargo', 'type']); b.cls = Z; labDefault(b);
+eq(b.attrs, Zdef, 'a suggestion the new class allows stays, one it forbids goes');
+eq([...b.suggested], ['cargo'], 'and is still marked as the model\'s');
+
+b = box(E, {axles: '3'}, ['axles']); b.cls = Z; labDefault(b);
+eq(b.attrs, {...Zdef, axles: '3', 'axle-config': '1+2'}, 'a counted 3 axles survives and drives 1+2');
+
+b = box(Z, {...Zdef, 'axle-config': '1+2'}, [], ['axle-config']);
+b.attrs.axles = '3'; b.touched.add('axles'); labFill(b, labImplies.axles['3'], true);
+eq(b.attrs['axle-config'], '1+2', 'axles 3 -> 1+2');
+b.attrs.axles = '2'; labFill(b, labImplies.axles['2'], true);
+eq(b.attrs['axle-config'], '1+1', 'axles 2 -> 1+1 even over a suggested config');
+b = box(Z, {...Zdef, 'axle-config': '1+2'}, ['axle-config']);
+labFill(b, labImplies.axles['2'], true);
+eq(b.attrs['axle-config'], '1+2', "the operator's own config is never overridden by implies");
+console.log('  js rules ok');
+"""
+    r = subprocess.run(["node", "-e", js], capture_output=True, text=True)
+    assert r.returncode == 0, r.stdout + r.stderr
+    print(r.stdout.strip())
+
+
 check("hostnet arp parser", hostnet_arp_parser)
 check("scan auto-joins once", scan_auto_joins_once)
 check("hostnet jetson (naming, no-carrier, bootstrap)", hostnet_jetson)
@@ -643,6 +715,7 @@ check("attribute restrict rules are real", attr_restricts_are_real)
 check("search with no class lists the pen", search_lists_the_pen)
 check("claims survive a restart", claims_survive_restart)
 check("site rename", site_rename)
+check("label strip rules (one-tap emergency, implies)", label_strip_rules)
 
 print(f"\n{'FAILED: ' + ', '.join(FAILS) if FAILS else 'all passed'}")
 sys.exit(1 if FAILS else 0)

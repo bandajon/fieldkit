@@ -1140,17 +1140,31 @@ const labLocked = (b, head) => b.touched.has(head) || b.suggested.has(head);
 
 // Fills heads nothing has claimed, skipping values the class disallows — machinery must never
 // overwrite a deliberate choice nor introduce a flagged-stale value.
-function labFill(b, map) {
+// `soft` lets a value the model merely suggested give way — the operator tapping the head
+// that implies it (axles -> axle-config) outranks a guess about the same box. A head the
+// operator touched themselves never gives way here.
+function labFill(b, map, soft) {
   const name = labClasses[b.cls];
-  for (const [head, v] of Object.entries(map || {}))
-    if (!labLocked(b, head) && labVocab(head, name, null).some(([a]) => a === v)) b.attrs[head] = v;
+  for (const [head, v] of Object.entries(map || {})) {
+    if (b.touched.has(head) || (b.suggested.has(head) && !soft)) continue;
+    if (!labVocab(head, name, null).some(([a]) => a === v)) continue;
+    b.attrs[head] = v;
+    if (soft) b.suggested.delete(head);
+  }
 }
 
 function labDefault(b) {
-  const def = labDefaults[labClasses[b.cls]] || {};
-  for (const head of Object.keys(b.attrs))     // the old class's defaults do not survive the new one
-    if (!labLocked(b, head) && !(head in def)) delete b.attrs[head];
+  const name = labClasses[b.cls], def = labDefaults[name] || {};
+  // The old class's values survive only where somebody chose them — operator or model — AND
+  // the new class allows them. A locked value the class forbids is not a decision about this
+  // class; it is debris from the last one, and it used to sail through the gap check.
+  for (const head of Object.keys(b.attrs)) {
+    const keep = labLocked(b, head) && labVocab(head, name, null).some(([a]) => a === b.attrs[head]);
+    if (!keep) { delete b.attrs[head]; b.touched.delete(head); b.suggested.delete(head); }
+  }
   labFill(b, def);
+  // Then the axle count decides the configuration, whichever way the count got here.
+  labFill(b, (labImplies.axles || {})[b.attrs.axles], true);
 }
 
 // --- Examples: what an approved class actually looks like ---
@@ -1230,7 +1244,7 @@ document.getElementById('l-attrs').onclick = e => {
     b.touched.add(head);
     b.suggested.delete(head);
     // One level, deliberately: chained implies are how a tap starts rewriting the whole strip.
-    labFill(b, (labImplies[head] || {})[t.dataset.val]);
+    labFill(b, (labImplies[head] || {})[t.dataset.val], true);
   }
   labSelect(labSel);
 };
