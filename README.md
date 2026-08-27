@@ -532,3 +532,14 @@ config.example.yaml  tracked, commented reference schema
 config.yaml        live config (untracked; auto-created on first boot)
 static/index.html  the entire UI, one file, vanilla JS
 ```
+
+## Training and the reference set
+
+`python train.py` fine-tunes on `dataset/approved/` — except the frames listed in
+`dataset/reference.txt`. That list is the frozen benchmark: everything curated up to
+2026-08-27 (1,058 frames, the v2 training set). No later model trains on those
+frames; every model is scored on them, and the score lands in
+`dataset/train_runs/<run>/reference-eval.json`, which is how one version is compared
+with the next. The file is synced through the bucket as config, so every training
+machine holds the same list; the frames stay in `approved/` and still serve as
+examples on the Label tab. `train_attrs.py` follows the same rule.

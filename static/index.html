@@ -893,7 +893,9 @@ const labNum = v => typeof v === 'number' ? v : (v && v.approve) || 0;   // {app
 const labStats = () => {
   const el = document.getElementById('l-stats'), a = labAssign;
   el.textContent = (labApproved.frames
-    ? `fine-tune set: ${labApproved.frames} frames · ` +
+    ? `fine-tune set: ${labApproved.frames} frames` +
+      (labApproved.frozen ? ` (${labApproved.frozen} frozen as the reference · ${
+          labApproved.frames - labApproved.frozen} new)` : '') + ' · ' +
       Object.entries(labApproved.boxes).map(([k, v]) => `${k} ${v}`).join(' · ')
     : 'fine-tune set: empty — approve samples to grow it')
     + (labWho && labProg   // .res is pre-line, so the team line lands under it

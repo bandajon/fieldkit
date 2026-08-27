@@ -639,7 +639,15 @@ def approved_counts():
                 continue
             if 0 <= cls < len(names):      # a stale id past the class list is skipped, not fatal
                 boxes[names[cls]] = boxes.get(names[cls], 0) + 1
-    return {"frames": frames, "boxes": boxes}
+    # Frames frozen as the reference benchmark (train.reference): still approved, still
+    # examples, but they train nothing — so "new since the freeze" is the number that
+    # says whether another run is worth starting.
+    try:
+        ref = {ln.strip() for ln in (DATASET / "reference.txt").read_text().splitlines() if ln.strip()}
+    except OSError:
+        ref = set()
+    frozen = sum(1 for p in (d.glob("*.txt") if d.is_dir() else []) if p.stem in ref)
+    return {"frames": frames, "boxes": boxes, "frozen": frozen}
 
 
 def sample_paths(sid, tree="pending"):

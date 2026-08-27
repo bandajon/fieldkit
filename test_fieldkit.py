@@ -726,6 +726,41 @@ def assign_targets():
             app.DATASET, app.REVIEWERS, app.push_file = keep
 
 
+def training_split_honours_reference():
+    """Frames in reference.txt never enter a training split and always form the benchmark tree."""
+    import tempfile
+    import train
+
+    keep = (train.DATASET, train.APPROVED, train.RUN, train.REF_RUN, train.REFERENCE, train.MIN_FRAMES)
+    with tempfile.TemporaryDirectory() as d:
+        try:
+            D = Path(d)
+            train.DATASET, train.APPROVED, train.RUN = D, D / "approved", D / "run"
+            train.REF_RUN, train.REFERENCE, train.MIN_FRAMES = D / "reference-run", D / "reference.txt", 2
+            for sub in ("images", "labels"):
+                (D / "approved" / sub).mkdir(parents=True)
+            stems = [f"f{i:03d}" for i in range(30)]
+            for s in stems:
+                (D / "approved" / "images" / f"{s}.jpg").write_bytes(b"x")
+                (D / "approved" / "labels" / f"{s}.txt").write_text("0 0.5 0.5 0.1 0.1\n")
+            split = train.build(["a-small"])
+            assert len(split["train"]) + len(split["val"]) == 30, "no reference: every frame trains"
+            assert not (D / "reference-run").exists()
+            (D / "reference.txt").write_text("\n".join(stems[:20]) + "\n")
+            split = train.build(["a-small"])
+            assert set(split["train"]) | set(split["val"]) == set(stems[20:]), "frozen frames leaked into the split"
+            held = {p.stem for p in (D / "reference-run" / "images" / "val").glob("*.jpg")}
+            assert held == set(stems[:20]) and (D / "reference-run" / "data.yaml").is_file()
+            (D / "reference.txt").write_text("\n".join(stems) + "\n")
+            try:
+                train.build(["a-small"])
+                raise AssertionError("built a split with nothing outside the reference set")
+            except SystemExit as e:
+                assert "reference" in str(e), e
+        finally:
+            (train.DATASET, train.APPROVED, train.RUN, train.REF_RUN, train.REFERENCE, train.MIN_FRAMES) = keep
+
+
 check("hostnet arp parser", hostnet_arp_parser)
 check("scan auto-joins once", scan_auto_joins_once)
 check("hostnet jetson (naming, no-carrier, bootstrap)", hostnet_jetson)
@@ -750,6 +785,7 @@ check("claims survive a restart", claims_survive_restart)
 check("site rename", site_rename)
 check("label strip rules (one-tap emergency, implies)", label_strip_rules)
 check("assignment targets (several, all)", assign_targets)
+check("training split honours the reference set", training_split_honours_reference)
 
 print(f"\n{'FAILED: ' + ', '.join(FAILS) if FAILS else 'all passed'}")
 sys.exit(1 if FAILS else 0)

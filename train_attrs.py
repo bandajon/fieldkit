@@ -18,7 +18,7 @@ from pathlib import Path
 import yaml
 from PIL import Image
 
-from train import is_val      # same deterministic split, same 1-in-10
+from train import is_val, reference   # same split, same frozen benchmark
 
 ROOT = Path(__file__).resolve().parent
 DATASET = ROOT / "dataset"
@@ -58,7 +58,10 @@ def build(heads):
     """-> ([crop], [targets], [stem]); targets are value ids per head, -1 = not labelled."""
     names = list(heads)
     crops, targets, stems, skipped = [], [], [], 0
+    ref = reference()                 # the benchmark frames train nothing, this head included
     for js in sorted((APPROVED / "attrs").glob("*.json")):
+        if js.stem in ref:
+            continue
         img_p = APPROVED / "images" / f"{js.stem}.jpg"
         lbl_p = APPROVED / "labels" / f"{js.stem}.txt"
         if not (img_p.is_file() and lbl_p.is_file()):
