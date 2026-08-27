@@ -1174,7 +1174,9 @@ def dataset_search(target: str = "", who: str = "", tree: str = "approved", limi
                    x_curator_token: str = Header("")):
     """Every frame holding a class or a whole toll category, newest first — the way back
     to work already filed, for a supervisor spot-checking a class or cleaning up after one
-    curator. `total` is the whole match, `results` the page of it.
+    curator. No class at all lists the whole tree: "what is in holding right now, and
+    whose is it" is a question with no vehicle in it. `total` is the whole match,
+    `results` the page of it, `by_curator` the whole match tallied by hand.
 
     ponytail: full scan of the tree per call, the same ceiling approved_counts() and
     label_files() already live with; index the labels if the dataset outgrows it."""
@@ -1182,7 +1184,7 @@ def dataset_search(target: str = "", who: str = "", tree: str = "approved", limi
     tree, who = valid_tree(tree), valid_who(who)
     names = dataset_classes()
     ids = {names.index(c) for c in target_classes(target)}
-    if not ids:
+    if not ids and str(target or "").strip():
         raise HTTPException(400, f"no class or category {target!r} — pick one of: "
                                  f"{', '.join(categories() + names)}")
     by = sample_curators(tree)
@@ -1191,7 +1193,7 @@ def dataset_search(target: str = "", who: str = "", tree: str = "approved", limi
                       key=lambda f: f.stat().st_mtime, reverse=True)
     except OSError:      # a sample moved mid-listing: fewer results beats an error
         rows = []
-    hits = []
+    hits, by_curator = [], {}
     for f in rows:
         curator = by.get(f.stem, "anon")
         if who and curator != who:
@@ -1200,10 +1202,13 @@ def dataset_search(target: str = "", who: str = "", tree: str = "approved", limi
             boxes = read_boxes(f)
         except OSError:
             continue
-        if any(b["cls"] in ids for b in boxes):
-            hits.append({"id": f.stem, "curator": curator, "tree": tree, "boxes": boxes,
-                         "attrs": read_attrs(attrs_path(f.stem, tree))})
-    return {"results": hits[:max(1, min(limit, 200))], "total": len(hits)}
+        if ids and not any(b["cls"] in ids for b in boxes):
+            continue
+        hits.append({"id": f.stem, "curator": curator, "tree": tree, "boxes": boxes,
+                     "attrs": read_attrs(attrs_path(f.stem, tree))})
+        by_curator[curator] = by_curator.get(curator, 0) + 1
+    return {"results": hits[:max(1, min(limit, 200))], "total": len(hits),
+            "by_curator": by_curator}
 
 
 @app.get("/api/dataset/sample")

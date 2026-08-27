@@ -525,6 +525,41 @@ def attr_restricts_are_real():
     assert seen, "no restrict rules — the tanker/cargo rule should be one of them"
 
 
+def search_lists_the_pen():
+    """No class picked = the whole tree, tallied by curator: the supervisor's view of holding."""
+    import tempfile
+    import app
+
+    keep = (app.DATASET, app.REVIEWERS)
+    with tempfile.TemporaryDirectory() as d:
+        try:
+            app.DATASET, app.REVIEWERS = Path(d), ["jonah"]
+            app.write_yaml("curators.yaml", {"jonah": "tok-jonah"})
+            (Path(d) / "classes.txt").write_text("a-small\ne-heavy\n")
+            pen = Path(d) / "holding" / "labels"
+            pen.mkdir(parents=True)
+            (pen / "x1.txt").write_text("0 0.5 0.5 0.1 0.1\n")
+            (pen / "x2.txt").write_text("1 0.5 0.5 0.3 0.3\n")
+            (pen / "x3.txt").write_text("1 0.4 0.4 0.3 0.3\n")
+            (Path(d) / "audit.jsonl").write_text(
+                '{"action":"approve","id":"x1","who":"curator01","held":true}\n'
+                '{"action":"approve","id":"x2","who":"curator02","held":true}\n'
+                '{"action":"approve","id":"x3","who":"curator02","held":true}\n')
+            s = lambda **kw: app.dataset_search(tree="holding", x_curator_token="tok-jonah", **kw)
+            whole = s()
+            assert whole["total"] == 3 and whole["by_curator"] == {"curator01": 1, "curator02": 2}, whole
+            assert s(target="E")["total"] == 2, "a category still narrows"
+            assert s(who="curator01")["total"] == 1, "a curator still narrows"
+            assert s(target="e-heavy", who="curator01")["total"] == 0
+            try:
+                s(target="zzz")
+                raise AssertionError("an unknown class must still be refused")
+            except app.HTTPException as e:
+                assert e.status_code == 400, e.detail
+        finally:
+            app.DATASET, app.REVIEWERS = keep
+
+
 check("hostnet arp parser", hostnet_arp_parser)
 check("scan auto-joins once", scan_auto_joins_once)
 check("hostnet jetson (naming, no-carrier, bootstrap)", hostnet_jetson)
@@ -544,6 +579,7 @@ check("record start validates hours", record_start_hours)
 check("README documents every config key", readme_documents_config)
 check("supervisor password + token minting", supervisor_tokens)
 check("attribute restrict rules are real", attr_restricts_are_real)
+check("search with no class lists the pen", search_lists_the_pen)
 
 print(f"\n{'FAILED: ' + ', '.join(FAILS) if FAILS else 'all passed'}")
 sys.exit(1 if FAILS else 0)

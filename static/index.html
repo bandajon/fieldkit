@@ -1676,9 +1676,13 @@ document.getElementById('l-sgo').onclick = async () => {
     return;
   }
   const hits = d.results || [];
-  if (!hits.length) return el.textContent = 'nothing matched';
+  if (!hits.length) return el.textContent = q.get('target') ? 'nothing matched' : `${tree} is empty`;
+  // Whose work this is, before the frames: with no class picked this IS the view of the
+  // pen, and the tally answers "who is in it" without scrolling.
+  const tally = Object.entries(d.by_curator || {}).sort((a, b) => b[1] - a[1]);
   // The chips are the point of the row: one glance says whether this frame is worth opening.
-  el.innerHTML = hits.map(s => {
+  el.innerHTML = (tally.length > 1 ? `<div class="res">${tally.map(([h, n]) =>
+      `${esc(h)} &times;${n}`).join(' &middot; ')}</div>` : '') + hits.map(s => {
     const names = [...new Set((s.boxes || []).map(b => labClasses[b.cls]).filter(Boolean))];
     return `<button class="btn" data-open="${esc(s.id)}" data-tree="${esc(s.tree || tree)}">` +
       `<b>${esc(s.id)}</b><i class="res">${esc(s.curator || '—')}</i>` +
