@@ -3,6 +3,7 @@
 
     python train_attrs.py          # build crops, train, report
     python train_attrs.py check    # build crops and count them only
+    python train_attrs.py all      # baseline: include the reference frames (first model only)
 
 One mobilenet backbone with a linear head per attribute (spec:
 docs/superpowers/specs/2026-08-23-toll-taxonomy-attributes-design.md). Partial
@@ -24,6 +25,7 @@ ROOT = Path(__file__).resolve().parent
 DATASET = ROOT / "dataset"
 APPROVED = DATASET / "approved"
 RUNS = DATASET / "attr_runs"
+BASELINE = "all" in sys.argv[1:]      # see build()
 
 INPUT = 224               # mobilenet's native size
 PAD = 0.10                # crop context: a truck's neighbours help read its type
@@ -58,7 +60,10 @@ def build(heads):
     """-> ([crop], [targets], [stem]); targets are value ids per head, -1 = not labelled."""
     names = list(heads)
     crops, targets, stems, skipped = [], [], [], 0
-    ref = reference()                 # the benchmark frames train nothing, this head included
+    # The benchmark frames train nothing, this head included — except for the very first
+    # model of its kind, which has no benchmark to protect: `train_attrs.py all` trains on
+    # everything once, the way the detector's v2 did before the set was frozen.
+    ref = set() if BASELINE else reference()
     for js in sorted((APPROVED / "attrs").glob("*.json")):
         if js.stem in ref:
             continue

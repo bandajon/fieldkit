@@ -1,6 +1,8 @@
 #!/bin/sh
 # Install the self-improving loop on this machine (macOS launchd, per-user, no sudo):
 # ingest every 4 hours, a training check every hour. Re-run to change intervals.
+# launchd starts jobs with a bare PATH, so the venv's bin (ffmpeg/ffprobe live there on a
+# machine without Homebrew: pip install static-ffmpeg, then symlink) is put on it here.
 set -e
 HERE="$(cd "$(dirname "$0")" && pwd)"
 PY="$HERE/.venv/bin/python"
@@ -16,6 +18,8 @@ agent() {   # label, seconds, subcommand
     <string>/usr/bin/caffeinate</string><string>-i</string>
     <string>$PY</string><string>$HERE/selfloop.py</string><string>$3</string></array>
   <key>WorkingDirectory</key><string>$HERE</string>
+  <key>EnvironmentVariables</key><dict>
+    <key>PATH</key><string>$HERE/.venv/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string></dict>
   <key>StartInterval</key><integer>$2</integer>
   <key>RunAtLoad</key><true/>
   <key>StandardOutPath</key><string>$HERE/loop-$3.log</string>
