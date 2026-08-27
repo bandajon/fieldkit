@@ -99,17 +99,31 @@ def promote(candidate, champion):
 
 # ---- the machinery ----
 
+WAIT = 900            # seconds a pass waits for the lock before giving up on this tick
+
+
+def holder():
+    """Pid of a live lock holder, or None (no lock, or a dead process left it)."""
+    try:
+        pid = int(LOCK.read_text().split()[0])
+        os.kill(pid, 0)
+        return pid
+    except (OSError, ValueError, IndexError):
+        return None
+
+
 class Lock:
     """One thing at a time on this machine: ingest and train both want the GPU, and two
-    trains at once would fight over dataset/run."""
+    trains at once would fight over dataset/run. A pass that finds the lock taken waits
+    a while rather than skipping its whole interval — the two agents fire together at
+    login, and an hourly check colliding with a ten-minute ingest is routine."""
     def __enter__(self):
-        if LOCK.exists():
-            try:
-                pid = int(LOCK.read_text().split()[0])
-                os.kill(pid, 0)
+        import time
+        deadline = time.monotonic() + WAIT
+        while holder() is not None:
+            if time.monotonic() > deadline:
                 sys.exit(f"busy: {LOCK.read_text().strip()}")
-            except (ValueError, IndexError, ProcessLookupError, PermissionError):
-                pass                              # stale lock from a dead process
+            time.sleep(15)
         LOCK.parent.mkdir(parents=True, exist_ok=True)
         LOCK.write_text(f"{os.getpid()} {sys.argv[1:]} since {now()}")
         return self
