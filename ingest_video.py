@@ -219,14 +219,8 @@ def pull(prefix, cfg):
                if not o.get(k)]
     if missing:
         sys.exit("config.yaml offload is missing: " + ", ".join(missing))
-    try:
-        import boto3
-    except ImportError:
-        sys.exit("pull needs boto3 — pip install boto3")
-    client = boto3.client(
-        "s3", endpoint_url=f"https://{o['account_id']}.r2.cloudflarestorage.com",
-        aws_access_key_id=o["access_key_id"],
-        aws_secret_access_key=o["secret_access_key"], region_name="auto")
+    import dataset_sync
+    client = dataset_sync.client(o)      # one R2 client for the repo, checksum guard included
     bucket = o.get("bucket") or "fieldkit-recordings"
     root, got = record_root(cfg), []
     for page in client.get_paginator("list_objects_v2").paginate(Bucket=bucket,

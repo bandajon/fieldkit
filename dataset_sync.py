@@ -65,10 +65,16 @@ def client(o):
         import boto3
     except ImportError:
         sys.exit("dataset_sync needs boto3 — pip install boto3")
+    from botocore.config import Config
+    # Same guard offload.py carries: newer botocore checksums every request and response
+    # by default, and R2 rejects the first on uploads and fails the second on large
+    # (multipart) downloads — a 100 MB segment came back FlexibleChecksumError.
     return boto3.client(
         "s3", endpoint_url=f"https://{o['account_id']}.r2.cloudflarestorage.com",
         aws_access_key_id=o["access_key_id"],
-        aws_secret_access_key=o["secret_access_key"], region_name="auto")
+        aws_secret_access_key=o["secret_access_key"], region_name="auto",
+        config=Config(request_checksum_calculation="when_required",
+                      response_checksum_validation="when_required"))
 
 
 def remote(cl, bucket, prefix):
