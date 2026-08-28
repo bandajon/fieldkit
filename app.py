@@ -1040,7 +1040,6 @@ def captured_at(stem, path=None):
         return "0"
 
 
-@app.get("/api/dataset/samples")
 def focus_suggestions(new_boxes, candidates, names, top=5):
     """Where to aim: the classes with the fewest boxes curated since the freeze that the
     queue can actually supply. A class with no candidate frames is not a suggestion —

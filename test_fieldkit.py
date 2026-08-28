@@ -832,6 +832,23 @@ def queue_focus_filters_and_suggests():
             app.DATASET, app.REVIEWERS = keep
 
 
+def routes_point_at_their_handlers():
+    """A helper inserted between a decorator and its function silently steals the route
+    (FastAPI then demands the helper's arguments as query fields — a live 422). Pin the
+    endpoints the tools depend on to the functions that implement them."""
+    import app
+    got = {(m, r.path): r.endpoint.__name__ for r in app.app.routes if hasattr(r, "endpoint")
+           for m in (getattr(r, "methods", None) or ())}
+    for (method, path), fn in {("GET", "/api/dataset/samples"): "dataset_samples",
+                               ("POST", "/api/dataset/label"): "dataset_label",
+                               ("GET", "/api/dataset/search"): "dataset_search",
+                               ("POST", "/api/dataset/assign"): "assign_edit",
+                               ("POST", "/api/dataset/class"): "dataset_class",
+                               ("GET", "/api/config/site"): "config_site",
+                               ("POST", "/api/config/site"): "config_site_set"}.items():
+        assert got.get((method, path)) == fn, f"{method} {path} -> {got.get((method, path))!r}, expected {fn}"
+
+
 check("hostnet arp parser", hostnet_arp_parser)
 check("scan auto-joins once", scan_auto_joins_once)
 check("hostnet jetson (naming, no-carrier, bootstrap)", hostnet_jetson)
@@ -860,6 +877,7 @@ check("training split honours the reference set", training_split_honours_referen
 check("queue orders by capture time", queue_orders_by_capture_time)
 check("approved counts split new from frozen", approved_counts_split_new_from_frozen)
 check("queue focus filters and suggests", queue_focus_filters_and_suggests)
+check("routes point at their handlers", routes_point_at_their_handlers)
 
 print(f"\n{'FAILED: ' + ', '.join(FAILS) if FAILS else 'all passed'}")
 sys.exit(1 if FAILS else 0)
