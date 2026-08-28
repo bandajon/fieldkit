@@ -7,9 +7,9 @@
     python train.py eval <run> # score an existing run on that same split and the reference tree
     python train.py bench <run> [<run>...]   # ms/frame on CPU (the gate boxes) and MPS at IMGSZ
 
-FIELDKIT_TRAIN_ARGS='{"optimizer": "AdamW", "lr0": 0.001, "mosaic": 0.5}' passes a recipe
-straight through to ultralytics — one knob, so a run's hyperparameters are on its command line
-and in its args.yaml, never hidden in an edit.
+FIELDKIT_TRAIN_ARGS='{"lr0": 0.002}' passes a recipe straight through to ultralytics, on top of
+RECIPE — one knob, so a run's hyperparameters are on its command line and in its args.yaml,
+never hidden in an edit.
 
 Everything it writes stays under dataset/ (gitignored): dataset/run/ is the
 symlinked training tree, dataset/train_runs/ holds ultralytics' output.
@@ -35,7 +35,11 @@ REF_RUN = DATASET / "reference-run"   # its symlink tree, rebuilt alongside RUN
 
 WEIGHTS = "yolo26n.pt"                # NMS-free, DFL-free: lighter on a CPU box, simpler to compile for Hailo
 BASELINE = "baseline" in sys.argv[1:] # see build(): the reference set itself, v2's split
-EXTRA = json.loads(os.environ.get("FIELDKIT_TRAIN_ARGS", "{}"))   # a recipe, passed straight to .train()
+# What won the 2026-08-28 comparison (docs/YOLO26.md): YOLO26's defaults are tuned for
+# COCO-scale data and under-fit a thousand frames — the trainer's `auto` optimiser picked a
+# lower lr and full mosaic and lost to yolov8n; this beat it.
+RECIPE = {"optimizer": "AdamW", "lr0": 0.001, "mosaic": 0.5}
+EXTRA = {**RECIPE, **json.loads(os.environ.get("FIELDKIT_TRAIN_ARGS", "{}"))}
 BENCH_FRAMES = 40
 EPOCHS = 100
 PATIENCE = 20
