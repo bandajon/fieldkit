@@ -801,6 +801,37 @@ def approved_counts_split_new_from_frozen():
             app.DATASET = keep
 
 
+def queue_focus_filters_and_suggests():
+    """A focus narrows the queue to frames pre-labelled with those classes, and the
+    suggestions name the under-represented classes the queue can still supply."""
+    import tempfile
+    import app
+    keep = (app.DATASET, app.REVIEWERS)
+    with tempfile.TemporaryDirectory() as d:
+        try:
+            app.DATASET, app.REVIEWERS = Path(d), []
+            D = Path(d)
+            (D / "classes.txt").write_text("a-small\nc-bus\ne-heavy\nf-abnormal\n")
+            for sub in ("pending/labels", "approved/labels"):
+                (D / sub).mkdir(parents=True)
+            (D / "pending" / "labels" / "p1-20260828-010000.txt").write_text("0 .5 .5 .1 .1\n")
+            (D / "pending" / "labels" / "p2-20260828-010010.txt").write_text("1 .5 .5 .1 .1\n0 .4 .4 .1 .1\n")
+            (D / "pending" / "labels" / "p3-20260828-010020.txt").write_text("3 .5 .5 .2 .2\n")
+            (D / "approved" / "labels" / "a1.txt").write_text("0 .5 .5 .1 .1\n0 .5 .5 .1 .1\n")
+            (D / "approved" / "labels" / "a2.txt").write_text("1 .5 .5 .1 .1\n")
+            (D / "reference.txt").write_text("")
+            r = app.dataset_samples(who="", focus="", x_curator_token="")
+            assert r["pending_total"] == 3 and r["focus"] == ""
+            assert r["candidates"] == {"a-small": 2, "c-bus": 1, "f-abnormal": 1}, r["candidates"]
+            assert [s["class"] for s in r["focus_suggestions"]] == ["f-abnormal", "c-bus", "a-small"], r["focus_suggestions"]
+            r = app.dataset_samples(who="", focus="c-bus,F", x_curator_token="")
+            assert sorted(s["id"] for s in r["pending"]) == ["p2-20260828-010010", "p3-20260828-010020"], r["pending"]
+            assert r["pending_total"] == 2 and r["focus"] == "c-bus,F"
+            assert app.dataset_samples(who="", focus="zzz", x_curator_token="")["pending_total"] == 3, "unknown focus filters nothing"
+        finally:
+            app.DATASET, app.REVIEWERS = keep
+
+
 check("hostnet arp parser", hostnet_arp_parser)
 check("scan auto-joins once", scan_auto_joins_once)
 check("hostnet jetson (naming, no-carrier, bootstrap)", hostnet_jetson)
@@ -828,6 +859,7 @@ check("assignment targets (several, all)", assign_targets)
 check("training split honours the reference set", training_split_honours_reference)
 check("queue orders by capture time", queue_orders_by_capture_time)
 check("approved counts split new from frozen", approved_counts_split_new_from_frozen)
+check("queue focus filters and suggests", queue_focus_filters_and_suggests)
 
 print(f"\n{'FAILED: ' + ', '.join(FAILS) if FAILS else 'all passed'}")
 sys.exit(1 if FAILS else 0)

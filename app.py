@@ -1041,11 +1041,25 @@ def captured_at(stem, path=None):
 
 
 @app.get("/api/dataset/samples")
-def dataset_samples(who: str = "", x_curator_token: str = Header("")):
+def focus_suggestions(new_boxes, candidates, names, top=5):
+    """Where to aim: the classes with the fewest boxes curated since the freeze that the
+    queue can actually supply. A class with no candidate frames is not a suggestion —
+    hunting it is the sampler's job (or the web's), not the curator's."""
+    rows = [{"class": n, "new": new_boxes.get(n, 0), "candidates": candidates.get(n, 0)}
+            for n in names if "-" in n and candidates.get(n, 0)]
+    return sorted(rows, key=lambda r: (r["new"], -r["candidates"]))[:top]
+
+
+@app.get("/api/dataset/samples")
+def dataset_samples(who: str = "", focus: str = "", x_curator_token: str = Header("")):
     who = check_token(valid_who(who), x_curator_token)
     held = purge_claims()
+    names = dataset_classes()
+    # focus: a class, a category, several of either, or "all" — the queue narrows to
+    # frames the detector pre-labelled with one of them. An unknown focus filters nothing.
+    want = {names.index(c) for c in target_classes(focus)}
     labels = DATASET / "pending" / "labels"
-    pending = []
+    pending, candidates = [], {}
     for p in sorted(labels.glob("*.txt")) if labels.is_dir() else []:
         try:
             s = {"id": p.stem, "boxes": read_boxes(p)}
@@ -1055,6 +1069,11 @@ def dataset_samples(who: str = "", x_curator_token: str = Header("")):
             suggested = read_attrs(suggest_path(p.stem))
             if suggested:
                 s["suggested"] = suggested
+            for c in {b["cls"] for b in s["boxes"]}:     # per frame: one bus in a frame is one candidate
+                if 0 <= c < len(names):
+                    candidates[names[c]] = candidates.get(names[c], 0) + 1
+            if want and not any(b["cls"] in want for b in s["boxes"]):
+                continue
             pending.append((captured_at(p.stem, p), s))
         except OSError:      # sample reviewed away mid-listing
             continue
@@ -1069,10 +1088,13 @@ def dataset_samples(who: str = "", x_curator_token: str = Header("")):
         # half, and the general pool still follows so nobody runs out of work.
         pending.sort(key=lambda t: not any(b["cls"] in ids for b in t[1]["boxes"]))
     out = [s for _, s in pending[:100]]
-    body = {"classes": dataset_classes(), "attributes": attr_vocab(),
+    approved = approved_counts()
+    body = {"classes": names, "attributes": attr_vocab(),
             "attr_constraints": attr_meta("constraints"), "attr_defaults": attr_meta("defaults"),
             "attr_implies": attr_meta("implies"),
-            "attr_restricts": attr_meta("restricts"), "approved": approved_counts(),
+            "attr_restricts": attr_meta("restricts"), "approved": approved,
+            "focus": focus if want else "", "candidates": candidates,
+            "focus_suggestions": focus_suggestions(approved.get("new_boxes", {}), candidates, names),
             "reviewer": who in REVIEWERS,
             # the list is capped for payload size; pending_total is the real pile
             "pending_total": len(pending), "pending": out}

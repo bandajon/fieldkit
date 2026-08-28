@@ -270,6 +270,13 @@
   <section id="label">
     <h2 id="cnt-label"></h2>
     <div id="l-who" class="res"></div>
+    <div class="acts" id="l-focus" hidden>
+      <i class="res">focus</i>
+      <select id="l-fsel" multiple size="3" title="cmd/ctrl-click for more than one"></select>
+      <button class="btn" id="l-fgo">Apply</button>
+      <button class="btn" id="l-fclr">Clear</button>
+      <span id="l-fsug" class="res"></span>
+    </div>
     <div id="l-wrap" hidden></div>
     <div class="rowbtns" id="l-acts" hidden>
       <button class="btn" id="l-back">&larr; Back</button>
@@ -920,6 +927,37 @@ const clsColor = i => `hsl(${(i * 137.508) % 360} 85% 55%)`;
 
 const WHO_RE = /^[a-z0-9][a-z0-9_-]{0,23}$/;
 let labWho = localStorage.fieldkit_who || '', labAsked = false, labProg = null, labRev = false;
+let labFocus = localStorage.fieldkit_focus || '';   // "c-bus,F": the queue narrowed to these
+
+function labFocusFill() {
+  const sel = document.getElementById('l-fsel'), picked = new Set(labFocus.split(',').filter(Boolean));
+  const cats = [...new Set(labClasses.filter(n => n.includes('-')).map(n => n[0].toUpperCase()))].sort();
+  const opt = (v, text) => `<option value="${esc(v)}"${picked.has(v) ? ' selected' : ''}>${esc(text)}</option>`;
+  sel.innerHTML = '<optgroup label="Categories">' + cats.map(c => opt(c, `Category ${c}`)).join('') +
+    '</optgroup><optgroup label="Classes">' + labSorted().map(([n]) => opt(n, n)).join('') + '</optgroup>';
+  document.getElementById('l-focus').hidden = false;
+}
+// The suggestions are the classes with the fewest boxes curated since the freeze that the
+// queue can still supply; one tap makes one the focus.
+function labFocusSug(list) {
+  document.getElementById('l-fsug').innerHTML = (list || []).length
+    ? 'suggested: ' + list.map(s => `<button class="btn quiet" data-focus="${esc(s.class)}"
+        title="${s.new} boxes curated since the freeze · ${s.candidates} frames in the queue"
+        >${esc(s.class)} <i>${s.new} new · ${s.candidates} queued</i></button>`).join(' ')
+    : (labFocus ? '' : 'suggested: nothing under-represented is left in the queue');
+}
+function labFocusSet(v) {
+  labFocus = v;
+  try { localStorage.fieldkit_focus = v; } catch (e) {}
+  labLoad();
+}
+document.getElementById('l-fgo').onclick = () =>
+  labFocusSet([...document.getElementById('l-fsel').selectedOptions].map(o => o.value).join(','));
+document.getElementById('l-fclr').onclick = () => labFocusSet('');
+document.getElementById('l-fsug').onclick = e => {
+  const b = e.target.closest('[data-focus]');
+  if (b) labFocusSet(b.dataset.focus);
+};
 let labIdle = null;                 // pending re-check while the queue is empty
 let labAuthErr = false;             // last load was refused, not empty
 const IDLE_RECHECK = 60000;
@@ -972,10 +1010,13 @@ async function labLoad() {
   labWhoShow();
   // Slices are claimed per handle, so who rides on the fetch as well as the writes.
   const who = labWho ? `?who=${encodeURIComponent(labWho)}` : '';
+  // The focus narrows the queue to frames pre-labelled with the chosen classes — the
+  // way to spend a shift on what the next run is short of rather than on the traffic mix.
+  const q = who + (labFocus ? `${who ? '&' : '?'}focus=${encodeURIComponent(labFocus)}` : '');
   if (labWho) labFetch('/api/dataset/progress').then(r => r.json())
     .then(p => { labProg = p; labStats(); }).catch(() => {});
   try {
-    const r = await labFetch((labRev ? '/api/dataset/review' : '/api/dataset/samples') + who);
+    const r = await labFetch(labRev ? '/api/dataset/review' + who : '/api/dataset/samples' + q);
     if (r.status === 403) return labNote('your handle is not on the reviewer list');
     // A 401 read as an empty response is the cruellest possible lie: it tells someone
     // whose token is wrong that there is no work, and both fixes are on this screen.
@@ -988,6 +1029,7 @@ async function labLoad() {
     const d = await r.json();
     // Review serves one sample at a time; whatever the envelope omits keeps its current value.
     labClasses = d.classes || labClasses;
+    if (!labRev) { labFocusFill(); labFocusSug(d.focus_suggestions); }
     labQueue = labRev ? (d.id ? [d] : []) : (d.pending || []);
     labTotal = labRev ? labQueue.length : (d.pending_total ?? labQueue.length);
     labApproved = d.approved || labApproved;
@@ -1069,7 +1111,7 @@ function labShow() {
     ? (s.held
        ? `held — ${s.curator || 'someone'}'s work, release or reject`
        : `reviewing ${s.curator || 'someone'}'s work — your corrections become the record`)
-    : `${labTotal} remaining · tap a box to select it, set class and attributes below, ` +
+    : `${labFocus ? `focus ${esc(labFocus)} · ` : ''}${labTotal} remaining · tap a box to select it, set class and attributes below, ` +
       `× to delete, drag to move, corner to resize, drag empty area to add a box`);
   wrap.innerHTML = '<img alt="">' +
     labBoxes.map(boxHtml).join('');
