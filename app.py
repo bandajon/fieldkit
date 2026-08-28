@@ -1034,8 +1034,10 @@ def captured_at(stem, path=None):
     m = STEM_TIME.search(stem)
     if m:
         return m.group(1) + m.group(2)
+    # No capture time in the name (a web image): its arrival is its time, in the same
+    # YYYYMMDDHHMMSS shape, so "latest first" ranks it with the frames, not under them.
     try:
-        return "%014.0f" % path.stat().st_mtime if path else "0"
+        return datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).strftime("%Y%m%d%H%M%S") if path else "0"
     except OSError:
         return "0"
 

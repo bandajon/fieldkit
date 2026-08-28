@@ -776,6 +776,14 @@ def queue_orders_by_capture_time():
     older, newer = app.captured_at("cam3-20260819-172820"), app.captured_at("loop-videos-20260827-223050")
     assert newer > older, "a freshly sampled frame must sort ahead of an old one"
     assert app.captured_at("no-timestamp-here") == "0", "no name to go on, no path: last"
+    import tempfile, os
+    with tempfile.TemporaryDirectory() as d:
+        f = Path(d) / "external-abc123def456.txt"; f.write_text("")
+        os.utime(f, (1787900000, 1787900000))
+        from datetime import datetime, timezone
+        want = datetime.fromtimestamp(1787900000, tz=timezone.utc).strftime("%Y%m%d%H%M%S")
+        assert app.captured_at(f.stem, f) == want, "arrival time in the same shape"
+        assert app.captured_at(f.stem, f) > app.captured_at("cam3-20260821-091402"), "a web image arriving today ranks as latest"
 
 
 def approved_counts_split_new_from_frozen():
