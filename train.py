@@ -57,6 +57,13 @@ def is_val(stem):
     return int(hashlib.sha1(stem.encode()).hexdigest(), 16) % VAL_EVERY == 0
 
 
+def split_of(stem):
+    """Which split a frame belongs to. Web images (ingest_images.py) always train: they
+    are signal for the rare classes the road will not supply, never a measure of the
+    gate — the val split and the frozen reference set stay pure toll-gate footage."""
+    return "train" if stem.startswith("external-") else ("val" if is_val(stem) else "train")
+
+
 def reference():
     """Stems of the frozen reference set, or an empty set.
 
@@ -96,7 +103,7 @@ def build(names):
     """The training split (reference frames left out) and, when there is a reference
     set, its own tree to score against. -> {split: [stems]}"""
     ref = reference()
-    part = lambda s: "val" if is_val(s) else "train"
+    part = split_of
     if BASELINE and ref:
         # The reference set itself, and nothing else: v2 trained on exactly these frames with
         # exactly this split, so a run here compares with v2 like for like — same train frames,

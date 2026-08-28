@@ -544,6 +544,30 @@ with the next. The file is synced through the bucket as config, so every trainin
 machine holds the same list; the frames stay in `approved/` and still serve as
 examples on the Label tab. `train_attrs.py` follows the same rule.
 
+## External images for rare classes
+
+The road supplies cars endlessly and abnormal loads almost never, so those classes come
+off the web:
+
+```
+python fetch_images.py f-abnormal "abnormal load truck" --max 200
+python ingest_images.py dataset/external/f-abnormal
+python ingest_images.py dataset/external/a-motorcycle --as a-motorcycle --push
+```
+
+`fetch_images.py` takes only CC BY, CC BY-SA, CC0 and public-domain images from Wikimedia
+Commons and records every file's licence and author in
+`dataset/external/<class>/sources.jsonl` — attribution is a condition of the licence, not
+a nicety. `ingest_images.py` pre-labels them (`--as a-motorcycle` uses the stock COCO
+model, which knows motorcycles far better than our fine-tune does) and writes them into
+`dataset/pending/` like any other sample; an image with no detections still becomes one,
+so a curator can draw the box.
+
+Two rules make this safe. A web image is a suggestion, never a record: curators confirm
+or redraw every box on the Label tab before it is approved. And a web image never
+validates — `train.py` keeps `external-*` stems in the training split, so the score that
+decides which model wins is still measured only on toll-gate footage.
+
 ## The self-improving loop
 
 `selfloop.py` on the always-on training machine samples frames from mirrored
