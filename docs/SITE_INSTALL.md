@@ -76,6 +76,13 @@ points — and whether it is heading `toward_gate` or `away_from_gate`. A camera
 the gate is on. Until a heading is set, events carry no direction at all — the software
 never guesses one.
 
+With a heading set, a vehicle is counted **once, when its centre crosses the count line**
+(`count_line`, default 0.55 of the frame along the travel axis) — not when it first appears.
+That is what keeps slow traffic honest: a vehicle queued short of the line is never counted
+however long it sits, a second track id the tracker gives the same crawling vehicle is
+recognised as a twin, and one that re-appears past the line never crosses again. Move the
+line with `count_line:` if the default sits on a spot where vehicles routinely stop.
+
 ## Carry the taxonomy with you
 
 `dataset/` is not in the repo, so a fresh clone knows nothing about your classes.

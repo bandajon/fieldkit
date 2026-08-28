@@ -16,6 +16,10 @@ cameras:                 # cameras recorded directly over RTSP
     #                  # travel and whether it is heading toward or away from the gate.
     # gate_ahead: true # override: is the gate in the camera's view direction? Defaults to
     #                  # true for a north camera, false for a south one.
+    # count_line: 0.55 # with a heading set, a vehicle is counted ONCE, when its centre crosses
+    #                  # this line across the travel axis (fraction of the frame) — so a queue
+    #                  # that crawls, stops and re-appears is never counted twice. null = count
+    #                  # on sight, as a camera without a heading does.
     # travel: {axis: y, neg: northbound, pos: southbound}   # only if heading cannot say it
     # speed_lines: {a: 0.55, b: 0.75, metres: 25}   # two reference lines on the travel
     #                                               # axis (normalized) + real distance

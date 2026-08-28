@@ -238,7 +238,7 @@ thereafter.
 
 | Key | Read by | Meaning |
 | --- | --- | --- |
-| `cameras` | FieldKit | Cameras recorded directly over RTSP. Per camera, `heading` (the compass direction it faces — north looks toward the toll gate, south away) gives each vehicle a direction of travel and a toward/away-from-gate relation; `gate_ahead` overrides which side the gate is on. |
+| `cameras` | FieldKit | Cameras recorded directly over RTSP. Per camera, `heading` (the compass direction it faces — north looks toward the toll gate, south away) gives each vehicle a direction of travel and a toward/away-from-gate relation; `gate_ahead` overrides which side the gate is on.; `count_line` (fraction of the frame on the travel axis, default 0.55) makes each vehicle count once, on the crossing, so slow traffic is never counted twice. |
 | `cameras[].name` | FieldKit | Short name. Used as the recording subdirectory and as the go2rtc stream name. |
 | `cameras[].ip` | FieldKit | Camera address. |
 | `cameras[].user` / `cameras[].password` | FieldKit | RTSP and ISAPI credentials for that camera. |

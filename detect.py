@@ -36,6 +36,11 @@ RECOUNT_GUARD = 45.0     # a counted vehicle's resting place is remembered this 
                          # that moved far while untracked still recounts; the honest fix
                          # there is higher effective fps, not longer memory.
 GUARD_IOU = 0.5
+COUNT_LINE = 0.55        # where a vehicle is counted once a camera has a travel axis: a line
+                         # across that axis, as a fraction of the frame. Counting on a crossing
+                         # is what survives a queue — a vehicle that crawls, stops, is hidden
+                         # and comes back as a new id either has not reached the line yet
+                         # (never counted) or is already past it (never crosses again).
 TRACKER_CFG = Path(__file__).resolve().parent / "bytetrack-fieldkit.yaml"
 TRACKER_YAML = """tracker_type: bytetrack
 track_high_thresh: 0.25
@@ -247,6 +252,14 @@ def gate_ahead(cam):
     if "gate_ahead" in cam:
         return bool(cam["gate_ahead"])
     return {"north": True, "south": False}.get(heading_of(cam))
+
+
+def count_line(cam):
+    """The count line's position on the travel axis, or None to count on sight (no travel
+    axis, or `count_line: null` in the camera's config)."""
+    if not travel_of(cam) or "count_line" in cam and cam["count_line"] is None:
+        return None
+    return float(cam.get("count_line", COUNT_LINE))
 
 
 def bound_of(cam, direction):
@@ -580,11 +593,13 @@ class Detector:
         interval of error — ~±0.25 s at 4 fps, ~10% on a 25 m gap at 60 km/h. Upgrade
         path: interpolate the crossing between the two frames that straddle it.
         """
-        lines = cam.get("speed_lines") or {}
+        lines = dict(cam.get("speed_lines") or {})
+        if count_line(cam) is not None:
+            lines["n"] = count_line(cam)          # the count line rides with the speed lines
         if prev is None or not lines:
             return
-        i = 0 if (cam.get("travel") or {}).get("axis") == "x" else 1
-        for tag in ("a", "b"):
+        i = 0 if (travel_of(cam) or {}).get("axis") == "x" else 1
+        for tag in ("a", "b", "n"):
             if tag in t["cross"] or lines.get(tag) is None:
                 continue
             edge = float(lines[tag]) * t["dim"][i]
@@ -818,22 +833,36 @@ class Detector:
                 # Votes and labels stay internal; only what leaves here is renamed.
                 disp = self.display[t["label"]]
                 if t["counted_as"] is None:
-                    if t["hits"] >= COUNT_AT_HITS:
+                    # With a travel axis a vehicle counts when it crosses the count line;
+                    # without one, on its second sighting, as before.
+                    ready = ("n" in t["cross"] if count_line(cam) is not None
+                             else t["hits"] >= COUNT_AT_HITS)
+                    if ready:
                         mem = self.recent.get(name, [])
                         mem[:] = [m for m in mem if m[2] > now]
                         ghost = next((m for m in mem
                                       if m[0] == disp and iou(m[1], box) >= GUARD_IOU), None)
-                        if ghost:
-                            # Same class, same resting place, within the guard window:
-                            # this is the vehicle we already counted, re-tracked after an
-                            # occlusion — never a second tally, never a second attrs run.
-                            mem.remove(ghost)
+                        # A live twin: another id of the same class, counted moments ago,
+                        # still on this very box — slow traffic splits one crawling vehicle
+                        # into two ids before the first has even expired.
+                        twin = ghost is None and any(
+                            o is not t and o["counted_as"] == disp and not o.get("ghost")
+                            and now - o.get("counted_mono", -1e9) < RECOUNT_GUARD
+                            and o.get("box") and iou(o["box"], box) >= GUARD_IOU
+                            for o in ids.values())
+                        if ghost or twin:
+                            # Same class, same place, within the guard window: this is the
+                            # vehicle we already counted — never a second tally, never a
+                            # second attrs run.
+                            if ghost:
+                                mem.remove(ghost)
                             t["counted_as"] = disp
                             t["ghost"] = True
                         else:
                             t["attrs"] = self._classify(t)
                             t["counted_as"] = disp
                             t["counted_at"] = self.wall()
+                            t["counted_mono"] = now
                             self.totals[disp] += 1
                             self._bump(disp, t["attrs"], 1)
                 elif t["counted_as"] != disp and not t.get("ghost"):
@@ -1514,6 +1543,30 @@ if __name__ == "__main__":
         assert d.recent["c"], "a flushed vehicle still arms the recount guard"
         d.flush("c")                             # nothing left: flushing twice is harmless
         assert len((ft / "2026-08-19.jsonl").read_text().splitlines()) == 1
+
+    # Counting on a line. A vehicle queued short of the line is never counted, however long
+    # it sits; it counts once when it crosses; a second id the tracker hands the same crawling
+    # vehicle is a twin, not a tally; an id that first appears past the line never crosses
+    # and never counts. This is what stops slow traffic being counted twice.
+    from PIL import Image as _Image
+    NCAM = {"name": "n", "heading": "north"}                  # count line at 0.55 * 720 = 396
+    d = Detector([NCAM], nosnap, {})
+    big = _Image.new("RGB", (1280, 720))
+    lo, hi, far = (600.0, 560.0, 680.0, 640.0), (600.0, 160.0, 680.0, 240.0), (900.0, 160.0, 980.0, 240.0)
+    for _ in range(4):
+        d._track("n", [("truck", 0.9, lo, 1)], big)
+    assert d.totals["truck"] == 0, "queued short of the line: not counted, however many hits"
+    d._track("n", [("truck", 0.9, hi, 1)], big)
+    assert d.totals["truck"] == 1, "counted once, on the crossing"
+    d._track("n", [("truck", 0.9, hi, 1), ("truck", 0.9, lo, 2)], big)
+    d._track("n", [("truck", 0.9, hi, 1), ("truck", 0.9, hi, 2)], big)   # id 2 crosses onto id 1
+    assert d.totals["truck"] == 1, "a twin id on a just-counted vehicle is not a second vehicle"
+    for _ in range(3):
+        d._track("n", [("truck", 0.9, far, 3)], big)
+    assert d.totals["truck"] == 1, "appeared past the line: never crosses, never counts"
+    assert Detector([{"name": "n", "heading": "north", "count_line": None}], nosnap, {})._cam("n") and \
+        count_line({"name": "n", "heading": "north", "count_line": None}) is None, "count on sight when opted out"
+    assert count_line({"name": "plain"}) is None, "no travel axis: count on sight"
 
     # Heading: the facing of the camera gives both the compass direction and the gate side.
     NORTH, SOUTH = {"name": "n", "heading": "north"}, {"name": "s", "heading": "south"}
