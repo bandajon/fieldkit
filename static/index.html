@@ -901,7 +901,11 @@ const labStats = () => {
     ? `fine-tune set: ${labApproved.frames} frames` +
       (labApproved.frozen ? ` (${labApproved.frozen} frozen as the reference · ${
           labApproved.frames - labApproved.frozen} new)` : '') + ' · ' +
-      Object.entries(labApproved.boxes).map(([k, v]) => `${k} ${v}`).join(' · ')
+      Object.entries(labApproved.boxes).map(([k, v]) => `${k} ${v}`).join(' · ') +
+      // What the next run trains on, per class — the line that says where to aim curation.
+      (labApproved.frozen && Object.keys(labApproved.new_boxes || {}).length
+        ? `\nnew since the freeze: ` + Object.entries(labApproved.new_boxes)
+            .sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k} ${v}`).join(' · ') : '')
     : 'fine-tune set: empty — approve samples to grow it')
     + (labWho && labProg   // .res is pre-line, so the team line lands under it
        ? `\ntoday: you ${labNum((labProg.by_who || {})[labWho])} · team ${labNum(labProg.total)}` : '');
@@ -1424,6 +1428,7 @@ async function labSend(action) {
     boxes.forEach(b => {
       const n = labClasses[b.cls];
       labApproved.boxes[n] = (labApproved.boxes[n] || 0) + 1;
+      (labApproved.new_boxes ||= {})[n] = (labApproved.new_boxes[n] || 0) + 1;   // an approval is always new
     });
     labStats();
   }
@@ -1460,6 +1465,7 @@ document.getElementById('l-back').onclick = async () => {
   r.boxes.forEach(b => {
     const n = labClasses[b.cls];
     labApproved.boxes[n] = Math.max(0, (labApproved.boxes[n] || 0) - 1);
+    if (labApproved.new_boxes) labApproved.new_boxes[n] = Math.max(0, (labApproved.new_boxes[n] || 0) - 1);
   });
   labStats();
   labShow();

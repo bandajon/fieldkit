@@ -623,7 +623,15 @@ def label_files():
 def approved_counts():
     """Size of the fine-tuning set. ponytail: full scan per request, same scale
     note as label_files()."""
-    names, boxes, frames = dataset_classes(), {}, 0
+    names, boxes, new_boxes, frames, frozen = dataset_classes(), {}, {}, 0, 0
+    # Frames frozen as the reference benchmark (train.reference): still approved, still
+    # examples, but they train nothing — so "new since the freeze", per class, is what
+    # says whether another run is worth starting and which classes it would still be
+    # thin on.
+    try:
+        ref = {ln.strip() for ln in (DATASET / "reference.txt").read_text().splitlines() if ln.strip()}
+    except OSError:
+        ref = set()
     d = DATASET / "approved" / "labels"
     for p in sorted(d.glob("*.txt")) if d.is_dir() else []:
         try:
@@ -631,6 +639,8 @@ def approved_counts():
         except OSError:
             continue
         frames += 1
+        fresh = p.stem not in ref
+        frozen += not fresh
         for line in text.splitlines():
             f = line.split()
             try:
@@ -639,15 +649,9 @@ def approved_counts():
                 continue
             if 0 <= cls < len(names):      # a stale id past the class list is skipped, not fatal
                 boxes[names[cls]] = boxes.get(names[cls], 0) + 1
-    # Frames frozen as the reference benchmark (train.reference): still approved, still
-    # examples, but they train nothing — so "new since the freeze" is the number that
-    # says whether another run is worth starting.
-    try:
-        ref = {ln.strip() for ln in (DATASET / "reference.txt").read_text().splitlines() if ln.strip()}
-    except OSError:
-        ref = set()
-    frozen = sum(1 for p in (d.glob("*.txt") if d.is_dir() else []) if p.stem in ref)
-    return {"frames": frames, "boxes": boxes, "frozen": frozen}
+                if fresh:
+                    new_boxes[names[cls]] = new_boxes.get(names[cls], 0) + 1
+    return {"frames": frames, "boxes": boxes, "frozen": frozen, "new_boxes": new_boxes}
 
 
 def sample_paths(sid, tree="pending"):

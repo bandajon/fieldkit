@@ -778,6 +778,29 @@ def queue_orders_by_capture_time():
     assert app.captured_at("no-timestamp-here") == "0", "no name to go on, no path: last"
 
 
+def approved_counts_split_new_from_frozen():
+    """The counter tells the whole set apart from what the next run trains on, per class."""
+    import tempfile
+    import app
+    keep = app.DATASET
+    with tempfile.TemporaryDirectory() as d:
+        try:
+            app.DATASET = Path(d)
+            (Path(d) / "classes.txt").write_text("a-small\ne-heavy\n")
+            lab = Path(d) / "approved" / "labels"
+            lab.mkdir(parents=True)
+            (lab / "old1.txt").write_text("0 .5 .5 .1 .1\n1 .5 .5 .1 .1\n")
+            (lab / "old2.txt").write_text("1 .5 .5 .1 .1\n")
+            (lab / "new1.txt").write_text("1 .5 .5 .1 .1\n1 .4 .4 .1 .1\n")
+            (Path(d) / "reference.txt").write_text("old1\nold2\n")
+            c = app.approved_counts()
+            assert (c["frames"], c["frozen"]) == (3, 2), c
+            assert c["boxes"] == {"a-small": 1, "e-heavy": 4}, c
+            assert c["new_boxes"] == {"e-heavy": 2}, "only the frames outside the reference set"
+        finally:
+            app.DATASET = keep
+
+
 check("hostnet arp parser", hostnet_arp_parser)
 check("scan auto-joins once", scan_auto_joins_once)
 check("hostnet jetson (naming, no-carrier, bootstrap)", hostnet_jetson)
@@ -804,6 +827,7 @@ check("label strip rules (one-tap emergency, implies)", label_strip_rules)
 check("assignment targets (several, all)", assign_targets)
 check("training split honours the reference set", training_split_honours_reference)
 check("queue orders by capture time", queue_orders_by_capture_time)
+check("approved counts split new from frozen", approved_counts_split_new_from_frozen)
 
 print(f"\n{'FAILED: ' + ', '.join(FAILS) if FAILS else 'all passed'}")
 sys.exit(1 if FAILS else 0)
