@@ -71,8 +71,11 @@ worse costs revenue.
 split v2 used — so two architectures can be compared on identical ground; `train.py eval
 <run>` re-scores an old run on that split and on the reference tree; `train.py bench <run>
 ...` times each on CPU (what a gate box has) and MPS at the working image size. A baseline
-run's reference score is inflated (it trained on those frames) and is recorded as such:
-`selfloop.py adopt` never turns it into the bar the loop's honest runs must clear.
+run's reference score is inflated (it trained on those frames), which is why promotion is
+not decided on it: a loop run continues from `dataset/champion.pt` (train.py `START`) on
+the new curations only, and both it and the champion are then scored on that run's val
+split (`train.py score dataset/champion.pt`) — new frames neither model trained on. The
+run is crowned only if it beats the champion there.
 `FIELDKIT_TRAIN_ARGS` passes a recipe through to ultralytics, e.g. the small-dataset one
 from the YOLO26 training guide: `{"optimizer": "AdamW", "lr0": 0.001, "mosaic": 0.5}`.
 

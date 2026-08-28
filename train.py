@@ -6,6 +6,7 @@
     python train.py baseline   # train on the reference set itself (v2's exact split): like-for-like runs
     python train.py eval <run> # score an existing run on that same split and the reference tree
     python train.py bench <run> [<run>...]   # ms/frame on CPU (the gate boxes) and MPS at IMGSZ
+    python train.py score <weights.pt>       # any model on the current split's val frames -> dataset/run/score.json
 
 FIELDKIT_TRAIN_ARGS='{"lr0": 0.002}' passes a recipe straight through to ultralytics, on top of
 RECIPE — one knob, so a run's hyperparameters are on its command line and in its args.yaml,
@@ -35,6 +36,11 @@ REF_RUN = DATASET / "reference-run"   # its symlink tree, rebuilt alongside RUN
 
 WEIGHTS = "yolo26n.pt"                # NMS-free, DFL-free: lighter on a CPU box, simpler to compile for Hailo
 BASELINE = "baseline" in sys.argv[1:] # see build(): the reference set itself, v2's split
+CHAMPION = DATASET / "champion.pt"
+# A loop run continues from the champion rather than restarting from COCO weights: the
+# reference frames never train again, so a run from scratch on a few hundred new frames
+# would know less than the model it is meant to replace. FIELDKIT_START overrides.
+START = os.environ.get("FIELDKIT_START") or (str(CHAMPION) if CHAMPION.is_file() and not BASELINE else WEIGHTS)
 # What won the 2026-08-28 comparison (docs/YOLO26.md): YOLO26's defaults are tuned for
 # COCO-scale data and under-fit a thousand frames — the trainer's `auto` optimiser picked a
 # lower lr and full mosaic and lost to yolov8n; this beat it.
@@ -225,6 +231,22 @@ def evaluate(names, run):
     return ev
 
 
+def score(names, weights):
+    """Any weights on the current split's val frames -> RUN/score.json. The loop scores the
+    champion here after a run: those frames are new curations neither model trained on, so
+    it is the one honest yardstick between a champion that saw the reference set and a
+    challenger that continued from it."""
+    from ultralytics import YOLO
+    m = YOLO(weights).val(data=str(RUN / "data.yaml"), imgsz=IMGSZ, device=device()).box
+    boxes = val_boxes(names)
+    per = report(m, names, boxes, f"{weights}: current val split ({sum(boxes.values())} boxes)")
+    out = {"weights": str(weights), "map50": round(float(m.map50), 4),
+           "map50_95": round(float(m.map), 4), "per_class_map50": per,
+           "frames": len(split_stems("val"))}
+    (RUN / "score.json").write_text(json.dumps(out, indent=1))
+    return out
+
+
 def split_stems(part):
     return [p.stem for p in (RUN / "labels" / part).glob("*.txt")]
 
@@ -233,10 +255,10 @@ def train(names):
     from ultralytics import YOLO
     dev = device()
     data, run = str(RUN / "data.yaml"), datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    print(f"training on {dev}: {WEIGHTS}, {EPOCHS} epochs, imgsz {IMGSZ}, batch {BATCH}"
+    print(f"training on {dev}: from {START}, {EPOCHS} epochs, imgsz {IMGSZ}, batch {BATCH}"
           + (f", recipe {EXTRA}" if EXTRA else "")
           + (" — BASELINE: the reference set itself" if BASELINE else ""), flush=True)
-    YOLO(WEIGHTS).train(data=data, imgsz=IMGSZ, epochs=EPOCHS, patience=PATIENCE, batch=BATCH,
+    YOLO(START).train(data=data, imgsz=IMGSZ, epochs=EPOCHS, patience=PATIENCE, batch=BATCH,
                         device=dev, project=str(RUNS), name=run, exist_ok=True, **EXTRA)
     evaluate(names, run)
     best = RUNS / run / "weights" / "best.pt"
@@ -282,6 +304,8 @@ if __name__ == "__main__":
         evaluate(names, a[1])
     elif cmd == "bench" and len(a) >= 2:
         bench(names, a[1:])
+    elif cmd == "score" and len(a) == 2:
+        score(names, a[1])
     elif cmd in ("", "baseline"):
         train(names)
     else:

@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """go2rtc sidecar: generate its config from the camera list, supervise one process."""
 
+import os
+import signal
 import subprocess
 import sys
 import threading
@@ -83,12 +85,21 @@ class Live:
 
     def _spawn(self):
         write_config(self.cameras, self.config_path)
+        # A sidecar outlives an app that died without its shutdown hook (it runs in its
+        # own process group) and keeps :1984, so the new one can never answer: four of
+        # them were found on one machine. The pid file is how the next app finds it.
+        pidfile = self.config_path.with_suffix(".pid")
+        try:
+            os.kill(int(pidfile.read_text()), signal.SIGTERM)
+        except (OSError, ValueError):
+            pass
         kw = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if WINDOWS else {}
         try:
             self.proc = subprocess.Popen(
                 [self.binary, "-config", str(self.config_path)],
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL, **kw)
+            pidfile.write_text(str(self.proc.pid))
             self.started_at = time.time()
             self.error = ""
         except OSError as e:      # back off instead of retrying exec every second

@@ -122,20 +122,11 @@ def should_train(new_frames, trained_frames, threshold=THRESHOLD):
     return new_frames - trained_frames >= threshold
 
 
-def champion_score(ev):
-    """What a crowned run is later compared against. A run that trained on the reference
-    set (train.py baseline — v2, and the YOLO26 comparison runs) scored itself on its own
-    training frames, so its number would be a bar no honest run could clear: recorded as
-    none, and the next loop-trained model replaces it unconditionally."""
-    if not ev or ev.get("baseline"):
-        return {"map50": None}
-    return {k: ev.get(k) for k in ("map50", "map50_95")}
-
-
 def promote(candidate, champion):
-    """Does this run's reference score earn it the champion slot? No champion, or a
-    champion with no comparable score (v2 trained on the reference set, so its number
-    would be inflated), is beaten by anything. Otherwise strictly better mAP50."""
+    """Does this run earn the champion slot? Both are scored on the run's val split —
+    new curations neither trained on (the run continued from the champion, and the
+    champion's own training frames are the frozen reference set), so the numbers are
+    comparable. No champion is beaten by anything; otherwise strictly better mAP50."""
     if champion is None or champion.get("map50") is None:
         return True
     return bool(candidate) and candidate.get("map50") is not None and candidate["map50"] > champion["map50"]
@@ -541,13 +532,14 @@ def train_pass(force=False):
             sys.exit(f"train.py failed ({r.returncode}); champion untouched")
         run = max(trainer.RUNS.glob("*/"), key=lambda p: p.stat().st_mtime)
         best = run / "weights" / "best.pt"
-        ev = run_eval(run)
-        s["trained_frames"], s["last_train"] = count, {"at": now(), "run": run.name, "eval": ev}
-        if promote(ev, s.get("champion")):
+        ev, incumbent = run_eval(run), champion_on_split()
+        s["trained_frames"], s["last_train"] = count, {"at": now(), "run": run.name, "eval": ev,
+                                                       "champion_on_same_split": incumbent}
+        if promote(ev, incumbent):
             crown(s, run, count, ev, cl, bucket)
         else:
-            print(f"{now()} train: {run.name} scored {ev['map50'] if ev else 'n/a'} on the reference, "
-                  f"champion stays at {s['champion']['map50']}", flush=True)
+            print(f"{now()} train: {run.name} scored {ev['map50'] if ev else 'n/a'} on the new frames' "
+                  f"val split, champion {incumbent['map50']} on the same — champion stays", flush=True)
         attrs_pass(s, cl, bucket)
         save_state(s)
 
@@ -582,10 +574,27 @@ def attrs_report(run):
 
 
 def run_eval(run):
+    """The run on its own val split — the frames promotion is decided on."""
     try:
-        return json.loads((run / "reference-eval.json").read_text())
+        return json.loads((run / "val-eval.json").read_text())
     except (OSError, ValueError):
         return None
+
+
+def champion_on_split():
+    """The champion scored on the split the last train.py built (train.py score), or None
+    when there is no champion — the run's own val-eval was measured on the same frames."""
+    import train
+    if not CHAMPION.is_file():
+        return None
+    r = subprocess.run([sys.executable, str(ROOT / "train.py"), "score", str(CHAMPION)], cwd=ROOT)
+    if r.returncode:
+        print(f"{now()} train: could not score the champion ({r.returncode}); it keeps its slot", flush=True)
+        return {"map50": float("inf")}      # an unscored champion is never demoted by default
+    try:
+        return json.loads((train.RUN / "score.json").read_text())
+    except (OSError, ValueError):
+        return {"map50": float("inf")}
 
 
 def crown(s, run, frames, ev, cl, bucket):
@@ -593,7 +602,8 @@ def crown(s, run, frames, ev, cl, bucket):
     bucket for whoever deploys it to a gate."""
     best = run / "weights" / "best.pt"
     shutil.copy2(best, CHAMPION)
-    s["champion"] = {"run": run.name, "frames": frames, "at": now(), **champion_score(ev)}
+    s["champion"] = {"run": run.name, "frames": frames, "at": now(),
+                     **{k: (ev or {}).get(k) for k in ("map50", "map50_95")}}
     for key in (f"{MODELS}{run.name}/best.pt", f"{MODELS}champion.pt"):
         cl.upload_file(str(best), bucket, key)
     if ev:
@@ -795,9 +805,7 @@ def selfcheck():
     assert promote({"map50": 0.5}, None) and promote({"map50": 0.1}, {"map50": None})
     assert promote({"map50": 0.71}, {"map50": 0.70}) and not promote({"map50": 0.70}, {"map50": 0.70})
     assert not promote(None, {"map50": 0.70}), "no score, no promotion"
-    assert champion_score({"map50": 0.9, "map50_95": 0.6, "baseline": True}) == {"map50": None}, \
-        "a baseline run's inflated score must not become the bar"
-    assert champion_score({"map50": 0.71, "map50_95": 0.5}) == {"map50": 0.71, "map50_95": 0.5}
+    assert not promote({"map50": 0.9}, {"map50": float("inf")}), "an unscored champion keeps its slot"
     assert promote_attrs({"mean_acc": 0.5}, None) and promote_attrs({"mean_acc": 0.1}, {"mean_acc": None})
     assert promote_attrs({"mean_acc": 0.88}, {"mean_acc": 0.87})
     assert not promote_attrs({"mean_acc": 0.87}, {"mean_acc": 0.87}), "a tie is not an improvement"
