@@ -35,6 +35,19 @@ bucket ─► selfloop classify (every 10 min)
 - Direction and `bound` on those events need `heading:` on the camera in `config.yaml`
   (see `config.example.yaml`). Without one the events are still complete, just undirected
   — a heading is never guessed from the footage.
+Rarity-aware sampling: both passes capture one frame per camera per `CAPTURE_EVERY`
+(10 s), which makes the queue mirror the traffic mix — cars and heavies pile up while
+buses, plant and abnormal loads stay at a handful. So a frame holding a *wanted* class
+is captured off the cadence instead. Wanted = fewer than `WANT_BOXES` (300) boxes in the
+frames curated **since the reference freeze**, per `dataset/classes.txt`; the frozen
+frames train nothing, so they say nothing about where the next run is thin. Each pass
+prints the list it is hunting. Scene dedup and the pending cap still apply to wanted
+classes, so a parked bus is one sample and not fifty, and rare frames use a 1 s id
+bucket instead of the 10 s one so they cannot overwrite each other. The classify pass
+carries the widest net — it decodes every mirrored segment, so it sees all 48 h of
+footage rather than the slice a sampling pass lands on — and pushes what it captures,
+attribute suggestions included, to the queue.
+
 - Change the cadence: edit `THRESHOLD` / `PER_CAM` / `CLASSIFY_PER_PASS` in `selfloop.py`, intervals in
   `install_loop.sh`, then `./install_loop.sh` again.
 

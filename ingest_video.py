@@ -132,12 +132,13 @@ class Sink:
     """dataset/pending writer with the live capture's gates, measured in footage time:
     no detections, an unchanged scene, or a too-recent sample and nothing lands."""
 
-    def __init__(self, dataset, ids, gate=""):
+    def __init__(self, dataset, ids, gate="", wanted=()):
         self.images = Path(dataset) / "pending" / "images"
         self.labels = Path(dataset) / "pending" / "labels"
         for d in (self.images, self.labels):
             d.mkdir(parents=True, exist_ok=True)
         self.ids, self.gate = ids, gate
+        self.wanted = set(wanted)   # classes worth a sample off-cadence (detect._capture)
         self.at = {}          # cam -> footage timestamp of its last capture
         self.dets = {}        # cam -> its `shown`, for the scene comparison
         self.written = Counter()
@@ -145,14 +146,19 @@ class Sink:
 
     def offer(self, cam, ts, jpeg, shown, w, h):
         # Cadence counts from the last real capture, not the last attempt: a scene that
-        # changes right after a skipped duplicate should be caught, not waited out.
-        if not shown or ts - self.at.get(cam, float("-inf")) < detect.CAPTURE_EVERY:
+        # changes right after a skipped duplicate should be caught, not waited out. A
+        # class the curated set is short of skips the cadence entirely — dedup still
+        # stops a parked one from becoming fifty samples.
+        if not shown:
+            return False
+        rare = any(d[0] in self.wanted for d in shown)
+        if not rare and ts - self.at.get(cam, float("-inf")) < detect.CAPTURE_EVERY:
             return False
         if detect.same_scene(shown, self.dets.get(cam, [])):
             return False
         self.at[cam], self.dets[cam] = ts, shown
         self._evict()
-        stem = detect.sample_stem(self.gate, cam, ts)
+        stem = detect.sample_stem(self.gate, cam, ts, detect.RARE_STEP if rare else None)
         lines = [f"{self.ids[cls]} {(x1 + x2) / 2 / w:.6f} {(y1 + y2) / 2 / h:.6f} "
                  f"{(x2 - x1) / w:.6f} {(y2 - y1) / h:.6f}"
                  for cls, _conf, (x1, y1, x2, y2) in shown if cls in self.ids]
@@ -205,7 +211,7 @@ def ingest_one(f, run, sink, cam=None):
 
 def ingest(files, cfg):
     run, ids = detector(cfg)
-    sink = Sink(DATASET, ids, gate_id(cfg))
+    sink = Sink(DATASET, ids, gate_id(cfg), cfg.get("capture_wanted") or ())
     sampled = sum(ingest_one(f, run, sink)[0] for f in files)
     print(f"\n{len(files)} file(s), {sampled} frames sampled at {INGEST_FPS} fps, "
           f"{sum(sink.written.values())} samples written to {sink.images.parent}")
@@ -362,6 +368,17 @@ def selfcheck():
     assert sink2.offer("c", base, b"again", car, 64, 64)
     assert len(list(sink.images.glob("*.jpg"))) == 2, "same stem, same file"
     assert (sink.images / "c-20260819-151100.jpg").read_bytes() == b"again"
+
+    # A wanted class ignores the cadence, so the rare vehicles the curated set is short
+    # of stop losing their frames to the common ones. Dedup still applies to them.
+    rare = Sink(tmp / "rare", dict(detect.CLASS_IDS), wanted=["bus"])
+    bus = [("bus", 0.9, (10.0, 10.0, 60.0, 60.0))]
+    bus2 = [("bus", 0.9, (300.0, 10.0, 350.0, 60.0))]
+    assert rare.offer("c", base, b"a", bus, 64, 64)
+    assert rare.offer("c", base + 2, b"b", bus2, 64, 64), "wanted: no cadence"
+    assert not rare.offer("c", base + 4, b"c", bus2, 64, 64), "wanted, but the same scene"
+    assert not rare.offer("c", base + 4, b"d", car, 64, 64), "an ordinary class still waits"
+    assert len(set(rare.stems)) == 2, rare.stems      # finer buckets: no id collision
 
     assert segments([str(tmp)]) == [odd, seg], segments([str(tmp)])
 

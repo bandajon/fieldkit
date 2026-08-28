@@ -53,6 +53,7 @@ EVENTS = "fieldkit-events/"   # bucket prefix the RDA importer reads
 # The Katuba box still calls itself site1; anything already named RDA-TG-* is its own id.
 GATES = {"site1": "RDA-TG-KTB"}
 TZ = "Africa/Lusaka"          # the gates and this machine; segment names are local wallclock
+WANT_BOXES = 300      # per-class floor for the next run; under it, a class is hunted
 CLASSIFY_PER_PASS = 12        # ~10 min of footage per camera per pass, at 600 s segments
 REMEMBER_CLASSIFIED = 20000
 
@@ -139,6 +140,44 @@ def local_path(key):
     """Where a bucket segment lands while it is being sampled: the same <site>/<cam>/
     <segment> shape as the bucket, because the camera's name is read off the path."""
     return VIDEOS / key
+
+
+def wanted_classes(counts, target=WANT_BOXES):
+    """Classes still under the floor — what the sampling passes capture off-cadence.
+    Counted in NEW boxes only: the frozen reference frames train nothing, so they say
+    nothing about where the next run is thin."""
+    return sorted(n for n, c in counts.items() if c < target)
+
+
+def new_box_counts():
+    """{class: boxes in approved frames outside the reference set}.
+
+    ponytail: full scan of approved/labels each pass, the same one app.py's counter does
+    — a few thousand small files, seconds. Upgrade path: cache it beside the ledger if
+    the set outgrows that. Kept here rather than imported from app.py: a launchd job
+    must not drag FastAPI in to count lines.
+    """
+    import train
+    names, ref = train.classes(), train.reference()
+    counts = {}
+    for p in (DATASET / "approved" / "labels").glob("*.txt"):
+        if p.stem in ref:
+            continue
+        try:
+            text = p.read_text()
+        except OSError:
+            continue
+        for line in text.splitlines():
+            f = line.split()
+            if not f:
+                continue
+            try:
+                cls = int(f[0])
+            except ValueError:
+                continue
+            if 0 <= cls < len(names):      # a stale id past the class list is skipped
+                counts[names[cls]] = counts.get(names[cls], 0) + 1
+    return {n: counts.get(n, 0) for n in names}
 
 
 def gate_of(prefix):
@@ -275,6 +314,14 @@ def suggest(stems):
     print(f"{now()} ingest: attributes suggested for {written} sample(s)", flush=True)
 
 
+def hunting():
+    """The wanted list for this pass, announced so the log says what it was aiming at."""
+    wanted = wanted_classes(new_box_counts())
+    what = ", ".join(wanted) or f"nothing — every class is past {WANT_BOXES}"
+    print(f"{now()} hunting: {what}", flush=True)
+    return wanted
+
+
 def ingest_pass():
     import ingest_video
     with Lock():
@@ -287,6 +334,7 @@ def ingest_pass():
         cfg = ingest_video.config()
         if CHAMPION.is_file():
             cfg["detect_weights"] = str(CHAMPION)   # the loop's own model pre-labels
+        cfg["capture_wanted"] = hunting()
         files = []
         for key in todo:
             # Mirror the bucket's <site>/<cam>/<segment> on disk: the sampler names the
@@ -358,14 +406,18 @@ def classify_pass():
         return
     with Lock():
         s = load_state()
-        _ds, cl, bucket = r2()
+        ds, cl, bucket = r2()
         todo = pick_classify(list(bucket_keys(cl, bucket)), s.get("classified", []))
         print(f"{now()} classify: {len(todo)} segment(s)", flush=True)
         if not todo:
             return
         base, tz = ingest_video.config(), ZoneInfo(TZ)
+        # This pass decodes every mirrored segment anyway, so it sees all 48 h of footage
+        # — the widest net there is for a class that shows up twice a day.
+        base["capture_wanted"], base["dataset_dir"] = hunting(), str(DATASET)
         VIDEOS.mkdir(parents=True, exist_ok=True)
         done = events = 0
+        stems = []
         for key in todo:
             prefix, cam_name, seg = key.split("/")
             gate = gate_of(prefix)
@@ -383,7 +435,8 @@ def classify_pass():
             try:
                 print(f"  v {key}", flush=True)
                 cl.download_file(bucket, key, str(video))
-                day = detect.classify_segment(video, cam, cfg, tz, out)
+                day, captured = detect.classify_segment(video, cam, cfg, tz, out)
+                stems += captured
                 n = publish(cl, bucket, out, gate, Path(seg).stem, day)
                 # Recorded only once published: a segment that died mid-pass is retried
                 # next tick rather than lost, and re-running it rewrites the same keys.
@@ -396,7 +449,14 @@ def classify_pass():
             finally:
                 video.unlink(missing_ok=True)
                 shutil.rmtree(out, ignore_errors=True)
-        s["last_classify"] = {"at": now(), "segments": done, "events": events}
+        if stems:
+            if ATTRS_CHAMPION.is_file():
+                suggest(stems)       # same courtesy the ingest pass does: correct, not type
+            sent, _ = ds.push(cl, bucket, names=PENDING)
+            print(f"{now()} classify: {len(stems)} frame(s) captured for the queue, "
+                  f"{sent} file(s) pushed", flush=True)
+        s["last_classify"] = {"at": now(), "segments": done, "events": events,
+                              "captured": len(stems)}
         save_state(s)
         print(f"{now()} classify: {done}/{len(todo)} segment(s), {events} event(s) published",
               flush=True)
@@ -681,6 +741,8 @@ def selfcheck():
     assert not promote_attrs(None, {"mean_acc": 0.87}), "no report, no promotion"
     assert local_path("site1/cam3/20260827-100000.mkv").parent.name == "cam3", \
         "the camera must be the parent directory, or every camera samples as one"
+    assert wanted_classes({"a": 5, "b": 300, "c": 299, "d": 0}, target=300) == ["a", "c", "d"]
+    assert wanted_classes({"a": 5}, target=0) == [], "a floor of 0 hunts nothing"
     assert gate_of("site1") == "RDA-TG-KTB", "the Katuba box still calls itself site1"
     assert gate_of("RDA-TG-KTB") == "RDA-TG-KTB", "a gate already named for itself"
     # Newest segment first, across cameras, so the portal gets current traffic first.

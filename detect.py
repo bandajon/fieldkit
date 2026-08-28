@@ -59,6 +59,7 @@ EVENTS_KEEP_DAYS = 30    # crops age out; the jsonl lines are tiny and stay
 DIRECTION_MIN = 0.03     # displacement under this fraction of the frame is not travel
 SPEED_MIN, SPEED_MAX = 1.0, 160.0        # outside: a tracking artifact, not a vehicle
 CAPTURE_EVERY = 10.0     # dataset samples per camera; dedup already skips unchanged scenes
+RARE_STEP = 1            # a wanted class ignores the cadence, so its stems need finer buckets
 DATASET_CAP = 10000      # rolling buffer of the freshest unlabeled frames; ~2-3 GB of JPEGs.
                          # Sized for the fleet goal: 9 toll gates, >=10k contributed each,
                          # 100k-image combined dataset.
@@ -87,7 +88,7 @@ def same_scene(a, b, iou_min=0.85):
     if len(a) != len(b):
         return False
     pool = list(b)
-    for cls, _conf, box in a:
+    for cls, _conf, box, *_ in a:
         hit = next((o for o in pool if o[0] == cls and iou(box, o[2]) >= iou_min), None)
         if hit is None:
             return False
@@ -95,7 +96,7 @@ def same_scene(a, b, iou_min=0.85):
     return True
 
 
-def sample_stem(gate, cam, ts):
+def sample_stem(gate, cam, ts, step=None):
     """The sample id two nodes independently agree on for one moment on one camera.
 
     The box at the gate and a laptop re-ingesting that same footage watch the same
@@ -106,8 +107,11 @@ def sample_stem(gate, cam, ts):
     and the two collapse into one.
 
     A node cannot collide with itself here: CAPTURE_EVERY is also the minimum spacing
-    between its own captures, so consecutive samples always fall in different buckets."""
-    step = int(CAPTURE_EVERY) or 1
+    between its own captures, so consecutive samples always fall in different buckets —
+    except a rarity capture, which ignores that spacing on purpose and passes a finer
+    `step` so its frames do not all floor onto one id and overwrite each other. Two nodes
+    still agree on a rare frame whenever their clocks agree to the second."""
+    step = int(step or CAPTURE_EVERY) or 1
     at = datetime.fromtimestamp(int(ts // step) * step, timezone.utc)
     return "-".join(x for x in (gate, cam, at.strftime("%Y%m%d-%H%M%S")) if x)
 
@@ -452,6 +456,10 @@ class Detector:
         # Stage 2: attributes off the counted vehicle's best crop (type/axles/cargo).
         self.attr_weights = str(cfg.get("attr_weights", "") or "").strip()
         self.attrs = None
+        # Classes the curated set is still short of. A frame holding one is worth more
+        # than the cadence, so it is captured off-schedule (selfloop.wanted_classes).
+        self.wanted = set(cfg.get("capture_wanted") or [])
+        self.captured = []              # stems written this run, for the caller to suggest on
         self.state = "stopped"
         self.error = ""
         self.day = date.today().isoformat()
@@ -1018,13 +1026,21 @@ class Detector:
         capture never stops (an overnight fill used to mean no morning-peak samples).
         Eviction only ever touches pending — approved samples are permanent.
 
-        ponytail: the pending cap is counted per capture attempt (at most once per
-        CAPTURE_EVERY per camera), not per pass — a glob of 1000 names every frame buys
-        nothing. Upgrade path: keep a counter once something else writes the directory.
+        ponytail: the pending cap is counted per capture attempt, not per pass — a glob
+        of 1000 names every frame buys nothing. A wanted class now bypasses the cadence,
+        so during a rare vehicle's pass that glob can run once per changed frame rather
+        than once per CAPTURE_EVERY. Upgrade path: keep a counter once that shows up in
+        a profile, or once something else writes the directory.
         """
-        now = time.monotonic()
-        if (not self.dataset_dir or not shown
-                or now - self.last_capture.get(name, float("-inf")) < CAPTURE_EVERY):
+        now = self.clock()
+        if not self.dataset_dir or not shown:
+            return
+        # The cadence is what makes the queue mirror the traffic mix: cars and heavies
+        # pile up while a bus or an abnormal load stays at a handful. A frame holding a
+        # class we are short of skips it. Dedup below still applies, so a parked bus is
+        # one sample, not fifty.
+        rare = any(d[0] in self.wanted for d in shown)
+        if not rare and now - self.last_capture.get(name, float("-inf")) < CAPTURE_EVERY:
             return
         self.last_capture[name] = now     # set first: a failing disk must not retry per frame
         # Before the cap check, not after: a duplicate must not evict a real sample.
@@ -1044,13 +1060,15 @@ class Detector:
                 (pending / "labels" / f"{oldest.stem}.txt").unlink(missing_ok=True)
             # The gate id rides in the sample name: a frame that reaches a shared queue
             # from one of nine sites has to say which one without a lookup.
-            stem = sample_stem(self.gate, name, time.time())
+            stem = sample_stem(self.gate, name, self.wall(), RARE_STEP if rare else None)
+            # *_ : a counted vehicle carries a direction chip as a 4th element.
             lines = [f"{self.display_ids[cls]} {(x1 + x2) / 2 / w:.6f} {(y1 + y2) / 2 / h:.6f} "
                      f"{(x2 - x1) / w:.6f} {(y2 - y1) / h:.6f}"
-                     for cls, _conf, (x1, y1, x2, y2) in shown if cls in self.display_ids]
+                     for cls, _conf, (x1, y1, x2, y2), *_ in shown if cls in self.display_ids]
             (pending / "images" / f"{stem}.jpg").write_bytes(jpeg)
             (pending / "labels" / f"{stem}.txt").write_text("\n".join(lines) + "\n")
             self.last_boxes[name] = shown
+            self.captured.append(stem)
         except OSError as e:
             self._set("running", f"dataset capture failed: {e}")
 
@@ -1067,19 +1085,25 @@ def classify_segment(path, cam, cfg, tz, events_dir):
 
     import ingest_video          # imports detect: keep the import inside the call
 
-    d = Detector([cam], None, cfg, events_dir=events_dir)
+    d = Detector([cam], None, cfg, events_dir=events_dir,
+                 dataset_dir=cfg.get("dataset_dir"))
     d.tz = tz
     start = ingest_video.cam_and_start(path)[1]
     at = [start]
     d.clock = d.wall = lambda: at[0]
     track = d._load()
+    d._dataset_init()            # makes pending/ when capturing; hands off classes.txt
     name = cam["name"]
     for i, jpeg in enumerate(ingest_video.frames(path, fps=FPS)):
         at[0] = start + i / FPS
         img = Image.open(io.BytesIO(jpeg)).convert("RGB")
-        d._track(name, track(name, img), img)
+        shown = d._track(name, track(name, img), img)
+        # This pass already decodes every mirrored segment, so it is the cheapest place
+        # to hunt the classes the curated set is short of — 48 h of footage, not the
+        # slice a sampling pass happens to land on.
+        d._capture(name, jpeg, shown, img.width, img.height)
     d.flush(name)                # the last frame's vehicles are events too
-    return datetime.fromtimestamp(start, tz=tz).strftime("%Y-%m-%d")
+    return datetime.fromtimestamp(start, tz=tz).strftime("%Y-%m-%d"), d.captured
 
 
 if __name__ == "__main__":
@@ -1568,6 +1592,43 @@ if __name__ == "__main__":
     assert Detector([{"name": "n", "heading": "north", "count_line": None}], nosnap, {})._cam("n") and \
         count_line({"name": "n", "heading": "north", "count_line": None}) is None, "count on sight when opted out"
     assert count_line({"name": "plain"}) is None, "no travel axis: count on sight"
+
+    # Rarity: a frame holding a class the curated set is short of is captured off the
+    # cadence, so buses stop losing to cars. Dedup and the cap still apply to both.
+    if jpeg:
+        rare_dir = Path(tempfile.mkdtemp())
+        DATASET_CAP = 10          # the eviction case above left it at 2
+        clk = [1000.0]
+        d = Detector([CAM], nosnap, {"capture_wanted": ["bus"]}, dataset_dir=rare_dir)
+        d.clock = d.wall = lambda: clk[0]
+        d._dataset_init()
+        BUS_A = [("bus", 0.9, (10.0, 10.0, 60.0, 60.0))]
+        BUS_B = [("bus", 0.9, (200.0, 10.0, 250.0, 60.0))]
+        d._capture("c", b"bus1", BUS_A, 64, 64)
+        clk[0] += 2                                  # 2 s: far inside the cadence
+        d._capture("c", b"bus2", BUS_B, 64, 64)
+        assert len(d.captured) == 2, d.captured      # wanted: the cadence does not apply
+        assert len(set(d.captured)) == 2, "rare stems must not floor onto one id"
+        clk[0] += 2
+        d._capture("c", b"bus3", BUS_B, 64, 64)      # identical scene
+        assert len(d.captured) == 2, "dedup still applies to a wanted class"
+
+        clk[0] += 100
+        CAR_A = [("car", 0.9, (10.0, 10.0, 60.0, 60.0))]
+        CAR_B = [("car", 0.9, (200.0, 10.0, 250.0, 60.0))]
+        d._capture("c", b"car1", CAR_A, 64, 64)
+        clk[0] += 2
+        d._capture("c", b"car2", CAR_B, 64, 64)      # a different scene, but not wanted
+        assert len(d.captured) == 3, "an ordinary class still waits for the cadence"
+        assert {p.read_bytes() for p in (rare_dir / "pending" / "images").glob("*.jpg")} == {
+            b"bus1", b"bus2", b"car1"}, list((rare_dir / "pending" / "images").glob("*.jpg"))
+
+        # A counted vehicle carries a direction chip; capture and dedup must survive it.
+        chip = [("bus", 0.9, (10.0, 10.0, 60.0, 60.0), "northbound\u2192gate")]
+        clk[0] += 100
+        d._capture("c", b"chip", chip, 64, 64)
+        assert d.captured[-1] and not d.info()["error"], d.info()
+        assert same_scene(chip, chip), "the chip must not break the scene comparison"
 
     # Heading: the facing of the camera gives both the compass direction and the gate side.
     NORTH, SOUTH = {"name": "n", "heading": "north"}, {"name": "s", "heading": "south"}
