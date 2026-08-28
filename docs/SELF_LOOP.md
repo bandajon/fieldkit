@@ -46,7 +46,12 @@ classes, so a parked bus is one sample and not fifty, and rare frames use a 1 s 
 bucket instead of the 10 s one so they cannot overwrite each other. The classify pass
 carries the widest net — it decodes every mirrored segment, so it sees all 48 h of
 footage rather than the slice a sampling pass lands on — and pushes what it captures,
-attribute suggestions included, to the queue.
+attribute suggestions included, to the queue. It is slow, though — it tracks every
+frame — so `python selfloop.py hunt` (every 10 min, `HUNT_PER_PASS` segments a pass)
+sweeps the last `HUNT_HOURS` (48) of footage newest first at the ingest rate and keeps
+*only* wanted-class frames: a two-day backlog clears in hours, and after that the newest
+bus or plant frame in the queue is never more than a pass or two old. Only a class that
+is under the floor gets hunted; once every class is past it the pass is a no-op.
 
 - Change the cadence: edit `THRESHOLD` / `PER_CAM` / `CLASSIFY_PER_PASS` in `selfloop.py`, intervals in
   `install_loop.sh`, then `./install_loop.sh` again.

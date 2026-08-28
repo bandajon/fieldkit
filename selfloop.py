@@ -3,6 +3,8 @@
 
   python selfloop.py ingest        newest mirrored segments, every camera -> pending -> bucket
   python selfloop.py classify      newest un-classified segments -> vehicle events -> bucket
+  python selfloop.py hunt          last HUNT_HOURS of footage, newest first -> only frames of
+                                   wanted classes -> the queue
   python selfloop.py train         pull the curated set; train once enough is new; promote if better
   python selfloop.py train --now   train now, threshold or not
   python selfloop.py status        where the loop stands
@@ -55,6 +57,9 @@ GATES = {"site1": "RDA-TG-KTB"}
 TZ = "Africa/Lusaka"          # the gates and this machine; segment names are local wallclock
 WANT_BOXES = 300      # per-class floor for the next run; under it, a class is hunted
 CLASSIFY_PER_PASS = 12        # ~10 min of footage per camera per pass, at 600 s segments
+HUNT_HOURS = 48               # how far back a hunt looks: what the gates keep mirrored
+HUNT_PER_PASS = 30            # segments per pass, ~25 s each at 1 fps on the GPU: the
+                              # lock is back within classify's patience (WAIT)
 REMEMBER_CLASSIFIED = 20000
 
 
@@ -98,6 +103,15 @@ def pick(keys, ingested, per_cam=PER_CAM):
         fresh = [k for k in segs if k not in done]
         chosen += fresh[-per_cam:]
     return chosen
+
+
+def pick_hunt(keys, hunted, since, per_pass=HUNT_PER_PASS):
+    """The newest un-hunted segments recorded after `since` (a YYYYMMDD-HHMMSS stem,
+    local wallclock like the segment names), newest first across every camera."""
+    done = set(hunted)
+    fresh = sorted((k for segs in cameras(keys).values() for k in segs
+                    if k not in done and Path(k).stem >= since), key=lambda k: Path(k).stem)
+    return fresh[::-1][:per_pass]
 
 
 def should_train(new_frames, trained_frames, threshold=THRESHOLD):
@@ -366,6 +380,58 @@ def ingest_pass():
         save_state(s)
         sent, _ = ds.push(cl, bucket, names=PENDING)
         print(f"{now()} ingest: {s['last_ingest']['samples']} samples written, {sent} files pushed", flush=True)
+
+
+def hunt_pass():
+    """Frames of the classes the curated set is short of, from the last HUNT_HOURS.
+
+    The sampling passes see a slice of the footage and the classify pass sees all of it
+    but slowly (it tracks every frame). This decodes at the ingest rate and keeps nothing
+    but wanted-class frames, so two days of footage are swept in hours and the queue's
+    bus, plant and abnormal-load frames are days old at most, not a week.
+    """
+    import ingest_video
+    from datetime import timedelta
+    with Lock():
+        s = load_state()
+        wanted = hunting()
+        if not wanted:
+            return
+        ds, cl, bucket = r2()
+        since = (datetime.now(ZoneInfo(TZ)) - timedelta(hours=HUNT_HOURS)).strftime("%Y%m%d-%H%M%S")
+        todo = pick_hunt(list(bucket_keys(cl, bucket)), s.get("hunted", []), since)
+        print(f"{now()} hunt: {len(todo)} segment(s) since {since} to sweep", flush=True)
+        if not todo:
+            return
+        cfg = ingest_video.config()
+        if CHAMPION.is_file():
+            cfg["detect_weights"] = str(CHAMPION)
+        cfg["capture_wanted"], cfg["capture_only_wanted"] = wanted, True
+        files = []
+        for key in todo:
+            dest = local_path(key)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            cl.download_file(bucket, key, str(dest))
+            files.append(dest)
+        stems, written = [], 0
+        try:
+            by_gate = {}
+            for f in files:
+                by_gate.setdefault(gate_of(f.relative_to(VIDEOS).parts[0]), []).append(f)
+            for gate, fs in by_gate.items():
+                sink = ingest_video.ingest(fs, {**cfg, "toll_gate_id": gate})
+                stems += sink.stems
+                written += sum(sink.written.values())
+        finally:
+            for f in files:
+                f.unlink(missing_ok=True)
+        if ATTRS_CHAMPION.is_file():
+            suggest(stems)
+        s["hunted"] = (s.get("hunted", []) + todo)[-REMEMBER:]
+        s["last_hunt"] = {"at": now(), "segments": len(todo), "samples": written, "wanted": wanted}
+        save_state(s)
+        sent, _ = ds.push(cl, bucket, names=PENDING)
+        print(f"{now()} hunt: {written} wanted-class samples written, {sent} files pushed", flush=True)
 
 
 def publish(cl, bucket, out, gate, seg, day):
@@ -750,6 +816,11 @@ def selfcheck():
     assert got == ["site1/cam3/20260827-101000.mkv", "site1/cam3/20260827-100000.mkv"], got
     assert pick_classify(keys, classified=[])[0].endswith("102000.mkv"), "newest first"
     assert pick_classify(keys, classified=keys) == [], "everything classified: nothing to do"
+    hunted = pick_hunt(keys, hunted=["site1/cam3/20260827-102000.mkv"], since="20260827-100000")
+    assert hunted and all(Path(k).stem >= "20260827-100000" for k in hunted) \
+        and "site1/cam3/20260827-102000.mkv" not in hunted, "hunt: newest un-hunted since the cutoff"
+    assert hunted == sorted(hunted, key=lambda k: Path(k).stem, reverse=True), "hunt: newest first"
+    assert pick_hunt(keys, hunted=[], since="20990101-000000") == [], "hunt: nothing that recent"
     up = for_upload({"id": "c-1", "crops": {"best": "crops/2026-08-19/c-1-best.jpg"}},
                     "RDA-TG-KTB")
     assert up == {"id": "c-1", "gate": "RDA-TG-KTB",
@@ -773,6 +844,8 @@ if __name__ == "__main__":
         ingest_pass()
     elif a[0] == "classify":
         classify_pass()
+    elif a[0] == "hunt":
+        hunt_pass()
     elif a[0] == "train":
         train_pass(force="--now" in a)
     elif a[0] == "status":

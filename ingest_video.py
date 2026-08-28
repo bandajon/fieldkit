@@ -132,13 +132,14 @@ class Sink:
     """dataset/pending writer with the live capture's gates, measured in footage time:
     no detections, an unchanged scene, or a too-recent sample and nothing lands."""
 
-    def __init__(self, dataset, ids, gate="", wanted=()):
+    def __init__(self, dataset, ids, gate="", wanted=(), only_wanted=False):
         self.images = Path(dataset) / "pending" / "images"
         self.labels = Path(dataset) / "pending" / "labels"
         for d in (self.images, self.labels):
             d.mkdir(parents=True, exist_ok=True)
         self.ids, self.gate = ids, gate
         self.wanted = set(wanted)   # classes worth a sample off-cadence (detect._capture)
+        self.only_wanted = only_wanted   # a hunt: the cadence captures nothing at all
         self.at = {}          # cam -> footage timestamp of its last capture
         self.dets = {}        # cam -> its `shown`, for the scene comparison
         self.written = Counter()
@@ -152,7 +153,8 @@ class Sink:
         if not shown:
             return False
         rare = any(d[0] in self.wanted for d in shown)
-        if not rare and ts - self.at.get(cam, float("-inf")) < detect.CAPTURE_EVERY:
+        if not rare and (self.only_wanted
+                         or ts - self.at.get(cam, float("-inf")) < detect.CAPTURE_EVERY):
             return False
         if detect.same_scene(shown, self.dets.get(cam, [])):
             return False
@@ -211,7 +213,8 @@ def ingest_one(f, run, sink, cam=None):
 
 def ingest(files, cfg):
     run, ids = detector(cfg)
-    sink = Sink(DATASET, ids, gate_id(cfg), cfg.get("capture_wanted") or ())
+    sink = Sink(DATASET, ids, gate_id(cfg), cfg.get("capture_wanted") or (),
+                bool(cfg.get("capture_only_wanted")))
     sampled = sum(ingest_one(f, run, sink)[0] for f in files)
     print(f"\n{len(files)} file(s), {sampled} frames sampled at {INGEST_FPS} fps, "
           f"{sum(sink.written.values())} samples written to {sink.images.parent}")
@@ -379,6 +382,10 @@ def selfcheck():
     assert not rare.offer("c", base + 4, b"c", bus2, 64, 64), "wanted, but the same scene"
     assert not rare.offer("c", base + 4, b"d", car, 64, 64), "an ordinary class still waits"
     assert len(set(rare.stems)) == 2, rare.stems      # finer buckets: no id collision
+    only = Sink(tmp / "only", dict(detect.CLASS_IDS), wanted=["bus"], only_wanted=True)
+    assert not only.offer("c", base, b"a", car, 64, 64), "a hunt keeps no ordinary frames"
+    assert not only.offer("c", base + 60, b"b", car, 64, 64), "...however long it waits"
+    assert only.offer("c", base + 61, b"c", bus, 64, 64), "a hunt keeps the wanted ones"
 
     assert segments([str(tmp)]) == [odd, seg], segments([str(tmp)])
 
