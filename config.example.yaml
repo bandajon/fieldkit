@@ -34,6 +34,8 @@ record_dir: ./recordings # root for ffmpeg segment recordings
 go2rtc_binary: ""        # path to the go2rtc binary; empty = Monitor stays on snapshots
 detect_backend: cpu      # Monitor vehicle detection: cpu (needs pip install ultralytics pillow) — hailo lands with the site AI servers
 # hef_path: ""           # hailo only: compiled model from the Hailo model zoo
+# detect_weights: dataset/champion.pt          # the crowned fine-tune: python dataset_sync.py models
+# attr_weights: dataset/attrs-champion.pt      # ...and its attribute heads (type/axles/cargo on Monitor)
 camera_defaults:         # credentials tried by the discovery sweep on unknown cameras
   user: admin
   password: ""

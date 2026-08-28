@@ -203,7 +203,7 @@
   <button data-tab="cameras" class="on">Cameras</button>
   <button data-tab="record">Record</button>
   <button data-tab="monitor">Monitor</button>
-  <button data-tab="label">Label</button>
+  <button data-tab="label" hidden>Label</button>
   <button data-tab="review">Review</button>
 </nav>
 
@@ -242,12 +242,7 @@
         <label class="res"><input type="checkbox" id="mirror"> back up recordings to cloud</label>
         <span id="mirrornote" class="res"></span>
       </div>
-      <div class="acts">
-        <label class="res"><input type="checkbox" id="contrib"> contribute training images to the shared dataset</label>
-        <span id="contribnote" class="res"></span>
-      </div>
-      <div class="res">Captured frames are uploaded for the labelling team; recordings are unaffected either way.</div>
-      <div id="contribstats" class="res"></div>
+      <div class="res">Mirrored recordings feed the shared training set; labelling happens on the curation service.</div>
       <textarea id="cfgtext" spellcheck="false"></textarea>
       <div class="rowbtns">
         <button class="btn" id="cfgsave">Save config</button>
@@ -267,7 +262,7 @@
     <div id="bdown" hidden></div>
     <div id="counts" hidden></div>
   </section>
-  <section id="label">
+  <section id="label" hidden>
     <h2 id="cnt-label"></h2>
     <div id="l-who" class="res"></div>
     <div class="acts" id="l-focus" hidden>
@@ -384,6 +379,10 @@ function labelOnly() {
     document.querySelector(`nav [data-tab=${t}]`).hidden = true;
     document.getElementById(t).hidden = true;
   }
+  // A console has no Label tab at all: frames reach the curation service through the
+  // recordings it mirrors, and are labelled there.
+  document.querySelector('nav [data-tab=label]').hidden = false;
+  document.getElementById('label').hidden = false;
   document.querySelector('nav [data-tab=label]').click();      // reuses the tab handler
 }
 
@@ -473,13 +472,6 @@ async function recPoll() {
   mir.checked = !!o.mirror;
   document.getElementById('mirrornote').textContent =
     mir.disabled ? 'cloud backup needs offload credentials in config.yaml' : '';
-  const con = document.getElementById('contrib');
-  con.disabled = mir.disabled;               // same credentials gate the uploads
-  con.checked = !!o.contribute;
-  document.getElementById('contribnote').textContent =
-    con.disabled ? 'contributing needs offload credentials in config.yaml' : '';
-  document.getElementById('contribstats').textContent =
-    `${o.contributed || 0} uploaded \u00b7 ${o.pending_samples || 0} waiting`;
   const cams = Object.entries(s.cameras);
   setCount('record', cams.length, 'configured');
   document.getElementById('reclist').innerHTML = cams.length === 0
@@ -505,10 +497,6 @@ async function recPoll() {
 }
 document.getElementById('mirror').onchange = async e => {
   await post('/api/offload/mirror', {on: e.target.checked});
-  recPoll();
-};
-document.getElementById('contrib').onchange = async e => {
-  await post('/api/offload/contribute', {on: e.target.checked});
   recPoll();
 };
 

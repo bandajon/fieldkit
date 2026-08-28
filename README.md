@@ -574,3 +574,9 @@ decides which model wins is still measured only on toll-gate footage.
 recordings for curation, trains once 1,000 new curated frames have accumulated,
 scores each run on the reference set, and promotes a run to champion only when it
 beats the last one. See `docs/SELF_LOOP.md`.
+
+A console never captures training frames itself: what it records and mirrors is what the
+loop samples, and labelling happens on the curation service. To run the crowned model on
+Monitor, `python dataset_sync.py models` fetches `dataset/champion.pt` and
+`dataset/attrs-champion.pt` (with a `.json` beside each naming the run); point
+`detect_weights` / `attr_weights` at them and restart. Run it again after a promotion.

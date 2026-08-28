@@ -3,6 +3,7 @@
 
   python dataset_sync.py push [--prefix curation-test/]   local dataset -> bucket
   python dataset_sync.py pull [--ledgers|--config]        bucket -> local dataset
+  python dataset_sync.py models                           bucket models/champion*.pt -> dataset/
   python dataset_sync.py                                  self-check
 
 Credentials come from OFFLOAD_ACCOUNT_ID / OFFLOAD_ACCESS_KEY_ID /
@@ -465,6 +466,26 @@ def selfcheck():
           "creds win")
 
 
+def models(cl, bucket, root=DATASET):
+    """The crowned weights (selfloop adopt publishes them under models/) into dataset/,
+    where config.yaml's detect_weights / attr_weights point on a console. Same size and
+    name = same file, like push/pull; the .json beside each says which run it is."""
+    got = []
+    for name in ("champion.pt", "champion.json", "attrs-champion.pt", "attrs-champion.json"):
+        key = "models/" + name
+        try:
+            size = cl.head_object(Bucket=bucket, Key=key)["ContentLength"]
+        except Exception:
+            continue                      # nothing crowned yet
+        dest = root / name
+        if dest.exists() and dest.stat().st_size == size:
+            continue
+        cl.download_file(bucket, key, str(dest))
+        got.append(name)
+    print(f"models: {', '.join(got) or 'up to date'}")
+    return got
+
+
 if __name__ == "__main__":
     args = sys.argv[1:]
     prefix = PREFIX
@@ -482,5 +503,8 @@ if __name__ == "__main__":
     elif args[0] == "pull":
         o = creds()
         pull(client(o), o["bucket"], prefix, names=names)
+    elif args[0] == "models":
+        o = creds()
+        models(client(o), o["bucket"])
     else:
         sys.exit(__doc__)

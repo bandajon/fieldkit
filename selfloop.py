@@ -56,6 +56,8 @@ EVENTS = "fieldkit-events/"   # bucket prefix the RDA importer reads
 GATES = {"site1": "RDA-TG-KTB"}
 TZ = "Africa/Lusaka"          # the gates and this machine; segment names are local wallclock
 WANT_BOXES = 300      # per-class floor for the next run; under it, a class is hunted
+HUNT_TOP = 6          # ...but only the thinnest few at once: with most classes under the
+                      # floor a hunt kept every frame with a vehicle in it (400 per segment)
 CLASSIFY_PER_PASS = 12        # ~10 min of footage per camera per pass, at 600 s segments
 HUNT_HOURS = 48               # how far back a hunt looks: what the gates keep mirrored
 HUNT_PER_PASS = 30            # segments per pass, ~25 s each at 1 fps on the GPU: the
@@ -156,11 +158,12 @@ def local_path(key):
     return VIDEOS / key
 
 
-def wanted_classes(counts, target=WANT_BOXES):
-    """Classes still under the floor — what the sampling passes capture off-cadence.
-    Counted in NEW boxes only: the frozen reference frames train nothing, so they say
-    nothing about where the next run is thin."""
-    return sorted(n for n, c in counts.items() if c < target)
+def wanted_classes(counts, target=WANT_BOXES, top=HUNT_TOP):
+    """The thinnest classes still under the floor — what the sampling passes capture
+    off-cadence. Counted in NEW boxes only: the frozen reference frames train nothing,
+    so they say nothing about where the next run is thin."""
+    under = sorted((c, n) for n, c in counts.items() if c < target)
+    return sorted(n for _, n in under[:top])
 
 
 def new_box_counts():
@@ -225,45 +228,37 @@ def for_upload(doc, gate):
 WAIT = 900            # seconds a pass waits for the lock before giving up on this tick
 
 
-def holder():
-    """Pid of a live lock holder, or None (no lock, or a dead process left it)."""
-    try:
-        pid = int(LOCK.read_text().split()[0])
-        os.kill(pid, 0)
-        return pid
-    except (OSError, ValueError, IndexError):
-        return None
-
-
 class Lock:
-    """One thing at a time on this machine: ingest and train both want the GPU, and two
-    trains at once would fight over dataset/run. A pass that finds the lock taken waits
-    a while rather than skipping its whole interval — the two agents fire together at
-    login, and an hourly check colliding with a ten-minute ingest is routine."""
+    """One thing at a time on this machine: ingest, hunt, classify and train all want the
+    GPU, and two trains at once would fight over dataset/run. A pass that finds the lock
+    taken waits a while rather than skipping its whole interval — the agents fire together
+    at login, and an hourly check colliding with a ten-minute pass is routine.
+
+    A kernel flock, not a pid file: the lock dies with its process, so there is no stale-
+    holder takeover — and the takeover was the bug, three agents waking together each
+    unlinked the other's freshly written lock and all three ran on the GPU at once."""
     def __enter__(self):
+        import fcntl
         import time
         deadline = time.monotonic() + WAIT
         LOCK.parent.mkdir(parents=True, exist_ok=True)
+        self.fd = os.open(LOCK, os.O_CREAT | os.O_RDWR)
         while True:
-            # O_EXCL makes the check and the take one step. The old check-then-write let
-            # two agents that woke in the same second both see it free and both proceed
-            # — ingest then deleted the download folder under a running classify pass.
             try:
-                fd = os.open(LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            except FileExistsError:
-                if holder() is None:
-                    LOCK.unlink(missing_ok=True)      # a dead process left it: take over
-                    continue                          # ...through O_EXCL, never around it
+                fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
                 if time.monotonic() > deadline:
+                    os.close(self.fd)
                     sys.exit(f"busy: {LOCK.read_text().strip()}")
                 time.sleep(15)
-                continue
-            with os.fdopen(fd, "w") as f:
-                f.write(f"{os.getpid()} {sys.argv[1:]} since {now()}")
-            return self
+        os.ftruncate(self.fd, 0)
+        os.write(self.fd, f"{os.getpid()} {sys.argv[1:]} since {now()}".encode())
+        return self
 
     def __exit__(self, *_):
-        LOCK.unlink(missing_ok=True)
+        os.ftruncate(self.fd, 0)     # status reads "free" from an empty file
+        os.close(self.fd)            # ...and this releases the flock
 
 
 def r2():
@@ -671,7 +666,7 @@ def status():
         gap = THRESHOLD - (count - s.get("trained_frames", 0))
         print(f"new frames:    {count} outside the reference set, {s.get('trained_frames', 0)} at the last run"
               f" — {'ready to train' if gap <= 0 else f'{gap} more before the next run'}")
-    print(f"lock:          {LOCK.read_text().strip() if LOCK.exists() else 'free'}")
+    print(f"lock:          {(LOCK.read_text().strip() if LOCK.exists() else '') or 'free'}")
 
 
 def suggest_check():
@@ -735,15 +730,17 @@ def lock_check():
     me = sys.modules[__name__]
     tmp = Path(tempfile.mkdtemp()) / "loop.lock"
     with patch.object(me, "LOCK", tmp), patch.object(me, "WAIT", 0):
-        tmp.write_text("999999999 ['ghost'] since never")   # no such pid: stale
+        tmp.write_text("999999999 ['ghost'] since never")   # left by a dead process
         with Lock():
-            assert tmp.read_text().startswith(str(os.getpid())), "stale lock not taken over"
+            assert tmp.read_text().startswith(str(os.getpid())), "dead process's lock not taken"
             try:
                 with Lock():
                     raise AssertionError("a live lock was granted twice")
             except SystemExit as e:
                 assert "busy" in str(e), e
-        assert not tmp.exists(), "lock not released"
+        assert tmp.read_text() == "", "lock not released"
+        with Lock():
+            pass
 
 
 def publish_check():
@@ -809,6 +806,8 @@ def selfcheck():
         "the camera must be the parent directory, or every camera samples as one"
     assert wanted_classes({"a": 5, "b": 300, "c": 299, "d": 0}, target=300) == ["a", "c", "d"]
     assert wanted_classes({"a": 5}, target=0) == [], "a floor of 0 hunts nothing"
+    assert wanted_classes({"a": 5, "b": 9, "c": 1, "d": 7}, target=300, top=2) == ["a", "c"], \
+        "only the thinnest few are hunted at once"
     assert gate_of("site1") == "RDA-TG-KTB", "the Katuba box still calls itself site1"
     assert gate_of("RDA-TG-KTB") == "RDA-TG-KTB", "a gate already named for itself"
     # Newest segment first, across cameras, so the portal gets current traffic first.

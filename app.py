@@ -223,7 +223,10 @@ else:
                      console_creds=CONSOLE_CREDS, controls=CONTROLS)
     HIVE.start()   # no-op unless config.yaml has an ops: block
     DETECT = detect.Detector(CONFIG.get("cameras", []), detect_snapshot, CONFIG,
-                             creds_fn=lambda ip: cam_creds(ip), dataset_dir=DATASET,
+                             # dataset_dir=None: a console captures no training frames.
+                             # Recordings mirrored to the bucket are what the loop samples,
+                             # and the curation service is where labelling happens.
+                             creds_fn=lambda ip: cam_creds(ip), dataset_dir=None,
                              counts_dir=ROOT / "counts",   # one JSON per day: the durable tallies
                              events_dir=ROOT / "events")   # per-vehicle records + evidence crops
     DETECT.start()   # no-op unless the optional detection deps are installed
