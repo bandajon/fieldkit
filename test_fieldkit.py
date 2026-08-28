@@ -768,6 +768,16 @@ def training_split_honours_reference():
             (train.DATASET, train.APPROVED, train.RUN, train.REF_RUN, train.REFERENCE, train.MIN_FRAMES) = keep
 
 
+def queue_orders_by_capture_time():
+    """Newest capture first, from the stem — not from file mtime, which any label rewrite scrambles."""
+    import app
+    assert app.captured_at("cam3-20260821-071527") == "20260821071527"
+    assert app.captured_at("RDA-TG-KTB-cam3-20260828-004512") == "20260828004512"
+    older, newer = app.captured_at("cam3-20260819-172820"), app.captured_at("loop-videos-20260827-223050")
+    assert newer > older, "a freshly sampled frame must sort ahead of an old one"
+    assert app.captured_at("no-timestamp-here") == "0", "no name to go on, no path: last"
+
+
 check("hostnet arp parser", hostnet_arp_parser)
 check("scan auto-joins once", scan_auto_joins_once)
 check("hostnet jetson (naming, no-carrier, bootstrap)", hostnet_jetson)
@@ -793,6 +803,7 @@ check("site rename", site_rename)
 check("label strip rules (one-tap emergency, implies)", label_strip_rules)
 check("assignment targets (several, all)", assign_targets)
 check("training split honours the reference set", training_split_honours_reference)
+check("queue orders by capture time", queue_orders_by_capture_time)
 
 print(f"\n{'FAILED: ' + ', '.join(FAILS) if FAILS else 'all passed'}")
 sys.exit(1 if FAILS else 0)

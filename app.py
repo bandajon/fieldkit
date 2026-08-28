@@ -1018,6 +1018,24 @@ def finish(who, sid, action, payload, extra=None):
     return payload
 
 
+STEM_TIME = re.compile(r"(\d{8})-(\d{6})$")
+
+
+def captured_at(stem, path=None):
+    """When the frame was captured, from its name (<...>-YYYYMMDD-HHMMSS): what "newest
+    first" has to mean for the queue. File mtime used to stand in for it, and any
+    rewrite of the label files — a class removal remaps every one — made thousands of
+    old frames the "newest" overnight and buried the freshly sampled, pre-filled ones.
+    A name without a timestamp falls back to the file's mtime."""
+    m = STEM_TIME.search(stem)
+    if m:
+        return m.group(1) + m.group(2)
+    try:
+        return "%014.0f" % path.stat().st_mtime if path else "0"
+    except OSError:
+        return "0"
+
+
 @app.get("/api/dataset/samples")
 def dataset_samples(who: str = "", x_curator_token: str = Header("")):
     who = check_token(valid_who(who), x_curator_token)
@@ -1033,7 +1051,7 @@ def dataset_samples(who: str = "", x_curator_token: str = Header("")):
             suggested = read_attrs(suggest_path(p.stem))
             if suggested:
                 s["suggested"] = suggested
-            pending.append((p.stat().st_mtime, s))
+            pending.append((captured_at(p.stem, p), s))
         except OSError:      # sample reviewed away mid-listing
             continue
     pending.sort(key=lambda t: t[0], reverse=True)
