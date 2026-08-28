@@ -13,6 +13,7 @@ still becomes a sample — for abnormal loads that is the whole point.
 """
 
 import hashlib
+import json
 import io
 import sys
 from pathlib import Path
@@ -21,6 +22,7 @@ import ingest_video
 
 ROOT = Path(__file__).resolve().parent
 DATASET = ROOT / "dataset"
+EXTERNAL = DATASET / "external"
 CHAMPION = DATASET / "champion.pt"
 ATTRS_CHAMPION = DATASET / "attrs-champion.pt"
 IMG = (".jpg", ".jpeg", ".png")
@@ -48,6 +50,26 @@ def images(args):
     return out
 
 
+MANIFEST = DATASET / "external.json"      # {stem: class it was fetched for}; synced as config
+
+
+def load_manifest():
+    try:
+        return json.loads(MANIFEST.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def save_manifest(m):
+    """Which class each web image was fetched for. The champion boxes few of them — an
+    abnormal load or a grader in a random photo is not what it trained on — and the
+    queue's focus filters on pre-labelled classes, so without this record the images
+    fetched FOR a class are invisible under that class's focus. Synced as config, the
+    curation service reads it the way it reads reference.txt."""
+    MANIFEST.parent.mkdir(parents=True, exist_ok=True)
+    MANIFEST.write_text(json.dumps(m, indent=0, sort_keys=True))
+
+
 def ingest(files, as_class=None):
     """-> the stems written. Each image becomes one pending sample, boxes or not."""
     from PIL import Image
@@ -63,9 +85,13 @@ def ingest(files, as_class=None):
     for d in (imgs, labels):
         d.mkdir(parents=True, exist_ok=True)
     stems = []
+    manifest = load_manifest()
     for f in files:
         blob = f.read_bytes()
         stem = "external-" + hashlib.sha1(blob).hexdigest()[:12]
+        fetched_for = as_class or (f.parent.name if f.parent.parent == EXTERNAL else None)
+        if fetched_for:
+            manifest[stem] = fetched_for
         try:
             img = Image.open(io.BytesIO(blob)).convert("RGB")
         except Exception as e:          # a truncated download costs one sample, not the run
@@ -81,6 +107,7 @@ def ingest(files, as_class=None):
         (labels / f"{stem}.txt").write_text("".join(ln + "\n" for ln in lines))
         stems.append(stem)
         print(f"  {f.name} -> {stem}  {len(lines)} box(es)", flush=True)
+    save_manifest(manifest)
     return stems
 
 

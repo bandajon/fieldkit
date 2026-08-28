@@ -1042,6 +1042,15 @@ def captured_at(stem, path=None):
         return "0"
 
 
+def external_manifest():
+    """{stem: class} for web images (ingest_images.py), synced as config. Empty when none."""
+    try:
+        m = json.loads((DATASET / "external.json").read_text())
+        return m if isinstance(m, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
 def focus_suggestions(new_boxes, candidates, names, top=5):
     """Where to aim: the classes with the fewest boxes curated since the freeze that the
     queue can actually supply. A class with no candidate frames is not a suggestion —
@@ -1061,6 +1070,7 @@ def dataset_samples(who: str = "", focus: str = "", x_curator_token: str = Heade
     want = {names.index(c) for c in target_classes(focus)}
     labels = DATASET / "pending" / "labels"
     pending, candidates = [], {}
+    external = external_manifest()
     for p in sorted(labels.glob("*.txt")) if labels.is_dir() else []:
         try:
             s = {"id": p.stem, "boxes": read_boxes(p)}
@@ -1070,10 +1080,17 @@ def dataset_samples(who: str = "", focus: str = "", x_curator_token: str = Heade
             suggested = read_attrs(suggest_path(p.stem))
             if suggested:
                 s["suggested"] = suggested
-            for c in {b["cls"] for b in s["boxes"]}:     # per frame: one bus in a frame is one candidate
+            # A web image counts for the class it was fetched for, boxed or not: the
+            # champion rarely boxes an abnormal load in a random photo, and the point of
+            # the image is that a curator draws it.
+            classes_here = {b["cls"] for b in s["boxes"]}
+            if p.stem in external and external[p.stem] in names:
+                s["external"] = external[p.stem]
+                classes_here.add(names.index(external[p.stem]))
+            for c in classes_here:                       # per frame: one bus in a frame is one candidate
                 if 0 <= c < len(names):
                     candidates[names[c]] = candidates.get(names[c], 0) + 1
-            if want and not any(b["cls"] in want for b in s["boxes"]):
+            if want and not (want & classes_here):
                 continue
             pending.append((captured_at(p.stem, p), s))
         except OSError:      # sample reviewed away mid-listing

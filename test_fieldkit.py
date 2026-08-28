@@ -836,6 +836,13 @@ def queue_focus_filters_and_suggests():
             assert sorted(s["id"] for s in r["pending"]) == ["p2-20260828-010010", "p3-20260828-010020"], r["pending"]
             assert r["pending_total"] == 2 and r["focus"] == "c-bus,F"
             assert app.dataset_samples(who="", focus="zzz", x_curator_token="")["pending_total"] == 3, "unknown focus filters nothing"
+            # a web image fetched for a class is a candidate for it even with no box yet
+            (D / "pending" / "labels" / "external-abc123def456.txt").write_text("")
+            (D / "external.json").write_text('{"external-abc123def456": "f-abnormal"}')
+            r = app.dataset_samples(who="", focus="F", x_curator_token="")
+            assert [s["id"] for s in r["pending"]][-1] == "external-abc123def456" or any(
+                s["id"] == "external-abc123def456" for s in r["pending"]), r["pending"]
+            assert r["candidates"]["f-abnormal"] == 2 and next(s for s in r["pending"] if s["id"].startswith("external"))["external"] == "f-abnormal"
         finally:
             app.DATASET, app.REVIEWERS = keep
 
