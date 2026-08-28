@@ -624,7 +624,7 @@ class Detector:
     def _speed(self, t, cam):
         """km/h between the two reference lines, or None when the run is not credible."""
         lines = cam.get("speed_lines") or {}
-        if len(t["cross"]) < 2 or not lines.get("metres"):
+        if "a" not in t["cross"] or "b" not in t["cross"] or not lines.get("metres"):
             return None
         gap = abs(t["cross"]["b"] - t["cross"]["a"])
         kph = round(float(lines["metres"]) / gap * 3.6, 1) if gap else 0.0
@@ -1504,7 +1504,8 @@ if __name__ == "__main__":
         for y in (100.0, 115.0, 160.0, 190.0):
             d._track("c", [("truck", 0.9, (100.0, y - 10, 140.0, y + 10), 1)], pic)
         t = d.tracks["c"][1]
-        assert set(t["cross"]) == {"a", "b"}, t["cross"]
+        assert {"a", "b"} <= set(t["cross"]), t["cross"]    # the count line "n" rides along
+        assert d._speed({"cross": {"a": 1.0, "n": 1.0}}, TRAVEL) is None, "count line is not a speed line"
         t["cross"] = {"a": 10.0, "b": 11.5}           # 25 m in 1.5 s = 60 km/h
         t["last_seen"] -= 20
         d._track("c", [])
