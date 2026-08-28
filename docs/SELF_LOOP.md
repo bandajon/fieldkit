@@ -46,3 +46,15 @@ What it deliberately does not do: touch a toll gate. `models/champion.pt` in the
 is the offer; deploying it to a site box (`detect_weights`, restart) stays a human step,
 because a pre-labeller that got worse costs curators minutes and a gate detector that got
 worse costs revenue.
+
+## Comparing models like for like
+
+`python train.py baseline` trains on the reference set itself — the exact frames and hash
+split v2 used — so two architectures can be compared on identical ground; `train.py eval
+<run>` re-scores an old run on that split and on the reference tree; `train.py bench <run>
+...` times each on CPU (what a gate box has) and MPS at the working image size. A baseline
+run's reference score is inflated (it trained on those frames) and is recorded as such:
+`selfloop.py adopt` never turns it into the bar the loop's honest runs must clear.
+`FIELDKIT_TRAIN_ARGS` passes a recipe through to ultralytics, e.g. the small-dataset one
+from the YOLO26 training guide: `{"optimizer": "AdamW", "lr0": 0.001, "mosaic": 0.5}`.
+

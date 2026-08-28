@@ -757,7 +757,14 @@ def training_split_honours_reference():
                 raise AssertionError("built a split with nothing outside the reference set")
             except SystemExit as e:
                 assert "reference" in str(e), e
+            # baseline: the reference set itself and nothing else, whatever else is approved
+            (D / "reference.txt").write_text("\n".join(stems[:20]) + "\n")
+            train.BASELINE = True
+            split = train.build(["a-small"])
+            assert set(split["train"]) | set(split["val"]) == set(stems[:20]), "baseline is not the reference set"
+            assert (D / "reference-run" / "data.yaml").is_file(), "the reference tree is still scored"
         finally:
+            train.BASELINE = False
             (train.DATASET, train.APPROVED, train.RUN, train.REF_RUN, train.REFERENCE, train.MIN_FRAMES) = keep
 
 

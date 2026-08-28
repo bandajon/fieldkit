@@ -105,6 +105,16 @@ def should_train(new_frames, trained_frames, threshold=THRESHOLD):
     return new_frames - trained_frames >= threshold
 
 
+def champion_score(ev):
+    """What a crowned run is later compared against. A run that trained on the reference
+    set (train.py baseline — v2, and the YOLO26 comparison runs) scored itself on its own
+    training frames, so its number would be a bar no honest run could clear: recorded as
+    none, and the next loop-trained model replaces it unconditionally."""
+    if not ev or ev.get("baseline"):
+        return {"map50": None}
+    return {k: ev.get(k) for k in ("map50", "map50_95")}
+
+
 def promote(candidate, champion):
     """Does this run's reference score earn it the champion slot? No champion, or a
     champion with no comparable score (v2 trained on the reference set, so its number
@@ -462,8 +472,7 @@ def crown(s, run, frames, ev, cl, bucket):
     bucket for whoever deploys it to a gate."""
     best = run / "weights" / "best.pt"
     shutil.copy2(best, CHAMPION)
-    s["champion"] = {"run": run.name, "frames": frames, "at": now(),
-                     **({k: ev[k] for k in ("map50", "map50_95")} if ev else {"map50": None})}
+    s["champion"] = {"run": run.name, "frames": frames, "at": now(), **champion_score(ev)}
     for key in (f"{MODELS}{run.name}/best.pt", f"{MODELS}champion.pt"):
         cl.upload_file(str(best), bucket, key)
     if ev:
@@ -663,6 +672,9 @@ def selfcheck():
     assert promote({"map50": 0.5}, None) and promote({"map50": 0.1}, {"map50": None})
     assert promote({"map50": 0.71}, {"map50": 0.70}) and not promote({"map50": 0.70}, {"map50": 0.70})
     assert not promote(None, {"map50": 0.70}), "no score, no promotion"
+    assert champion_score({"map50": 0.9, "map50_95": 0.6, "baseline": True}) == {"map50": None}, \
+        "a baseline run's inflated score must not become the bar"
+    assert champion_score({"map50": 0.71, "map50_95": 0.5}) == {"map50": 0.71, "map50_95": 0.5}
     assert promote_attrs({"mean_acc": 0.5}, None) and promote_attrs({"mean_acc": 0.1}, {"mean_acc": None})
     assert promote_attrs({"mean_acc": 0.88}, {"mean_acc": 0.87})
     assert not promote_attrs({"mean_acc": 0.87}, {"mean_acc": 0.87}), "a tie is not an improvement"

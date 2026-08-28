@@ -1,8 +1,15 @@
 #!/usr/bin/env python3
 """Fine-tune the Monitor detector on the operator-approved dataset.
 
-    python train.py          # build the split, train, report
-    python train.py check    # build the split only, then sanity-check it
+    python train.py            # build the split, train, report
+    python train.py check      # build the split only, then sanity-check it
+    python train.py baseline   # train on the reference set itself (v2's exact split): like-for-like runs
+    python train.py eval <run> # score an existing run on that same split and the reference tree
+    python train.py bench <run> [<run>...]   # ms/frame on CPU (the gate boxes) and MPS at IMGSZ
+
+FIELDKIT_TRAIN_ARGS='{"optimizer": "AdamW", "lr0": 0.001, "mosaic": 0.5}' passes a recipe
+straight through to ultralytics — one knob, so a run's hyperparameters are on its command line
+and in its args.yaml, never hidden in an edit.
 
 Everything it writes stays under dataset/ (gitignored): dataset/run/ is the
 symlinked training tree, dataset/train_runs/ holds ultralytics' output.
@@ -10,6 +17,7 @@ symlinked training tree, dataset/train_runs/ holds ultralytics' output.
 
 import hashlib
 import json
+import os
 import shutil
 import sys
 from datetime import datetime, timezone
@@ -25,7 +33,10 @@ RUNS = DATASET / "train_runs"
 REFERENCE = DATASET / "reference.txt" # the frozen benchmark: never trained on, always scored on
 REF_RUN = DATASET / "reference-run"   # its symlink tree, rebuilt alongside RUN
 
-WEIGHTS = "yolov8n.pt"                # same base the console runs; fine-tune from it
+WEIGHTS = "yolo26n.pt"                # NMS-free, DFL-free: lighter on a CPU box, simpler to compile for Hailo
+BASELINE = "baseline" in sys.argv[1:] # see build(): the reference set itself, v2's split
+EXTRA = json.loads(os.environ.get("FIELDKIT_TRAIN_ARGS", "{}"))   # a recipe, passed straight to .train()
+BENCH_FRAMES = 40
 EPOCHS = 100
 PATIENCE = 20
 IMGSZ = 1280                          # matches detect.py: sub-streams are 1280x720
@@ -85,14 +96,23 @@ def build(names):
     """The training split (reference frames left out) and, when there is a reference
     set, its own tree to score against. -> {split: [stems]}"""
     ref = reference()
-    split, orphans = link_tree(RUN, lambda s: None if s in ref else ("val" if is_val(s) else "train"))
+    part = lambda s: "val" if is_val(s) else "train"
+    if BASELINE and ref:
+        # The reference set itself, and nothing else: v2 trained on exactly these frames with
+        # exactly this split, so a run here compares with v2 like for like — same train frames,
+        # same 116 val frames. Its reference score is inflated the same way v2's is, and
+        # reference-eval.json says so ("baseline"), which keeps it out of the loop's promotion.
+        choose, excluded = (lambda s: part(s) if s in ref else None), set()
+    else:
+        choose, excluded = (lambda s: None if s in ref else part(s)), ref
+    split, orphans = link_tree(RUN, choose)
     split = {"train": split.get("train", []), "val": split.get("val", [])}
     images = {p.stem for p in (APPROVED / "images").glob("*.jpg")}
-    orphans += len(images - set(split["train"]) - set(split["val"]) - ref)
+    orphans += len((images & ref if BASELINE and ref else images) - set(split["train"]) - set(split["val"]) - excluded)
     total = len(split["train"]) + len(split["val"])
     if total < MIN_FRAMES:
         sys.exit(f"only {total} approved frames outside the reference set — label at least "
-                 f"{MIN_FRAMES} new ones on the Label tab first" if ref else
+                 f"{MIN_FRAMES} new ones on the Label tab first" if ref and not BASELINE else
                  f"only {total} approved frames — label at least {MIN_FRAMES} on the Label tab first")
     (RUN / "data.yaml").write_text(yaml.safe_dump(
         {"path": str(RUN), "train": "images/train", "val": "images/val", "names": names},
@@ -102,7 +122,9 @@ def build(names):
         (REF_RUN / "data.yaml").write_text(yaml.safe_dump(   # val only; train key is required, unused
             {"path": str(REF_RUN), "train": "images/val", "val": "images/val", "names": names},
             sort_keys=False))
-        print(f"{len(held.get('val', []))} reference frames held out — the benchmark, never trained on")
+        print(f"{len(held.get('val', []))} reference frames" + (
+            " — this BASELINE run trains on them; its reference score is not comparable to the loop's"
+            if BASELINE else " held out — the benchmark, never trained on"))
     print(f"{total} approved frames: {len(split['train'])} train / {len(split['val'])} val"
           + (f" ({orphans} unpaired file(s) skipped)" if orphans else ""))
     return split
@@ -154,38 +176,102 @@ def report(m, names, boxes, title):
     return out
 
 
-def train(names):
-    from ultralytics import YOLO
+def device():
     try:
         import torch
-        dev = "mps" if torch.backends.mps.is_available() else "cpu"
+        return "mps" if torch.backends.mps.is_available() else "cpu"
     except Exception:                 # torch rides along with ultralytics
-        dev = "cpu"
-    data, run = str(RUN / "data.yaml"), datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    print(f"training on {dev}: {EPOCHS} epochs, imgsz {IMGSZ}, batch {BATCH}", flush=True)
-    YOLO(WEIGHTS).train(data=data, imgsz=IMGSZ, epochs=EPOCHS, patience=PATIENCE, batch=BATCH,
-                        device=dev, project=str(RUNS), name=run, exist_ok=True)
-    best = RUNS / run / "weights" / "best.pt"
+        return "cpu"
+
+
+def evaluate(names, run):
+    """Score a run's best.pt on the current split's val frames and on the reference tree,
+    and leave both numbers beside the weights: val-eval.json and reference-eval.json. The
+    same function scores a fresh run and re-scores an old one, so v2 and a challenger are
+    measured by one yardstick. -> the reference eval dict, or None."""
+    from ultralytics import YOLO
+    dev, best = device(), RUNS / run / "weights" / "best.pt"
+    if not best.is_file():
+        sys.exit(f"no weights under {RUNS / run}")
     model = YOLO(best)
-    report(model.val(data=data, imgsz=IMGSZ, device=dev).box, names, val_boxes(names),
-           "own val split")
-    if (REF_RUN / "data.yaml").is_file():
-        # The number that compares versions: same frames for every model, never trained on.
-        m = model.val(data=str(REF_RUN / "data.yaml"), imgsz=IMGSZ, device=dev).box
-        boxes = val_boxes(names, REF_RUN)
-        per = report(m, names, boxes, f"reference set ({sum(boxes.values())} boxes)")
-        (RUNS / run / "reference-eval.json").write_text(json.dumps(
-            {"run": run, "map50": round(float(m.map50), 4), "map50_95": round(float(m.map), 4),
-             "per_class_map50": per, "frames": len(list((REF_RUN / "labels" / "val").glob("*.txt")))},
-            indent=1))
+    m = model.val(data=str(RUN / "data.yaml"), imgsz=IMGSZ, device=dev).box
+    boxes = val_boxes(names)
+    per = report(m, names, boxes, f"{run}: own val split ({sum(boxes.values())} boxes)")
+    (RUNS / run / "val-eval.json").write_text(json.dumps(
+        {"run": run, "map50": round(float(m.map50), 4), "map50_95": round(float(m.map), 4),
+         "per_class_map50": per, "frames": len(split_stems("val")), "baseline": BASELINE}, indent=1))
+    if not (REF_RUN / "data.yaml").is_file():
+        return None
+    # The number that compares versions: same frames for every model. Not comparable when the
+    # run trained on those very frames (baseline) — the loop's promotion ignores such a score.
+    m = model.val(data=str(REF_RUN / "data.yaml"), imgsz=IMGSZ, device=dev).box
+    boxes = val_boxes(names, REF_RUN)
+    per = report(m, names, boxes, f"{run}: reference set ({sum(boxes.values())} boxes)")
+    ev = {"run": run, "map50": round(float(m.map50), 4), "map50_95": round(float(m.map), 4),
+          "per_class_map50": per, "frames": len(list((REF_RUN / "labels" / "val").glob("*.txt"))),
+          "baseline": BASELINE, "weights": WEIGHTS}
+    (RUNS / run / "reference-eval.json").write_text(json.dumps(ev, indent=1))
+    return ev
+
+
+def split_stems(part):
+    return [p.stem for p in (RUN / "labels" / part).glob("*.txt")]
+
+
+def train(names):
+    from ultralytics import YOLO
+    dev = device()
+    data, run = str(RUN / "data.yaml"), datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    print(f"training on {dev}: {WEIGHTS}, {EPOCHS} epochs, imgsz {IMGSZ}, batch {BATCH}"
+          + (f", recipe {EXTRA}" if EXTRA else "")
+          + (" — BASELINE: the reference set itself" if BASELINE else ""), flush=True)
+    YOLO(WEIGHTS).train(data=data, imgsz=IMGSZ, epochs=EPOCHS, patience=PATIENCE, batch=BATCH,
+                        device=dev, project=str(RUNS), name=run, exist_ok=True, **EXTRA)
+    evaluate(names, run)
+    best = RUNS / run / "weights" / "best.pt"
     print(f"\nweights: {best}")
     print(f"to deploy: set detect_weights: {best} in config.yaml and restart FieldKit")
 
 
+def bench(names, runs):
+    """ms per frame at IMGSZ, on real held-out frames, per run: CPU is what the gate boxes
+    have, MPS is this machine. Includes JPEG decode and letterboxing, the same for every
+    model, so the numbers compare models rather than measure a kernel."""
+    import time
+    from ultralytics import YOLO
+    frames = sorted((REF_RUN / "images" / "val").glob("*.jpg"))[:BENCH_FRAMES] or \
+        sorted((RUN / "images" / "val").glob("*.jpg"))[:BENCH_FRAMES]
+    devs = ["cpu"] + (["mps"] if device() == "mps" else [])
+    out = {}
+    for run in runs:
+        model = YOLO(RUNS / run / "weights" / "best.pt")
+        for dev in devs:
+            for f in frames[:3]:
+                model.predict(f, imgsz=IMGSZ, device=dev, verbose=False)      # warm-up
+            t0 = time.perf_counter()
+            for f in frames:
+                model.predict(f, imgsz=IMGSZ, device=dev, verbose=False)
+            out.setdefault(run, {})[dev] = round((time.perf_counter() - t0) / len(frames) * 1000, 1)
+        print(f"  {run:<22} " + "   ".join(f"{d} {ms:7.1f} ms/frame" for d, ms in out[run].items()),
+              flush=True)
+    (RUNS / "bench.json").write_text(json.dumps(
+        {"imgsz": IMGSZ, "frames": len(frames), "ms_per_frame": out}, indent=1))
+    return out
+
 if __name__ == "__main__":
+    a = sys.argv[1:]
+    cmd = a[0] if a else ""
+    if cmd in ("eval", "bench"):
+        BASELINE = True           # scoring and timing happen on the reference set's split
     names = classes()
     split = build(names)
-    if len(sys.argv) > 1 and sys.argv[1] == "check":
+    if cmd == "check":
         check(names, split)
-    else:
+    elif cmd == "eval" and len(a) == 2:
+        evaluate(names, a[1])
+    elif cmd == "bench" and len(a) >= 2:
+        bench(names, a[1:])
+    elif cmd in ("", "baseline"):
         train(names)
+    else:
+        sys.exit(__doc__)
