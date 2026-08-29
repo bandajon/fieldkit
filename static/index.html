@@ -165,6 +165,8 @@
                  font:400 14px/1 var(--mono); }
   #l-sres i, #l-sres .res { margin:0; }
   #l-sres .chip { padding-right:10px; }
+  #l-sres .thumb { width:160px; height:90px; object-fit:cover; background:#000;
+                   border:1px solid var(--line); border-radius:4px; flex:none; }
   .box .x { position:absolute; right:-3px; top:-3px; width:24px; height:24px; background:var(--c);
             border:2px solid #000; border-radius:3px; color:#000; cursor:pointer;
             font:700 16px/20px var(--mono); text-align:center; }
@@ -1779,12 +1781,27 @@ document.getElementById('l-sgo').onclick = async () => {
       `${esc(h)} &times;${n}`).join(' &middot; ')}</div>` : '') + hits.map(s => {
     const names = [...new Set((s.boxes || []).map(b => labClasses[b.cls]).filter(Boolean))];
     return `<button class="btn" data-open="${esc(s.id)}" data-tree="${esc(s.tree || tree)}">` +
+      `<img class="thumb" data-thumb="${esc(s.id)}" alt="">` +
       `<b>${esc(s.id)}</b><i class="res">${esc(s.curator || '—')}</i>` +
       names.map(n => `<span class="chip" style="--c:${clsColor(labClasses.indexOf(n))}"
         >${esc(n)}</span>`).join('') + '</button>';
   }).join('') +
   (d.total > hits.length ? `<div class="res">showing ${hits.length} of ${d.total}</div>` : '');
+  labThumbUrls.splice(0).forEach(URL.revokeObjectURL);
+  el.querySelectorAll('[data-thumb]').forEach(img => labThumbs.observe(img));
 };
+
+// Thumbnails load as rows scroll into view, through the same token-bearing fetch as the
+// editor: the image route is gated on the deployed tool, so a plain src cannot reach it,
+// and fifty full frames at once would be a slow page for a glance at the pen.
+const labThumbUrls = [];
+const labThumbs = new IntersectionObserver(entries => entries.forEach(async en => {
+  if (!en.isIntersecting) return;
+  const img = en.target;
+  labThumbs.unobserve(img);
+  const r = await labFetch(`/api/dataset/image?id=${encodeURIComponent(img.dataset.thumb)}`);
+  if (r.ok) labThumbUrls.push(img.src = URL.createObjectURL(await r.blob()));
+}), {rootMargin: '300px'});
 
 // A hit opens in the ordinary editor — same boxes, same gestures, same Submit.
 document.getElementById('l-sres').onclick = async e => {
