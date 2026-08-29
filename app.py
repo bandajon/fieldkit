@@ -1279,7 +1279,7 @@ def dataset_review(who: str, x_curator_token: str = Header("")):
 
 @app.get("/api/dataset/search")
 def dataset_search(target: str = "", who: str = "", tree: str = "approved", limit: int = 50,
-                   x_curator_token: str = Header("")):
+                   offset: int = 0, x_curator_token: str = Header("")):
     """Every frame holding a class or a whole toll category, newest first — the way back
     to work already filed, for a supervisor spot-checking a class or cleaning up after one
     curator. No class at all lists the whole tree: "what is in holding right now, and
@@ -1315,8 +1315,9 @@ def dataset_search(target: str = "", who: str = "", tree: str = "approved", limi
         hits.append({"id": f.stem, "curator": curator, "tree": tree, "boxes": boxes,
                      "attrs": read_attrs(attrs_path(f.stem, tree))})
         by_curator[curator] = by_curator.get(curator, 0) + 1
-    return {"results": hits[:max(1, min(limit, 200))], "total": len(hits),
-            "by_curator": by_curator}
+    offset = max(0, offset)
+    return {"results": hits[offset:offset + max(1, min(limit, 200))], "total": len(hits),
+            "offset": offset, "by_curator": by_curator}
 
 
 @app.get("/api/dataset/sample")

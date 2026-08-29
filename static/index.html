@@ -325,6 +325,7 @@
         <button class="btn go" id="l-sgo">Search</button>
       </div>
       <div id="l-sres"></div>
+      <button class="btn" id="l-smore" hidden>show more</button>
     </details>
     <div id="l-stats" class="res"></div>
     <div id="l-note" class="res"></div>
@@ -1752,16 +1753,20 @@ document.getElementById('l-aclr').onclick = () => {
 // Every filter is optional, so an empty target and curator mean "everything in this tree".
 const SEARCH_LIMIT = 50;
 
-document.getElementById('l-sgo').onclick = async () => {
+let labSearchOffset = 0;   // where the next "show more" page starts
+document.getElementById('l-sgo').onclick = () => labSearch(0);
+async function labSearch(offset) {
   const tree = document.getElementById('l-stree').value;
   // Several classes or categories at once: frames holding any of them. "any class"
   // among the picks means no class filter at all.
   const picked = [...document.getElementById('l-scls').selectedOptions].map(o => o.value);
   const q = new URLSearchParams({target: picked.includes('') ? '' : picked.join(','),
                                  who: document.getElementById('l-swho').value,
-                                 tree, limit: SEARCH_LIMIT});
+                                 tree, limit: SEARCH_LIMIT, offset});
   const el = document.getElementById('l-sres');
-  el.textContent = 'searching…';
+  const more = document.getElementById('l-smore');
+  if (!offset) el.textContent = 'searching…';
+  more.hidden = true;
   let d;
   try {
     const r = await labFetch('/api/dataset/search?' + q);
@@ -1772,24 +1777,34 @@ document.getElementById('l-sgo').onclick = async () => {
     return;
   }
   const hits = d.results || [];
-  if (!hits.length) return el.textContent = q.get('target') ? 'nothing matched' : `${tree} is empty`;
+  if (!hits.length && !offset) return el.textContent = q.get('target') ? 'nothing matched' : `${tree} is empty`;
   // Whose work this is, before the frames: with no class picked this IS the view of the
   // pen, and the tally answers "who is in it" without scrolling.
   const tally = Object.entries(d.by_curator || {}).sort((a, b) => b[1] - a[1]);
   // The chips are the point of the row: one glance says whether this frame is worth opening.
-  el.innerHTML = (tally.length > 1 ? `<div class="res">${tally.map(([h, n]) =>
-      `${esc(h)} &times;${n}`).join(' &middot; ')}</div>` : '') + hits.map(s => {
+  const rows = hits.map(s => {
     const names = [...new Set((s.boxes || []).map(b => labClasses[b.cls]).filter(Boolean))];
     return `<button class="btn" data-open="${esc(s.id)}" data-tree="${esc(s.tree || tree)}">` +
       `<img class="thumb" data-thumb="${esc(s.id)}" alt="">` +
       `<b>${esc(s.id)}</b><i class="res">${esc(s.curator || '—')}</i>` +
       names.map(n => `<span class="chip" style="--c:${clsColor(labClasses.indexOf(n))}"
         >${esc(n)}</span>`).join('') + '</button>';
-  }).join('') +
-  (d.total > hits.length ? `<div class="res">showing ${hits.length} of ${d.total}</div>` : '');
-  labThumbUrls.splice(0).forEach(URL.revokeObjectURL);
-  el.querySelectorAll('[data-thumb]').forEach(img => labThumbs.observe(img));
-};
+  }).join('');
+  // A first page replaces the list; a further page is appended below what is there —
+  // the pen holds thousands, and the way to "see more" must not lose the place.
+  if (!offset) {
+    labThumbUrls.splice(0).forEach(URL.revokeObjectURL);
+    el.innerHTML = (tally.length > 1 ? `<div class="res">${tally.map(([h, n]) =>
+        `${esc(h)} &times;${n}`).join(' &middot; ')}</div>` : '') + rows;
+  } else {
+    el.insertAdjacentHTML('beforeend', rows);
+  }
+  labSearchOffset = offset + hits.length;
+  more.hidden = labSearchOffset >= d.total;
+  more.textContent = `show more (${labSearchOffset} of ${d.total})`;
+  el.querySelectorAll('[data-thumb]:not([src])').forEach(img => labThumbs.observe(img));
+}
+document.getElementById('l-smore').onclick = () => labSearch(labSearchOffset);
 
 // Thumbnails load as rows scroll into view, through the same token-bearing fetch as the
 // editor: the image route is gated on the deployed tool, so a plain src cannot reach it,
