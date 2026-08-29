@@ -2009,7 +2009,9 @@ def attr_value_remove(cfg, head, value, replace, who):
             else:
                 dd.pop(head)
     (DATASET / "attributes.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False))
-    publish("attributes.yaml")
+    # Not best-effort here: the sync loop pulls config by size, so an edit that failed to
+    # reach the bucket is pulled back over within two minutes — the caller must know.
+    published = publish("attributes.yaml")
     rewritten = 0
     for tree in TREES:
         for f in (DATASET / tree / "attrs").glob("*.json"):
@@ -2027,7 +2029,7 @@ def attr_value_remove(cfg, head, value, replace, who):
     audit(who, "", "attr_value_remove", {"head": head, "value": value, "replace": replace,
                                          "rewritten": rewritten})
     return {"ok": True, "attributes": attr_vocab(), "attr_implies": attr_meta("implies"),
-            "rewritten": rewritten}
+            "rewritten": rewritten, "published": published or not CURATION}
 
 
 @app.post("/api/camera/test_rtsp")

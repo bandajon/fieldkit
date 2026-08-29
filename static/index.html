@@ -1327,7 +1327,8 @@ async function labAddValue(head, name) {
       for (const b of labBoxes) if (b.attrs[head] === value) {   // the open frame follows suit
         if (replace) b.attrs[head] = replace; else delete b.attrs[head];
       }
-      labNote(`${head} "${value}" removed; ${r.rewritten} frame(s) rewritten`);
+      labNote(`${head} "${value}" removed; ${r.rewritten} frame(s) rewritten` +
+              (r.published ? '' : ' — NOT published to the bucket, try again in a minute'));
     }
   } catch (e) {
     return labNote(String(e.message || e));
