@@ -499,6 +499,44 @@ def supervisor_tokens():
             app.DATASET, app.REVIEWERS, app.push_roster = keep
 
 
+def attr_value_remove():
+    import json
+    import tempfile
+    import app
+    keep = (app.DATASET, app.REVIEWERS, app.publish)
+    with tempfile.TemporaryDirectory() as d:
+        try:
+            app.DATASET, app.REVIEWERS, app.publish = Path(d), ["jonah"], lambda name: False
+            app.write_yaml("curators.yaml", {"jonah": "tok-jonah", "curator01": "tok-c1"})
+            (Path(d) / "attributes.yaml").write_text(yaml.safe_dump({
+                "axle-config": ["1+1", "1+2+2+2", "1222", "other"],
+                "implies": {"axle-config": {"1222": {"axles": "7"}}},
+                "defaults": {"e-heavy": {"axle-config": "1222"}}}, sort_keys=False))
+            a = Path(d) / "approved" / "attrs"
+            a.mkdir(parents=True)
+            (a / "f1.json").write_text('{"0": {"axle-config": "1222", "cargo": "none"}, "1": {"axle-config": "1+1"}}')
+            (a / "f2.json").write_text('{"0": {"axle-config": "1+1"}}')
+            body = {"head": "axle-config", "value": "1222", "remove": True, "replace": "1+2+2+2"}
+            try:
+                app.dataset_attr_value(body, x_curator_token="tok-c1")
+                raise AssertionError("a curator must not remove values")
+            except app.HTTPException as e:
+                assert e.status_code == 403, e.detail
+            r = app.dataset_attr_value(body, x_curator_token="tok-jonah")
+            assert r["rewritten"] == 1 and "1222" not in r["attributes"]["axle-config"], r
+            f1 = json.loads((a / "f1.json").read_text())
+            assert f1["0"] == {"axle-config": "1+2+2+2", "cargo": "none"} and f1["1"]["axle-config"] == "1+1", f1
+            cfg = yaml.safe_load((Path(d) / "attributes.yaml").read_text())
+            assert "1222" not in cfg["implies"]["axle-config"] and cfg["defaults"]["e-heavy"]["axle-config"] == "1+2+2+2", cfg
+            try:
+                app.dataset_attr_value({**body, "replace": "9+9"}, x_curator_token="tok-jonah")
+                raise AssertionError("an unknown replacement must be refused")
+            except app.HTTPException as e:
+                assert e.status_code in (400, 404), e.detail
+        finally:
+            app.DATASET, app.REVIEWERS, app.publish = keep
+
+
 def attr_restricts_are_real():
     """Every restricts rule must name a head and values the vocabulary actually has.
 
@@ -883,6 +921,7 @@ check("record start validates hours", record_start_hours)
 check("README documents every config key", readme_documents_config)
 check("supervisor password + token minting", supervisor_tokens)
 check("attribute restrict rules are real", attr_restricts_are_real)
+check("a reviewer can remove an attribute value and remap its frames", attr_value_remove)
 check("search with no class lists the pen", search_lists_the_pen)
 check("claims survive a restart", claims_survive_restart)
 check("site rename", site_rename)

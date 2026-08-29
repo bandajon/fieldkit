@@ -1954,13 +1954,19 @@ def dataset_class(body: dict = Body(default={})):
 
 
 @app.post("/api/dataset/attr_value")
-def dataset_attr_value(body: dict = Body(default={})):
-    """Append-only, like classes: sidecars already name these values, and dropping
-    one would silently rewrite what an operator recorded."""
+def dataset_attr_value(body: dict = Body(default={}), x_curator_token: str = Header("")):
+    """Append-only for curators, like classes: sidecars already name these values, and
+    dropping one would silently rewrite what an operator recorded. A reviewer may remove
+    one — a typo such as 1222 for 1+2+2+2 — and every sidecar that names it is rewritten
+    to `replace` (or loses the head) in the same step, so nothing is left pointing at a
+    value the vocabulary no longer has."""
     head, value = body.get("head") or "", body.get("value") or ""
     cfg = attr_yaml()
     if not isinstance(cfg.get(head), list):
         raise HTTPException(404, f"no attribute named {head!r}")
+    if body.get("remove"):
+        return attr_value_remove(cfg, head, value, body.get("replace") or "",
+                                 require_reviewer(token_who(x_curator_token)))
     if not ATTR_VALUE.match(value):
         raise HTTPException(400, "value must start with a lowercase letter or digit, then "
                                  "lowercase letters, digits, + . _ or - (max 32)")
@@ -1983,6 +1989,45 @@ def dataset_attr_value(body: dict = Body(default={})):
         (DATASET / "attributes.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False))
         publish("attributes.yaml")
     return {"ok": True, "attributes": attr_vocab(), "attr_implies": attr_meta("implies")}
+
+
+def attr_value_remove(cfg, head, value, replace, who):
+    vals = [str(x) for x in cfg[head]]
+    if value not in vals:
+        raise HTTPException(404, f"{head} has no value {value!r}")
+    if replace and replace not in vals:
+        raise HTTPException(400, f"{head} has no value {replace!r} to replace it with")
+    cfg[head] = [v for v in vals if v != value]
+    (cfg.get("implies") or {}).get(head, {}).pop(value, None)
+    for cls, cons in (cfg.get("constraints") or {}).items():
+        if isinstance(cons.get(head), list) and value in cons[head]:
+            cons[head] = [v for v in cons[head] if v != value]
+    for cls, dd in (cfg.get("defaults") or {}).items():
+        if dd.get(head) == value:
+            if replace:
+                dd[head] = replace
+            else:
+                dd.pop(head)
+    (DATASET / "attributes.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False))
+    publish("attributes.yaml")
+    rewritten = 0
+    for tree in TREES:
+        for f in (DATASET / tree / "attrs").glob("*.json"):
+            attrs = read_attrs(f)
+            hit = [k for k, a in attrs.items() if isinstance(a, dict) and a.get(head) == value]
+            if not hit:
+                continue
+            for k in hit:
+                if replace:
+                    attrs[k][head] = replace
+                else:
+                    attrs[k].pop(head)
+            f.write_text(json.dumps(attrs, indent=1))
+            rewritten += 1
+    audit(who, "", "attr_value_remove", {"head": head, "value": value, "replace": replace,
+                                         "rewritten": rewritten})
+    return {"ok": True, "attributes": attr_vocab(), "attr_implies": attr_meta("implies"),
+            "rewritten": rewritten}
 
 
 @app.post("/api/camera/test_rtsp")
