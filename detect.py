@@ -60,6 +60,8 @@ DIRECTION_MIN = 0.03     # displacement under this fraction of the frame is not 
 SPEED_MIN, SPEED_MAX = 1.0, 160.0        # outside: a tracking artifact, not a vehicle
 CAPTURE_EVERY = 10.0     # dataset samples per camera; dedup already skips unchanged scenes
 RARE_STEP = 1            # a wanted class ignores the cadence, so its stems need finer buckets
+RARE_EVERY = 5.0         # ...but one frame of it per this many seconds: a vehicle rolling through
+                         # at one frame a second is the same sample five times, and a curator's five minutes
 DATASET_CAP = 10000      # rolling buffer of the freshest unlabeled frames; ~2-3 GB of JPEGs.
                          # Sized for the fleet goal: 9 toll gates, >=10k contributed each,
                          # 100k-image combined dataset.
@@ -474,6 +476,7 @@ class Detector:
         self.readers = {}     # camera name -> Reader; owned by the worker thread
         self.models = {}      # camera name -> YOLO; ByteTrack state lives in the instance
         self.last_capture = {}
+        self.last_rare = {}             # camera -> wallclock of its last off-cadence capture
         self.last_boxes = {}  # camera name -> last captured `shown`, for scene dedup
         self.recent = {}      # camera name -> [(label, box, expires)]: the recount guard
         self.lock = threading.Lock()
@@ -1039,10 +1042,13 @@ class Detector:
         # pile up while a bus or an abnormal load stays at a handful. A frame holding a
         # class we are short of skips it. Dedup below still applies, so a parked bus is
         # one sample, not fifty.
-        rare = any(d[0] in self.wanted for d in shown)
+        rare = any(d[0] in self.wanted for d in shown) \
+            and now - self.last_rare.get(name, float("-inf")) >= RARE_EVERY
         if not rare and now - self.last_capture.get(name, float("-inf")) < CAPTURE_EVERY:
             return
         self.last_capture[name] = now     # set first: a failing disk must not retry per frame
+        if rare:
+            self.last_rare[name] = now
         # Before the cap check, not after: a duplicate must not evict a real sample.
         # A vehicle parked for hours is one sample; any new vehicle changes the set and
         # capture resumes.
@@ -1605,7 +1611,10 @@ if __name__ == "__main__":
         BUS_A = [("bus", 0.9, (10.0, 10.0, 60.0, 60.0))]
         BUS_B = [("bus", 0.9, (200.0, 10.0, 250.0, 60.0))]
         d._capture("c", b"bus1", BUS_A, 64, 64)
-        clk[0] += 2                                  # 2 s: far inside the cadence
+        clk[0] += 2                                  # 2 s: inside even the rare spacing
+        d._capture("c", b"bus2", BUS_B, 64, 64)
+        assert len(d.captured) == 1, "one frame of a wanted class per RARE_EVERY, not per second"
+        clk[0] += 3                                  # 5 s: past the rare spacing, inside the cadence
         d._capture("c", b"bus2", BUS_B, 64, 64)
         assert len(d.captured) == 2, d.captured      # wanted: the cadence does not apply
         assert len(set(d.captured)) == 2, "rare stems must not floor onto one id"

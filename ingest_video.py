@@ -141,6 +141,7 @@ class Sink:
         self.wanted = set(wanted)   # classes worth a sample off-cadence (detect._capture)
         self.only_wanted = only_wanted   # a hunt: the cadence captures nothing at all
         self.at = {}          # cam -> footage timestamp of its last capture
+        self.rare_at = {}     # cam -> footage timestamp of its last off-cadence capture
         self.dets = {}        # cam -> its `shown`, for the scene comparison
         self.written = Counter()
         self.stems = []       # what this run wrote, in order: the caller pre-fills suggestions
@@ -152,13 +153,16 @@ class Sink:
         # stops a parked one from becoming fifty samples.
         if not shown:
             return False
-        rare = any(d[0] in self.wanted for d in shown)
+        rare = any(d[0] in self.wanted for d in shown) \
+            and ts - self.rare_at.get(cam, float("-inf")) >= detect.RARE_EVERY
         if not rare and (self.only_wanted
                          or ts - self.at.get(cam, float("-inf")) < detect.CAPTURE_EVERY):
             return False
         if detect.same_scene(shown, self.dets.get(cam, [])):
             return False
         self.at[cam], self.dets[cam] = ts, shown
+        if rare:
+            self.rare_at[cam] = ts
         self._evict()
         stem = detect.sample_stem(self.gate, cam, ts, detect.RARE_STEP if rare else None)
         lines = [f"{self.ids[cls]} {(x1 + x2) / 2 / w:.6f} {(y1 + y2) / 2 / h:.6f} "
@@ -378,14 +382,16 @@ def selfcheck():
     bus = [("bus", 0.9, (10.0, 10.0, 60.0, 60.0))]
     bus2 = [("bus", 0.9, (300.0, 10.0, 350.0, 60.0))]
     assert rare.offer("c", base, b"a", bus, 64, 64)
-    assert rare.offer("c", base + 2, b"b", bus2, 64, 64), "wanted: no cadence"
-    assert not rare.offer("c", base + 4, b"c", bus2, 64, 64), "wanted, but the same scene"
-    assert not rare.offer("c", base + 4, b"d", car, 64, 64), "an ordinary class still waits"
+    assert not rare.offer("c", base + 2, b"b", bus2, 64, 64), "one wanted frame per RARE_EVERY"
+    assert rare.offer("c", base + 5, b"b", bus2, 64, 64), "wanted: no cadence"
+    assert not rare.offer("c", base + 10, b"c", bus2, 64, 64), "wanted, but the same scene"
+    assert not rare.offer("c", base + 10, b"d", car, 64, 64), "an ordinary class still waits"
     assert len(set(rare.stems)) == 2, rare.stems      # finer buckets: no id collision
     only = Sink(tmp / "only", dict(detect.CLASS_IDS), wanted=["bus"], only_wanted=True)
     assert not only.offer("c", base, b"a", car, 64, 64), "a hunt keeps no ordinary frames"
     assert not only.offer("c", base + 60, b"b", car, 64, 64), "...however long it waits"
     assert only.offer("c", base + 61, b"c", bus, 64, 64), "a hunt keeps the wanted ones"
+    assert not only.offer("c", base + 62, b"d", bus2, 64, 64), "...spaced like any rare capture"
 
     assert segments([str(tmp)]) == [odd, seg], segments([str(tmp)])
 
