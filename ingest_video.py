@@ -5,10 +5,13 @@
   python ingest_video.py pull <site>/<cam>     fetch missing segments from R2, then ingest
   python ingest_video.py incoming              ingest the R2 drop-box, then archive it
   python ingest_video.py check <file>          probe one file, write nothing
-  python ingest_video.py hunt <classes> [--max N] <dir> [...]
+  python ingest_video.py hunt <classes> [--max N] [--weights coco|<file>] <dir> [...]
                                                only frames holding one of the classes
                                                (comma-separated), up to N per class, each
-                                               directory's name prefixing its sample ids
+                                               directory's name prefixing its sample ids.
+                                               --weights coco hunts with stock YOLO (car,
+                                               motorcycle, bus, truck): the way to find a
+                                               class the champion has not learnt yet
   python ingest_video.py                       self-check
 
 Same detector, same dedup, same dataset/pending layout as detect.py, so a sample from
@@ -514,13 +517,17 @@ if __name__ == "__main__":
             sys.exit("usage: ingest_video.py check <file>")
         check(args[1], config())
     elif args[0] == "hunt":
-        cap, rest = 1000, args[1:]
+        cap, rest, cfg = 1000, args[1:], config()
         if "--max" in rest:
             i = rest.index("--max")
             cap, rest = int(rest[i + 1]), rest[:i] + rest[i + 2:]
+        if "--weights" in rest:
+            i = rest.index("--weights")
+            cfg["detect_weights"] = "" if rest[i + 1] == "coco" else rest[i + 1]
+            rest = rest[:i] + rest[i + 2:]
         if len(rest) < 2:
-            sys.exit("usage: ingest_video.py hunt <classes> [--max N] <dir> [...]")
-        hunt([c.strip() for c in rest[0].split(",") if c.strip()], rest[1:], config(), cap)
+            sys.exit("usage: ingest_video.py hunt <classes> [--max N] [--weights coco|<file>] <dir> [...]")
+        hunt([c.strip() for c in rest[0].split(",") if c.strip()], rest[1:], cfg, cap)
     else:
         files = segments(args)
         if not files:
