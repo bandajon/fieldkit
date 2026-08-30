@@ -1482,6 +1482,7 @@ async function labSend(action) {
     labNote('Save failed — sample kept, tap again to retry.');
     return;
   }
+  if (labOpened) labSearchDrop(s.id);   // reviewed, rejected or unapproved: it left this list
   if (labOne()) return labLoad();   // no queue behind this one: go back for the next
   if (action === 'approve') {   // bumped locally; the next labLoad trues it up from disk
     labDone.push(s.id);         // approvals only — a discard is deleted server-side
@@ -1859,6 +1860,7 @@ async function labSearch(offset) {
     el.insertAdjacentHTML('beforeend', rows);
   }
   labSearchOffset = offset + hits.length;
+  labSearchTotal = d.total;
   more.hidden = labSearchOffset >= d.total;
   more.textContent = `show more (${labSearchOffset} of ${d.total})`;
   // Held work only: a few opened and found sound, the rest signed off as labelled.
@@ -1877,6 +1879,20 @@ async function labSearch(offset) {
   el.querySelectorAll('[data-thumb]:not([src])').forEach(img => labThumbs.observe(img));
 }
 document.getElementById('l-smore').onclick = () => labSearch(labSearchOffset);
+
+// A hit that was just decided on leaves the list, so the list is what is still to look at.
+let labSearchTotal = 0;
+function labSearchDrop(id) {
+  const row = document.querySelector(`#l-sres [data-open="${CSS.escape(id)}"]`);
+  if (!row) return;
+  row.remove();
+  labSearchOffset--; labSearchTotal--;
+  const more = document.getElementById('l-smore');
+  more.textContent = `show more (${labSearchOffset} of ${labSearchTotal})`;
+  const rel = document.getElementById('l-srel');
+  if (!rel.hidden) rel.textContent = rel.textContent.replace(/\d+/, labSearchTotal);
+  if (labSearchTotal <= 0) rel.hidden = true;
+}
 
 // Thumbnails load as rows scroll into view, through the same token-bearing fetch as the
 // editor: the image route is gated on the deployed tool, so a plain src cannot reach it,
