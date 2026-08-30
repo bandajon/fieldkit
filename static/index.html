@@ -1852,17 +1852,17 @@ async function labSearch(offset) {
   labSearchOffset = offset + hits.length;
   more.hidden = labSearchOffset >= d.total;
   more.textContent = `show more (${labSearchOffset} of ${d.total})`;
-  // Held work only, and one curator's at a time: a few opened and found sound, the rest
-  // signed off as they labelled them. Every frame still goes through review server-side.
-  const rel = document.getElementById('l-srel'), who = q.get('who');
-  rel.hidden = !(tree === 'holding' && who && d.total);
-  rel.textContent = `Release all ${d.total} of ${who}'s → approved`;
+  // Held work only: a few opened and found sound, the rest signed off as labelled.
+  // Every frame still goes through review server-side, credited to its own curator.
+  const rel = document.getElementById('l-srel'), who = q.get('who'), whose = who ? `${who}'s` : 'everyone\'s';
+  rel.hidden = !(tree === 'holding' && d.total);
+  rel.textContent = `Release all ${d.total} of ${whose} → approved`;
   rel.onclick = async () => {
-    if (!confirm(`Approve all ${d.total} held frames of ${who} matching this search, as labelled?`)) return;
+    if (!confirm(`Approve all ${d.total} held frames of ${whose} matching this search, as labelled?`)) return;
     rel.disabled = true;
     const r = await post('/api/dataset/release', {who, target: q.get('target'), attr: q.get('attr')});
     rel.disabled = false;
-    labNote(r.detail ? String(r.detail) : `released ${r.released} of ${r.total} for ${who}`);
+    labNote(r.detail ? String(r.detail) : `released ${r.released} of ${r.total} (${whose})`);
     labSearch(0);
   };
   el.querySelectorAll('[data-thumb]:not([src])').forEach(img => labThumbs.observe(img));
