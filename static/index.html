@@ -281,6 +281,8 @@
       <button class="btn go" id="l-ok">Approve</button>
       <button class="btn" id="l-skip">Skip</button>
       <button class="btn" id="l-skip10" title="skip the next ten frames">Skip 10</button>
+      <button class="btn" id="l-skip50" title="skip the next fifty frames">Skip 50</button>
+      <button class="btn" id="l-skip100" title="skip the next hundred frames">Skip 100</button>
       <button class="btn halt" id="l-no">Discard</button>
       <button class="btn halt" id="l-rej" hidden>Reject</button>
     </div>
@@ -921,6 +923,7 @@ const clsColor = i => `hsl(${(i * 137.508) % 360} 85% 55%)`;
 const WHO_RE = /^[a-z0-9][a-z0-9_-]{0,23}$/;
 let labWho = localStorage.fieldkit_who || '', labAsked = false, labProg = null, labRev = false;
 let labFocus = localStorage.fieldkit_focus || '';   // "c-bus,F": the queue narrowed to these
+let labSkipped = 0;                                  // frames passed over this sitting (see labSkip)
 
 function labFocusFill() {
   const sel = document.getElementById('l-fsel'), picked = new Set(labFocus.split(',').filter(Boolean));
@@ -941,6 +944,7 @@ function labFocusSug(list) {
 }
 function labFocusSet(v) {
   labFocus = v;
+  labSkipped = 0;             // a new focus is a new queue: nothing in it has been skipped
   try { localStorage.fieldkit_focus = v; } catch (e) {}
   labLoad();
 }
@@ -1005,7 +1009,8 @@ async function labLoad() {
   const who = labWho ? `?who=${encodeURIComponent(labWho)}` : '';
   // The focus narrows the queue to frames pre-labelled with the chosen classes — the
   // way to spend a shift on what the next run is short of rather than on the traffic mix.
-  const q = who + (labFocus ? `${who ? '&' : '?'}focus=${encodeURIComponent(labFocus)}` : '');
+  const q = who + (labFocus ? `${who ? '&' : '?'}focus=${encodeURIComponent(labFocus)}` : '')
+              + (labSkipped ? `${who || labFocus ? '&' : '?'}offset=${labSkipped}` : '');
   if (labWho) labFetch('/api/dataset/progress').then(r => r.json())
     .then(p => { labProg = p; labStats(); }).catch(() => {});
   try {
@@ -1025,6 +1030,8 @@ async function labLoad() {
     if (!labRev) { labFocusFill(); labFocusSug(d.focus_suggestions); }
     labQueue = labRev ? (d.id ? [d] : []) : (d.pending || []);
     labTotal = labRev ? labQueue.length : (d.pending_total ?? labQueue.length);
+    // Skipped past everything that is pending: start over from the top, once.
+    if (!labRev && !labQueue.length && labSkipped) { labSkipped = 0; return labLoad(); }
     labApproved = d.approved || labApproved;
     labAssign = d.assignment || null;
     labAttrs = d.attributes || labAttrs;
@@ -1066,7 +1073,7 @@ function labShow() {
   // The row survives an empty queue while Back can still reopen the last approval.
   document.getElementById('l-acts').hidden = !s && !labDone.length;
   document.getElementById('l-back').disabled = !labDone.length;
-  ['l-ok', 'l-skip', 'l-skip10', 'l-no', 'l-rej'].forEach(id => document.getElementById(id).disabled = !s);
+  ['l-ok', 'l-skip', 'l-skip10', 'l-skip50', 'l-skip100', 'l-no', 'l-rej'].forEach(id => document.getElementById(id).disabled = !s);
   // Reviewers correct, they do not delete or rewind.
   document.getElementById('l-ok').textContent = labOne() ? 'Submit review' : 'Approve';
   document.getElementById('l-no').hidden = document.getElementById('l-back').hidden = labOne();
@@ -1074,7 +1081,8 @@ function labShow() {
   // Reject exists only where holding does: a supervisor's review or search hit. A curator's own
   // queue carries no held flag, so the button never appears for them even if one leaked through.
   document.getElementById('l-rej').hidden = !(labOne() && s && s.held);
-  document.getElementById('l-skip10').hidden = labOne();   // one frame: nothing behind it to skip
+  ['l-skip10', 'l-skip50', 'l-skip100'].forEach(id =>
+    document.getElementById(id).hidden = labOne());   // one frame: nothing behind it to skip
   if (!s) {
     // The batch is done but more may wait on disk (the fetch is capped at 100).
     if (labTotal > 0) return labLoad();
@@ -1489,11 +1497,19 @@ async function labSend(action) {
 document.getElementById('l-ok').onclick = () => labSend(labOne() ? 'review' : 'approve');
 // Skipped samples stay pending and age out of the rolling capture buffer on their own;
 // Skip is for near-duplicates (parked vehicles) not worth a decision.
-document.getElementById('l-skip').onclick = () =>
-  labOne() ? labLoad() : (labQueue.shift(), labShow());
-// Ten at once: a parked vehicle fills a stretch of the queue, not one frame of it.
-document.getElementById('l-skip10').onclick = () =>
-  labOne() ? labLoad() : (labQueue.splice(0, 10), labShow());
+// Skipped frames stay pending AND claimed by this curator, so the next page is asked for
+// from past them (labSkipped -> offset); otherwise a batch of skips would come straight back.
+function labSkip(n) {
+  if (labOne()) return labLoad();
+  labSkipped += n;              // more than the page holds: the rest is skipped server-side
+  labQueue.splice(0, n);
+  labShow();
+}
+document.getElementById('l-skip').onclick = () => labSkip(1);
+// A parked vehicle fills a stretch of the queue, not one frame of it.
+document.getElementById('l-skip10').onclick = () => labSkip(10);
+document.getElementById('l-skip50').onclick = () => labSkip(50);
+document.getElementById('l-skip100').onclick = () => labSkip(100);
 document.getElementById('l-no').onclick = () => labSend('discard');
 // Reject returns a held frame to the queue for its curator to redo — the opposite of Submit.
 document.getElementById('l-rej').onclick = () => labSend('reject');

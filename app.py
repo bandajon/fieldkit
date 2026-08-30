@@ -1064,7 +1064,12 @@ def focus_suggestions(new_boxes, candidates, names, top=5):
 
 
 @app.get("/api/dataset/samples")
-def dataset_samples(who: str = "", focus: str = "", x_curator_token: str = Header("")):
+def dataset_samples(who: str = "", focus: str = "", offset: int = 0,
+                    x_curator_token: str = Header("")):
+    """offset: frames the curator has skipped this sitting. A skipped frame stays pending
+    and claimed by them, so a plain reload would hand it straight back; the page starts
+    past them instead. Frames they approve leave pending, so the count of skips IS the
+    offset — a fresh capture arriving at the top shifts it by one and costs one repeat."""
     who = check_token(valid_who(who), x_curator_token)
     held = purge_claims()
     names = dataset_classes()
@@ -1108,7 +1113,8 @@ def dataset_samples(who: str = "", focus: str = "", x_curator_token: str = Heade
         # Stable sort: the assigned classes float up, newest-first survives inside each
         # half, and the general pool still follows so nobody runs out of work.
         pending.sort(key=lambda t: not any(b["cls"] in ids for b in t[1]["boxes"]))
-    out = [s for _, s in pending[:100]]
+    offset = max(0, offset)
+    out = [s for _, s in pending[offset:offset + 100]]
     approved = approved_counts()
     body = {"classes": names, "attributes": attr_vocab(),
             "attr_constraints": attr_meta("constraints"), "attr_defaults": attr_meta("defaults"),

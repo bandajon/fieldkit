@@ -886,6 +886,10 @@ def queue_focus_filters_and_suggests():
             assert r["pending_total"] == 3 and r["focus"] == ""
             assert r["candidates"] == {"a-small": 2, "c-bus": 1, "f-abnormal": 1}, r["candidates"]
             assert [s["class"] for s in r["focus_suggestions"]] == ["f-abnormal", "c-bus", "a-small"], r["focus_suggestions"]
+            first = [s["id"] for s in r["pending"]]
+            r2 = app.dataset_samples(who="", focus="", offset=1, x_curator_token="")
+            assert [s["id"] for s in r2["pending"]] == first[1:] and r2["pending_total"] == 3, "offset skips, total stays"
+            assert app.dataset_samples(offset=99, x_curator_token="")["pending"] == [], "past the end is empty"
             r = app.dataset_samples(who="", focus="c-bus,F", x_curator_token="")
             assert sorted(s["id"] for s in r["pending"]) == ["p2-20260828-010010", "p3-20260828-010020"], r["pending"]
             assert r["pending_total"] == 2 and r["focus"] == "c-bus,F"
