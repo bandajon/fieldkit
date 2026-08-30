@@ -283,6 +283,7 @@
       <button class="btn" id="l-skip10" title="skip the next ten frames">Skip 10</button>
       <button class="btn" id="l-skip50" title="skip the next fifty frames">Skip 50</button>
       <button class="btn" id="l-skip100" title="skip the next hundred frames">Skip 100</button>
+      <button class="btn" id="l-clear" title="delete every box to draw afresh">Clear boxes</button>
       <button class="btn halt" id="l-no">Discard</button>
       <button class="btn halt" id="l-rej" hidden>Reject</button>
     </div>
@@ -1076,7 +1077,7 @@ function labShow() {
   // The row survives an empty queue while Back can still reopen the last approval.
   document.getElementById('l-acts').hidden = !s && !labDone.length;
   document.getElementById('l-back').disabled = !labDone.length;
-  ['l-ok', 'l-skip', 'l-skip10', 'l-skip50', 'l-skip100', 'l-no', 'l-rej'].forEach(id => document.getElementById(id).disabled = !s);
+  ['l-ok', 'l-skip', 'l-skip10', 'l-skip50', 'l-skip100', 'l-clear', 'l-no', 'l-rej'].forEach(id => document.getElementById(id).disabled = !s);
   // Reviewers correct, they do not delete or rewind.
   document.getElementById('l-ok').textContent = labOne() ? 'Submit review' : 'Approve';
   document.getElementById('l-no').hidden = document.getElementById('l-back').hidden = labOne();
@@ -1514,6 +1515,13 @@ document.getElementById('l-skip').onclick = () => labSkip(1);
 document.getElementById('l-skip10').onclick = () => labSkip(10);
 document.getElementById('l-skip50').onclick = () => labSkip(50);
 document.getElementById('l-skip100').onclick = () => labSkip(100);
+// Wipe the slate to redraw: the same per-box delete, all at once. Local until Approve —
+// leaving the frame and reopening it brings the original boxes back.
+document.getElementById('l-clear').onclick = () => {
+  labBoxes.forEach(b => b.del = true);
+  document.querySelectorAll('#l-wrap .box').forEach(d => d.remove());
+  labSelect(-1);
+};
 document.getElementById('l-no').onclick = () => labSend('discard');
 // Reject returns a held frame to the queue for its curator to redo — the opposite of Submit.
 document.getElementById('l-rej').onclick = () => labSend('reject');
