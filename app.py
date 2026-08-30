@@ -29,6 +29,7 @@ from fastapi.staticfiles import StaticFiles
 
 import camera
 import detect
+import payroll_report as payroll
 import hive
 import hostnet
 import live
@@ -1792,6 +1793,7 @@ def dataset_progress():
     labellers is a few thousand lines; index it if a season's log ever gets slow."""
     total, by_who, today = {"approve": 0, "discard": 0}, {}, {"approve": 0, "discard": 0}
     day = datetime.now(timezone.utc).date().isoformat()
+    stamps = {}                           # who -> decision timestamps, for payroll.pace
 
     def tally(handle):
         return by_who.setdefault(handle or "anon",
@@ -1818,12 +1820,15 @@ def dataset_progress():
         total[act] = total.get(act, 0) + 1
         mine = tally(r.get("who"))
         mine[act] = mine.get(act, 0) + 1
+        if not r.get("note"):             # a script's decisions are nobody's hours
+            stamps.setdefault(r.get("who") or "anon", []).append(r.get("ts"))
         if r.get("held"):                 # an approval that landed in the pen, not the set
             mine["held"] += 1
         if str(r.get("ts", "")).startswith(day):
             today[act] = today.get(act, 0) + 1
     for w, stats in by_who.items():
         stats.update(quality(w))
+        stats.update(payroll.pace(stamps.get(w, [])))   # hours at the screen vs hours invoiced
         if assignment(w):
             stats["assignment"] = assignment(w)
     return {"total": total, "by_who": by_who, "today": today}

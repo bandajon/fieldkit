@@ -1665,6 +1665,13 @@ function labCorrTag(h) {
   const c = Object.entries(labCorr(h));
   return c.length ? `<i class="res">corrections: ${c.map(([k, v]) => `${esc(k)} ${v}`).join(' · ')}</i>` : '';
 }
+// Hours actually spent deciding (gaps over ten minutes are breaks) and the pace within them:
+// the figures to hold against an invoice.
+function labPaceTag(h) {
+  const p = (labProg && labProg.by_who || {})[h];
+  return p && p.active_hours ? `<i class="res">${p.active_hours}h active over ${p.days} day${p.days === 1 ? '' : 's'}` +
+    (p.per_hour ? ` · ${p.per_hour}/h` : '') + '</i>' : '';
+}
 function labRosterShow(d) {
   labTeam = d;
   document.getElementById('l-signin').hidden = true;
@@ -1677,7 +1684,7 @@ function labRosterShow(d) {
   // .halt is reserved for the one destructive control on the row.
   document.getElementById('l-roster').innerHTML = Object.entries(d.curators).map(([h, t]) =>
     `<div class="acts toggle"><b>${esc(h)}</b>${labAssignTag(h)}` +
-    `<code data-copy="${esc(t)}">${esc(t)}</code>` + labCorrTag(h) +
+    `<code data-copy="${esc(t)}">${esc(t)}</code>` + labPaceTag(h) + labCorrTag(h) +
     // A supervisor's own work is never held, so there is no state to flip for one.
     (d.reviewers.includes(h) ? '<i class="res">supervisor</i>'
                              : `<button class="btn${labTrust[h] ? ' on' : ''}" data-trust="${esc(h)}"
