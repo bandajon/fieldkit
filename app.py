@@ -1297,6 +1297,14 @@ def dataset_search(target: str = "", who: str = "", tree: str = "approved", limi
     ponytail: full scan of the tree per call, the same ceiling approved_counts() and
     label_files() already live with; index the labels if the dataset outgrows it."""
     require_reviewer(token_who(x_curator_token))
+    hits, by_curator = search_hits(target, who, tree, attr)
+    offset = max(0, offset)
+    return {"results": hits[offset:offset + max(1, min(limit, 200))], "total": len(hits),
+            "offset": offset, "by_curator": by_curator}
+
+
+def search_hits(target, who, tree, attr):
+    """Every frame in `tree` matching the search terms, newest first -> (hits, by_curator)."""
     tree, who = valid_tree(tree), valid_who(who)
     names = dataset_classes()
     ids = {names.index(c) for c in target_classes(target)}
@@ -1329,9 +1337,26 @@ def dataset_search(target: str = "", who: str = "", tree: str = "approved", limi
         hits.append({"id": f.stem, "curator": curator, "tree": tree, "boxes": boxes,
                      "attrs": attrs})
         by_curator[curator] = by_curator.get(curator, 0) + 1
-    offset = max(0, offset)
-    return {"results": hits[offset:offset + max(1, min(limit, 200))], "total": len(hits),
-            "offset": offset, "by_curator": by_curator}
+    return hits, by_curator
+
+
+@app.post("/api/dataset/release")
+def dataset_release(body: dict = Body(default={}), x_curator_token: str = Header("")):
+    """Release every held frame a search matches, as the curator labelled it. A reviewer
+    who has opened a few of a curator's frames and found them sound signs the rest off in
+    one move; each one still goes through review_label, so it is scored, audited and
+    credited to the curator exactly as an opened-and-approved frame is."""
+    me = require_reviewer(token_who(x_curator_token))
+    hits, _ = search_hits(body.get("target", ""), body.get("who", ""), "holding",
+                          body.get("attr", ""))
+    released = 0
+    for h in hits:
+        try:
+            review_label(h["id"], me, {"boxes": h["boxes"], "attrs": h["attrs"]})
+            released += 1
+        except HTTPException:      # moved or torn since the listing: the rest still go
+            continue
+    return {"ok": True, "released": released, "total": len(hits)}
 
 
 def attr_filter(attr):

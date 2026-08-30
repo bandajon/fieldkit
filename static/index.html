@@ -330,6 +330,7 @@
       </div>
       <div id="l-sres"></div>
       <button class="btn" id="l-smore" hidden>show more</button>
+      <button class="btn go" id="l-srel" hidden>Release all</button>
     </details>
     <div id="l-stats" class="res"></div>
     <div id="l-note" class="res"></div>
@@ -1820,7 +1821,10 @@ async function labSearch(offset) {
     return;
   }
   const hits = d.results || [];
-  if (!hits.length && !offset) return el.textContent = q.get('target') || q.get('attr') ? 'nothing matched' : `${tree} is empty`;
+  if (!hits.length && !offset) {
+    document.getElementById('l-srel').hidden = true;
+    return el.textContent = q.get('target') || q.get('attr') ? 'nothing matched' : `${tree} is empty`;
+  }
   // Whose work this is, before the frames: with no class picked this IS the view of the
   // pen, and the tally answers "who is in it" without scrolling.
   const tally = Object.entries(d.by_curator || {}).sort((a, b) => b[1] - a[1]);
@@ -1848,6 +1852,19 @@ async function labSearch(offset) {
   labSearchOffset = offset + hits.length;
   more.hidden = labSearchOffset >= d.total;
   more.textContent = `show more (${labSearchOffset} of ${d.total})`;
+  // Held work only, and one curator's at a time: a few opened and found sound, the rest
+  // signed off as they labelled them. Every frame still goes through review server-side.
+  const rel = document.getElementById('l-srel'), who = q.get('who');
+  rel.hidden = !(tree === 'holding' && who && d.total);
+  rel.textContent = `Release all ${d.total} of ${who}'s → approved`;
+  rel.onclick = async () => {
+    if (!confirm(`Approve all ${d.total} held frames of ${who} matching this search, as labelled?`)) return;
+    rel.disabled = true;
+    const r = await post('/api/dataset/release', {who, target: q.get('target'), attr: q.get('attr')});
+    rel.disabled = false;
+    labNote(r.detail ? String(r.detail) : `released ${r.released} of ${r.total} for ${who}`);
+    labSearch(0);
+  };
   el.querySelectorAll('[data-thumb]:not([src])').forEach(img => labThumbs.observe(img));
 }
 document.getElementById('l-smore').onclick = () => labSearch(labSearchOffset);

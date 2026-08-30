@@ -611,6 +611,17 @@ def search_lists_the_pen():
                 raise AssertionError("an unknown class must still be refused")
             except app.HTTPException as e:
                 assert e.status_code == 400, e.detail
+            # Release all of one curator's held frames a search matches, as they labelled them.
+            (Path(d) / "holding" / "images").mkdir()
+            for x in ("x1", "x2", "x3"):
+                (Path(d) / "holding" / "images" / f"{x}.jpg").write_bytes(b"jpg")
+            r = app.dataset_release({"who": "curator02", "target": "E"}, x_curator_token="tok-jonah")
+            assert (r["released"], r["total"]) == (2, 2), r
+            assert s()["total"] == 1, "x1 still held"
+            assert app.dataset_search(tree="approved", x_curator_token="tok-jonah")["total"] == 2, "x2, x3 moved"
+            assert (Path(d) / "approved" / "attrs" / "x3.json").is_file(), "attributes travel with the frame"
+            assert sum(1 for l in (Path(d) / "audit.jsonl").read_text().splitlines()
+                       if '"review"' in l and '"curator02"' in l) == 2, "each release credits the curator"
         finally:
             app.DATASET, app.REVIEWERS = keep
 
@@ -915,6 +926,7 @@ def routes_point_at_their_handlers():
     for (method, path), fn in {("GET", "/api/dataset/samples"): "dataset_samples",
                                ("POST", "/api/dataset/label"): "dataset_label",
                                ("GET", "/api/dataset/search"): "dataset_search",
+                               ("POST", "/api/dataset/release"): "dataset_release",
                                ("POST", "/api/dataset/assign"): "assign_edit",
                                ("POST", "/api/dataset/class"): "dataset_class",
                                ("GET", "/api/config/site"): "config_site",
