@@ -911,7 +911,9 @@ const labStats = () => {
             .sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k} ${v}`).join(' · ') : '')
     : 'fine-tune set: empty — approve samples to grow it')
     + (labWho && labProg   // .res is pre-line, so the team line lands under it
-       ? `\ntoday: you ${labNum((labProg.by_who || {})[labWho])} · team ${labNum(labProg.total)}` : '');
+       ? `\ntoday: you ${labNum((labProg.by_who || {})[labWho])} · team ${labNum(labProg.total)}` : '')
+    + (labWho && Object.keys(labCorr(labWho)).length
+       ? `\nreviewers corrected your: ` + Object.entries(labCorr(labWho)).map(([k, v]) => `${k} ${v}`).join(' · ') : '');
   if (a) el.innerHTML += `\nassignment: ${esc(a.class)} · ` +
     `<b style="color:${labClasses.includes(a.class) ? clsColor(labClasses.indexOf(a.class)) : 'var(--fg)'}"
       >${a.done}/${a.min}</b>`;
@@ -1013,7 +1015,7 @@ async function labLoad() {
   const q = who + (labFocus ? `${who ? '&' : '?'}focus=${encodeURIComponent(labFocus)}` : '')
               + (labSkipped ? `${who || labFocus ? '&' : '?'}offset=${labSkipped}` : '');
   if (labWho) labFetch('/api/dataset/progress').then(r => r.json())
-    .then(p => { labProg = p; labStats(); }).catch(() => {});
+    .then(p => { labProg = p; labStats(); if (labTeam) labRosterShow(labTeam); }).catch(() => {});
   try {
     const r = await labFetch(labRev ? '/api/dataset/review' + who : '/api/dataset/samples' + q);
     if (r.status === 403) return labNote('your handle is not on the reviewer list');
@@ -1655,6 +1657,13 @@ async function labRoster() {
   labAssignLoad();
 }
 
+// "corrections: e-heavy 4 · b-light 1" — per class, what a reviewer had to fix in this
+// curator's work; the list they read to know what to improve on. From /api/dataset/progress.
+const labCorr = h => ((labProg && labProg.by_who || {})[h] || {}).corrections || {};
+function labCorrTag(h) {
+  const c = Object.entries(labCorr(h));
+  return c.length ? `<i class="res">corrections: ${c.map(([k, v]) => `${esc(k)} ${v}`).join(' · ')}</i>` : '';
+}
 function labRosterShow(d) {
   labTeam = d;
   document.getElementById('l-signin').hidden = true;
@@ -1667,7 +1676,7 @@ function labRosterShow(d) {
   // .halt is reserved for the one destructive control on the row.
   document.getElementById('l-roster').innerHTML = Object.entries(d.curators).map(([h, t]) =>
     `<div class="acts toggle"><b>${esc(h)}</b>${labAssignTag(h)}` +
-    `<code data-copy="${esc(t)}">${esc(t)}</code>` +
+    `<code data-copy="${esc(t)}">${esc(t)}</code>` + labCorrTag(h) +
     // A supervisor's own work is never held, so there is no state to flip for one.
     (d.reviewers.includes(h) ? '<i class="res">supervisor</i>'
                              : `<button class="btn${labTrust[h] ? ' on' : ''}" data-trust="${esc(h)}"

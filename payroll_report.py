@@ -24,14 +24,15 @@ ROOT = Path(__file__).resolve().parent
 DATASET = ROOT / "dataset"
 MIN_SCORES = 3        # same honesty rule as the Progress panel
 COLUMNS = ("curator", "approvals", "discards", "held", "released", "golds_seen",
-           "gold_accuracy", "reviews", "review_accuracy", "quality")
+           "gold_accuracy", "reviews", "review_accuracy", "corrections", "quality")
 
 
 def blank():
     """held: approvals that landed in the holding pen instead of the training set.
     released: how many of those a reviewer has since cleared. The gap is work nobody
     has proved yet — pay for it at your own risk."""
-    return {"approvals": 0, "discards": 0, "held": 0, "released": 0, "gold": [], "review": []}
+    return {"approvals": 0, "discards": 0, "held": 0, "released": 0, "gold": [], "review": [],
+            "corrections": {}}
 
 
 def rows(name, since):
@@ -80,6 +81,9 @@ def main():
         if kind in ("gold", "review") and isinstance(r.get("score"), (int, float)):
             people.setdefault(who, blank())
             people[who][kind].append(r["score"])
+            for c in r.get("corrections") or []:       # per class: what to improve on
+                cc = people[who]["corrections"]
+                cc[c.get("class")] = cc.get(c.get("class"), 0) + 1
 
     table = []
     for who, p in sorted(people.items()):
@@ -90,6 +94,8 @@ def main():
                       "held": p["held"], "released": p["released"],
                       "golds_seen": len(p["gold"]), "gold_accuracy": gold,
                       "reviews": len(p["review"]), "review_accuracy": review,
+                      "corrections": " ".join(f"{k}:{v}" for k, v in
+                                              sorted(p["corrections"].items(), key=lambda kv: -kv[1])),
                       "quality": quality})
     if not table:
         sys.exit(f"no labelling logged in the last {days} day(s)")
@@ -101,7 +107,8 @@ def main():
         print(f"{t['curator']:<16}{t['approvals']:>6}{t['discards']:>6}{t['held']:>6}"
               f"{t['released']:>6}{t['golds_seen']:>7}"
               f"{show(t['gold_accuracy']):>22}{t['reviews']:>9}"
-              f"{show(t['review_accuracy']):>22}{show(t['quality']):>22}")
+              f"{show(t['review_accuracy']):>22}{show(t['quality']):>22}"
+              + (f"   corrections {t['corrections']}" if t['corrections'] else ""))
 
     out = DATASET / f"payroll-{datetime.now(timezone.utc).date().isoformat()}.csv"
     with open(out, "w", newline="") as f:

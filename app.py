@@ -918,6 +918,28 @@ def agreement(a_boxes, a_attrs, b_boxes, b_attrs):
     return total / (len(pairs) + len(miss_a) + len(miss_b))
 
 
+def corrections(a_boxes, a_attrs, b_boxes, b_attrs):
+    """What the reviewer changed, each keyed by the class the CURATOR gave the box — the
+    class whose labelling needs work. -> [{"class": name, "what": ...}]: "class->x" for a
+    reclassification, "attr:head" for a changed attribute, "removed" for a box the reviewer
+    dropped, "added" (keyed by the reviewer's class) for one they had to draw."""
+    names = dataset_classes()
+    name = lambda c: names[c] if 0 <= c < len(names) else str(c)
+    pairs, miss_a, miss_b = match_boxes(a_boxes, b_boxes, MATCH_BOX)
+    out = []
+    for i, (j, _) in pairs.items():
+        mine = name(a_boxes[i]["cls"])
+        if a_boxes[i]["cls"] != b_boxes[j]["cls"]:
+            out.append({"class": mine, "what": f"class->{name(b_boxes[j]['cls'])}"})
+        theirs = b_attrs.get(str(j)) or {}
+        for h, val in (a_attrs.get(str(i)) or {}).items():
+            if theirs.get(h) != val:
+                out.append({"class": mine, "what": f"attr:{h}"})
+    out += [{"class": name(a_boxes[i]["cls"]), "what": "removed"} for i in miss_a]
+    out += [{"class": name(b_boxes[j]["cls"]), "what": "added"} for j in miss_b]
+    return out
+
+
 def parse_boxes(body):
     """Validated boxes from a label payload — one rule set for real samples, golds
     and reviews alike."""
@@ -1225,9 +1247,11 @@ def review_label(sid, who, body):
     boxes = parse_boxes(body)
     attrs = valid_attrs(body.get("attrs"), len(boxes))
     curator = sample_curators(tree).get(sid, "anon")
-    score = agreement(read_boxes(lbl), read_attrs(attrs_path(sid, tree)), boxes, attrs)
+    was_boxes, was_attrs = read_boxes(lbl), read_attrs(attrs_path(sid, tree))
+    score = agreement(was_boxes, was_attrs, boxes, attrs)
     append_line("scores.jsonl", {"kind": "review", "who": curator, "reviewer": who,
-                                 "id": sid, "score": round(score, 3)})
+                                 "id": sid, "score": round(score, 3),
+                                 "corrections": corrections(was_boxes, was_attrs, boxes, attrs)})
     dst_img, dst_lbl = sample_paths(sid, "approved")
     dst_lbl.parent.mkdir(parents=True, exist_ok=True)
     dst_lbl.write_text(box_lines(boxes))
@@ -1752,6 +1776,13 @@ def quality(who):
                 and isinstance(r.get("score"), (int, float))]
         out[count_key] = len(vals)
         out[acc_key] = round(sum(vals) / len(vals), 3) if len(vals) >= MIN_SCORES else None
+    # Corrections per class: the list a curator reads to know what to improve on.
+    by_class = {}
+    for r in read_lines("scores.jsonl"):
+        if r.get("kind") == "review" and r.get("who") == who:
+            for c in r.get("corrections") or []:
+                by_class[c.get("class")] = by_class.get(c.get("class"), 0) + 1
+    out["corrections"] = dict(sorted(by_class.items(), key=lambda kv: -kv[1]))
     return out
 
 

@@ -622,6 +622,14 @@ def search_lists_the_pen():
             assert (Path(d) / "approved" / "attrs" / "x3.json").is_file(), "attributes travel with the frame"
             assert sum(1 for l in (Path(d) / "audit.jsonl").read_text().splitlines()
                        if '"review"' in l and '"curator02"' in l) == 2, "each release credits the curator"
+            # What a review changed, keyed by the class the curator gave — their list to improve on.
+            was = [{"cls": 0, "cx": .5, "cy": .5, "w": .1, "h": .1}, {"cls": 1, "cx": .2, "cy": .2, "w": .1, "h": .1}]
+            now = [{"cls": 1, "cx": .5, "cy": .5, "w": .1, "h": .1}, {"cls": 0, "cx": .8, "cy": .8, "w": .1, "h": .1}]
+            c = app.corrections(was, {"0": {"type": "car"}}, now, {"0": {"type": "van"}})
+            assert sorted((x["class"], x["what"]) for x in c) == [
+                ("a-small", "added"), ("a-small", "attr:type"), ("a-small", "class->e-heavy"), ("e-heavy", "removed")], c
+            assert app.corrections(was, {}, was, {}) == [], "an untouched frame is no correction"
+            assert app.quality("curator02")["corrections"] == {}, "a release as labelled corrects nothing"
         finally:
             app.DATASET, app.REVIEWERS = keep
 
