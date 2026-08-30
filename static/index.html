@@ -280,6 +280,7 @@
       <button class="btn" id="l-toq" hidden>&larr; Back to queue</button>
       <button class="btn go" id="l-ok">Approve</button>
       <button class="btn" id="l-skip">Skip</button>
+      <button class="btn" id="l-skip10" title="skip the next ten frames">Skip 10</button>
       <button class="btn halt" id="l-no">Discard</button>
       <button class="btn halt" id="l-rej" hidden>Reject</button>
     </div>
@@ -316,6 +317,7 @@
       </div>
       <div class="acts" id="l-search" hidden>
         <select id="l-scls" multiple size="6" title="cmd/ctrl-click for more than one"></select>
+        <select id="l-sattr" multiple size="6" title="cmd/ctrl-click for more than one"></select>
         <select id="l-swho"></select>
         <select id="l-stree">
           <option value="approved">approved</option>
@@ -1064,7 +1066,7 @@ function labShow() {
   // The row survives an empty queue while Back can still reopen the last approval.
   document.getElementById('l-acts').hidden = !s && !labDone.length;
   document.getElementById('l-back').disabled = !labDone.length;
-  ['l-ok', 'l-skip', 'l-no', 'l-rej'].forEach(id => document.getElementById(id).disabled = !s);
+  ['l-ok', 'l-skip', 'l-skip10', 'l-no', 'l-rej'].forEach(id => document.getElementById(id).disabled = !s);
   // Reviewers correct, they do not delete or rewind.
   document.getElementById('l-ok').textContent = labOne() ? 'Submit review' : 'Approve';
   document.getElementById('l-no').hidden = document.getElementById('l-back').hidden = labOne();
@@ -1072,6 +1074,7 @@ function labShow() {
   // Reject exists only where holding does: a supervisor's review or search hit. A curator's own
   // queue carries no held flag, so the button never appears for them even if one leaked through.
   document.getElementById('l-rej').hidden = !(labOne() && s && s.held);
+  document.getElementById('l-skip10').hidden = labOne();   // one frame: nothing behind it to skip
   if (!s) {
     // The batch is done but more may wait on disk (the fetch is capped at 100).
     if (labTotal > 0) return labLoad();
@@ -1488,6 +1491,9 @@ document.getElementById('l-ok').onclick = () => labSend(labOne() ? 'review' : 'a
 // Skip is for near-duplicates (parked vehicles) not worth a decision.
 document.getElementById('l-skip').onclick = () =>
   labOne() ? labLoad() : (labQueue.shift(), labShow());
+// Ten at once: a parked vehicle fills a stretch of the queue, not one frame of it.
+document.getElementById('l-skip10').onclick = () =>
+  labOne() ? labLoad() : (labQueue.splice(0, 10), labShow());
 document.getElementById('l-no').onclick = () => labSend('discard');
 // Reject returns a held frame to the queue for its curator to redo — the opposite of Submit.
 document.getElementById('l-rej').onclick = () => labSend('reject');
@@ -1737,6 +1743,11 @@ function labAssignShow(d) {
   labFill(document.getElementById('l-acls'),
           '<option value="all">All classes</option>' + labTargets());
   labFill(document.getElementById('l-scls'), '<option value="">any class</option>' + labTargets());
+  // Attributes as search terms: same head = either value, different heads = both on one box.
+  labFill(document.getElementById('l-sattr'), '<option value="">any attributes</option>' +
+    Object.entries(labAttrs).map(([h, vals]) => `<optgroup label="${esc(h)}">` +
+      vals.map(v => `<option value="${esc(h)}=${esc(v)}">${esc(h)}: ${esc(v)}</option>`).join('') +
+      '</optgroup>').join(''));
   document.getElementById('l-assign').hidden = false;
   document.getElementById('l-search').hidden = false;
   if (labTeam) labRosterShow(labTeam);       // the roster line carries the assignment
@@ -1774,7 +1785,9 @@ async function labSearch(offset) {
   // Several classes or categories at once: frames holding any of them. "any class"
   // among the picks means no class filter at all.
   const picked = [...document.getElementById('l-scls').selectedOptions].map(o => o.value);
+  const attrs = [...document.getElementById('l-sattr').selectedOptions].map(o => o.value);
   const q = new URLSearchParams({target: picked.includes('') ? '' : picked.join(','),
+                                 attr: attrs.includes('') ? '' : attrs.join(','),
                                  who: document.getElementById('l-swho').value,
                                  tree, limit: SEARCH_LIMIT, offset});
   const el = document.getElementById('l-sres');
@@ -1791,18 +1804,21 @@ async function labSearch(offset) {
     return;
   }
   const hits = d.results || [];
-  if (!hits.length && !offset) return el.textContent = q.get('target') ? 'nothing matched' : `${tree} is empty`;
+  if (!hits.length && !offset) return el.textContent = q.get('target') || q.get('attr') ? 'nothing matched' : `${tree} is empty`;
   // Whose work this is, before the frames: with no class picked this IS the view of the
   // pen, and the tally answers "who is in it" without scrolling.
   const tally = Object.entries(d.by_curator || {}).sort((a, b) => b[1] - a[1]);
   // The chips are the point of the row: one glance says whether this frame is worth opening.
   const rows = hits.map(s => {
     const names = [...new Set((s.boxes || []).map(b => labClasses[b.cls]).filter(Boolean))];
+    // The vehicle types beside the classes: excavator or loader is the difference being hunted.
+    const types = [...new Set(Object.values(s.attrs || {}).map(a => a && a.type).filter(Boolean))];
     return `<button class="btn" data-open="${esc(s.id)}" data-tree="${esc(s.tree || tree)}">` +
       `<img class="thumb" data-thumb="${esc(s.id)}" alt="">` +
       `<b>${esc(s.id)}</b><i class="res">${esc(s.curator || '—')}</i>` +
       names.map(n => `<span class="chip" style="--c:${clsColor(labClasses.indexOf(n))}"
-        >${esc(n)}</span>`).join('') + '</button>';
+        >${esc(n)}</span>`).join('') +
+      types.map(t => `<i class="res">${esc(t)}</i>`).join('') + '</button>';
   }).join('');
   // A first page replaces the list; a further page is appended below what is there —
   // the pen holds thousands, and the way to "see more" must not lose the place.

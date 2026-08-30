@@ -1279,12 +1279,14 @@ def dataset_review(who: str, x_curator_token: str = Header("")):
 
 @app.get("/api/dataset/search")
 def dataset_search(target: str = "", who: str = "", tree: str = "approved", limit: int = 50,
-                   offset: int = 0, x_curator_token: str = Header("")):
+                   offset: int = 0, attr: str = "", x_curator_token: str = Header("")):
     """Every frame holding a class or a whole toll category, newest first — the way back
     to work already filed, for a supervisor spot-checking a class or cleaning up after one
     curator. No class at all lists the whole tree: "what is in holding right now, and
     whose is it" is a question with no vehicle in it. `total` is the whole match,
-    `results` the page of it, `by_curator` the whole match tallied by hand.
+    `results` the page of it, `by_curator` the whole match tallied by hand. `attr` is
+    "type=excavator,type=loader,axles=6": a frame hits when one box carries all the heads
+    named, any of the values named for each — the way back to a class you mislabelled.
 
     ponytail: full scan of the tree per call, the same ceiling approved_counts() and
     label_files() already live with; index the labels if the dataset outgrows it."""
@@ -1295,10 +1297,12 @@ def dataset_search(target: str = "", who: str = "", tree: str = "approved", limi
     if not ids and str(target or "").strip():
         raise HTTPException(400, f"no class or category {target!r} — pick one of: "
                                  f"{', '.join(categories() + names)}")
+    want = attr_filter(attr)
     by = sample_curators(tree)
     try:
+        # By capture time, not mtime: a class remap rewrites every label file (see captured_at).
         rows = sorted((DATASET / tree / "labels").glob("*.txt"),
-                      key=lambda f: f.stat().st_mtime, reverse=True)
+                      key=lambda f: captured_at(f.stem, f), reverse=True)
     except OSError:      # a sample moved mid-listing: fewer results beats an error
         rows = []
     hits, by_curator = [], {}
@@ -1312,12 +1316,31 @@ def dataset_search(target: str = "", who: str = "", tree: str = "approved", limi
             continue
         if ids and not any(b["cls"] in ids for b in boxes):
             continue
+        attrs = read_attrs(attrs_path(f.stem, tree))
+        if want and not any(isinstance(a, dict) and all(a.get(h) in vs for h, vs in want.items())
+                            for a in attrs.values()):
+            continue
         hits.append({"id": f.stem, "curator": curator, "tree": tree, "boxes": boxes,
-                     "attrs": read_attrs(attrs_path(f.stem, tree))})
+                     "attrs": attrs})
         by_curator[curator] = by_curator.get(curator, 0) + 1
     offset = max(0, offset)
     return {"results": hits[offset:offset + max(1, min(limit, 200))], "total": len(hits),
             "offset": offset, "by_curator": by_curator}
+
+
+def attr_filter(attr):
+    """"type=excavator,type=loader,axles=6" -> {"type": {"excavator", "loader"}, "axles": {"6"}}.
+    Heads and values must be in the vocabulary: a typo would silently match nothing."""
+    vocab, want = attr_vocab(), {}
+    for term in str(attr or "").split(","):
+        if not term.strip():
+            continue
+        head, _, value = term.partition("=")
+        head, value = head.strip(), value.strip()
+        if head not in vocab or value not in vocab[head]:
+            raise HTTPException(400, f"no attribute {term.strip()!r} — heads: {', '.join(vocab)}")
+        want.setdefault(head, set()).add(value)
+    return want
 
 
 @app.get("/api/dataset/sample")

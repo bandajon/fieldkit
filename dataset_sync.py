@@ -198,6 +198,9 @@ def fetch(cl, bucket, dest, key):
         cl.download_file(bucket, key, str(dest))
 
 
+FINISHED = ("approve", "discard", "review")   # last-action-wins: unapprove/reject reopen
+
+
 def consumed(root):
     """Sample ids this node has already dealt with, from its own audit ledger.
 
@@ -206,7 +209,8 @@ def consumed(root):
     back and the labeller meets their own finished work again. The ledger is the record
     of what happened to each sample and it syncs both ways, so both nodes agree. An
     unapprove puts the sample back in the queue, hence last-action-wins rather than
-    "ever approved"."""
+    "ever approved". A review is an approval re-checked — the frame is still filed, so
+    it must not come back either."""
     last = {}
     try:
         lines = (Path(root) / "audit.jsonl").read_text().splitlines()
@@ -219,7 +223,7 @@ def consumed(root):
             continue
         if r.get("id") and r.get("action"):
             last[r["id"]] = r["action"]
-    return {i for i, a in last.items() if a in ("approve", "discard")}
+    return {i for i, a in last.items() if a in FINISHED}
 
 
 def sweep_consumed(root, in_bucket=()):
@@ -248,9 +252,9 @@ def sweep_consumed(root, in_bucket=()):
         return 0
     gone = 0
     for sid, action in last.items():
-        if action not in ("approve", "discard"):
+        if action not in FINISHED:
             continue
-        if action == "approve" and sid not in in_bucket and not any(
+        if action != "discard" and sid not in in_bucket and not any(
                 (root / tree / "labels" / f"{sid}.txt").exists()
                 for tree in ("approved", "holding")):
             continue                       # no other copy anywhere we can see: leave it
@@ -418,6 +422,13 @@ def selfcheck():
     pull(cl2, "buck", "curation/", back)
     assert not (back / "pending" / "images" / "s1.jpg").exists(), "approved frame came back"
     assert (back / "pending" / "images" / "s2.jpg").exists(), "untouched frame must arrive"
+    # A reviewer re-checking that approval (search -> edit -> save) writes a "review" line
+    # after the "approve": still finished, the frame must not come round again.
+    with (back / "audit.jsonl").open("a") as f:
+        f.write('{"ts": "t", "who": "r", "id": "s1", "action": "review"}\n')
+    assert "s1" in consumed(back), "a reviewed approval is still finished"
+    pull(cl2, "buck", "curation/", back)
+    assert not (back / "pending" / "images" / "s1.jpg").exists(), "reviewed frame came back"
 
     # An earlier pull left a duplicate behind; the sweep clears it, but only because the
     # approved copy is really there.

@@ -590,6 +590,22 @@ def search_lists_the_pen():
             assert s(target="A,E")["total"] == 3 and s(target="a-small,e-heavy")["total"] == 3, "several terms union"
             assert s(who="curator01")["total"] == 1, "a curator still narrows"
             assert s(target="e-heavy", who="curator01")["total"] == 0
+            # Attributes narrow too: the way back to every "excavator" that was a loader.
+            (Path(d) / "attributes.yaml").write_text(yaml.safe_dump(
+                {"type": ["excavator", "loader"], "axles": ["2", "6"]}))
+            at = Path(d) / "holding" / "attrs"
+            at.mkdir()
+            (at / "x2.txt").with_suffix(".json").write_text('{"0": {"type": "excavator", "axles": "6"}}')
+            (at / "x3.json").write_text('{"0": {"type": "loader", "axles": "6"}}')
+            assert s(attr="type=excavator")["total"] == 1, "one head, one value"
+            assert s(attr="type=excavator,type=loader")["total"] == 2, "same head: either"
+            assert s(attr="type=loader,axles=2")["total"] == 0, "two heads: both, on one box"
+            assert s(attr="axles=6", target="E")["total"] == 2 and s(attr="axles=6", who="curator01")["total"] == 0
+            try:
+                s(attr="type=digger")
+                raise AssertionError("an unknown attribute value must be refused")
+            except app.HTTPException as e:
+                assert e.status_code == 400, e.detail
             try:
                 s(target="zzz")
                 raise AssertionError("an unknown class must still be refused")
