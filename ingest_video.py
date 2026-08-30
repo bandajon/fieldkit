@@ -5,6 +5,10 @@
   python ingest_video.py pull <site>/<cam>     fetch missing segments from R2, then ingest
   python ingest_video.py incoming              ingest the R2 drop-box, then archive it
   python ingest_video.py check <file>          probe one file, write nothing
+  python ingest_video.py hunt <classes> [--max N] <dir> [...]
+                                               only frames holding one of the classes
+                                               (comma-separated), up to N per class, each
+                                               directory's name prefixing its sample ids
   python ingest_video.py                       self-check
 
 Same detector, same dedup, same dataset/pending layout as detect.py, so a sample from
@@ -144,6 +148,7 @@ class Sink:
         self.rare_at = {}     # cam -> footage timestamp of its last off-cadence capture
         self.dets = {}        # cam -> its `shown`, for the scene comparison
         self.written = Counter()
+        self.hits = Counter()   # wanted class -> frames written holding it: a hunt's quota
         self.stems = []       # what this run wrote, in order: the caller pre-fills suggestions
 
     def offer(self, cam, ts, jpeg, shown, w, h):
@@ -171,6 +176,7 @@ class Sink:
         (self.images / f"{stem}.jpg").write_bytes(jpeg)      # re-ingest overwrites: idempotent
         (self.labels / f"{stem}.txt").write_text("\n".join(lines) + "\n")
         self.written[cam] += 1
+        self.hits.update({cls for cls, _c, _b in shown if cls in self.wanted})
         self.stems.append(stem)
         return True
 
@@ -225,6 +231,32 @@ def ingest(files, cfg):
     for cam, n in sorted(sink.written.items()):
         print(f"  {cam}: {n}")
     return sink
+
+
+def hunt(classes, dirs, cfg, cap):
+    """Sweep whole recording trees for the classes the curated set is short of — the
+    motorcycles and plant a season of footage holds but the cadence never kept. Each
+    directory is one site, its name the sample prefix, so ids from two sites with a cam1
+    each never meet. Stops early once every class has `cap` frames."""
+    run, ids = detector(cfg)
+    missing = [c for c in classes if c not in ids]
+    if missing:
+        sys.exit(f"the detector has no class {', '.join(missing)} — it knows: {', '.join(ids)}")
+    grand = Counter()
+    for d in dirs:
+        files = segments([d])
+        gate = CAM_CHARS.sub("-", Path(d).name).strip("-")
+        sink = Sink(DATASET, ids, gate, classes, only_wanted=True)
+        sink.hits.update(grand)                       # the quota is across sites
+        print(f"\n{gate}: {len(files)} segment(s)", flush=True)
+        for f in files:
+            if all(sink.hits[c] >= cap for c in classes):
+                break
+            ingest_one(f, run, sink)
+            print(f"  {f.parent.name}/{f.name}: " + ", ".join(f"{c} {sink.hits[c]}" for c in classes), flush=True)
+        grand = Counter(sink.hits)
+    print("\nhunt done: " + ", ".join(f"{c} {grand[c]}" for c in classes) + f" frames in {DATASET / 'pending'}")
+    return grand
 
 
 def pull(prefix, cfg):
@@ -391,6 +423,7 @@ def selfcheck():
     assert not only.offer("c", base, b"a", car, 64, 64), "a hunt keeps no ordinary frames"
     assert not only.offer("c", base + 60, b"b", car, 64, 64), "...however long it waits"
     assert only.offer("c", base + 61, b"c", bus, 64, 64), "a hunt keeps the wanted ones"
+    assert only.hits == {"bus": 1}, f"a hunt counts its frames per wanted class: {only.hits}"
     assert not only.offer("c", base + 62, b"d", bus2, 64, 64), "...spaced like any rare capture"
 
     assert segments([str(tmp)]) == [odd, seg], segments([str(tmp)])
@@ -480,6 +513,14 @@ if __name__ == "__main__":
         if len(args) != 2:
             sys.exit("usage: ingest_video.py check <file>")
         check(args[1], config())
+    elif args[0] == "hunt":
+        cap, rest = 1000, args[1:]
+        if "--max" in rest:
+            i = rest.index("--max")
+            cap, rest = int(rest[i + 1]), rest[:i] + rest[i + 2:]
+        if len(rest) < 2:
+            sys.exit("usage: ingest_video.py hunt <classes> [--max N] <dir> [...]")
+        hunt([c.strip() for c in rest[0].split(",") if c.strip()], rest[1:], config(), cap)
     else:
         files = segments(args)
         if not files:
