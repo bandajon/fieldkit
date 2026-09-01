@@ -10,6 +10,7 @@ FieldKit runs. Design: docs/superpowers/specs/2026-08-19-video-feed-and-labeling
 import io
 import os
 import json
+import re
 import shutil
 import subprocess
 import threading
@@ -201,9 +202,24 @@ def attr_classifier(path, dev="cpu"):
     def classify(pil):
         with torch.no_grad():
             f = pool(net.features(prep(pil).unsqueeze(0).to(dev))).flatten(1)
-            return {n: vocab[n][int(net.fc[j](f).argmax())] for j, n in enumerate(names)}
+            a = {n: vocab[n][int(net.fc[j](f).argmax())] for j, n in enumerate(names)}
+        # The config head reads the wheel grouping ("1+2+3") far better than the axles
+        # head counts — 6 vs 7 was its signature miss — so when the config parses, the
+        # count IS its sum. Wheel-derived counts still override this downstream.
+        n = config_axles(a.get("axle-config"))
+        if n:
+            a["axles"] = str(min(n, 9))
+        return a
 
     return classify
+
+
+def config_axles(value):
+    """"1+2+3" -> 6, "1222" -> 7 (digits are groups either way); None for "other",
+    blanks, or anything that does not parse as axle groups."""
+    parts = re.findall(r"\d", str(value or ""))
+    total = sum(int(d) for d in parts)
+    return total if parts and total else None
 
 
 def palette(names):
@@ -1412,6 +1428,8 @@ if __name__ == "__main__":
 
     assert letter_of("e-heavy") == "E" and letter_of("a-small") == "A"
     assert letter_of("motorcycle") is None and letter_of("wheel") is None
+    assert config_axles("1+2+3") == 6 and config_axles("1222") == 7 and config_axles("1+1") == 2
+    assert config_axles("other") is None and config_axles("") is None and config_axles(None) is None
     assert letter_of("mini-bus-long") is None, "only a single-letter prefix is a toll letter"
 
     # Axles from wheels. Gaps of 2 and 1 px are the same axle seen doubled; 38-40 px
