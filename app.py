@@ -632,10 +632,15 @@ def approved_counts():
     # examples, but they train nothing — so "new since the freeze", per class, is what
     # says whether another run is worth starting and which classes it would still be
     # thin on.
-    try:
-        ref = {ln.strip() for ln in (DATASET / "reference.txt").read_text().splitlines() if ln.strip()}
-    except OSError:
-        ref = set()
+    def stems(name):
+        try:
+            return {ln.strip() for ln in (DATASET / name).read_text().splitlines() if ln.strip()}
+        except OSError:
+            return set()
+    ref = stems("reference.txt")
+    # ...and frames a crowned run has already trained on (selfloop.crown writes the list):
+    # also not "new" — the tally aims the NEXT run, and these are in the model already.
+    trained = stems("trained.txt") - ref
     d = DATASET / "approved" / "labels"
     for p in sorted(d.glob("*.txt")) if d.is_dir() else []:
         try:
@@ -643,8 +648,8 @@ def approved_counts():
         except OSError:
             continue
         frames += 1
-        fresh = p.stem not in ref
-        frozen += not fresh
+        fresh = p.stem not in ref and p.stem not in trained
+        frozen += p.stem in ref
         for line in text.splitlines():
             f = line.split()
             try:
@@ -655,7 +660,8 @@ def approved_counts():
                 boxes[names[cls]] = boxes.get(names[cls], 0) + 1
                 if fresh:
                     new_boxes[names[cls]] = new_boxes.get(names[cls], 0) + 1
-    return {"frames": frames, "boxes": boxes, "frozen": frozen, "new_boxes": new_boxes}
+    return {"frames": frames, "boxes": boxes, "frozen": frozen, "new_boxes": new_boxes,
+            "trained": len(trained)}
 
 
 def sample_paths(sid, tree="pending"):

@@ -878,6 +878,11 @@ def approved_counts_split_new_from_frozen():
             assert (c["frames"], c["frozen"]) == (3, 2), c
             assert c["boxes"] == {"a-small": 1, "e-heavy": 4}, c
             assert c["new_boxes"] == {"e-heavy": 2}, "only the frames outside the reference set"
+            # A crowned run's trained.txt re-baselines "new": those frames are in the model.
+            (Path(d) / "trained.txt").write_text("new1\n")
+            c = app.approved_counts()
+            assert (c["trained"], c["frames"], c["frozen"]) == (1, 3, 2), c
+            assert c["new_boxes"] == {}, "a trained frame is no longer new"
         finally:
             app.DATASET = keep
 

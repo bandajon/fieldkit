@@ -609,6 +609,19 @@ def crown(s, run, frames, ev, cl, bucket):
     if ev:
         cl.upload_file(str(run / "reference-eval.json"), bucket, f"{MODELS}{run.name}/reference-eval.json")
     cl.put_object(Bucket=bucket, Key=f"{MODELS}champion.json", Body=json.dumps(s["champion"]).encode())
+    # Every approved frame outside the reference went into this run: record the list, so
+    # the consoles' "new since the last training" starts from zero — and publish it where
+    # the config pull already looks.
+    ref = set()
+    try:
+        ref = {ln.strip() for ln in (DATASET / "reference.txt").read_text().splitlines() if ln.strip()}
+    except OSError:
+        pass
+    done = sorted(p.stem for p in (DATASET / "approved" / "labels").glob("*.txt")
+                  if p.stem not in ref)
+    (DATASET / "trained.txt").write_text("\n".join(done) + "\n")
+    import dataset_sync
+    cl.upload_file(str(DATASET / "trained.txt"), bucket, dataset_sync.PREFIX + "trained.txt")
     print(f"{now()}: {run.name} is the champion (reference mAP50 {ev['map50'] if ev else 'n/a'}) "
           f"— published under {MODELS}", flush=True)
 

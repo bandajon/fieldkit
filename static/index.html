@@ -908,7 +908,7 @@ const labStats = () => {
       Object.entries(labApproved.boxes).map(([k, v]) => `${k} ${v}`).join(' · ') +
       // What the next run trains on, per class — the line that says where to aim curation.
       (labApproved.frozen && Object.keys(labApproved.new_boxes || {}).length
-        ? `\nnew since the freeze: ` + Object.entries(labApproved.new_boxes)
+        ? `\nnew since the last training: ` + Object.entries(labApproved.new_boxes)
             .sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k} ${v}`).join(' · ') : '')
     : 'fine-tune set: empty — approve samples to grow it')
     + (labWho && labProg   // .res is pre-line, so the team line lands under it
