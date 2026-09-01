@@ -119,11 +119,18 @@ def push(cl, bucket, prefix=PREFIX, root=DATASET, names=PUSH, force=False):
     these are write-once samples, never edited in place. Pending samples go further —
     see once(): an id already in the bucket is left exactly as it is, so two nodes
     watching one camera contribute one frame between them rather than two."""
+    # A forced publish is one deliberate file: upload it, no questions — the full-prefix
+    # listing below is ninety thousand keys, and a roster edit must not pay for it.
+    if force:
+        sent = transfer(lambda f, key: cl.upload_file(str(f), bucket, key),
+                        [(f, prefix + rel) for rel, f in walk(Path(root), names)], "pushed")
+        print(f"push: {sent} uploaded, forced ({prefix} on {bucket})")
+        return sent, 0
     have = remote(cl, bucket, prefix)
     todo, skipped = [], 0
     for rel, f in walk(Path(root), names):
         key = prefix + rel
-        if key not in have or force or (always(rel) and not once(rel)):
+        if key not in have or (always(rel) and not once(rel)):
             todo.append((f, key))
         elif once(rel) or have[key] == f.stat().st_size:
             skipped += 1
