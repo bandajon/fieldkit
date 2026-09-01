@@ -114,7 +114,7 @@ def transfer(fn, items, verb):
     return done
 
 
-def push(cl, bucket, prefix=PREFIX, root=DATASET, names=PUSH):
+def push(cl, bucket, prefix=PREFIX, root=DATASET, names=PUSH, force=False):
     """Upload what curation needs. Same name and same size is assumed the same file:
     these are write-once samples, never edited in place. Pending samples go further —
     see once(): an id already in the bucket is left exactly as it is, so two nodes
@@ -123,7 +123,7 @@ def push(cl, bucket, prefix=PREFIX, root=DATASET, names=PUSH):
     todo, skipped = [], 0
     for rel, f in walk(Path(root), names):
         key = prefix + rel
-        if always(rel) or key not in have:
+        if key not in have or force or (always(rel) and not once(rel)):
             todo.append((f, key))
         elif once(rel) or have[key] == f.stat().st_size:
             skipped += 1
@@ -136,8 +136,17 @@ def push(cl, bucket, prefix=PREFIX, root=DATASET, names=PUSH):
     return sent, skipped
 
 
+ROSTER = ("curators.yaml", "trusted.yaml", "assignments.yaml")
+
+
 def once(rel):
     """Pending samples are written once and never replaced, whoever holds the newer copy.
+
+    The roster files are the same, for a different reason: they are edited on the
+    curation instance and published from there (app.push_file), so a plain push from a
+    laptop whose copy is weeks stale must never overwrite them — that is exactly how the
+    whole team lost their tokens once. Seeding an empty bucket still works: once() only
+    protects a key that already exists.
 
     Two nodes watching one camera now mint the same id for the same moment (see
     detect.sample_stem), so their frames meet on one key — near-identical pictures of the
@@ -145,7 +154,7 @@ def once(rel):
     is the copy every curator sees. Uploading the other over it would swap the image out
     from under whoever is mid-label, leaving their boxes describing a frame that is gone.
     So for pending, the key existing at all is reason enough to leave it be."""
-    return rel.startswith("pending/")
+    return rel.startswith("pending/") or rel in ROSTER
 
 
 def always(rel):
@@ -406,6 +415,19 @@ def selfcheck():
         for k, v in keep.items():
             os.environ.pop(k, None) if v is None else os.environ.update({k: v})
     assert creds()["bucket"], "a bucket name is always resolvable"
+
+    # A laptop's stale roster must never clobber the bucket's: curators.yaml pushes only
+    # where the bucket has none (seeding), and push_file's force carries a real edit.
+    rst = Path(tempfile.mkdtemp())
+    (rst / "curators.yaml").write_text("stale: token\n")
+    clr = FakeS3()
+    push(clr, "buck", "curation/", rst, names=("curators.yaml",))
+    assert clr.objects["curation/curators.yaml"] == b"stale: token\n", "an empty bucket is seeded"
+    (rst / "curators.yaml").write_text("edited: fresh\n")
+    push(clr, "buck", "curation/", rst, names=("curators.yaml",))
+    assert clr.objects["curation/curators.yaml"] == b"stale: token\n", "a plain push must not clobber the roster"
+    push(clr, "buck", "curation/", rst, names=("curators.yaml",), force=True)
+    assert clr.objects["curation/curators.yaml"] == b"edited: fresh\n", "a deliberate edit still publishes"
 
     # A finished sample must never come back round. This is the bug that had one
     # labeller approving the same frames twice: pending copies live on in the bucket.

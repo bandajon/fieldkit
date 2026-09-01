@@ -1549,7 +1549,7 @@ def push_file(name):
     unreachable."""
     try:
         ds, cl, bucket = r2()
-        ds.push(cl, bucket, names=(name,))
+        ds.push(cl, bucket, names=(name,), force=True)   # a deliberate edit outranks the bucket copy
         return True
     except Exception:
         return False
