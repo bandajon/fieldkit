@@ -8,6 +8,7 @@ FieldKit runs. Design: docs/superpowers/specs/2026-08-19-video-feed-and-labeling
 """
 
 import io
+import os
 import json
 import shutil
 import subprocess
@@ -334,7 +335,10 @@ def review_frame(jpeg, cfg):
     path = weights or WEIGHTS
     with _review_lock:
         try:
-            if _review.get("path") != path:
+            # Keyed on mtime too: a crowned champion replaces the file under the same
+            # path, and the Review tab must box with the new model, not the cached one.
+            stamp = (path, os.stat(path).st_mtime if Path(path).exists() else 0)
+            if _review.get("path") != stamp:
                 from ultralytics import YOLO
                 try:
                     import torch
@@ -345,7 +349,7 @@ def review_frame(jpeg, cfg):
                 # Fine-tuned weights carry the operator's taxonomy; stock weights are COCO.
                 lookup = dict(model.names) if weights else CLASSES
                 COLORS.update(palette(lookup.values()))
-                _review.update(path=path, model=model, lookup=lookup, dev=dev,
+                _review.update(path=stamp, model=model, lookup=lookup, dev=dev,
                                extra={} if weights else {"classes": list(CLASSES)})
             if _review.get("attrs_path") != attrs_path:
                 _review["attrs"] = (attr_classifier(attrs_path, _review["dev"])
