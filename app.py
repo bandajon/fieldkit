@@ -1434,6 +1434,13 @@ def sync_both(ds, cl, bucket):
     on same-name-same-size, so a steady state is one listing and a pile of stat calls."""
     sent, _ = ds.push(cl, bucket, names=ds.LEDGERS)
     got, _ = ds.pull(cl, bucket)
+    # The crowned weights ride along so /api/dataset/classify has something to run. Never
+    # fatal: a node with no champion labels by hand, a node that fails the pass labels
+    # nothing.
+    try:
+        ds.models(cl, bucket, root=DATASET)
+    except Exception as e:
+        print(f"models: not pulled ({e})", flush=True)
     return sent, got
 
 
@@ -1849,6 +1856,48 @@ def dataset_image(id: str):
         if img.is_file():
             return FileResponse(img, media_type="image/jpeg")
     raise HTTPException(404, f"no pending sample {id!r}")
+
+
+@app.post("/api/dataset/classify")
+def dataset_classify(body: dict = Body(default={}), x_curator_token: str = Header("")):
+    """What the crowned models make of a box the curator has just drawn. A suggestion is
+    not a decision: nothing is written and nothing is audited — the operator's own label
+    still arrives through /api/dataset/label."""
+    check_token(valid_who(body.get("who")), x_curator_token)
+    sid = valid_sample_id(body.get("id"))
+    tree = valid_tree(body.get("tree") or "pending")
+    b = body.get("box") or {}
+    try:
+        cx, cy, w, h = (float(b[k]) for k in ("cx", "cy", "w", "h"))
+    except (KeyError, IndexError, TypeError, ValueError):
+        raise HTTPException(400, "box must be {cx, cy, w, h} in 0..1")
+    if not all(0 <= v <= 1 for v in (cx, cy, w, h)) or not (w > 0 and h > 0):
+        raise HTTPException(400, "box must be {cx, cy, w, h} in 0..1")
+    gold = gold_for(sid) if sid.startswith("g-") else None
+    # The named tree first, then the rest: a sample moves between trees mid-review and a
+    # stale tree in the caller is not worth a 404.
+    img = next((p for p in ([gold / "image.jpg"] if gold else
+                            [sample_paths(sid, t)[0] for t in (tree, *TREES)]) if p.is_file()),
+               None)
+    if img is None:
+        raise HTTPException(404, f"no sample {sid!r}")
+    def weights(key, name):
+        return CONFIG.get(key) or (str(DATASET / name) if (DATASET / name).is_file() else "")
+    cfg = {"detect_weights": weights("detect_weights", "champion.pt"),
+           "attr_weights": weights("attr_weights", "attrs-champion.pt")}
+    if not cfg["detect_weights"]:
+        raise HTTPException(503, "no champion on this node yet — it arrives with the next sync")
+    res, err = detect.classify_box(img.read_bytes(), cfg, (cx, cy, w, h))
+    if err:
+        raise HTTPException(503, err)
+    names, vocab = dataset_classes(), attr_vocab()
+    name = (res or {}).get("cls")
+    # A head this node has no vocabulary for is the model talking about a different
+    # dataset — dropped, not offered to the curator as a value they cannot save.
+    attrs = {k: v for k, v in ((res or {}).get("attrs") or {}).items()
+             if k in vocab and v in vocab[k]}
+    return {"ok": True, "cls": names.index(name) if name in names else None,
+            "name": name or None, "attrs": attrs}
 
 
 def send_back(sid, tree):
