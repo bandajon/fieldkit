@@ -1280,6 +1280,16 @@ async function labExShow(target) {
   }
 }
 
+// A box's class changed: repaint its chrome in place. Never re-render the wrapper — that
+// would refetch the image. labSelect re-adds .sel.
+function labRepaint(i) {
+  const b = labBoxes[i], d = document.querySelector(`#l-wrap .box[data-i="${i}"]`);
+  if (!b || !d) return;
+  d.className = boxCls(b);
+  d.style.setProperty('--c', clsColor(b.cls));
+  d.querySelector('span').textContent = labClasses[b.cls] || 'removed';
+}
+
 document.getElementById('l-attrs').onclick = e => {
   const t = e.target.closest('[data-head], [data-cls], [data-add], [data-ex]'),
         b = labBoxes[labSel];
@@ -1291,10 +1301,7 @@ document.getElementById('l-attrs').onclick = e => {
     b.cls = +t.dataset.cls;
     if (b.cls < labClasses.length) labLastCls = b.cls;   // runs of one missed class draw as that class
     labDefault(b);
-    const d = document.querySelector(`#l-wrap .box[data-i="${labSel}"]`);
-    d.className = boxCls(b);        // labSelect re-adds .sel below
-    d.style.setProperty('--c', clsColor(b.cls));
-    d.querySelector('span').textContent = labClasses[b.cls] || 'removed';
+    labRepaint(labSel);
   } else if (b.attrs[head] === t.dataset.val) {
     delete b.attrs[head];           // tap the active chip to unset
     b.touched.delete(head);
@@ -1424,6 +1431,41 @@ document.getElementById('l-wrap').onpointerdown = e => {
   };
 };
 
+// A freshly drawn box goes to the champion for a class and attributes. Everything it answers
+// is a suggestion, lit but overridable, exactly like the VLM pre-fills — and everything here
+// is best-effort: the drawn box survives a missing model, a stale index or a dead network.
+async function labClassify(b, i) {
+  const s = labQueue[0];
+  if (!s) return;
+  const tree = s.tree || (labOpened && labOpened.tree) || 'pending';
+  let r;
+  try {
+    r = await post('/api/dataset/classify',
+                   {id: s.id, tree, who: labWho, box: {cx: b.cx, cy: b.cy, w: b.w, h: b.h}});
+  } catch (e) { return; }                    // network gone: the box is drawn, that is what matters
+  if (labBoxes[i] !== b || b.del) return;    // the curator moved on; nothing left to suggest onto
+  if (b.cls >= labClasses.length) return;    // an explicit removal outranks a late suggestion
+  if (r.detail) return labNote(String(r.detail));
+  if (typeof r.cls === 'number' && r.cls !== b.cls) {
+    b.cls = r.cls;
+    labLastCls = r.cls;                      // the next box in a run draws as this class too
+    labDefault(b);                           // same cleanup a class tap does
+    labRepaint(i);
+  }
+  const name = labClasses[b.cls];
+  for (const [head, v] of Object.entries(r.attrs || {})) {
+    if (b.touched.has(head)) continue;       // tapped while the answer was in flight
+    if (!labVocab(head, name, null).some(([a]) => a === v)) continue;
+    b.attrs[head] = v;
+    b.suggested.add(head);
+  }
+  // A suggested axle count cascades to its configuration just as a tapped one would.
+  labFill(b, (labImplies.axles || {})[b.attrs.axles], true);
+  if (labSel === i) labSelect(i);
+  const said = [r.name, ...Object.values(r.attrs || {})].filter(Boolean);
+  labNote(said.length ? 'suggested: ' + said.join(' · ') : 'no suggestion for this box');
+}
+
 // Press on the image itself: rubber-band a new box for a vehicle the detector missed.
 function labDraw(e) {
   const wrap = e.currentTarget, r = wrap.getBoundingClientRect();
@@ -1450,6 +1492,7 @@ function labDraw(e) {
     nb.suggested = new Set();
     labBoxes.push(nb);                                  // data-i already holds this index
     labSelect(labBoxes.length - 1);
+    labClassify(nb, labBoxes.length - 1);               // suggestions land when they land
   };
 }
 
