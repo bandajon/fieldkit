@@ -1,0 +1,9 @@
+# The curation instance only: classify-on-draw runs the crowned detector and attribute
+# heads on CPU. Consoles and the offline release stay on requirements.txt (torch-free —
+# a recording-only node never runs detection, and the Jetson wants NVIDIA's own torch).
+-r requirements.txt
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
+torchvision
+ultralytics
+pillow
