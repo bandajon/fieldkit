@@ -937,6 +937,7 @@ def classify_suggests_class_and_attrs():
     import app
 
     keep = (app.DATASET, app.CONFIG, app.detect.classify_box)
+    tokens = dict(app.GOLD_TOKENS)
     with tempfile.TemporaryDirectory() as d:
         try:
             app.DATASET, app.CONFIG = Path(d), {}
@@ -972,9 +973,28 @@ def classify_suggests_class_and_attrs():
                     return e.status_code
                 raise AssertionError(f"{what} must be refused")
 
+            # A degenerate box is legal in a label file — parse_boxes takes it — but there
+            # is nothing to crop, so classify alone refuses it.
+            assert app.parse_boxes({"boxes": [{"cls": 0, "cx": 0.5, "cy": 0.5,
+                                               "w": 0, "h": 0.1}]})[0]["w"] == 0
+
+            # The frame is found wherever it lives now, whatever tree the caller names.
+            (Path(d) / "approved" / "images").mkdir(parents=True)
+            (Path(d) / "approved" / "images" / "x2.jpg").write_bytes(b"jpg")
+            assert app.sample_image("x1").name == "x1.jpg", "pending is searched"
+            assert app.sample_image("x2", "pending").parent.parent.name == "approved", \
+                "a stale tree falls through to the others"
+            assert app.sample_image("nosuch") is None
+            gold = Path(d) / "gold" / "g1"
+            gold.mkdir(parents=True)
+            (gold / "perturbed.txt").write_text("0 0.5 0.5 0.1 0.1\n")
+            (gold / "image.jpg").write_bytes(b"jpg")
+            app.GOLD_TOKENS["g-abcd1234"] = "g1"
+            assert app.sample_image("g-abcd1234") == gold / "image.jpg", "gold has its own dir"
+
             app.detect.classify_box = lambda jpeg, cfg, box: (None, "boom")
             assert fails("a detector that errors") == 503
-            app.detect.classify_box = lambda jpeg, cfg, box: ({"cls": "e-heavy"}, None)
+            app.detect.classify_box = lambda jpeg, cfg, box: ({"cls": "e-heavy", "attrs": {}}, None)
             assert fails("a zero-width box", box={"cx": 0.5, "cy": 0.5, "w": 0, "h": 0.2}) == 400
             assert fails("a box outside the frame",
                          box={"cx": 1.5, "cy": 0.5, "w": 0.2, "h": 0.2}) == 400
@@ -990,6 +1010,8 @@ def classify_suggests_class_and_attrs():
                 assert e.status_code == 401, e.detail
         finally:
             app.DATASET, app.CONFIG, app.detect.classify_box = keep
+            app.GOLD_TOKENS.clear()
+            app.GOLD_TOKENS.update(tokens)
 
 
 def routes_point_at_their_handlers():

@@ -564,6 +564,16 @@ def review_segments(name: str):
     return {"segments": [{"start": s, "duration": d} for _, s, d in segments(name)]}
 
 
+def model_cfg():
+    """Weights for detect.py's review/classify model singleton: config first, then whatever
+    the last sync crowned. Every caller must pass the SAME paths — the model is cached on
+    its path, so two callers disagreeing reload it against each other on every request."""
+    def path(key, name):
+        return CONFIG.get(key) or (str(DATASET / name) if (DATASET / name).is_file() else "")
+    return {"detect_weights": path("detect_weights", "champion.pt"),
+            "attr_weights": path("attr_weights", "attrs-champion.pt")}
+
+
 @app.get("/api/review/frame")
 def review_frame(name: str, t: str):
     cam_or_404(name)
@@ -583,7 +593,7 @@ def review_frame(name: str, t: str):
         raise HTTPException(502, "frame extraction timed out")
     if not out.stdout:
         raise HTTPException(502, "could not extract a frame")
-    data, err = detect.review_frame(out.stdout, CONFIG)
+    data, err = detect.review_frame(out.stdout, model_cfg())
     if err == detect.PIP_HINT:   # no model on this node: scrubbing without boxes beats no scrubbing
         return Response(content=out.stdout, media_type="image/jpeg")
     if err:
@@ -947,6 +957,18 @@ def corrections(a_boxes, a_attrs, b_boxes, b_attrs):
     return out
 
 
+def parse_box(b):
+    """One box's geometry, validated. -> (cx, cy, w, h). A zero-width box is legal here:
+    it is what a label file may already hold, and refusing it would reject the sample."""
+    try:
+        cx, cy, w, h = (float(b[k]) for k in ("cx", "cy", "w", "h"))
+    except (KeyError, TypeError, ValueError):
+        raise HTTPException(400, f"malformed box: {b!r}")
+    if not all(0 <= v <= 1 for v in (cx, cy, w, h)):
+        raise HTTPException(400, f"box out of range: {b!r}")
+    return cx, cy, w, h
+
+
 def parse_boxes(body):
     """Validated boxes from a label payload — one rule set for real samples, golds
     and reviews alike."""
@@ -954,10 +976,10 @@ def parse_boxes(body):
     for b in body.get("boxes") or []:   # an empty list is legal: every box removed = a negative sample
         try:
             cls = int(b["cls"])
-            cx, cy, w, h = (float(b[k]) for k in ("cx", "cy", "w", "h"))
         except (KeyError, TypeError, ValueError):
             raise HTTPException(400, f"malformed box: {b!r}")
-        if not 0 <= cls < nclasses or not all(0 <= v <= 1 for v in (cx, cy, w, h)):
+        cx, cy, w, h = parse_box(b)
+        if not 0 <= cls < nclasses:
             raise HTTPException(400, f"box out of range: {b!r}")
         out.append({"cls": cls, "cx": cx, "cy": cy, "w": w, "h": h})
     return out
@@ -1434,13 +1456,18 @@ def sync_both(ds, cl, bucket):
     on same-name-same-size, so a steady state is one listing and a pile of stat calls."""
     sent, _ = ds.push(cl, bucket, names=ds.LEDGERS)
     got, _ = ds.pull(cl, bucket)
-    # The crowned weights ride along so /api/dataset/classify has something to run. Never
-    # fatal: a node with no champion labels by hand, a node that fails the pass labels
-    # nothing.
-    try:
-        ds.models(cl, bucket, root=DATASET)
-    except Exception as e:
-        print(f"models: not pulled ({e})", flush=True)
+    # The crowned weights ride along so /api/dataset/classify has something to run. A
+    # missing object is already a skip inside models(), so anything raised here is a
+    # failed download — let it out, or the Status tab calls the pass healthy while
+    # classify 503s forever.
+    ds.models(cl, bucket, root=DATASET)
+    # Pay the torch import and the weight load here rather than in the first curator's
+    # request — and again on every pass, so a freshly crowned champion is warm too.
+    if model_cfg()["detect_weights"]:
+        try:
+            detect.review_models(model_cfg())
+        except Exception as e:
+            print(f"models: not loaded ({e})", flush=True)
     return sent, got
 
 
@@ -1847,15 +1874,23 @@ def dataset_progress():
     return {"total": total, "by_who": by_who, "today": today}
 
 
+def sample_image(sid, first=None):
+    """This sample's frame wherever it currently lives, or None. `first` is the tree the
+    caller believes it is in — tried first, then the rest, because a sample moves between
+    trees mid-review and a stale guess is not worth a 404. Gold hides in its own dir."""
+    if sid.startswith("g-"):
+        gold = gold_for(sid)
+        return gold / "image.jpg" if gold and (gold / "image.jpg").is_file() else None
+    trees = dict.fromkeys((first, *TREES) if first else TREES)
+    return next((p for p in (sample_paths(sid, t)[0] for t in trees) if p.is_file()), None)
+
+
 @app.get("/api/dataset/image")
 def dataset_image(id: str):
-    sid = valid_sample_id(id)
-    gold = gold_for(sid) if sid.startswith("g-") else None
-    for img in ([gold / "image.jpg"] if gold else
-                [sample_paths(sid, t)[0] for t in TREES]):
-        if img.is_file():
-            return FileResponse(img, media_type="image/jpeg")
-    raise HTTPException(404, f"no pending sample {id!r}")
+    img = sample_image(valid_sample_id(id))
+    if img is None:
+        raise HTTPException(404, f"no pending sample {id!r}")
+    return FileResponse(img, media_type="image/jpeg")
 
 
 @app.post("/api/dataset/classify")
@@ -1866,36 +1901,25 @@ def dataset_classify(body: dict = Body(default={}), x_curator_token: str = Heade
     check_token(valid_who(body.get("who")), x_curator_token)
     sid = valid_sample_id(body.get("id"))
     tree = valid_tree(body.get("tree") or "pending")
-    b = body.get("box") or {}
-    try:
-        cx, cy, w, h = (float(b[k]) for k in ("cx", "cy", "w", "h"))
-    except (KeyError, IndexError, TypeError, ValueError):
-        raise HTTPException(400, "box must be {cx, cy, w, h} in 0..1")
-    if not all(0 <= v <= 1 for v in (cx, cy, w, h)) or not (w > 0 and h > 0):
-        raise HTTPException(400, "box must be {cx, cy, w, h} in 0..1")
-    gold = gold_for(sid) if sid.startswith("g-") else None
-    # The named tree first, then the rest: a sample moves between trees mid-review and a
-    # stale tree in the caller is not worth a 404.
-    img = next((p for p in ([gold / "image.jpg"] if gold else
-                            [sample_paths(sid, t)[0] for t in (tree, *TREES)]) if p.is_file()),
-               None)
+    cx, cy, w, h = parse_box(body.get("box") or {})
+    if not (w > 0 and h > 0):   # a label may hold a degenerate box; there is nothing to crop
+        raise HTTPException(400, "box has no area")
+    img = sample_image(sid, tree)
     if img is None:
         raise HTTPException(404, f"no sample {sid!r}")
-    def weights(key, name):
-        return CONFIG.get(key) or (str(DATASET / name) if (DATASET / name).is_file() else "")
-    cfg = {"detect_weights": weights("detect_weights", "champion.pt"),
-           "attr_weights": weights("attr_weights", "attrs-champion.pt")}
+    cfg = model_cfg()
     if not cfg["detect_weights"]:
-        raise HTTPException(503, "no champion on this node yet — it arrives with the next sync")
+        raise HTTPException(503, "no champion on this node yet — " + (
+            "it arrives with the next sync" if CURATION else
+            "run: python dataset_sync.py models, or set detect_weights in config.yaml"))
     res, err = detect.classify_box(img.read_bytes(), cfg, (cx, cy, w, h))
     if err:
         raise HTTPException(503, err)
     names, vocab = dataset_classes(), attr_vocab()
-    name = (res or {}).get("cls")
+    name = res["cls"]
     # A head this node has no vocabulary for is the model talking about a different
     # dataset — dropped, not offered to the curator as a value they cannot save.
-    attrs = {k: v for k, v in ((res or {}).get("attrs") or {}).items()
-             if k in vocab and v in vocab[k]}
+    attrs = {k: v for k, v in (res["attrs"] or {}).items() if k in vocab and v in vocab[k]}
     return {"ok": True, "cls": names.index(name) if name in names else None,
             "name": name or None, "attrs": attrs}
 
