@@ -13,6 +13,10 @@
 builder = "RAILPACK"
 # Only the curation service carries torch: service variables are visible at build time,
 # so the extra install is gated on FIELDKIT_MODE and every other service builds as before.
+# ultralytics brings the GUI build of OpenCV, which needs X11/GL libraries the slim image
+# lacks; the curation service sets RAILPACK_DEPLOY_APT_PACKAGES to
+# "libgl1 libglib2.0-0 libxcb1 libsm6 libxext6 libxrender1" for that (a service variable,
+# not repo config — Railpack reads it at build time).
 buildCommand = "if [ \"$FIELDKIT_MODE\" = curation ]; then pip install -r requirements-curation.txt; fi"
 
 [deploy]
