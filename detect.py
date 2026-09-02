@@ -41,6 +41,8 @@ RECOUNT_GUARD = 45.0     # a counted vehicle's resting place is remembered this 
 GUARD_IOU = 0.5
 DRAWN_IOU = 0.3          # looser than GUARD_IOU: a hand-drawn box is a curator's estimate
                          # of where a vehicle is, not a detector's box seen twice
+CROP_CONF = 0.15         # a second look at the crop alone: the curator drew there because the
+                         # detector missed it at CONF, so the crop is asked more leniently
 COUNT_LINE = 0.55        # where a vehicle is counted once a camera has a travel axis: a line
                          # across that axis, as a fraction of the frame. Counting on a crossing
                          # is what survives a queue — a vehicle that crawls, stops, is hidden
@@ -460,6 +462,25 @@ def review_frame(jpeg, cfg):
     return _under_review(jpeg, cfg, draw)
 
 
+def crop_class(m, img, xyxy):
+    """The vehicle filling a curator's crop, when the full frame showed none there. The
+    crop is padded and scaled up so a distant vehicle the frame-level pass skipped is
+    large enough to see, and the largest vehicle in it is the one that was drawn."""
+    c = crop(img, xyxy, pad=0.25)
+    scale = max(1, 320 // max(1, min(c.width, c.height)))
+    if scale > 1:
+        c = c.resize((c.width * scale, c.height * scale))
+    best = None
+    for r in m["model"].predict(c, imgsz=640, conf=CROP_CONF, agnostic_nms=True,
+                                device=m["dev"], verbose=False, **m["extra"]):
+        for b, cid in zip(r.boxes.xyxy.tolist(), r.boxes.cls.tolist()):
+            cls = m["lookup"].get(int(cid))
+            area = (b[2] - b[0]) * (b[3] - b[1])
+            if cls and is_vehicle(cls) and (best is None or area > best[0]):
+                best = (area, cls)
+    return best[1] if best else None
+
+
 def classify_box(jpeg, cfg, box):
     """What the curator just drew: the class of the vehicle under the box and its
     attributes. `box` is (cx, cy, w, h) normalised 0..1, the YOLO label convention.
@@ -473,7 +494,7 @@ def classify_box(jpeg, cfg, box):
         cx, cy, w, h = (float(v) for v in box)
         drawn = ((cx - w / 2) * img.width, (cy - h / 2) * img.height,
                  (cx + w / 2) * img.width, (cy + h / 2) * img.height)
-        cls = best_match(dets, drawn)
+        cls = best_match(dets, drawn) or crop_class(m, img, drawn)
         return {"cls": cls,
                 "attrs": m["attrs"](crop(img, drawn)) if (cls and m["attrs"]) else {}}
     return _under_review(jpeg, cfg, pick)
