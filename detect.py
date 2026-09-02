@@ -333,14 +333,9 @@ _review = {}                      # lazy singleton: model + class lookup, built 
 _review_lock = threading.Lock()
 
 
-def review_frame(jpeg, cfg):
-    """Annotate one still for the Review tab. -> (jpeg bytes, None) | (None, error).
-
-    predict(), not track(): stills have no continuity, and the live models belong to the
-    worker thread — sharing one would corrupt its ByteTrack state.
-
-    ponytail: one model behind one lock, so concurrent scrubs queue instead of racing it.
-    Upgrade path: a small pool if review ever needs parallelism.
+def review_models(cfg):
+    """The Review tab's model + optional attribute classifier, loaded once and reused.
+    -> (models, None) | (None, error). Callers run the model under `_review_lock`.
     """
     weights = str(cfg.get("detect_weights", "") or "").strip()
     if weights and not Path(weights).exists():
@@ -371,22 +366,82 @@ def review_frame(jpeg, cfg):
                 _review["attrs"] = (attr_classifier(attrs_path, _review["dev"])
                                     if attrs_path else None)
                 _review["attrs_path"] = attrs_path
+            return _review, None
+        except ImportError:
+            return None, PIP_HINT
+        except Exception as e:
+            return None, str(e)
+
+
+def review_predict(m, img):
+    """Every detection the review model sees in one frame -> [(cls, conf, xyxy)]."""
+    dets = []
+    for r in m["model"].predict(img, imgsz=IMGSZ, conf=CONF, agnostic_nms=True,
+                                device=m["dev"], verbose=False, **m["extra"]):
+        for box, cid, conf in zip(r.boxes.xyxy.tolist(), r.boxes.cls.tolist(),
+                                  r.boxes.conf.tolist()):
+            cls = m["lookup"].get(int(cid))
+            if cls:
+                dets.append((cls, float(conf), tuple(float(v) for v in box)))
+    return dets
+
+
+def best_match(dets, xyxy, floor=0.3):
+    """Class of the detection that best covers a hand-drawn box, or None when nothing
+    overlaps it enough. Wheels never win: a curator drawing a box means the vehicle, and
+    a wheel sitting inside a small crop can otherwise beat the truck around it."""
+    hits = [(iou(box, xyxy), cls) for cls, _conf, box in dets if cls != WHEEL]
+    score, cls = max(hits, key=lambda h: h[0], default=(0.0, None))
+    return cls if score >= floor else None
+
+
+def review_frame(jpeg, cfg):
+    """Annotate one still for the Review tab. -> (jpeg bytes, None) | (None, error).
+
+    predict(), not track(): stills have no continuity, and the live models belong to the
+    worker thread — sharing one would corrupt its ByteTrack state.
+
+    ponytail: one model behind one lock, so concurrent scrubs queue instead of racing it.
+    Upgrade path: a small pool if review ever needs parallelism.
+    """
+    m, err = review_models(cfg)
+    if err:
+        return None, err
+    with _review_lock:
+        try:
             from PIL import Image
             img = Image.open(io.BytesIO(jpeg)).convert("RGB")
-            dets = []
-            for r in _review["model"].predict(img, imgsz=IMGSZ, conf=CONF, agnostic_nms=True,
-                                              device=_review["dev"], verbose=False,
-                                              **_review["extra"]):
-                for box, cid, conf in zip(r.boxes.xyxy.tolist(), r.boxes.cls.tolist(),
-                                          r.boxes.conf.tolist()):
-                    cls = _review["lookup"].get(int(cid))
-                    if not cls:
-                        continue
-                    box = tuple(float(v) for v in box)
-                    attrs = _review["attrs"](crop(img, box)) if (
-                        _review["attrs"] and cls != WHEEL) else {}
-                    dets.append((cls, float(conf), box, attr_text(attrs)))
-            return annotate(img, dets), None
+            shown = []
+            for cls, conf, box in review_predict(m, img):
+                attrs = m["attrs"](crop(img, box)) if (m["attrs"] and cls != WHEEL) else {}
+                shown.append((cls, conf, box, attr_text(attrs)))
+            return annotate(img, shown), None
+        except ImportError:
+            return None, PIP_HINT
+        except Exception as e:
+            return None, str(e)
+
+
+def classify_box(jpeg, cfg, box):
+    """What the curator just drew: the class of the vehicle under the box and its
+    attributes. `box` is (cx, cy, w, h) normalised 0..1, the YOLO label convention.
+    -> ({"cls": name | None, "attrs": {head: value}}, None) | (None, error).
+
+    Attributes come from the drawn box, not the matched detection: the curator framed the
+    vehicle they meant, and that crop is the better one even when the detector disagrees
+    about where the box belongs."""
+    m, err = review_models(cfg)
+    if err:
+        return None, err
+    with _review_lock:
+        try:
+            from PIL import Image
+            img = Image.open(io.BytesIO(jpeg)).convert("RGB")
+            cx, cy, w, h = (float(v) for v in box)
+            drawn = ((cx - w / 2) * img.width, (cy - h / 2) * img.height,
+                     (cx + w / 2) * img.width, (cy + h / 2) * img.height)
+            return {"cls": best_match(review_predict(m, img), drawn),
+                    "attrs": m["attrs"](crop(img, drawn)) if m["attrs"] else {}}, None
         except ImportError:
             return None, PIP_HINT
         except Exception as e:
@@ -1431,6 +1486,14 @@ if __name__ == "__main__":
     assert config_axles("1+2+3") == 6 and config_axles("1222") == 7 and config_axles("1+1") == 2
     assert config_axles("other") is None and config_axles("") is None and config_axles(None) is None
     assert letter_of("mini-bus-long") is None, "only a single-letter prefix is a toll letter"
+
+    # A drawn box picks the detection that covers it.
+    DRAWN = (100.0, 100.0, 200.0, 200.0)
+    assert best_match([("car", 0.9, DRAWN)], DRAWN) == "car"
+    assert best_match([("car", 0.9, (0.0, 0.0, 20.0, 20.0))], DRAWN) is None, "too far off"
+    assert best_match([("truck", 0.6, (105.0, 105.0, 195.0, 195.0)),
+                       (WHEEL, 0.9, DRAWN)], DRAWN) == "truck", "a wheel never wins"
+    assert best_match([], DRAWN) is None
 
     # Axles from wheels. Gaps of 2 and 1 px are the same axle seen doubled; 38-40 px
     # gaps are separate axles, so these six wheels are 4 axles.
