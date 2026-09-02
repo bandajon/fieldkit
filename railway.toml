@@ -11,6 +11,9 @@
 # tab, which is far more use than a container that never started.
 [build]
 builder = "RAILPACK"
+# Only the curation service carries torch: service variables are visible at build time,
+# so the extra install is gated on FIELDKIT_MODE and every other service builds as before.
+buildCommand = "if [ \"$FIELDKIT_MODE\" = curation ]; then pip install -r requirements-curation.txt; fi"
 
 [deploy]
 startCommand = "{ mkdir -p /data/dataset && rm -rf dataset && ln -s /data/dataset dataset; } || echo 'boot: no /data volume — using the repo dataset dir'; python dataset_sync.py pull --config || echo 'boot: no dataset pulled — serving what is already here'; exec python app.py"

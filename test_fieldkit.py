@@ -929,6 +929,91 @@ def queue_focus_filters_and_suggests():
             app.DATASET, app.REVIEWERS = keep
 
 
+def classify_suggests_class_and_attrs():
+    """The curator draws a box, the crowned models say what is in it. Stubbed detection:
+    what is under test is the plumbing — the vocab filter, the class-name lookup, and
+    every way this can decline."""
+    import tempfile
+    import app
+
+    keep = (app.DATASET, app.CONFIG, app.detect.classify_box)
+    tokens = dict(app.GOLD_TOKENS)
+    with tempfile.TemporaryDirectory() as d:
+        try:
+            app.DATASET, app.CONFIG = Path(d), {}
+            app.write_yaml("curators.yaml", {"jonah": "tok-jonah"})
+            (Path(d) / "classes.txt").write_text("a-small\ne-heavy\n")
+            (Path(d) / "attributes.yaml").write_text(yaml.safe_dump(
+                {"type": ["car", "rigid-truck"], "axles": ["2", "6"]}))
+            for sub, name, data in (("images", "x1.jpg", b"jpg"),
+                                    ("labels", "x1.txt", b"0 0.5 0.5 0.1 0.1\n")):
+                (Path(d) / "pending" / sub).mkdir(parents=True, exist_ok=True)
+                (Path(d) / "pending" / sub / name).write_bytes(data)
+            champ = Path(d) / "champion.pt"
+            champ.write_bytes(b"weights")
+            body = {"who": "jonah", "id": "x1",
+                    "box": {"cx": 0.5, "cy": 0.5, "w": 0.2, "h": 0.2}}
+            call = lambda **kw: app.dataset_classify({**body, **kw}, x_curator_token="tok-jonah")
+
+            app.detect.classify_box = lambda jpeg, cfg, box: (
+                {"cls": "e-heavy", "attrs": {"type": "rigid-truck", "axles": "6",
+                                             "bogus": "x", "type2": "y"}}, None)
+            r = call()
+            assert r == {"ok": True, "cls": 1, "name": "e-heavy",
+                         "attrs": {"type": "rigid-truck", "axles": "6"}}, r
+
+            # A stock COCO name the operator's class list has never heard of: named, unmapped.
+            app.detect.classify_box = lambda jpeg, cfg, box: ({"cls": "truck", "attrs": {}}, None)
+            assert call() == {"ok": True, "cls": None, "name": "truck", "attrs": {}}
+
+            def fails(what, **kw):
+                try:
+                    call(**kw)
+                except app.HTTPException as e:
+                    return e.status_code
+                raise AssertionError(f"{what} must be refused")
+
+            # A degenerate box is legal in a label file — parse_boxes takes it — but there
+            # is nothing to crop, so classify alone refuses it.
+            assert app.parse_boxes({"boxes": [{"cls": 0, "cx": 0.5, "cy": 0.5,
+                                               "w": 0, "h": 0.1}]})[0]["w"] == 0
+
+            # The frame is found wherever it lives now, whatever tree the caller names.
+            (Path(d) / "approved" / "images").mkdir(parents=True)
+            (Path(d) / "approved" / "images" / "x2.jpg").write_bytes(b"jpg")
+            assert app.sample_image("x1").name == "x1.jpg", "pending is searched"
+            assert app.sample_image("x2", "pending").parent.parent.name == "approved", \
+                "a stale tree falls through to the others"
+            assert app.sample_image("nosuch") is None
+            gold = Path(d) / "gold" / "g1"
+            gold.mkdir(parents=True)
+            (gold / "perturbed.txt").write_text("0 0.5 0.5 0.1 0.1\n")
+            (gold / "image.jpg").write_bytes(b"jpg")
+            app.GOLD_TOKENS["g-abcd1234"] = "g1"
+            assert app.sample_image("g-abcd1234") == gold / "image.jpg", "gold has its own dir"
+
+            app.detect.classify_box = lambda jpeg, cfg, box: (None, "boom")
+            assert fails("a detector that errors") == 503
+            app.detect.classify_box = lambda jpeg, cfg, box: ({"cls": "e-heavy", "attrs": {}}, None)
+            assert fails("a zero-width box", box={"cx": 0.5, "cy": 0.5, "w": 0, "h": 0.2}) == 400
+            assert fails("a box outside the frame",
+                         box={"cx": 1.5, "cy": 0.5, "w": 0.2, "h": 0.2}) == 400
+            assert fails("a box missing a side", box={"cx": 0.5, "cy": 0.5}) == 400
+            assert fails("an unknown sample", id="nosuch") == 404
+            champ.unlink()
+            assert fails("a node with no champion") == 503, "no weights is 503, not a crash"
+            champ.write_bytes(b"weights")
+            try:
+                app.dataset_classify(body, x_curator_token="tok-wrong")
+                raise AssertionError("a bad token must be refused")
+            except app.HTTPException as e:
+                assert e.status_code == 401, e.detail
+        finally:
+            app.DATASET, app.CONFIG, app.detect.classify_box = keep
+            app.GOLD_TOKENS.clear()
+            app.GOLD_TOKENS.update(tokens)
+
+
 def routes_point_at_their_handlers():
     """A helper inserted between a decorator and its function silently steals the route
     (FastAPI then demands the helper's arguments as query fields — a live 422). Pin the
@@ -938,6 +1023,7 @@ def routes_point_at_their_handlers():
            for m in (getattr(r, "methods", None) or ())}
     for (method, path), fn in {("GET", "/api/dataset/samples"): "dataset_samples",
                                ("POST", "/api/dataset/label"): "dataset_label",
+                               ("POST", "/api/dataset/classify"): "dataset_classify",
                                ("GET", "/api/dataset/search"): "dataset_search",
                                ("POST", "/api/dataset/release"): "dataset_release",
                                ("POST", "/api/dataset/assign"): "assign_edit",
@@ -976,6 +1062,7 @@ check("training split honours the reference set", training_split_honours_referen
 check("queue orders by capture time", queue_orders_by_capture_time)
 check("approved counts split new from frozen", approved_counts_split_new_from_frozen)
 check("queue focus filters and suggests", queue_focus_filters_and_suggests)
+check("classify suggests a class and its attributes", classify_suggests_class_and_attrs)
 check("routes point at their handlers", routes_point_at_their_handlers)
 
 print(f"\n{'FAILED: ' + ', '.join(FAILS) if FAILS else 'all passed'}")

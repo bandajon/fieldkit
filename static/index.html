@@ -1200,16 +1200,18 @@ const labLocked = (b, head) => b.touched.has(head) || b.suggested.has(head);
 
 // Fills heads nothing has claimed, skipping values the class disallows — machinery must never
 // overwrite a deliberate choice nor introduce a flagged-stale value.
-// `soft` lets a value the model merely suggested give way — the operator tapping the head
-// that implies it (axles -> axle-config) outranks a guess about the same box. A head the
-// operator touched themselves never gives way here.
-function labFill(b, map, soft) {
-  const name = labClasses[b.cls];
+// `mode` true/'soft' lets a value the model merely suggested give way — the operator tapping
+// the head that implies it (axles -> axle-config) outranks a guess about the same box.
+// 'suggest' is the model proposing values itself: same guards, but the head lights up as a
+// suggestion rather than settling silently. A head the operator touched never gives way here.
+function labFill(b, map, mode) {
+  const name = labClasses[b.cls], sug = mode === 'suggest', soft = mode === true || mode === 'soft';
   for (const [head, v] of Object.entries(map || {})) {
-    if (b.touched.has(head) || (b.suggested.has(head) && !soft)) continue;
+    if (b.touched.has(head) || (b.suggested.has(head) && !soft && !sug)) continue;
     if (!labVocab(head, name, null).some(([a]) => a === v)) continue;
     b.attrs[head] = v;
-    if (soft) b.suggested.delete(head);
+    if (sug) b.suggested.add(head);
+    else if (soft) b.suggested.delete(head);
   }
 }
 
@@ -1280,6 +1282,16 @@ async function labExShow(target) {
   }
 }
 
+// A box's class changed: repaint its chrome in place. Never re-render the wrapper — that
+// would refetch the image. labSelect re-adds .sel.
+function labRepaint(i) {
+  const b = labBoxes[i], d = document.querySelector(`#l-wrap .box[data-i="${i}"]`);
+  if (!b || !d) return;
+  d.className = boxCls(b);
+  d.style.setProperty('--c', clsColor(b.cls));
+  d.querySelector('span').textContent = labClasses[b.cls] || 'removed';
+}
+
 document.getElementById('l-attrs').onclick = e => {
   const t = e.target.closest('[data-head], [data-cls], [data-add], [data-ex]'),
         b = labBoxes[labSel];
@@ -1291,10 +1303,7 @@ document.getElementById('l-attrs').onclick = e => {
     b.cls = +t.dataset.cls;
     if (b.cls < labClasses.length) labLastCls = b.cls;   // runs of one missed class draw as that class
     labDefault(b);
-    const d = document.querySelector(`#l-wrap .box[data-i="${labSel}"]`);
-    d.className = boxCls(b);        // labSelect re-adds .sel below
-    d.style.setProperty('--c', clsColor(b.cls));
-    d.querySelector('span').textContent = labClasses[b.cls] || 'removed';
+    labRepaint(labSel);
   } else if (b.attrs[head] === t.dataset.val) {
     delete b.attrs[head];           // tap the active chip to unset
     b.touched.delete(head);
@@ -1424,6 +1433,44 @@ document.getElementById('l-wrap').onpointerdown = e => {
   };
 };
 
+// A freshly drawn box goes to the champion for a class and attributes. Everything it answers
+// is a suggestion, lit but overridable, exactly like the VLM pre-fills — and everything here
+// is best-effort: the drawn box survives a missing model, a stale index or a dead network.
+let labClassifySaid = false;
+async function labClassify(b, i) {
+  const s = labQueue[0];
+  if (!s) return;
+  const tree = s.tree || (labOpened && labOpened.tree) || 'pending';
+  const was = b.cls;                         // a class tapped while this is in flight wins
+  let r;
+  try {
+    r = await post('/api/dataset/classify',
+                   {id: s.id, tree, who: labWho, box: {cx: b.cx, cy: b.cy, w: b.w, h: b.h}});
+  } catch (e) { return; }                    // network gone: the box is drawn, that is what matters
+  if (labBoxes[i] !== b || b.del) return;    // the curator moved on; nothing left to suggest onto
+  if (b.cls >= labClasses.length) return;    // an explicit removal outranks a late suggestion
+  // Said once: a node with no champion fails on every box, and the queue note is worth more
+  // than the same complaint restated per draw.
+  if (r.detail) {
+    if (!labClassifySaid) { labClassifySaid = true; labNote(String(r.detail)); }
+    return;
+  }
+  // Bounds-checked: a class this page has not loaded would land on the 'removed' rung and
+  // drop the box from the label POST entirely.
+  if (typeof r.cls === 'number' && r.cls !== b.cls && b.cls === was && r.cls < labClasses.length) {
+    b.cls = r.cls;
+    labLastCls = r.cls;                      // the next box in a run draws as this class too
+    labDefault(b);                           // same cleanup a class tap does
+    labRepaint(i);
+  }
+  labFill(b, r.attrs, 'suggest');
+  // A suggested axle count cascades to its configuration just as a tapped one would.
+  labFill(b, (labImplies.axles || {})[b.attrs.axles], true);
+  if (labSel === i) labSelect(i);
+  const said = [r.name, ...Object.values(r.attrs || {})].filter(Boolean);
+  labNote(said.length ? 'suggested: ' + said.join(' · ') : 'no suggestion for this box');
+}
+
 // Press on the image itself: rubber-band a new box for a vehicle the detector missed.
 function labDraw(e) {
   const wrap = e.currentTarget, r = wrap.getBoundingClientRect();
@@ -1450,6 +1497,7 @@ function labDraw(e) {
     nb.suggested = new Set();
     labBoxes.push(nb);                                  // data-i already holds this index
     labSelect(labBoxes.length - 1);
+    labClassify(nb, labBoxes.length - 1);               // suggestions land when they land
   };
 }
 
@@ -1685,8 +1733,8 @@ function labRosterShow(d) {
   document.getElementById('l-signin').hidden = true;
   document.getElementById('l-team-add').hidden = false;
   const handles = Object.keys(d.curators).map(h => `<option>${esc(h)}</option>`).join('');
-  labFill(document.getElementById('l-acur'), handles);
-  labFill(document.getElementById('l-swho'), '<option value="">any curator</option>' + handles);
+  labOptions(document.getElementById('l-acur'), handles);
+  labOptions(document.getElementById('l-swho'), '<option value="">any curator</option>' + handles);
   // Tokens are made to be read out and handed over, so they are shown, not masked.
   // .toggle so the trust button lights when it is on, the way every other state chip here does —
   // .halt is reserved for the one destructive control on the row.
@@ -1758,7 +1806,9 @@ document.getElementById('l-roster').onclick = async e => {
 // --- Supervisor: who is labelling what ---
 // Refilling a <select> drops its selection; keep it where the option survived, else fall to the
 // first, since value='' on an option-less select leaves the box blank.
-function labFill(sel, html) {
+// Not labFill: one script, so a second top-level function of that name silently replaces the
+// box-attribute labFill above and every default and implies cascade quietly stops working.
+function labOptions(sel, html) {
   const keep = sel.value;
   sel.innerHTML = html;
   sel.value = keep;
@@ -1782,11 +1832,11 @@ function labAssignShow(d) {
   labAssigns = d.assignments || {};
   labClasses = d.classes || labClasses;      // same list labLoad reads; keeps the colours in step
   labCats = d.categories || labCats;
-  labFill(document.getElementById('l-acls'),
+  labOptions(document.getElementById('l-acls'),
           '<option value="all">All classes</option>' + labTargets());
-  labFill(document.getElementById('l-scls'), '<option value="">any class</option>' + labTargets());
+  labOptions(document.getElementById('l-scls'), '<option value="">any class</option>' + labTargets());
   // Attributes as search terms: same head = either value, different heads = both on one box.
-  labFill(document.getElementById('l-sattr'), '<option value="">any attributes</option>' +
+  labOptions(document.getElementById('l-sattr'), '<option value="">any attributes</option>' +
     Object.entries(labAttrs).map(([h, vals]) => `<optgroup label="${esc(h)}">` +
       vals.map(v => `<option value="${esc(h)}=${esc(v)}">${esc(h)}: ${esc(v)}</option>`).join('') +
       '</optgroup>').join(''));
