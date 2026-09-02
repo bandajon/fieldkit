@@ -7,6 +7,7 @@ the worker thread, so a node without them reports state "absent" and the rest of
 FieldKit runs. Design: docs/superpowers/specs/2026-08-19-video-feed-and-labeling-design.md
 """
 
+import hashlib
 import io
 import os
 import json
@@ -38,6 +39,8 @@ RECOUNT_GUARD = 45.0     # a counted vehicle's resting place is remembered this 
                          # that moved far while untracked still recounts; the honest fix
                          # there is higher effective fps, not longer memory.
 GUARD_IOU = 0.5
+DRAWN_IOU = 0.3          # looser than GUARD_IOU: a hand-drawn box is a curator's estimate
+                         # of where a vehicle is, not a detector's box seen twice
 COUNT_LINE = 0.55        # where a vehicle is counted once a camera has a travel axis: a line
                          # across that axis, as a fraction of the frame. Counting on a crossing
                          # is what survives a queue — a vehicle that crawls, stops, is hidden
@@ -132,6 +135,12 @@ def jpeg_crop(img, box, quality=80):
     buf = io.BytesIO()
     crop(img, box).save(buf, "JPEG", quality=quality)
     return buf.getvalue()
+
+
+def is_vehicle(cls):
+    """Wheels are detected but never counted, labelled or classified — they only feed
+    axle counting."""
+    return cls != WHEEL
 
 
 def letter_of(name):
@@ -362,15 +371,37 @@ def review_models(cfg):
                 COLORS.update(palette(lookup.values()))
                 _review.update(path=stamp, model=model, lookup=lookup, dev=dev,
                                extra={} if weights else {"classes": list(CLASSES)})
-            if _review.get("attrs_path") != attrs_path:
+            # Same (path, mtime) shape as the detector: sync overwrites the attrs
+            # champion in place, so the path alone would serve the dethroned head.
+            attrs_stamp = (attrs_path, os.stat(attrs_path).st_mtime if attrs_path else 0)
+            if _review.get("attrs_path") != attrs_stamp:
                 _review["attrs"] = (attr_classifier(attrs_path, _review["dev"])
                                     if attrs_path else None)
-                _review["attrs_path"] = attrs_path
-            return _review, None
+                _review["attrs_path"] = attrs_stamp
+            # A snapshot, not the live dict: a caller predicts after releasing the lock's
+            # load half, and the next cfg through here must not swap the model under it.
+            return dict(_review), None
         except ImportError:
             return None, PIP_HINT
         except Exception as e:
             return None, str(e)
+
+
+_memo = ()      # (model stamp, jpeg digest, dets) for the frame last looked at
+
+
+def memo_dets(key, jpeg, predict):
+    """Detections for one frame, computed once. A curator drawing four boxes on a still
+    asks four times about the same pixels, and a full-frame predict each time is seconds
+    of wall clock for an answer already known.
+
+    ponytail: one entry — a curator works a frame at a time. A small LRU if they ever
+    interleave frames."""
+    global _memo
+    digest = hashlib.sha1(jpeg).hexdigest()
+    if _memo[:2] != (key, digest):
+        _memo = (key, digest, predict())
+    return _memo[2]
 
 
 def review_predict(m, img):
@@ -386,17 +417,17 @@ def review_predict(m, img):
     return dets
 
 
-def best_match(dets, xyxy, floor=0.3):
+def best_match(dets, xyxy, floor=DRAWN_IOU):
     """Class of the detection that best covers a hand-drawn box, or None when nothing
     overlaps it enough. Wheels never win: a curator drawing a box means the vehicle, and
     a wheel sitting inside a small crop can otherwise beat the truck around it."""
-    hits = [(iou(box, xyxy), cls) for cls, _conf, box in dets if cls != WHEEL]
+    hits = [(iou(box, xyxy), cls) for cls, _conf, box in dets if is_vehicle(cls)]
     score, cls = max(hits, key=lambda h: h[0], default=(0.0, None))
     return cls if score >= floor else None
 
 
-def review_frame(jpeg, cfg):
-    """Annotate one still for the Review tab. -> (jpeg bytes, None) | (None, error).
+def _under_review(jpeg, cfg, fn):
+    """Load the models, decode the frame, run `fn(m, img, dets)` -> (result, None) | (None, error).
 
     predict(), not track(): stills have no continuity, and the live models belong to the
     worker thread — sharing one would corrupt its ByteTrack state.
@@ -411,15 +442,22 @@ def review_frame(jpeg, cfg):
         try:
             from PIL import Image
             img = Image.open(io.BytesIO(jpeg)).convert("RGB")
-            shown = []
-            for cls, conf, box in review_predict(m, img):
-                attrs = m["attrs"](crop(img, box)) if (m["attrs"] and cls != WHEEL) else {}
-                shown.append((cls, conf, box, attr_text(attrs)))
-            return annotate(img, shown), None
+            return fn(m, img, memo_dets(m["path"], jpeg, lambda: review_predict(m, img))), None
         except ImportError:
             return None, PIP_HINT
         except Exception as e:
             return None, str(e)
+
+
+def review_frame(jpeg, cfg):
+    """Annotate one still for the Review tab. -> (jpeg bytes, None) | (None, error)."""
+    def draw(m, img, dets):
+        shown = [(cls, conf, box,
+                  attr_text(m["attrs"](crop(img, box))
+                            if (m["attrs"] and is_vehicle(cls)) else {}))
+                 for cls, conf, box in dets]
+        return annotate(img, shown)
+    return _under_review(jpeg, cfg, draw)
 
 
 def classify_box(jpeg, cfg, box):
@@ -429,23 +467,16 @@ def classify_box(jpeg, cfg, box):
 
     Attributes come from the drawn box, not the matched detection: the curator framed the
     vehicle they meant, and that crop is the better one even when the detector disagrees
-    about where the box belongs."""
-    m, err = review_models(cfg)
-    if err:
-        return None, err
-    with _review_lock:
-        try:
-            from PIL import Image
-            img = Image.open(io.BytesIO(jpeg)).convert("RGB")
-            cx, cy, w, h = (float(v) for v in box)
-            drawn = ((cx - w / 2) * img.width, (cy - h / 2) * img.height,
-                     (cx + w / 2) * img.width, (cy + h / 2) * img.height)
-            return {"cls": best_match(review_predict(m, img), drawn),
-                    "attrs": m["attrs"](crop(img, drawn)) if m["attrs"] else {}}, None
-        except ImportError:
-            return None, PIP_HINT
-        except Exception as e:
-            return None, str(e)
+    about where the box belongs. No class means no attributes — an argmax head answers
+    "type" for a patch of empty road just as confidently, and the UI would offer it."""
+    def pick(m, img, dets):
+        cx, cy, w, h = (float(v) for v in box)
+        drawn = ((cx - w / 2) * img.width, (cy - h / 2) * img.height,
+                 (cx + w / 2) * img.width, (cy + h / 2) * img.height)
+        cls = best_match(dets, drawn)
+        return {"cls": cls,
+                "attrs": m["attrs"](crop(img, drawn)) if (cls and m["attrs"]) else {}}
+    return _under_review(jpeg, cfg, pick)
 
 
 class Reader:
@@ -869,8 +900,8 @@ class Detector:
         """
         now = self.clock()
         shown = []
-        wheels = [d for d in dets if d[0] == WHEEL]
-        dets = [d for d in dets if d[0] != WHEEL]
+        wheels = [d for d in dets if not is_vehicle(d[0])]
+        dets = [d for d in dets if is_vehicle(d[0])]
         axles = wheel_axles(dets, wheels)         # {det index: axles seen this frame}
         with self.lock:
             if not self._known(name):
@@ -1494,6 +1525,18 @@ if __name__ == "__main__":
     assert best_match([("truck", 0.6, (105.0, 105.0, 195.0, 195.0)),
                        (WHEEL, 0.9, DRAWN)], DRAWN) == "truck", "a wheel never wins"
     assert best_match([], DRAWN) is None
+
+    # One predict per frame, however many boxes; a new frame or new weights redoes it.
+    runs = []
+    def stub():
+        runs.append(1)
+        return [("car", 0.9, DRAWN)]
+    assert memo_dets("w1", b"frame", stub)[0][0] == "car"
+    memo_dets("w1", b"frame", stub)
+    assert len(runs) == 1, runs
+    memo_dets("w1", b"other frame", stub)
+    memo_dets("w2", b"other frame", stub)
+    assert len(runs) == 3, runs
 
     # Axles from wheels. Gaps of 2 and 1 px are the same axle seen doubled; 38-40 px
     # gaps are separate axles, so these six wheels are 4 axles.

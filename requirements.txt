@@ -4,10 +4,5 @@ requests
 pyyaml
 websockets
 boto3          # Cloudflare R2 offload/mirror + dataset sync
-# Detection + attributes: the Monitor overlay on a console, and classify-on-draw on the
-# curation instance. CPU-only torch keeps the cloud image ~1 GB instead of ~4 GB.
---extra-index-url https://download.pytorch.org/whl/cpu
-torch
-torchvision
-ultralytics
-pillow
+# ultralytics  # optional — Monitor detection overlay (vehicle boxes + counts)
+# pillow  # optional — Monitor detection overlay
