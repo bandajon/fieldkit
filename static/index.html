@@ -278,6 +278,8 @@
     <div class="rowbtns" id="l-acts" hidden>
       <button class="btn" id="l-back">&larr; Back</button>
       <button class="btn" id="l-toq" hidden>&larr; Back to queue</button>
+      <button class="btn" id="l-prev" hidden title="previous search hit (←)">&#9664; Prev</button>
+      <button class="btn" id="l-next" hidden title="next search hit (→)">Next &#9654;</button>
       <button class="btn go" id="l-ok">Approve</button>
       <button class="btn" id="l-skip">Skip</button>
       <button class="btn" id="l-skip10" title="skip the next ten frames">Skip 10</button>
@@ -1082,6 +1084,7 @@ function labShow() {
   document.getElementById('l-ok').textContent = labOne() ? 'Submit review' : 'Approve';
   document.getElementById('l-no').hidden = document.getElementById('l-back').hidden = labOne();
   document.getElementById('l-toq').hidden = !labOpened;
+  labHitButtons();
   // Reject exists only where holding does: a supervisor's review or search hit. A curator's own
   // queue carries no held flag, so the button never appears for them even if one leaked through.
   document.getElementById('l-rej').hidden = !(labOne() && s && s.held);
@@ -1531,7 +1534,14 @@ async function labSend(action) {
     labNote('Save failed — sample kept, tap again to retry.');
     return;
   }
-  if (labOpened) labSearchDrop(s.id);   // reviewed, rejected or unapproved: it left this list
+  if (labOpened) {
+    // Reviewed, rejected or unapproved: it left this list — and the browse carries on with
+    // whatever sat next to it, so a curator's whole batch is one pass of Submit, Submit, Submit.
+    const rows = labHitRows(), i = rows.findIndex(r => r.dataset.open === s.id);
+    const after = rows[i + 1] || rows[i - 1];
+    labSearchDrop(s.id);
+    if (after) return labOpenHit(after.dataset.open, after.dataset.tree, false);
+  }
   if (labOne()) return labLoad();   // no queue behind this one: go back for the next
   if (action === 'approve') {   // bumped locally; the next labLoad trues it up from disk
     labDone.push(s.id);         // approvals only — a discard is deleted server-side
@@ -1972,10 +1982,7 @@ const labThumbs = new IntersectionObserver(entries => entries.forEach(async en =
 }), {rootMargin: '300px'});
 
 // A hit opens in the ordinary editor — same boxes, same gestures, same Submit.
-document.getElementById('l-sres').onclick = async e => {
-  const b = e.target.closest('[data-open]');
-  if (!b) return;
-  const {open: id, tree} = b.dataset;
+async function labOpenHit(id, tree, scroll) {
   let s;
   try {
     const r = await labFetch(`/api/dataset/sample?id=${encodeURIComponent(id)}` +
@@ -1989,8 +1996,43 @@ document.getElementById('l-sres').onclick = async e => {
   labOpened = {id, tree};
   labQueue = [{...s, id, boxes: s.boxes || []}];   // the id we asked for is the one that answered
   labShow();
-  document.getElementById('l-wrap').scrollIntoView();   // the editor is a screen away from here
+  if (scroll) document.getElementById('l-wrap').scrollIntoView();   // the editor is a screen away
+}
+document.getElementById('l-sres').onclick = e => {
+  const b = e.target.closest('[data-open]');
+  if (b) labOpenHit(b.dataset.open, b.dataset.tree, true);
 };
+
+// Browsing a curator's work: the search list is the itinerary, Prev/Next (or ← →) walk it at
+// full size without a trip back to the thumbnails. Walking off the end of the loaded page
+// fetches the next one first.
+const labHitRows = () => [...document.querySelectorAll('#l-sres [data-open]')];
+function labHitButtons() {
+  const rows = labHitRows(), i = labOpened ? rows.findIndex(r => r.dataset.open === labOpened.id) : -1;
+  const prev = document.getElementById('l-prev'), next = document.getElementById('l-next');
+  prev.hidden = next.hidden = !labOpened || !rows.length;
+  prev.disabled = i <= 0;
+  next.disabled = i < 0 || (i >= rows.length - 1 && document.getElementById('l-smore').hidden);
+  next.textContent = i >= 0 ? `Next \u25b6 (${i + 1} / ${labSearchTotal})` : 'Next \u25b6';
+}
+async function labHitStep(dir) {
+  if (!labOpened) return;
+  let rows = labHitRows(), i = rows.findIndex(r => r.dataset.open === labOpened.id) + dir;
+  if (i >= rows.length && !document.getElementById('l-smore').hidden) {
+    await labSearch(labSearchOffset);         // the next page appends; the index still holds
+    rows = labHitRows();
+  }
+  const r = rows[i];
+  if (r) return labOpenHit(r.dataset.open, r.dataset.tree, false);
+  labNote(dir > 0 ? 'that was the last hit' : 'that was the first hit');
+}
+document.getElementById('l-prev').onclick = () => labHitStep(-1);
+document.getElementById('l-next').onclick = () => labHitStep(1);
+addEventListener('keydown', e => {
+  if (!labOpened || e.target.matches('input, select, textarea') || e.metaKey || e.ctrlKey) return;
+  if (e.key === 'ArrowLeft') { e.preventDefault(); labHitStep(-1); }
+  if (e.key === 'ArrowRight') { e.preventDefault(); labHitStep(1); }
+});
 
 // --- Review tab ---
 let revSegs = [], revT = 0, revTimer = null, revUrl = '';
