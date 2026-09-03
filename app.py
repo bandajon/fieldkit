@@ -1253,6 +1253,29 @@ def envelope(sid, tree, curator):
             "attrs": read_attrs(attrs_path(sid, tree))}
 
 
+def superadmin(who):
+    """The one handle whose review RELEASES held work: SUPERVISOR when the node names one,
+    else any reviewer — a node without a super admin keeps behaving as it always did."""
+    return not SUPERVISOR or who == SUPERVISOR
+
+
+def vetted(tree="holding"):
+    """{held sample id: reviewer who vetted it}. A vetting is a reviewer's sign-off short of
+    release; a later approve/reject/unapprove of the same id re-opens it, so the newest
+    audit line decides."""
+    live = {p.stem for p in (DATASET / tree / "labels").glob("*.txt")}
+    out = {}
+    for r in read_lines("audit.jsonl"):
+        sid = r.get("id")
+        if sid not in live:
+            continue
+        if r.get("action") == "review" and r.get("vetted"):
+            out[sid] = r.get("who") or "anon"
+        elif r.get("action") in ("approve", "reject", "unapprove"):
+            out.pop(sid, None)
+    return out
+
+
 def require_reviewer(who):
     """Reviewer powers need both: a proven handle, and REVIEWERS naming it."""
     if not REVIEWERS:
@@ -1281,6 +1304,20 @@ def review_label(sid, who, body):
     append_line("scores.jsonl", {"kind": "review", "who": curator, "reviewer": who,
                                  "id": sid, "score": round(score, 3),
                                  "corrections": corrections(was_boxes, was_attrs, boxes, attrs)})
+    if tree == "holding" and not superadmin(who):
+        # A reviewer who is not the super admin VETS: their version replaces the curator's
+        # in holding, scored and credited exactly as a release is, but the frame waits there
+        # for the super admin — whose search for "holding · vetted" is the release desk.
+        lbl.write_text(box_lines(boxes))
+        held_attrs = attrs_path(sid, "holding")
+        if attrs:
+            held_attrs.parent.mkdir(parents=True, exist_ok=True)
+            held_attrs.write_text(json.dumps(attrs))
+        else:
+            held_attrs.unlink(missing_ok=True)
+        audit(who, sid, "review", {"vetted": True, "curator": curator})
+        return {"ok": True, "curator": curator, "score": round(score, 3),
+                "released": False, "vetted": True}
     dst_img, dst_lbl = sample_paths(sid, "approved")
     dst_lbl.parent.mkdir(parents=True, exist_ok=True)
     dst_lbl.write_text(box_lines(boxes))
@@ -1338,7 +1375,8 @@ def dataset_review(who: str, x_curator_token: str = Header("")):
 
 @app.get("/api/dataset/search")
 def dataset_search(target: str = "", who: str = "", tree: str = "approved", limit: int = 50,
-                   offset: int = 0, attr: str = "", x_curator_token: str = Header("")):
+                   offset: int = 0, attr: str = "", vetted: int = 0,
+                   x_curator_token: str = Header("")):
     """Every frame holding a class or a whole toll category, newest first — the way back
     to work already filed, for a supervisor spot-checking a class or cleaning up after one
     curator. No class at all lists the whole tree: "what is in holding right now, and
@@ -1350,14 +1388,16 @@ def dataset_search(target: str = "", who: str = "", tree: str = "approved", limi
     ponytail: full scan of the tree per call, the same ceiling approved_counts() and
     label_files() already live with; index the labels if the dataset outgrows it."""
     require_reviewer(token_who(x_curator_token))
-    hits, by_curator = search_hits(target, who, tree, attr)
+    hits, by_curator = search_hits(target, who, tree, attr, only_vetted=bool(vetted))
     offset = max(0, offset)
     return {"results": hits[offset:offset + max(1, min(limit, 200))], "total": len(hits),
             "offset": offset, "by_curator": by_curator}
 
 
-def search_hits(target, who, tree, attr):
-    """Every frame in `tree` matching the search terms, newest first -> (hits, by_curator)."""
+def search_hits(target, who, tree, attr, only_vetted=False):
+    """Every frame in `tree` matching the search terms, newest first -> (hits, by_curator).
+    Held hits carry `vetted`: the reviewer who signed them off short of release; `only_vetted`
+    narrows holding to exactly those — the super admin's release desk."""
     tree, who = valid_tree(tree), valid_who(who)
     names = dataset_classes()
     ids = {names.index(c) for c in target_classes(target)}
@@ -1366,6 +1406,7 @@ def search_hits(target, who, tree, attr):
                                  f"{', '.join(categories() + names)}")
     want = attr_filter(attr)
     by = sample_curators(tree)
+    vet = vetted(tree) if tree == "holding" else {}
     try:
         # By capture time, not mtime: a class remap rewrites every label file (see captured_at).
         rows = sorted((DATASET / tree / "labels").glob("*.txt"),
@@ -1387,8 +1428,10 @@ def search_hits(target, who, tree, attr):
         if want and not any(isinstance(a, dict) and all(a.get(h) in vs for h, vs in want.items())
                             for a in attrs.values()):
             continue
+        if only_vetted and f.stem not in vet:
+            continue
         hits.append({"id": f.stem, "curator": curator, "tree": tree, "boxes": boxes,
-                     "attrs": attrs})
+                     "attrs": attrs, "vetted": vet.get(f.stem)})
         by_curator[curator] = by_curator.get(curator, 0) + 1
     return hits, by_curator
 
@@ -1401,15 +1444,18 @@ def dataset_release(body: dict = Body(default={}), x_curator_token: str = Header
     credited to the curator exactly as an opened-and-approved frame is."""
     me = require_reviewer(token_who(x_curator_token))
     hits, _ = search_hits(body.get("target", ""), body.get("who", ""), "holding",
-                          body.get("attr", ""))
-    released = 0
+                          body.get("attr", ""), only_vetted=bool(body.get("vetted")))
+    released = vetted_now = 0
     for h in hits:
         try:
-            review_label(h["id"], me, {"boxes": h["boxes"], "attrs": h["attrs"]})
-            released += 1
+            r = review_label(h["id"], me, {"boxes": h["boxes"], "attrs": h["attrs"]})
         except HTTPException:      # moved or torn since the listing: the rest still go
             continue
-    return {"ok": True, "released": released, "total": len(hits)}
+        if r.get("released"):
+            released += 1
+        else:
+            vetted_now += 1        # a reviewer short of super admin signs off, does not release
+    return {"ok": True, "released": released, "vetted": vetted_now, "total": len(hits)}
 
 
 def attr_filter(attr):

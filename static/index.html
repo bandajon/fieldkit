@@ -327,6 +327,7 @@
         <select id="l-stree">
           <option value="approved">approved</option>
           <option value="holding">holding</option>
+          <option value="holding-vetted">holding &middot; vetted</option>
           <option value="pending">pending</option>
         </select>
         <button class="btn go" id="l-sgo">Search</button>
@@ -1520,6 +1521,7 @@ async function labSend(action) {
   try {
     const r = await post('/api/dataset/label', {id: s.id, action, boxes, attrs, who: labWho});
     if (!r.ok) throw new Error(r.detail || 'rejected');
+    if (r.vetted) labNote('vetted — it waits in holding for the super admin to release');
   } catch (e) {
     // Finished by someone else while it was open here (a synced approval, or a slice
     // handed out twice across a restart): there is nothing left to save, so say so and
@@ -1883,13 +1885,15 @@ const SEARCH_LIMIT = 50;
 let labSearchOffset = 0;   // where the next "show more" page starts
 document.getElementById('l-sgo').onclick = () => labSearch(0);
 async function labSearch(offset) {
-  const tree = document.getElementById('l-stree').value;
+  // "holding · vetted": held frames a reviewer has signed off — the super admin's release desk.
+  const treeSel = document.getElementById('l-stree').value, tree = treeSel.replace('-vetted', '');
   // Several classes or categories at once: frames holding any of them. "any class"
   // among the picks means no class filter at all.
   const picked = [...document.getElementById('l-scls').selectedOptions].map(o => o.value);
   const attrs = [...document.getElementById('l-sattr').selectedOptions].map(o => o.value);
   const q = new URLSearchParams({target: picked.includes('') ? '' : picked.join(','),
                                  attr: attrs.includes('') ? '' : attrs.join(','),
+                                 vetted: treeSel.endsWith('-vetted') ? 1 : '',
                                  who: document.getElementById('l-swho').value,
                                  tree, limit: SEARCH_LIMIT, offset});
   const el = document.getElementById('l-sres');
@@ -1923,7 +1927,8 @@ async function labSearch(offset) {
       `<b>${esc(s.id)}</b><i class="res">${esc(s.curator || '—')}</i>` +
       names.map(n => `<span class="chip" style="--c:${clsColor(labClasses.indexOf(n))}"
         >${esc(n)}</span>`).join('') +
-      types.map(t => `<i class="res">${esc(t)}</i>`).join('') + '</button>';
+      types.map(t => `<i class="res">${esc(t)}</i>`).join('') +
+      (s.vetted ? `<i class="res">vetted by ${esc(s.vetted)}</i>` : '') + '</button>';
   }).join('');
   // A first page replaces the list; a further page is appended below what is there —
   // the pen holds thousands, and the way to "see more" must not lose the place.
@@ -1942,13 +1947,16 @@ async function labSearch(offset) {
   // Every frame still goes through review server-side, credited to its own curator.
   const rel = document.getElementById('l-srel'), who = q.get('who'), whose = who ? `${who}'s` : 'everyone\'s';
   rel.hidden = !(tree === 'holding' && d.total);
-  rel.textContent = `Release all ${d.total} of ${whose} → approved`;
+  rel.textContent = `Sign off all ${d.total} of ${whose}`;   // the server decides: release or vet
   rel.onclick = async () => {
-    if (!confirm(`Approve all ${d.total} held frames of ${whose} matching this search, as labelled?`)) return;
+    if (!confirm(`Sign off all ${d.total} held frames of ${whose} matching this search, as labelled?`)) return;
     rel.disabled = true;
-    const r = await post('/api/dataset/release', {who, target: q.get('target'), attr: q.get('attr')});
+    const r = await post('/api/dataset/release', {who, target: q.get('target'), attr: q.get('attr'),
+                                                  vetted: q.get('vetted')});
     rel.disabled = false;
-    labNote(r.detail ? String(r.detail) : `released ${r.released} of ${r.total} (${whose})`);
+    labNote(r.detail ? String(r.detail)
+          : `released ${r.released} · vetted ${r.vetted} of ${r.total} (${whose})` +
+            (r.vetted ? ' — vetted frames wait in holding for the super admin' : ''));
     labSearch(0);
   };
   el.querySelectorAll('[data-thumb]:not([src])').forEach(img => labThumbs.observe(img));

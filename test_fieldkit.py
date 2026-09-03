@@ -563,6 +563,40 @@ def attr_restricts_are_real():
     assert seen, "no restrict rules — the tanker/cargo rule should be one of them"
 
 
+def admins_vet_super_admin_releases():
+    """A reviewer who is not the super admin signs a held frame off in place; only the
+    super admin's review moves it to approved."""
+    import tempfile
+    import app
+    keep = (app.DATASET, app.REVIEWERS, app.SUPERVISOR)
+    with tempfile.TemporaryDirectory() as d:
+        try:
+            app.DATASET, app.REVIEWERS, app.SUPERVISOR = Path(d), ["jonah", "joseph"], "jonah"
+            app.write_yaml("curators.yaml", {"jonah": "tok-jonah", "joseph": "tok-joseph"})
+            (Path(d) / "classes.txt").write_text("a-small\ne-heavy\n")
+            for sub in ("images", "labels"):
+                (Path(d) / "holding" / sub).mkdir(parents=True)
+            (Path(d) / "holding" / "images" / "h1.jpg").write_bytes(b"jpg")
+            (Path(d) / "holding" / "labels" / "h1.txt").write_text("0 0.5 0.5 0.1 0.1\n")
+            (Path(d) / "audit.jsonl").write_text('{"action":"approve","id":"h1","who":"brenda","held":true}\n')
+            body = {"boxes": [{"cls": 1, "cx": .5, "cy": .5, "w": .1, "h": .1}], "attrs": {}}
+            r = app.review_label("h1", "joseph", body)
+            assert r["vetted"] and not r["released"], r
+            assert (Path(d) / "holding" / "labels" / "h1.txt").read_text().startswith("1 "), "joseph's correction is the held record"
+            assert not (Path(d) / "approved" / "labels" / "h1.txt").exists(), "still held"
+            s = app.dataset_search(tree="holding", vetted=1, x_curator_token="tok-jonah")
+            assert s["total"] == 1 and s["results"][0]["vetted"] == "joseph", s
+            assert app.dataset_search(tree="holding", x_curator_token="tok-jonah")["total"] == 1
+            rel = app.dataset_release({"vetted": 1}, x_curator_token="tok-joseph")
+            assert (rel["released"], rel["vetted"]) == (0, 1), "joseph cannot release, only vet again"
+            rel = app.dataset_release({"vetted": 1}, x_curator_token="tok-jonah")
+            assert (rel["released"], rel["vetted"]) == (1, 0), rel
+            assert (Path(d) / "approved" / "labels" / "h1.txt").is_file(), "the super admin releases"
+            assert app.dataset_search(tree="holding", x_curator_token="tok-jonah")["total"] == 0
+        finally:
+            app.DATASET, app.REVIEWERS, app.SUPERVISOR = keep
+
+
 def search_lists_the_pen():
     """No class picked = the whole tree, tallied by curator: the supervisor's view of holding."""
     import tempfile
@@ -1053,6 +1087,7 @@ check("README documents every config key", readme_documents_config)
 check("supervisor password + token minting", supervisor_tokens)
 check("attribute restrict rules are real", attr_restricts_are_real)
 check("a reviewer can remove an attribute value and remap its frames", attr_value_remove)
+check("admins vet, the super admin releases", admins_vet_super_admin_releases)
 check("search with no class lists the pen", search_lists_the_pen)
 check("claims survive a restart", claims_survive_restart)
 check("site rename", site_rename)
