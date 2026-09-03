@@ -1893,7 +1893,7 @@ async function labSearch(offset) {
   const attrs = [...document.getElementById('l-sattr').selectedOptions].map(o => o.value);
   const q = new URLSearchParams({target: picked.includes('') ? '' : picked.join(','),
                                  attr: attrs.includes('') ? '' : attrs.join(','),
-                                 vetted: treeSel.endsWith('-vetted') ? 1 : '',
+                                 ...(treeSel.endsWith('-vetted') ? {vetted: 1} : {}),
                                  who: document.getElementById('l-swho').value,
                                  tree, limit: SEARCH_LIMIT, offset});
   const el = document.getElementById('l-sres');

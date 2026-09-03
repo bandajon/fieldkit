@@ -623,6 +623,7 @@ def search_lists_the_pen():
             assert s(target="E")["total"] == 2, "a category still narrows"
             assert s(target="A,E")["total"] == 3 and s(target="a-small,e-heavy")["total"] == 3, "several terms union"
             assert s(who="curator01")["total"] == 1, "a curator still narrows"
+            assert s(vetted="")["total"] == 3, "an empty vetted= (every ordinary search sends it) is not a filter"
             assert s(target="e-heavy", who="curator01")["total"] == 0
             # Attributes narrow too: the way back to every "excavator" that was a loader.
             (Path(d) / "attributes.yaml").write_text(yaml.safe_dump(

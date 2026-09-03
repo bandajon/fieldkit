@@ -1375,7 +1375,7 @@ def dataset_review(who: str, x_curator_token: str = Header("")):
 
 @app.get("/api/dataset/search")
 def dataset_search(target: str = "", who: str = "", tree: str = "approved", limit: int = 50,
-                   offset: int = 0, attr: str = "", vetted: int = 0,
+                   offset: int = 0, attr: str = "", vetted: str = "",
                    x_curator_token: str = Header("")):
     """Every frame holding a class or a whole toll category, newest first — the way back
     to work already filed, for a supervisor spot-checking a class or cleaning up after one
@@ -1388,7 +1388,10 @@ def dataset_search(target: str = "", who: str = "", tree: str = "approved", limi
     ponytail: full scan of the tree per call, the same ceiling approved_counts() and
     label_files() already live with; index the labels if the dataset outgrows it."""
     require_reviewer(token_who(x_curator_token))
-    hits, by_curator = search_hits(target, who, tree, attr, only_vetted=bool(vetted))
+    # A string, not an int: the page sends vetted= (empty) on an ordinary search, and an
+    # int field turns that into a 422 before the search runs.
+    hits, by_curator = search_hits(target, who, tree, attr,
+                                   only_vetted=str(vetted).lower() in ("1", "true", "yes"))
     offset = max(0, offset)
     return {"results": hits[offset:offset + max(1, min(limit, 200))], "total": len(hits),
             "offset": offset, "by_curator": by_curator}
