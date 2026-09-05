@@ -518,7 +518,9 @@ def models(cl, bucket, root=DATASET):
         except Exception:
             continue                      # nothing crowned yet
         dest = root / name
-        if dest.exists() and dest.stat().st_size == size:
+        # The .json beside each model is a few hundred bytes whose size barely changes
+        # between runs — a same-size skip served a stale run name once. Always fetch those.
+        if not name.endswith(".json") and dest.exists() and dest.stat().st_size == size:
             continue
         cl.download_file(bucket, key, str(dest))
         got.append(name)
