@@ -210,19 +210,51 @@ def attr_classifier(path, dev="cpu"):
                                transforms.Normalize([0.485, 0.456, 0.406],
                                                     [0.229, 0.224, 0.225])])
 
-    def classify(pil):
+    cons = attr_constraints(path)
+
+    def classify(pil, cls=None):
+        """`cls` is the vehicle's class: each head answers only with a value that class
+        allows (attributes.yaml constraints), and a head the class rules out ([]) is
+        silent — a motorcycle cannot have three axles or an axle configuration, however
+        the crop looked."""
         with torch.no_grad():
             f = pool(net.features(prep(pil).unsqueeze(0).to(dev))).flatten(1)
-            a = {n: vocab[n][int(net.fc[j](f).argmax())] for j, n in enumerate(names)}
-        # The config head reads the wheel grouping ("1+2+3") far better than the axles
-        # head counts — 6 vs 7 was its signature miss — so when the config parses, the
-        # count IS its sum. Wheel-derived counts still override this downstream.
+            scores = {n: net.fc[j](f)[0].tolist() for j, n in enumerate(names)}
+        allowed = cons.get(cls) or {}
+        a = {}
+        for n in names:
+            v = constrained(scores[n], vocab[n], allowed.get(n))
+            if v is not None:
+                a[n] = v
+        # The config head reads the wheel grouping better than the axles head counts, so
+        # the count follows it — but only to a count the class allows.
         n = config_axles(a.get("axle-config"))
-        if n:
+        if n and (allowed.get("axles") is None or str(n) in allowed["axles"]):
             a["axles"] = str(min(n, 9))
         return a
-
     return classify
+
+
+def attr_constraints(weights_path):
+    """{class: {head: [allowed values]}} from the attributes.yaml beside the weights, or
+    {} — the dataset directory holds both, and the curation UI reads the same rules."""
+    try:
+        import yaml
+        cfg = yaml.safe_load((Path(weights_path).parent / "attributes.yaml").read_text())
+        cons = (cfg or {}).get("constraints") or {}
+        return {c: {h: [str(x) for x in v] for h, v in rules.items() if isinstance(v, list)}
+                for c, rules in cons.items() if isinstance(rules, dict)}
+    except Exception:
+        return {}
+
+
+def constrained(scores, values, allowed):
+    """The best-scoring value among those allowed. `allowed` None = every value; [] = the
+    head does not apply to this class -> None."""
+    if allowed is None:
+        return values[max(range(len(values)), key=lambda i: scores[i])]
+    ok = [i for i, v in enumerate(values) if v in allowed]
+    return values[max(ok, key=lambda i: scores[i])] if ok else None
 
 
 def config_axles(value):
@@ -455,7 +487,7 @@ def review_frame(jpeg, cfg):
     """Annotate one still for the Review tab. -> (jpeg bytes, None) | (None, error)."""
     def draw(m, img, dets):
         shown = [(cls, conf, box,
-                  attr_text(m["attrs"](crop(img, box))
+                  attr_text(m["attrs"](crop(img, box), cls)
                             if (m["attrs"] and is_vehicle(cls)) else {}))
                  for cls, conf, box in dets]
         return annotate(img, shown)
@@ -496,7 +528,7 @@ def classify_box(jpeg, cfg, box):
                  (cx + w / 2) * img.width, (cy + h / 2) * img.height)
         cls = best_match(dets, drawn) or crop_class(m, img, drawn)
         return {"cls": cls,
-                "attrs": m["attrs"](crop(img, drawn)) if (cls and m["attrs"]) else {}}
+                "attrs": m["attrs"](crop(img, drawn), cls) if (cls and m["attrs"]) else {}}
     return _under_review(jpeg, cfg, pick)
 
 
@@ -1101,7 +1133,8 @@ class Detector:
         if self.attrs and t["best"][1]:
             try:
                 from PIL import Image
-                a = dict(self.attrs(Image.open(io.BytesIO(t["best"][1])).convert("RGB")))
+                a = dict(self.attrs(Image.open(io.BytesIO(t["best"][1])).convert("RGB"),
+                                    t["counted_as"]))
             except Exception as e:      # a bad crop costs attributes, never the count
                 self.error = f"attrs: {e}"
         if t["axles"] >= 2:
@@ -1537,6 +1570,11 @@ if __name__ == "__main__":
     assert letter_of("motorcycle") is None and letter_of("wheel") is None
     assert config_axles("1+2+3") == 6 and config_axles("1222") == 7 and config_axles("1+1") == 2
     assert config_axles("other") is None and config_axles("") is None and config_axles(None) is None
+    # A head answers only with what the class allows; a ruled-out head is silent.
+    assert constrained([0.1, 0.9, 0.5], ["2", "3", "4"], None) == "3"
+    assert constrained([0.1, 0.9, 0.5], ["2", "3", "4"], ["2", "4"]) == "4", "best of the allowed, not the argmax"
+    assert constrained([0.1, 0.9, 0.5], ["2", "3", "4"], []) is None, "axle-config: [] means no config for this class"
+    assert constrained([0.1, 0.9], ["2", "3"], ["9"]) is None, "nothing allowed is nothing said"
     assert letter_of("mini-bus-long") is None, "only a single-letter prefix is a toll letter"
 
     # A drawn box picks the detection that covers it.
@@ -1582,7 +1620,7 @@ if __name__ == "__main__":
 
     # Attributes: classified once at count time, wheel axles overriding the classifier.
     d = fresh()
-    d.attrs = lambda pil: {"type": "articulated", "axles": "2", "cargo": "mineral"}
+    d.attrs = lambda pil, cls=None: {"type": "articulated", "axles": "2", "cargo": "mineral"}
     if jpeg:
         from PIL import Image
         pic = Image.new("RGB", (300, 200))
@@ -1626,7 +1664,7 @@ if __name__ == "__main__":
         d = fresh(events_dir=ev)
         d.display = dict(d.display, truck="e-heavy")
         d.totals["e-heavy"] = 0
-        d.attrs = lambda pil: {"type": "articulated", "axles": "2", "cargo": "mineral"}
+        d.attrs = lambda pil, cls=None: {"type": "articulated", "axles": "2", "cargo": "mineral"}
         pic = Image.new("RGB", (300, 200))
         for _ in range(2):                       # counts on the 2nd, with 4 wheel axles
             d._track("c", [("truck", 0.9, VEH, 1)] + six, pic)

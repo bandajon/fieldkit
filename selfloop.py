@@ -288,6 +288,10 @@ def suggest(stems):
     except Exception:
         dev = "cpu"
     classify = detect.attr_classifier(str(ATTRS_CHAMPION), dev)   # the one loader, shared with live detection
+    try:
+        names = (DATASET / "classes.txt").read_text().split()
+    except OSError:
+        names = []
     out = DATASET / "pending" / "suggest"
     out.mkdir(parents=True, exist_ok=True)
     written = 0
@@ -305,7 +309,9 @@ def suggest(stems):
             for i, box in enumerate(b for b in map(str.split, lines) if len(b) == 5):
                 crop = train_attrs.crop_box(img, box[1:5])   # same padding the heads trained on
                 if crop is not None:
-                    got[str(i)] = classify(crop)
+                    # The class keeps the heads honest: no three-axle motorcycles suggested.
+                    cls = names[int(box[0])] if box[0].isdigit() and int(box[0]) < len(names) else None
+                    got[str(i)] = classify(crop, cls)
             if got:
                 js.write_text(json.dumps(got, indent=1))
                 written += 1
