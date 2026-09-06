@@ -59,7 +59,7 @@ def crop_box(img, box):
 def build(heads):
     """-> ([crop], [targets], [stem]); targets are value ids per head, -1 = not labelled."""
     names = list(heads)
-    crops, targets, stems, skipped = [], [], [], 0
+    crops, targets, stems, classes, skipped = [], [], [], [], 0
     # The benchmark frames train nothing, this head included — except for the very first
     # model of its kind, which has no benchmark to protect: `train_attrs.py all` trains on
     # everything once, the way the detector's v2 did before the set was frozen.
@@ -92,9 +92,10 @@ def build(heads):
             crops.append(crop)
             targets.append(t)
             stems.append(js.stem)
+            classes.append(int(boxes[i][0]) if boxes[i][0].isdigit() else -1)
     if skipped:
         print(f"{skipped} enriched box(es) skipped — no image/label pair, or a stale sidecar")
-    return crops, targets, stems
+    return crops, targets, stems, classes
 
 
 def report_counts(heads, targets, stems):
@@ -123,7 +124,15 @@ def check(heads, crops, targets, stems):
     print(f"ok — {len(heads)} heads, val split {frac:.0%}")
 
 
-def train(heads, crops, targets, stems):
+def class_names():
+    """classes.txt in id order — the class one-hot the heads are conditioned on."""
+    try:
+        return (DATASET / "classes.txt").read_text().split()
+    except OSError:
+        return []
+
+
+def train(heads, crops, targets, stems, classes):
     import numpy as np
     import torch
     from torch import nn
@@ -140,12 +149,21 @@ def train(heads, crops, targets, stems):
     X = torch.from_numpy(np.stack([np.asarray(c) for c in crops])).permute(0, 3, 1, 2).contiguous()
     X = (X.float().div(255) - mean) / std
     Y = torch.tensor(targets)
+    # The vehicle's class rides in beside the image features: a wheel pattern means one
+    # thing on a heavy truck and another on a pickup, and the heads should know which
+    # they are looking at rather than infer it from the crop again. One-hot over
+    # classes.txt; a box with no known class (-1) gets all zeros.
+    cnames = class_names()
+    Z = torch.zeros((len(classes), len(cnames)))
+    for r, c in enumerate(classes):
+        if 0 <= c < len(cnames):
+            Z[r, c] = 1.0
     val = torch.tensor([is_val(s) for s in stems])
-    xt, yt, xv, yv = X[~val], Y[~val], X[val], Y[val]
+    xt, yt, zt, xv, yv, zv = X[~val], Y[~val], Z[~val], X[val], Y[val], Z[val]
 
     model = mobilenet_v3_small(weights=MobileNet_V3_Small_Weights.DEFAULT)
     backbone, pool = model.features, model.avgpool
-    heads_fc = nn.ModuleList([nn.Linear(576, len(heads[n])) for n in names])
+    heads_fc = nn.ModuleList([nn.Linear(576 + len(cnames), len(heads[n])) for n in names])
     net = nn.Sequential()      # keeps one .to(dev)/.parameters() over both parts
     net.add_module("features", backbone)
     net.add_module("fc", heads_fc)
@@ -153,8 +171,9 @@ def train(heads, crops, targets, stems):
     opt = torch.optim.AdamW(net.parameters(), lr=LR)
     loss_fn = nn.CrossEntropyLoss(ignore_index=-1)
 
-    def forward(xb):
+    def forward(xb, zb):
         f = pool(backbone(xb)).reshape(len(xb), -1)   # flatten() is a view; MPS strides refuse it
+        f = torch.cat([f, zb], 1)                      # ...then the class one-hot
         return [h(f) for h in heads_fc]
 
     print(f"training on {dev}: {len(xt)} crops, {EPOCHS} epochs", flush=True)
@@ -162,10 +181,10 @@ def train(heads, crops, targets, stems):
         net.train()
         total = 0.0
         for i in torch.randperm(len(xt)).split(BATCH):
-            xb, yb = xt[i].to(dev), yt[i].to(dev)
+            xb, yb, zb = xt[i].to(dev), yt[i].to(dev), zt[i].to(dev)
             flip = torch.rand(len(xb), device=dev) < 0.5     # side-view symmetric; no colour jitter
             xb[flip] = torch.flip(xb[flip], dims=[3])
-            out = forward(xb)
+            out = forward(xb, zb)
             # A head with nothing labelled in this batch would give CE a nan.
             loss = sum(loss_fn(o, yb[:, j]) for j, o in enumerate(out) if (yb[:, j] >= 0).any())
             opt.zero_grad()
@@ -178,7 +197,8 @@ def train(heads, crops, targets, stems):
     preds = []
     with torch.no_grad():
         for i in torch.arange(len(xv)).split(BATCH):
-            preds.append(torch.stack([o.argmax(1).cpu() for o in forward(xv[i].to(dev))], 1))
+            preds.append(torch.stack([o.argmax(1).cpu()
+                                      for o in forward(xv[i].to(dev), zv[i].to(dev))], 1))
     P = torch.cat(preds) if preds else torch.zeros((0, len(names)), dtype=torch.long)
     print()
     accs, labelled, confusion = {}, {}, {}
@@ -204,6 +224,7 @@ def train(heads, crops, targets, stems):
     torch.save({"state_dict": {**{f"features.{k}": v for k, v in backbone.state_dict().items()},
                                **{f"fc.{k}": v for k, v in heads_fc.state_dict().items()}},
                 "heads": {n: heads[n] for n in names},
+                "classes": cnames,          # the one-hot's order; absent in older checkpoints
                 "backbone": "mobilenet_v3_small", "input": INPUT}, out)
     # The printed report is for a human reading the log; this one is for selfloop.py,
     # which promotes on mean_acc and quotes the confusion in its summary. A head nobody
@@ -219,7 +240,7 @@ def train(heads, crops, targets, stems):
 
 if __name__ == "__main__":
     heads = vocab()
-    crops, targets, stems = build(heads)
+    crops, targets, stems, classes = build(heads)
     if len(targets) < MIN_BOXES:
         report_counts(heads, targets, stems) if targets else None
         sys.exit(f"only {len(targets)} enriched boxes — attribute training needs at least "
@@ -227,4 +248,4 @@ if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "check":
         check(heads, crops, targets, stems)
     else:
-        train(heads, crops, targets, stems)
+        train(heads, crops, targets, stems, classes)

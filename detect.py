@@ -198,10 +198,15 @@ def attr_classifier(path, dev="cpu"):
     ck = torch.load(path, map_location=dev, weights_only=True)
     vocab = ck["heads"]
     names = list(vocab)
+    # A class-conditioned checkpoint (train_attrs.py from 2026-09) lists the classes whose
+    # one-hot rides beside the 576 image features; an older one has no such key and a
+    # 576-wide head. Both load.
+    cnames = list(ck.get("classes") or [])
     m = models.mobilenet_v3_small(weights=None)          # every weight comes from the file
     net = torch.nn.Sequential()
     net.add_module("features", m.features)
-    net.add_module("fc", torch.nn.ModuleList([torch.nn.Linear(576, len(vocab[n])) for n in names]))
+    net.add_module("fc", torch.nn.ModuleList([torch.nn.Linear(576 + len(cnames), len(vocab[n]))
+                                             for n in names]))
     net.load_state_dict(ck["state_dict"])
     net.eval().to(dev)
     pool = m.avgpool
@@ -219,6 +224,11 @@ def attr_classifier(path, dev="cpu"):
         the crop looked."""
         with torch.no_grad():
             f = pool(net.features(prep(pil).unsqueeze(0).to(dev))).flatten(1)
+            if cnames:                                   # the class the heads were trained to see
+                z = torch.zeros((1, len(cnames)), device=f.device)
+                if cls in cnames:
+                    z[0, cnames.index(cls)] = 1.0
+                f = torch.cat([f, z], 1)
             scores = {n: net.fc[j](f)[0].tolist() for j, n in enumerate(names)}
         allowed = cons.get(cls) or {}
         a = {}
