@@ -20,7 +20,7 @@ builder = "RAILPACK"
 buildCommand = "if [ \"$FIELDKIT_MODE\" = curation ]; then pip install -r requirements-curation.txt; fi"
 
 [deploy]
-startCommand = "{ mkdir -p /data/dataset && rm -rf dataset && ln -s /data/dataset dataset; } || echo 'boot: no /data volume — using the repo dataset dir'; python dataset_sync.py pull --config || echo 'boot: no dataset pulled — serving what is already here'; if [ \"$FIELDKIT_RETENTION_AUTHORITY\" = 1 ]; then python retention_maintenance.py activate --dataset /data/dataset || exit 1; fi; exec python app.py"
+startCommand = "{ mkdir -p /data/dataset && rm -rf dataset && ln -s /data/dataset dataset; } || echo 'boot: no /data volume — using the repo dataset dir'; if [ \"$FIELDKIT_RETENTION_AUTHORITY\" = 1 ] && [ \"$FIELDKIT_RETENTION_PAUSED\" = 1 ]; then python -c 'import sys; import dataset_retention as r; sys.exit(0 if r.cached_policy(\"/data/dataset\") else \"published retention policy required while paused\")' || exit 1; else python dataset_sync.py pull --config || echo 'boot: no dataset pulled — serving what is already here'; if [ \"$FIELDKIT_RETENTION_AUTHORITY\" = 1 ]; then python retention_maintenance.py activate --dataset /data/dataset || exit 1; fi; fi; exec python app.py"
 healthcheckPath = "/"
 healthcheckTimeout = 1200
 restartPolicyType = "ON_FAILURE"

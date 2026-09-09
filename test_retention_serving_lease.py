@@ -95,6 +95,12 @@ def main():
     t.start(); t.join()
     assert len(result) == 1 and isinstance(result[0], ns["HTTPException"])
     ns["DATASET_LOCK"].release()
+    rm.policy.DATASET_LOCK.acquire()
+    try:
+        with tempfile.TemporaryDirectory() as td, patch.dict("os.environ", {"FIELDKIT_RETENTION_PAUSED": "1"}):
+            assert rm.maintenance_once(Path(td), object(), "b") == {"paused": True}
+    finally:
+        rm.policy.DATASET_LOCK.release()
     print("ok — serving lease, independent loop lock, and fail-fast dataset mutation")
 
 

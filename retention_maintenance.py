@@ -409,6 +409,8 @@ def run(root=DATASET, cl=None, bucket=None, prefix=PREFIX, mode="plan", now=None
 
 
 def maintenance_once(root, cl, bucket, prefix=PREFIX):
+    if os.environ.get("FIELDKIT_RETENTION_PAUSED") == "1":
+        return {"paused": True}
     root = Path(root).resolve()
     import dataset_sync
     authority = os.environ.get("FIELDKIT_RETENTION_AUTHORITY") == "1"
