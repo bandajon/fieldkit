@@ -23,3 +23,7 @@ the initial floor at `2026-09-02T22:00Z`.
 
 `classifier-crops/` and best-evidence artifacts are permanent. Raw videos live
 outside this rolling dataset policy.
+
+The macOS launchd template discards routine stdout; `retention-last-run.json`
+and `retention-receipts.jsonl` remain the durable records. When installing it
+locally, use the available project virtualenv interpreter in the template.

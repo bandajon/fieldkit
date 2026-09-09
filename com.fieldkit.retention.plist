@@ -12,7 +12,7 @@
   </array>
   <key>StartInterval</key><integer>3600</integer>
   <key>WorkingDirectory</key><string>/Users/admin/fieldkit</string>
-  <key>StandardOutPath</key><string>/Users/admin/fieldkit/output/retention.log</string>
+  <key>StandardOutPath</key><string>/dev/null</string>
   <key>StandardErrorPath</key><string>/Users/admin/fieldkit/output/retention.err</string>
 </dict>
 </plist>
