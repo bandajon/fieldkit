@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- once keeps its compatibility acknowledgement; serving.lock makes overlap safe. -->
+  <key>Label</key><string>com.fieldkit.retention</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/admin/fieldkit/.venv/bin/python</string>
+    <string>/Users/admin/fieldkit/retention_maintenance.py</string>
+    <string>once</string><string>--dataset</string><string>/Users/admin/fieldkit/dataset</string><string>--quiesced</string>
+  </array>
+  <key>StartInterval</key><integer>3600</integer>
+  <key>WorkingDirectory</key><string>/Users/admin/fieldkit</string>
+  <key>StandardOutPath</key><string>/Users/admin/fieldkit/output/retention.log</string>
+  <key>StandardErrorPath</key><string>/Users/admin/fieldkit/output/retention.err</string>
+</dict>
+</plist>

@@ -22,7 +22,7 @@ from PIL import Image
 from train import is_val, reference   # same split, same frozen benchmark
 
 ROOT = Path(__file__).resolve().parent
-DATASET = ROOT / "dataset"
+DATASET = (ROOT / "dataset").resolve()
 APPROVED = DATASET / "approved"
 RUNS = DATASET / "attr_runs"
 BASELINE = "all" in sys.argv[1:]      # see build()
@@ -60,10 +60,26 @@ def build(heads):
     """-> ([crop], [targets], [stem]); targets are value ids per head, -1 = not labelled."""
     names = list(heads)
     crops, targets, stems, classes, skipped = [], [], [], [], 0
+    archive_root = DATASET / "classifier-crops"
+    archive_manifests = []
+    archive_refs = set()
+    if archive_root.is_symlink():
+        raise ValueError(f"archive root is symlink: {archive_root}")
+    if archive_root.is_dir():
+        from classifier_crops import verified_archive
+        for d in sorted(archive_root.iterdir()):
+            if d.is_symlink() or not d.is_dir():
+                raise ValueError(f"invalid archive entry: {d}")
+            m = verified_archive(DATASET, d.name)
+            archive_manifests.append((d, m))
+            if m["reference"]:
+                archive_refs.add(d.name)
+    current_sids = {p.stem for kind in ("images", "labels", "attrs")
+                    for p in (APPROVED / kind).glob("*")}
     # The benchmark frames train nothing, this head included — except for the very first
     # model of its kind, which has no benchmark to protect: `train_attrs.py all` trains on
     # everything once, the way the detector's v2 did before the set was frozen.
-    ref = set() if BASELINE else reference()
+    ref = set() if BASELINE else archive_refs | ({ln.strip() for ln in (DATASET / "reference.txt").read_text().splitlines() if ln.strip()} if (DATASET / "reference.txt").is_file() else set())
     for js in sorted((APPROVED / "attrs").glob("*.json")):
         if js.stem in ref:
             continue
@@ -93,6 +109,24 @@ def build(heads):
             targets.append(t)
             stems.append(js.stem)
             classes.append(int(boxes[i][0]) if boxes[i][0].isdigit() else -1)
+    # The archive lets retention remove approved full frames after export.  A corrupt
+    # manifest is fatal: silently shrinking the corpus makes a training run incomparable.
+    if archive_manifests:
+        for d, m in archive_manifests:
+            for s in m["samples"]:
+                if not BASELINE and s["source_sid"] in ref:
+                    continue
+                if s["source_sid"] in current_sids:
+                    continue
+                t = [heads[n].index(s["attrs"][n]) if s["attrs"].get(n) in heads[n] else -1 for n in names]
+                if all(v < 0 for v in t):
+                    continue
+                crop = Image.open(d / s["crop"]).convert("RGB")
+                crops.append(crop)
+                targets.append(t)
+                stems.append(s["source_sid"])
+                cnames = class_names()
+                classes.append(cnames.index(s["class_name"]) if s["class_name"] in cnames else -1)
     if skipped:
         print(f"{skipped} enriched box(es) skipped — no image/label pair, or a stale sidecar")
     return crops, targets, stems, classes

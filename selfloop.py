@@ -28,6 +28,7 @@ Classify is the other direction: the same champion, run over the mirrored record
 what turns a gate that only records into a gate that reports. Its events go to the bucket
 for the RDA importer, ten to twenty minutes behind live.
 """
+import hashlib
 import json
 import os
 import shutil
@@ -271,6 +272,78 @@ def new_frames():
     return sum(1 for p in (DATASET / "approved" / "labels").glob("*.txt") if p.stem not in ref)
 
 
+def retention_policy():
+    import dataset_retention
+    try:
+        return dataset_retention.cached_policy(DATASET)
+    except ValueError:
+        raise
+
+
+def _current_source_ids():
+    labels = {p.stem for p in (DATASET / "approved" / "labels").glob("*.txt")}
+    images = {p.stem for p in (DATASET / "approved" / "images").glob("*.jpg")}
+    return labels & images
+
+
+def retention_training_ids():
+    """Return newly observed detector and usable attribute source IDs.
+
+    Archive manifests are verified by classifier_crops; a malformed archive therefore
+    aborts the pass instead of silently changing the training corpus.
+    """
+    import train
+    import train_attrs
+    from classifier_crops import verified_archive
+    import dataset_retention
+
+    refs = set(train.reference())
+    policy = dataset_retention.cached_policy(DATASET)
+    live = lambda sid: not policy or not dataset_retention.expired(sid, policy)
+    detector = {sid for sid in _current_source_ids() - refs if live(sid)}
+    current = _current_source_ids()
+    current_presence = {p.stem for kind in ("images", "labels", "attrs")
+                        for p in (DATASET / "approved" / kind).glob("*") if p.is_file()}
+    try:
+        heads = train_attrs.vocab()
+    except SystemExit:
+        heads = {}
+    attrs = set()
+    archive_manifests = []
+    for js in (DATASET / "approved" / "attrs").glob("*.json"):
+        lbl = DATASET / "approved" / "labels" / f"{js.stem}.txt"
+        if js.stem in refs or js.stem not in current or not live(js.stem) or not lbl.is_file():
+            continue
+        try:
+            values = json.loads(js.read_text())
+            boxes = [line.split() for line in lbl.read_text().splitlines() if line.split()]
+            if any(str(i).lstrip("-").isdigit() and 0 <= int(i) < len(boxes)
+                   and isinstance(a, dict)
+                   and any(a.get(h) in vals for h, vals in heads.items())
+                   for i, a in values.items()):
+                attrs.add(js.stem)
+        except (OSError, ValueError, TypeError):
+            continue
+    archive = DATASET / "classifier-crops"
+    if archive.is_symlink():
+        raise ValueError(f"archive root is symlink: {archive}")
+    if archive.is_dir():
+        for d in sorted(archive.iterdir()):
+            if d.is_symlink() or not d.is_dir():
+                raise ValueError(f"invalid archive entry: {d}")
+            m = verified_archive(DATASET, d.name)
+            archive_manifests.append((d, m))
+            if m["reference"]:
+                refs.add(d.name)
+    for d, m in archive_manifests:
+        if d.name in current_presence or d.name in refs:
+            continue
+        if any(any(s["attrs"].get(h) in vals for h, vals in heads.items()) for s in m["samples"]):
+            attrs.add(d.name)
+    attrs -= refs
+    return detector, attrs
+
+
 def suggest(stems):
     """Pre-fill attribute suggestions for the samples this pass just wrote.
 
@@ -294,12 +367,17 @@ def suggest(stems):
         names = []
     out = DATASET / "pending" / "suggest"
     out.mkdir(parents=True, exist_ok=True)
+    import dataset_retention
     written = 0
     for stem in stems:
         js = out / f"{stem}.json"
         if js.exists():        # suggested already, or a re-ingest of the same stem
             continue
         try:
+            with dataset_retention.DATASET_LOCK:
+                policy = dataset_retention.cached_policy(DATASET)
+                if policy and dataset_retention.expired(stem, policy):
+                    continue
             img = Image.open(DATASET / "pending" / "images" / f"{stem}.jpg").convert("RGB")
             lines = (DATASET / "pending" / "labels" / f"{stem}.txt").read_text().splitlines()
             got = {}
@@ -313,8 +391,12 @@ def suggest(stems):
                     cls = names[int(box[0])] if box[0].isdigit() and int(box[0]) < len(names) else None
                     got[str(i)] = classify(crop, cls)
             if got:
-                js.write_text(json.dumps(got, indent=1))
-                written += 1
+                with dataset_retention.DATASET_LOCK:
+                    policy = dataset_retention.cached_policy(DATASET)
+                    if policy and dataset_retention.expired(stem, policy):
+                        continue
+                    js.write_text(json.dumps(got, indent=1))
+                    written += 1
         except Exception as e:      # one unreadable sample must not cost the whole pass
             print(f"  ! suggest {stem}: {e}", flush=True)
     print(f"{now()} ingest: attributes suggested for {written} sample(s)", flush=True)
@@ -426,23 +508,29 @@ def hunt_pass():
         print(f"{now()} hunt: {written} wanted-class samples written, {sent} files pushed", flush=True)
 
 
-def publish(cl, bucket, out, gate, seg, day):
+def publish(cl, bucket, out, gate, source_key, day):
     """Send one segment's events and crops to fieldkit-events/<gate>/<YYYYMMDD>/, the
     layout the RDA importer reads. -> events published."""
     # A quiet segment still publishes an empty file: that is what marks it done, and it
     # tells the importer the gate was watched and idle rather than never processed.
+    manifest = f"{Path(source_key).stem}-{hashlib.sha256(source_key.encode()).hexdigest()[:32]}"
     (out / f"{day}.jsonl").touch()
     total = 0
     for js in sorted(out.glob("*.jsonl")):      # a segment can straddle midnight
-        lines = [json.dumps(for_upload(json.loads(l), gate))
-                 for l in js.read_text().splitlines() if l.strip()]
-        total += len(lines)
+        docs = [for_upload(json.loads(l), gate)
+                for l in js.read_text().splitlines() if l.strip()]
+        lines = [json.dumps(doc) for doc in docs]
         where = f"{EVENTS}{gate}/{js.stem.replace('-', '')}"
-        cl.put_object(Bucket=bucket, Key=f"{where}/{seg}.jsonl",
+        crops = sorted({Path(rel).name for doc in docs for rel in doc["crops"].values()})
+        for name in crops:
+            crop = out / "crops" / js.stem / name
+            if not crop.is_file():
+                raise FileNotFoundError(f"event crop missing: {crop}")
+            cl.upload_file(str(crop), bucket, f"{where}/crops/{name}")
+        cl.put_object(Bucket=bucket, Key=f"{where}/{manifest}.jsonl",
                       Body="".join(l + "\n" for l in lines).encode(),
                       ContentType="application/json")
-        for crop in sorted((out / "crops" / js.stem).glob("*.jpg")):
-            cl.upload_file(str(crop), bucket, f"{where}/crops/{crop.name}")
+        total += len(lines)
     return total
 
 
@@ -493,9 +581,10 @@ def classify_pass():
             try:
                 print(f"  v {key}", flush=True)
                 cl.download_file(bucket, key, str(video))
-                day, captured = detect.classify_segment(video, cam, cfg, tz, out)
+                day, captured = detect.classify_segment(video, cam, cfg, tz, out,
+                                                        source_key=key)
                 stems += captured
-                n = publish(cl, bucket, out, gate, Path(seg).stem, day)
+                n = publish(cl, bucket, out, gate, key, day)
                 # Recorded only once published: a segment that died mid-pass is retried
                 # next tick rather than lost, and re-running it rewrites the same keys.
                 s["classified"] = (s.get("classified", []) + [key])[-REMEMBER_CLASSIFIED:]
@@ -526,27 +615,59 @@ def train_pass(force=False):
         s = load_state()
         ds, cl, bucket = r2()
         ds.pull(cl, bucket, names=ds.CONFIG)
-        ds.pull(cl, bucket, names=ds.LEDGERS)
+        active = retention_policy()
+        if active:
+            # Read-side only: archive is durable training input, never a pushed ledger.
+            ds.pull(cl, bucket, names=ds.LEDGERS + ("classifier-crops",))
+            detector_ids, attrs_ids = retention_training_ids()
+            old_detector = s.get("retention_detector_source_ids")
+            old_attrs = s.get("retention_attrs_source_ids")
+            if old_detector is None or old_attrs is None:
+                s["retention_detector_source_ids"] = sorted(detector_ids)
+                s["retention_attrs_source_ids"] = sorted(attrs_ids)
+                save_state(s)
+                print(f"{now()} train: retention snapshots initialized ({len(detector_ids)} detector, "
+                      f"{len(attrs_ids)} attrs)", flush=True)
+                return
+            new_detector = detector_ids - set(old_detector)
+            new_attrs = attrs_ids - set(old_attrs)
+            detector_due = force or len(new_detector) >= THRESHOLD
+            attrs_due = force or len(new_attrs) >= THRESHOLD
+        else:
+            detector_ids = attrs_ids = None
+            new_detector = new_attrs = set()
+            ds.pull(cl, bucket, names=ds.LEDGERS)
+            detector_due = force or should_train(new_frames(), s.get("trained_frames", 0))
+            attrs_due = detector_due
         count = new_frames()
-        if not force and not should_train(count, s.get("trained_frames", 0)):
+        if not detector_due and not attrs_due:
             print(f"{now()} train: {count} new frames, {s.get('trained_frames', 0)} at the last run "
                   f"— {THRESHOLD - (count - s.get('trained_frames', 0))} more to go", flush=True)
             return
-        print(f"{now()} train: {count} new frames — training", flush=True)
-        r = subprocess.run([sys.executable, str(ROOT / "train.py")], cwd=ROOT)
-        if r.returncode:
-            sys.exit(f"train.py failed ({r.returncode}); champion untouched")
-        run = max(trainer.RUNS.glob("*/"), key=lambda p: p.stat().st_mtime)
-        best = run / "weights" / "best.pt"
-        ev, incumbent = run_eval(run), champion_on_split()
-        s["trained_frames"], s["last_train"] = count, {"at": now(), "run": run.name, "eval": ev,
-                                                       "champion_on_same_split": incumbent}
-        if promote(ev, incumbent):
-            crown(s, run, count, ev, cl, bucket)
-        else:
-            print(f"{now()} train: {run.name} scored {ev['map50'] if ev else 'n/a'} on the new frames' "
-                  f"val split, champion {incumbent['map50']} on the same — champion stays", flush=True)
-        attrs_pass(s, cl, bucket)
+        if detector_due:
+            print(f"{now()} train: {count} new frames — training", flush=True)
+            r = subprocess.run([sys.executable, str(ROOT / "train.py")], cwd=ROOT)
+            if r.returncode:
+                if not active:
+                    sys.exit(f"train.py failed ({r.returncode}); champion untouched")
+                print(f"{now()} train.py failed ({r.returncode}); detector snapshot unchanged", flush=True)
+            else:
+                run = max(trainer.RUNS.glob("*/"), key=lambda p: p.stat().st_mtime)
+                best = run / "weights" / "best.pt"
+                ev, incumbent = run_eval(run), champion_on_split()
+                s["trained_frames"], s["last_train"] = count, {"at": now(), "run": run.name, "eval": ev,
+                                                               "champion_on_same_split": incumbent}
+                if promote(ev, incumbent):
+                    crown(s, run, count, ev, cl, bucket)
+                else:
+                    print(f"{now()} train: {run.name} scored {ev['map50'] if ev else 'n/a'} on the new frames' "
+                          f"val split, champion {incumbent['map50']} on the same — champion stays", flush=True)
+                if active:
+                    s["retention_detector_source_ids"] = sorted(set(old_detector) | detector_ids)
+        if attrs_due:
+            attrs_ok = attrs_pass(s, cl, bucket)
+            if active and attrs_ok:
+                s["retention_attrs_source_ids"] = sorted(set(old_attrs) | attrs_ids)
         save_state(s)
 
 
@@ -561,7 +682,7 @@ def attrs_pass(s, cl, bucket):
     if r.returncode:
         print(f"{now()} attrs: train_attrs.py failed ({r.returncode}); attrs champion untouched",
               flush=True)
-        return
+        return False
     run = max(train_attrs.RUNS.glob("*/"), key=lambda p: p.stat().st_mtime)
     rep = attrs_report(run)
     s["last_attrs"] = {"at": now(), "run": run.name, "mean_acc": rep and rep["mean_acc"]}
@@ -570,6 +691,7 @@ def attrs_pass(s, cl, bucket):
     else:
         print(f"{now()} attrs: {run.name} scored {rep['mean_acc'] if rep else 'n/a'} mean val "
               f"accuracy, attrs champion stays at {s['attrs_champion']['mean_acc']}", flush=True)
+    return True
 
 
 def attrs_report(run):
@@ -779,13 +901,16 @@ def publish_check():
     import tempfile
 
     class FakeS3:
-        def __init__(self):
+        def __init__(self, fail_crop=False):
             self.put, self.sent = {}, []
+            self.fail_crop = fail_crop
 
         def put_object(self, Bucket, Key, Body, ContentType=None):
             self.put[Key] = Body
 
         def upload_file(self, path, Bucket, Key):
+            if self.fail_crop:
+                raise OSError("upload failed")
             self.sent.append(Key)
 
     out = Path(tempfile.mkdtemp())
@@ -795,17 +920,52 @@ def publish_check():
         json.dumps({"id": "c-123", "class": "e-heavy",
                     "crops": {"best": "crops/2026-08-19/c-123-best.jpg"}}) + "\n")
     cl = FakeS3()
-    assert publish(cl, "buck", out, "RDA-TG-KTB", "20260819-151108", "2026-08-19") == 1
-    key = "fieldkit-events/RDA-TG-KTB/20260819/20260819-151108.jsonl"
+    source = "RDA-TG-KTB/north/20260819-151108.mkv"
+    manifest = f"20260819-151108-{hashlib.sha256(source.encode()).hexdigest()[:32]}"
+    assert publish(cl, "buck", out, "RDA-TG-KTB", source, "2026-08-19") == 1
+    key = f"fieldkit-events/RDA-TG-KTB/20260819/{manifest}.jsonl"
     assert list(cl.put) == [key], cl.put
     doc = json.loads(cl.put[key].decode())
     assert doc["gate"] == "RDA-TG-KTB" and doc["crops"] == {"best": "crops/c-123-best.jpg"}, doc
     assert cl.sent == ["fieldkit-events/RDA-TG-KTB/20260819/crops/c-123-best.jpg"], cl.sent
 
+    # This publication exposes no manifest containing a missing or failed crop reference.
+    for missing, client in ((True, FakeS3()), (False, FakeS3(fail_crop=True))):
+        broken = Path(tempfile.mkdtemp())
+        (broken / "crops" / "2026-08-19").mkdir(parents=True)
+        if not missing:
+            (broken / "crops" / "2026-08-19" / "x.jpg").write_bytes(b"jpeg")
+        (broken / "2026-08-19.jsonl").write_text(json.dumps(
+            {"id": "x", "crops": {"best": "crops/2026-08-19/x.jpg"}}) + "\n")
+        try:
+            publish(client, "buck", broken, "G", "G/north/same.mkv", "2026-08-19")
+            raise AssertionError("broken evidence published")
+        except OSError:
+            pass
+        assert client.put == {}, client.put
+
     # A segment with no vehicles still publishes, or it would be classified again forever.
     quiet, cl = Path(tempfile.mkdtemp()), FakeS3()
-    assert publish(cl, "buck", quiet, "RDA-TG-KTB", "20260819-152108", "2026-08-19") == 0
-    assert cl.put == {"fieldkit-events/RDA-TG-KTB/20260819/20260819-152108.jsonl": b""}, cl.put
+    quiet_source = "RDA-TG-KTB/north/20260819-152108.mkv"
+    assert publish(cl, "buck", quiet, "RDA-TG-KTB", quiet_source, "2026-08-19") == 0
+    quiet_name = f"20260819-152108-{hashlib.sha256(quiet_source.encode()).hexdigest()[:32]}"
+    assert cl.put == {f"fieldkit-events/RDA-TG-KTB/20260819/{quiet_name}.jsonl": b""}, cl.put
+
+    midnight, cl = Path(tempfile.mkdtemp()), FakeS3()
+    (midnight / "2026-08-19.jsonl").write_text(json.dumps({"id": "a"}) + "\n")
+    (midnight / "2026-08-20.jsonl").write_text(json.dumps({"id": "b"}) + "\n")
+    midnight_source = "G/north/cross-midnight.mkv"
+    assert publish(cl, "buck", midnight, "G", midnight_source, "2026-08-19") == 2
+    midnight_name = f"cross-midnight-{hashlib.sha256(midnight_source.encode()).hexdigest()[:32]}"
+    assert set(cl.put) == {f"fieldkit-events/G/20260819/{midnight_name}.jsonl",
+                          f"fieldkit-events/G/20260820/{midnight_name}.jsonl"}, cl.put
+
+    # Flat, camera-specific keys retain both cameras; retrying one source overwrites only itself.
+    cl = FakeS3()
+    for source in ("G/north/20260819-151108.mkv", "G/south/20260819-151108.mkv",
+                   "G/north/20260819-151108.mkv"):
+        publish(cl, "buck", Path(tempfile.mkdtemp()), "G", source, "2026-08-19")
+    assert len(cl.put) == 2, cl.put
 
 
 def selfcheck():

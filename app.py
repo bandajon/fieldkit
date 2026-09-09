@@ -18,6 +18,7 @@ import sys
 import tempfile
 import threading
 import time
+import functools
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -35,11 +36,18 @@ import hostnet
 import live
 import offload
 import recorder
+import dataset_retention as retention
+import retention_maintenance
 
 ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = ROOT / "config.yaml"
 EXAMPLE_PATH = ROOT / "config.example.yaml"
 DATASET = ROOT / "dataset"                        # detection samples awaiting operator review
+DATASET.mkdir(parents=True, exist_ok=True)
+_SERVING_LEASE = retention_maintenance.serving_lease(DATASET.resolve())
+if not _SERVING_LEASE.__enter__():
+    _SERVING_LEASE.__exit__(None, None, None)
+    sys.exit("dataset serving lease is busy")
 
 CONFIG = {}
 CAM_NAME = re.compile(r"^[A-Za-z0-9_-]{1,32}$")   # becomes a directory name
@@ -77,6 +85,44 @@ GOLD_TOKENS = {}          # disguised id -> gold id; refilled from gold-served.j
 CLAIM_TTL = 1800.0        # a slice someone walked away from frees itself after this
 CLAIMS = {}               # sample id -> (who, expiry as wall-clock); mirrored to claims.json
 CLAIMS_LOCK = threading.Lock()
+DATASET_LOCK = retention.DATASET_LOCK
+
+
+def dataset_mutation(fn):
+    @functools.wraps(fn)
+    def wrapped(*args, **kwargs):
+        if not DATASET_LOCK.acquire(blocking=False):
+            raise HTTPException(503, "dataset is busy")
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            DATASET_LOCK.release()
+    wrapped.__name__ = fn.__name__
+    wrapped.__doc__ = fn.__doc__
+    return wrapped
+
+
+def active_policy():
+    try: return retention.cached_policy(DATASET.resolve())
+    except ValueError: raise HTTPException(503, "retention policy is invalid") from None
+
+
+def ensure_active(sid):
+    if sid.startswith("g-"):
+        gold = gold_for(sid)
+        if gold is not None: sid = gold.name
+    p = active_policy()
+    if p and retention.expired(sid, p):
+        raise HTTPException(410, f"sample {sid!r} has expired")
+    return sid
+
+
+def is_active(sid):
+    if sid.startswith("g-"):
+        gold = gold_for(sid)
+        if gold is not None: sid = gold.name
+    p = active_policy()
+    return not p or not retention.expired(sid, p)
 
 
 def claims_path():
@@ -214,7 +260,7 @@ else:
     if resumed:
         print(f"resumed recording after restart: {', '.join(resumed)}", flush=True)
     OFFLOAD = offload.Offload(CONFIG, record_dir(),   # holds CONFIG: config edits land live
-                              console_creds=CONSOLE_CREDS)
+                              console_creds=CONSOLE_CREDS, active_file=REC.file_active)
     OFFLOAD.start()   # no-op unless offload.enabled is set
     # lambda: record_status is a route defined further down, and the heartbeat sends its
     # body verbatim — the console sees exactly what the local Record tab does.
@@ -241,6 +287,8 @@ def _shutdown():
         REC.shutdown()   # not stop(): a restart must not erase the sessions resume() re-arms
         LIVE.stop()
         DETECT.stop()
+    if _SERVING_LEASE is not None:
+        _SERVING_LEASE.__exit__(None, None, None)
 
 app = FastAPI(title="FieldKit")
 app.mount("/static", StaticFiles(directory=ROOT / "static"), name="static")
@@ -1008,7 +1056,7 @@ def gold_for(token):
 def pick_gold(who):
     """A gold this labeller has not seen, disguised as an ordinary pending sample."""
     seen = {r.get("gold") for r in read_lines("gold-served.jsonl") if r.get("who") == who}
-    fresh = [g for g in golds() if g.name not in seen]
+    fresh = [g for g in golds() if g.name not in seen and is_active(g.name)]
     if not fresh:
         return None
     g = random.choice(fresh)
@@ -1130,7 +1178,10 @@ def dataset_samples(who: str = "", focus: str = "", offset: int = 0,
     labels = DATASET / "pending" / "labels"
     pending, candidates = [], {}
     external = external_manifest()
+    policy = active_policy()
     for p in sorted(labels.glob("*.txt")) if labels.is_dir() else []:
+        if policy and retention.expired(p.stem, policy):
+            continue
         try:
             s = {"id": p.stem, "boxes": read_boxes(p)}
             attrs = read_attrs(attrs_path(p.stem))
@@ -1227,6 +1278,8 @@ def dataset_examples(target: str = "", limit: int = 6, x_curator_token: str = He
     rows.sort(key=lambda p: by.get(p.stem) not in REVIEWERS)
     out = []
     for p in rows:
+        if not is_active(p.stem):
+            continue
         # one example per matching box: two lorries in a frame are two references
         out += [{"id": p.stem, "class": names[b["cls"]],
                  **{k: b[k] for k in ("cx", "cy", "w", "h")}}
@@ -1248,6 +1301,7 @@ def valid_tree(tree):
 
 def envelope(sid, tree, curator):
     """One sample as the editor wants it, wherever it currently lives."""
+    ensure_active(sid)
     return {"id": sid, "curator": curator, "tree": tree,
             "boxes": read_boxes(sample_paths(sid, tree)[1]),
             "attrs": read_attrs(attrs_path(sid, tree))}
@@ -1285,10 +1339,12 @@ def require_reviewer(who):
     return who
 
 
+@dataset_mutation
 def review_label(sid, who, body):
     """The reviewer's version replaces the curator's: a re-check that leaves the worse
     labels on disk would be an opinion, not QA. The same act RELEASES a held sample —
     reviewed and moved into the training set in one move, scored exactly as any review."""
+    ensure_active(sid)
     require_reviewer(who)
     tree = "holding" if sample_paths(sid, "holding")[1].is_file() else "approved"
     src_img, lbl = sample_paths(sid, tree)
@@ -1352,6 +1408,7 @@ def dataset_review(who: str, x_curator_token: str = Header("")):
                      key=lambda f: f.stat().st_mtime)
     except OSError:      # released mid-listing: fall through to the sampled review
         pen = []
+    pen = [p for p in pen if is_active(p.stem)]
     if pen:
         sid = pen[0].stem
         return {**envelope(sid, "holding", sample_curators("holding").get(sid, "anon")),
@@ -1363,6 +1420,8 @@ def dataset_review(who: str, x_curator_token: str = Header("")):
     reviewed = {r.get("id") for r in read_lines("scores.jsonl") if r.get("kind") == "review"}
     pool, approvals = {}, {}
     for sid, curator in sample_curators().items():
+        if not is_active(sid):
+            continue
         approvals[curator] = approvals.get(curator, 0) + 1
         if curator != who and sid not in reviewed:
             pool.setdefault(curator, []).append(sid)
@@ -1418,6 +1477,8 @@ def search_hits(target, who, tree, attr, only_vetted=False):
         rows = []
     hits, by_curator = [], {}
     for f in rows:
+        if not is_active(f.stem):
+            continue
         curator = by.get(f.stem, "anon")
         if who and curator != who:
             continue
@@ -1440,6 +1501,7 @@ def search_hits(target, who, tree, attr, only_vetted=False):
 
 
 @app.post("/api/dataset/release")
+@dataset_mutation
 def dataset_release(body: dict = Body(default={}), x_curator_token: str = Header("")):
     """Release every held frame a search matches, as the curator labelled it. A reviewer
     who has opened a few of a curator's frames and found them sound signs the rest off in
@@ -1481,6 +1543,7 @@ def dataset_sample(id: str, tree: str = "approved", x_curator_token: str = Heade
     """One sample's envelope, so a searched frame loads straight into the editor."""
     require_reviewer(token_who(x_curator_token))
     sid, tree = valid_sample_id(id), valid_tree(tree)
+    ensure_active(sid)
     if not sample_paths(sid, tree)[1].is_file():
         raise HTTPException(404, f"no {tree} sample {id!r}")
     return envelope(sid, tree, sample_curators(tree).get(sid, "anon"))
@@ -1503,6 +1566,8 @@ def r2():
 def sync_both(ds, cl, bucket):
     """Our work up, everything else down. -> (uploaded, downloaded). Both directions skip
     on same-name-same-size, so a steady state is one listing and a pile of stat calls."""
+    import retention_maintenance
+    retention_maintenance.maintenance_once(DATASET.resolve(), cl, bucket)
     sent, _ = ds.push(cl, bucket, names=ds.LEDGERS)
     got, _ = ds.pull(cl, bucket)
     # The crowned weights ride along so /api/dataset/classify has something to run. A
@@ -1535,6 +1600,18 @@ def sync_loop():
             sync_both(*r2())
         except Exception as e:   # a failed pass is a retry in SYNC_EVERY, never a dead server
             print(f"dataset sync failed: {e}", flush=True)
+        time.sleep(SYNC_EVERY)
+
+
+def maintenance_loop():
+    """Console nodes may prune locally when an explicit policy is present."""
+    while True:
+        try:
+            if (DATASET / retention.POLICY_NAME).exists():
+                _, cl, bucket = r2()
+                retention_maintenance.maintenance_once(DATASET.resolve(), cl, bucket)
+        except Exception as e:
+            print(f"retention maintenance failed: {e}", flush=True)
         time.sleep(SYNC_EVERY)
 
 
@@ -1936,7 +2013,9 @@ def sample_image(sid, first=None):
 
 @app.get("/api/dataset/image")
 def dataset_image(id: str):
-    img = sample_image(valid_sample_id(id))
+    sid = valid_sample_id(id)
+    ensure_active(sid)
+    img = sample_image(sid)
     if img is None:
         raise HTTPException(404, f"no pending sample {id!r}")
     return FileResponse(img, media_type="image/jpeg")
@@ -1949,6 +2028,7 @@ def dataset_classify(body: dict = Body(default={}), x_curator_token: str = Heade
     still arrives through /api/dataset/label."""
     check_token(valid_who(body.get("who")), x_curator_token)
     sid = valid_sample_id(body.get("id"))
+    ensure_active(sid)
     tree = valid_tree(body.get("tree") or "pending")
     cx, cy, w, h = parse_box(body.get("box") or {})
     if not (w > 0 and h > 0):   # a label may hold a degenerate box; there is nothing to crop
@@ -1973,10 +2053,12 @@ def dataset_classify(body: dict = Body(default={}), x_curator_token: str = Heade
             "name": name or None, "attrs": attrs}
 
 
+@dataset_mutation
 def send_back(sid, tree):
     """Move a sample out of a finished tree and back into pending, labels and attrs with
     it. -> {"boxes", "attrs"} as they landed. The one path back: unapprove walks an
     approved sample out, reject walks a held one out."""
+    ensure_active(sid)
     src_img, src_lbl = sample_paths(sid, tree)
     if not src_img.is_file():
         raise HTTPException(404, f"{sid} is not in the {tree} set")
@@ -1999,8 +2081,10 @@ def send_back(sid, tree):
 
 
 @app.post("/api/dataset/label")
+@dataset_mutation
 def dataset_label(body: dict = Body(default={}), x_curator_token: str = Header("")):
     sid = valid_sample_id(body.get("id"))
+    ensure_active(sid)
     who = check_token(valid_who(body.get("who")), x_curator_token)
     action = body.get("action")
     if sid.startswith("g-"):
@@ -2116,6 +2200,7 @@ def remap_class_ids(path, fn):
 
 
 @app.post("/api/dataset/class")
+@dataset_mutation
 def dataset_class(body: dict = Body(default={})):
     action = body.get("action") or "add"
     classes = dataset_classes()
@@ -2172,6 +2257,7 @@ def dataset_class(body: dict = Body(default={})):
 
 
 @app.post("/api/dataset/attr_value")
+@dataset_mutation
 def dataset_attr_value(body: dict = Body(default={}), x_curator_token: str = Header("")):
     """Append-only for curators, like classes: sidecars already name these values, and
     dropping one would silently rewrite what an operator recorded. A reviewer may remove
@@ -2382,6 +2468,8 @@ if CURATION and not curators():
 
 if CURATION:
     threading.Thread(target=sync_loop, daemon=True).start()
+else:
+    threading.Thread(target=maintenance_loop, daemon=True).start()
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))

@@ -7,8 +7,8 @@
 # /data and the repo's dataset/ path is a symlink to it; boot pulls ONLY the config
 # (a curation node wants its roster before it serves) and the samples stream in
 # from the server's own background sync, so the service answers within seconds.
-# Every step is allowed to fail: a node that cannot reach R2 says so on its Status
-# tab, which is far more use than a container that never started.
+# Setup and config pull remain best-effort for ordinary services. Explicit retention
+# authority activation is the exception: a failed activation must stop that service.
 [build]
 builder = "RAILPACK"
 # Only the curation service carries torch: service variables are visible at build time,
@@ -20,6 +20,7 @@ builder = "RAILPACK"
 buildCommand = "if [ \"$FIELDKIT_MODE\" = curation ]; then pip install -r requirements-curation.txt; fi"
 
 [deploy]
-startCommand = "{ mkdir -p /data/dataset && rm -rf dataset && ln -s /data/dataset dataset; } || echo 'boot: no /data volume — using the repo dataset dir'; python dataset_sync.py pull --config || echo 'boot: no dataset pulled — serving what is already here'; exec python app.py"
+startCommand = "{ mkdir -p /data/dataset && rm -rf dataset && ln -s /data/dataset dataset; } || echo 'boot: no /data volume — using the repo dataset dir'; python dataset_sync.py pull --config || echo 'boot: no dataset pulled — serving what is already here'; if [ \"$FIELDKIT_RETENTION_AUTHORITY\" = 1 ]; then python retention_maintenance.py activate --dataset /data/dataset || exit 1; fi; exec python app.py"
 healthcheckPath = "/"
+healthcheckTimeout = 1200
 restartPolicyType = "ON_FAILURE"

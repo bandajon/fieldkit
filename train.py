@@ -113,15 +113,18 @@ def build(names):
     """The training split (reference frames left out) and, when there is a reference
     set, its own tree to score against. -> {split: [stems]}"""
     ref = reference()
+    import dataset_retention
+    policy = dataset_retention.cached_policy(DATASET)
+    live = lambda s: not policy or not dataset_retention.expired(s, policy)
     part = split_of
     if BASELINE and ref:
         # The reference set itself, and nothing else: v2 trained on exactly these frames with
         # exactly this split, so a run here compares with v2 like for like — same train frames,
         # same 116 val frames. Its reference score is inflated the same way v2's is, and
         # reference-eval.json says so ("baseline"), which keeps it out of the loop's promotion.
-        choose, excluded = (lambda s: part(s) if s in ref else None), set()
+        choose, excluded = (lambda s: part(s) if s in ref and live(s) else None), set()
     else:
-        choose, excluded = (lambda s: None if s in ref else part(s)), ref
+        choose, excluded = (lambda s: None if s in ref or not live(s) else part(s)), ref
     split, orphans = link_tree(RUN, choose)
     split = {"train": split.get("train", []), "val": split.get("val", [])}
     images = {p.stem for p in (APPROVED / "images").glob("*.jpg")}
@@ -134,11 +137,14 @@ def build(names):
     (RUN / "data.yaml").write_text(yaml.safe_dump(
         {"path": str(RUN), "train": "images/train", "val": "images/val", "names": names},
         sort_keys=False))
-    if ref:
-        held, _ = link_tree(REF_RUN, lambda s: "val" if s in ref else None)
+    held = {}
+    held, _ = link_tree(REF_RUN, lambda s: "val" if s in ref and live(s) else None)
+    if held.get("val"):
         (REF_RUN / "data.yaml").write_text(yaml.safe_dump(   # val only; train key is required, unused
             {"path": str(REF_RUN), "train": "images/val", "val": "images/val", "names": names},
             sort_keys=False))
+    else:
+        (REF_RUN / "data.yaml").unlink(missing_ok=True)
         print(f"{len(held.get('val', []))} reference frames" + (
             " — this BASELINE run trains on them; its reference score is not comparable to the loop's"
             if BASELINE else " held out — the benchmark, never trained on"))

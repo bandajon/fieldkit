@@ -3,6 +3,7 @@
 
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -20,6 +21,13 @@ STALL_SECONDS = 30.0     # RECORDING but no new bytes — matroska flushes every
 NO_FILE_SECONDS = 60.0   # alive but never opened the stream at all
 
 
+def _alive(p):
+    try:
+        return p is not None and p.poll() is None
+    except (OSError, ValueError):
+        return p is not None       # uncertainty must retain ownership and file protection
+
+
 def rtsp_url(cam):
     """Main stream. Never /102 — the sub stream is for live view only."""
     return (f"rtsp://{quote(cam['user'], safe='')}:{quote(cam['password'], safe='')}"
@@ -31,15 +39,36 @@ def _graceful(p):
     try:
         p.send_signal(signal.CTRL_BREAK_EVENT if WINDOWS else signal.SIGINT)
     except (OSError, ValueError):
-        return
+        pass
     try:
         p.wait(timeout=10)
+        return True
     except subprocess.TimeoutExpired:
+        pass
+    except (OSError, ValueError):
+        if not _alive(p):
+            return True
+    try:
         p.terminate()
-        try:
-            p.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            p.kill()
+    except (OSError, ValueError):
+        pass
+    try:
+        p.wait(timeout=5)
+        return True
+    except subprocess.TimeoutExpired:
+        pass
+    except (OSError, ValueError):
+        if not _alive(p):
+            return True
+    try:
+        p.kill()
+    except (OSError, ValueError):
+        pass
+    try:
+        p.wait(timeout=5)
+    except (subprocess.TimeoutExpired, OSError, ValueError):
+        pass
+    return not _alive(p)
 
 
 class Recorder:
@@ -53,7 +82,8 @@ class Recorder:
         self.st = {n: {"desired": False, "proc": None, "state": "STOPPED",
                        "started": None, "until": None, "restarts": 0, "alive_since": 0.0,
                        "next_spawn": 0.0, "backoff": 2.0, "tail": deque(maxlen=20),
-                       "last_bytes": 0, "last_progress": 0.0}
+                       "last_bytes": 0, "last_progress": 0.0, "active_file": None,
+                       "writer_dir": None, "stopping": False}
                    for n in self.cams}
         self.lock = threading.Lock()
         threading.Thread(target=self._supervise, daemon=True).start()
@@ -64,18 +94,20 @@ class Recorder:
         with self.lock:
             name = cam["name"]
             self.cams[name] = cam
-            if self.st.get(name, {}).get("desired"):
-                return          # already recording: leave the running session alone
+            old = self.st.get(name)
+            if old and (old["desired"] or _alive(old["proc"])):
+                return          # preserve ownership while recording or stopping
             self.st[name] = {"desired": False, "proc": None, "state": "STOPPED",
                              "started": None, "until": None, "restarts": 0, "alive_since": 0.0,
                              "next_spawn": 0.0, "backoff": 2.0, "tail": deque(maxlen=20),
-                             "last_bytes": 0, "last_progress": 0.0}
+                             "last_bytes": 0, "last_progress": 0.0, "active_file": None,
+                             "writer_dir": None, "stopping": False}
 
     def remove_camera(self, name):
         """Forget a camera. Refuses while its session is active; files on disk stay."""
         with self.lock:
             s = self.st.get(name)
-            if s and s["desired"]:
+            if s and (s["desired"] or _alive(s["proc"])):
                 return False
             self.cams.pop(name, None)
             self.st.pop(name, None)
@@ -91,11 +123,28 @@ class Recorder:
         if not start or not d.is_dir():
             return []
         # -1s: coarse mtime granularity
-        return [f for f in d.glob("*.mkv") if f.stat().st_mtime >= start - 1]
+        return [f for f, _ in self._session_stats(name)]
+
+    def _session_stats(self, name):
+        """Stat each segment once; offload may unlink it at any point."""
+        start = self.st[name]["started"] or 0
+        if not start:
+            return []
+        found = []
+        try:
+            for f in self.cam_dir(name).glob("*.mkv"):
+                try:
+                    stat = f.stat()
+                except OSError:
+                    continue
+                if stat.st_mtime >= start - 1:
+                    found.append((f, stat.st_size))
+        except OSError:
+            pass
+        return found
 
     def _spawn(self, name):
         d = self.cam_dir(name)
-        d.mkdir(parents=True, exist_ok=True)
         cmd = ["ffmpeg", "-rtsp_transport", "tcp", "-use_wallclock_as_timestamps", "1",
                "-i", rtsp_url(self.cams[name]), "-c", "copy", "-f", "segment",
                "-segment_time", str(SEGMENT_SECONDS), "-reset_timestamps", "1",
@@ -103,6 +152,8 @@ class Recorder:
         kw = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if WINDOWS else {}
         s = self.st[name]
         try:
+            d.mkdir(parents=True, exist_ok=True)
+            writer_dir = d.resolve()
             p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                  stderr=subprocess.PIPE, text=True, errors="replace", **kw)
         except OSError as e:      # ffmpeg missing from PATH must not kill the supervisor
@@ -113,47 +164,95 @@ class Recorder:
             return
         s["proc"] = p
         s["alive_since"] = s["last_progress"] = time.time()
-        threading.Thread(target=self._drain, args=(p, s["tail"]), daemon=True).start()
+        s.update(active_file=None, writer_dir=writer_dir, last_bytes=0, stopping=False)
+        threading.Thread(target=self._drain, args=(name, p), daemon=True).start()
 
-    @staticmethod
-    def _drain(p, tail):
+    def _drain(self, name, p):
         """Must consume stderr or the pipe fills and ffmpeg blocks."""
         for line in p.stderr:
-            tail.append(line.rstrip())
+            line = line.rstrip()
+            with self.lock:
+                s = self.st.get(name)
+                if not s or s["proc"] is not p:
+                    continue
+                s["tail"].append(line)
+                match = re.search(r"Opening '(.+)' for writing", line)
+                if not match:
+                    continue
+                try:
+                    path = Path(match.group(1)).resolve()
+                    path.relative_to(s["writer_dir"])
+                except (OSError, ValueError):
+                    continue
+                if path != s["active_file"]:
+                    s.update(active_file=path, last_bytes=0, last_progress=time.time())
 
-    def _supervise(self):
+    def file_active(self, path):
+        """Protect the writer; until ffmpeg names it, protect that camera's tree."""
+        path = Path(path).resolve()
+        with self.lock:
+            for name, s in self.st.items():
+                try:
+                    if s["writer_dir"] is None:
+                        continue
+                    path.relative_to(s["writer_dir"])
+                except ValueError:
+                    continue
+                p = s["proc"]
+                if not _alive(p):
+                    return False
+                return s["active_file"] is None or path == s["active_file"]
+        return False
+
+    def _supervise(self, once=False):
         while True:
             now = time.time()
             expired = []
+            restart = []
             with self.lock:
                 for name, s in self.st.items():
                     if not s["desired"]:
+                        p = s["proc"]
+                        if _alive(p) and not s["stopping"]:
+                            s["stopping"] = True
+                            restart.append(p)
+                        elif p is not None and not _alive(p):
+                            s.update(proc=None, state="STOPPED", started=None, until=None,
+                                     active_file=None, writer_dir=None, stopping=False)
                         continue
                     if s["until"] and now >= s["until"]:
                         expired.append(name)
                         continue
                     p = s["proc"]
-                    if p is not None and p.poll() is None:
+                    if _alive(p):
                         # Liveness alone lies: ffmpeg stuck in TCP connect to a dead
                         # camera never exits. It only creates the segment file once the
                         # input is open and the header written, so existence proves a
                         # real connection — size can lag, matroska flushes in clusters.
-                        files = self._session_files(name)
-                        nbytes = sum(f.stat().st_size for f in files)
-                        if nbytes > s["last_bytes"]:
+                        files = self._session_stats(name)
+                        active = s["active_file"]
+                        nbytes = next((size for f, size in files if f == active), None)
+                        if nbytes is None and active is not None:
+                            try:
+                                nbytes = active.stat().st_size
+                            except OSError:
+                                pass
+                        if nbytes is not None and nbytes > s["last_bytes"]:
                             s["last_bytes"], s["last_progress"] = nbytes, now
-                        if now - s["alive_since"] >= SETTLED and files:
+                        if now - s["alive_since"] >= SETTLED and active is not None:
                             s["state"] = "RECORDING"
                             s["backoff"] = 2.0
                         # Watchdog. ffmpeg's own timeout flags differ across 4.x/5+/Jetson
                         # builds, so judge by bytes landing on disk instead.
                         stalled = (s["state"] == "RECORDING"
                                    and now - s["last_progress"] > STALL_SECONDS)
-                        wedged = not files and now - s["alive_since"] > NO_FILE_SECONDS
-                        if stalled or wedged:
+                        wedged = active is None and now - s["alive_since"] > NO_FILE_SECONDS
+                        if (stalled or wedged) and not s["stopping"]:
                             s["tail"].append("[fieldkit] " + ("stalled" if stalled else
                                              "no stream opened") + " — restarting")
-                            p.terminate()   # the died-branch handles RECONNECTING + backoff
+                            s["stopping"] = True
+                            s["state"] = "RECONNECTING"
+                            restart.append(p)
                         continue
                     if p is not None:            # it died while we still want it
                         s["restarts"] += 1
@@ -162,12 +261,22 @@ class Recorder:
                         s["backoff"] = 2.0 if alive >= SETTLED else min(s["backoff"] * 2, MAX_BACKOFF)
                         s["next_spawn"] = now + s["backoff"]
                         s["proc"] = None
+                        s["active_file"] = None
+                        s["writer_dir"] = None
                     elif now >= s["next_spawn"]:
                         self._spawn(name)
-            # Outside the lock: stop() takes it, and _graceful blocks up to 15 s per
+            # Outside the lock: stop() takes it, and _graceful blocks up to 20 s per
             # process — supervision of the others pauses meanwhile, same as an operator Stop.
             if expired:
                 self.stop(expired)
+            for p in restart:
+                if not _graceful(p):
+                    with self.lock:
+                        for s in self.st.values():
+                            if s["proc"] is p:
+                                s["stopping"] = False   # retry the bounded escalation next tick
+            if once:
+                return
             time.sleep(1)
 
     def _save_state(self):
@@ -218,8 +327,12 @@ class Recorder:
                 s = self.st.get(n)
                 if s is None or s["desired"]:
                     continue
+                live = _alive(s["proc"])
                 s.update(desired=True, state="RECONNECTING", started=time.time(),
-                         until=until, restarts=0, backoff=2.0, next_spawn=0.0, last_bytes=0)
+                         until=until, restarts=0, backoff=2.0, next_spawn=0.0,
+                         last_bytes=0)
+                if not live:
+                    s.update(active_file=None, writer_dir=None, stopping=False)
             self._save_state()
 
     def stop(self, names=None):
@@ -232,15 +345,23 @@ class Recorder:
                     continue
                 s["desired"] = False
                 if s["proc"]:
-                    procs.append(s["proc"])
-        for p in procs:                          # signal outside the lock: waits up to 15 s
-            _graceful(p)
+                    s["state"] = "RECONNECTING"
+                    s["stopping"] = True
+                    procs.append((n, s["proc"]))
+        stopped = {n: (p, _graceful(p)) for n, p in procs}  # waits outside the lock
         with self.lock:
             for n in names:
                 s = self.st.get(n)
+                result = stopped.get(n)
                 # A start() that landed mid-stop owns the state now; don't clobber it.
-                if s and not s["desired"]:
-                    s.update(proc=None, state="STOPPED", started=None, until=None)
+                if (s and not s["desired"] and
+                        (not s["proc"] or (result and s["proc"] is result[0] and result[1]))):
+                    s.update(proc=None, state="STOPPED", started=None, until=None,
+                             active_file=None, writer_dir=None, stopping=False)
+                elif s and not s["desired"] and result and s["proc"] is result[0]:
+                    s["stopping"] = False       # supervisor retries the bounded stop
+                elif s and s["desired"] and result and s["proc"] is result[0] and not result[1]:
+                    s["stopping"] = False       # start() reclaimed the still-live process
             self._save_state()
 
     def shutdown(self):
@@ -261,7 +382,7 @@ class Recorder:
                 start = s["started"] or 0
                 out[n] = {
                     "state": s["state"],
-                    "bytes": sum(f.stat().st_size for f in self._session_files(n)),
+                    "bytes": sum(size for _, size in self._session_stats(n)),
                     # ponytail: wallclock since Start, not decoded duration — close enough
                     # for an operator; ffprobe the segments if exact footage time matters.
                     "minutes": round((now - start) / 60, 1) if start else 0,
@@ -354,4 +475,81 @@ if __name__ == "__main__":
         assert b.st["wedged"]["backoff"] > 2.0, b.st["wedged"]["backoff"]   # kept looping
         assert any("cannot start ffmpeg" in x for x in b.st["wedged"]["tail"])
     b.stop(["wedged"])
+
+    # An unresponsive child gets every bounded step, in order, and is reaped.
+    class Stubborn:
+        def __init__(self):
+            self.calls, self.dead = [], False
+        def send_signal(self, _sig):
+            self.calls.append("sigint")
+        def terminate(self):
+            self.calls.append("terminate")
+        def kill(self):
+            self.calls.append("kill")
+            self.dead = True
+        def wait(self, timeout):
+            self.calls.append(("wait", timeout))
+            if not self.dead:
+                raise subprocess.TimeoutExpired("ffmpeg", timeout)
+        def poll(self):
+            return 0 if self.dead else None
+    stubborn = Stubborn()
+    assert _graceful(stubborn)
+    assert stubborn.calls == ["sigint", ("wait", 10), "terminate", ("wait", 5),
+                              "kill", ("wait", 5)], stubborn.calls
+
+    # Progress follows only the current writer: removed old segments, rotation and
+    # disappearing files are routine, and output from an old process is ignored.
+    class Alive:
+        def __init__(self, lines=()):
+            self.stderr = lines
+        def poll(self):
+            return None
+    probe = Recorder.__new__(Recorder)
+    probe.out_root, probe.site, probe.lock = Path(tempfile.mkdtemp()), "site", threading.Lock()
+    probe.state_path = None
+    probe.cams = {"cam": cam}
+    d = probe.cam_dir("cam")
+    d.mkdir(parents=True)
+    old, current = d / "old.mkv", d / "current.mkv"
+    old.write_bytes(b"x" * 1000)
+    current.write_bytes(b"x" * 100)
+    proc = Alive([f"Opening '{old}' for writing\n", f"Opening '{current}' for writing\n"])
+    probe.st = {"cam": {"desired": True, "proc": proc, "state": "RECORDING",
+                         "started": time.time() - 100, "until": None, "restarts": 0,
+                         "alive_since": time.time() - SETTLED, "next_spawn": 0,
+                         "backoff": 2, "tail": deque(maxlen=20), "last_bytes": 99,
+                         "last_progress": time.time() - STALL_SECONDS - 1,
+                         "active_file": None, "writer_dir": d.resolve(), "stopping": False}}
+    probe._drain("cam", proc)
+    assert probe.st["cam"]["active_file"] == current.resolve()
+    assert probe.st["cam"]["last_bytes"] == 0, "rotation did not reset progress"
+    probe._supervise(once=True)
+    assert probe.st["cam"]["last_bytes"] == 100, "retained bytes counted as progress"
+    old.unlink()                              # offload removed a retained segment
+    with open(current, "ab") as f:
+        f.write(b"x" * 20)
+    probe.st["cam"]["last_progress"] = time.time() - STALL_SECONDS - 1
+    probe._supervise(once=True)
+    assert probe.st["cam"]["last_bytes"] == 120
+    assert not probe.st["cam"]["stopping"], "old-segment deletion caused a false stall"
+    stale = Alive([f"Opening '{old}' for writing\n"])
+    probe._drain("cam", stale)
+    assert probe.st["cam"]["active_file"] == current.resolve(), "stale stderr won"
+    current.unlink()
+    assert probe.status()["cam"]["bytes"] == 0, "vanished segment broke status"
+    probe.st["cam"]["active_file"] = None
+    old.write_bytes(b"old")
+    assert probe.file_active(old), "unknown current filename did not protect the camera"
+    probe.st["cam"]["desired"] = False
+    probe.site = "changed-while-stopping"
+    assert probe.file_active(old), "site change lost protection for the live writer"
+    replacement = dict(cam, ip="10.0.0.2")
+    probe.add_camera(dict(replacement, name="cam"))
+    assert probe.cams["cam"]["ip"] == "10.0.0.2", "camera config was not updated"
+    assert probe.st["cam"]["proc"] is proc and probe.file_active(old), \
+        "config update detached the stopping writer"
+    writer_dir = probe.st["cam"]["writer_dir"]
+    probe.start(["cam"])
+    assert probe.st["cam"]["writer_dir"] == writer_dir, "start detached the stopping writer"
     print("recorder self-check ok:", st["restarts"], "restart(s), watchdog + spawn-fail ok")

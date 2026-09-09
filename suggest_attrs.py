@@ -175,9 +175,14 @@ def main():
         sys.exit(f"no ollama at {OLLAMA} — start it (ollama serve) and pull {MODEL}")
 
     began, done, skipped, stopping = time.monotonic(), 0, 0, False
+    import dataset_retention
     for stem, img_path, boxes in work:
         got = {}
         try:
+            with dataset_retention.DATASET_LOCK:
+                policy = dataset_retention.cached_policy(DATASET)
+                if policy and dataset_retention.expired(stem, policy):
+                    continue
             img = Image.open(img_path).convert("RGB")
             for i, (cls, box) in boxes.items():
                 jpeg = crop_jpeg(img, box)
@@ -203,7 +208,10 @@ def main():
         if got:
             out = PENDING / "suggest" / f"{stem}.json"
             out.parent.mkdir(parents=True, exist_ok=True)
-            out.write_text(json.dumps({**load_json(out), **got}))
+            with dataset_retention.DATASET_LOCK:
+                policy = dataset_retention.cached_policy(DATASET)
+                if not policy or not dataset_retention.expired(stem, policy):
+                    out.write_text(json.dumps({**load_json(out), **got}))
         if stopping:
             break
     print(f"{done} suggested, {skipped} skipped in {(time.monotonic() - began) / 60:.1f} min")
