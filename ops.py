@@ -683,6 +683,9 @@ background:#1d2d3d;color:#fff;border:0;cursor:pointer">SIGN IN</button>
 
 @app.middleware("http")
 async def _guard(request, call_next):
+    # The platform probes this before any operator can log in: never gated.
+    if request.url.path == "/healthz":
+        return await call_next(request)
     if not OPS_PASSWORD:
         return await call_next(request)
     import secrets as _s
@@ -924,6 +927,12 @@ def api_logs(hive: str, node: str):
         raise HTTPException(404, "unknown node")
     cams = {c: v.get("log") or [] for c, v in (n["record"].get("cameras") or {}).items()}
     return {"node": n["log"], "cameras": cams, "last_seen": n["last_seen"]}
+
+
+@app.get("/healthz")
+def healthz():
+    """Liveness, ungated — the twin of app.py's, so railway.toml needs one path."""
+    return {"ok": True, "app": "ops"}
 
 
 @app.get("/")
