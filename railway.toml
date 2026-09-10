@@ -11,6 +11,14 @@
 # authority activation is the exception: a failed activation must stop that service.
 [build]
 builder = "RAILPACK"
+# Pushes do NOT deploy. Deliberately: app.py at HEAD cannot boot — it calls
+# REC.file_active and passes CONSOLE_CREDS to an Offload built from modules that live
+# only in the operator's working tree, so a build from the commit crashes on import and
+# took the curation tool down twice on 2026-09-10. Deploy with `railway up`, which sends
+# the working tree. No pushed file matches this pattern, so Railway skips the build.
+# Remove this line once HEAD can boot on its own (recorder.py, dataset_sync.py, selfloop.py
+# and the retention modules all need to be committed together).
+watchPatterns = ["deploy.trigger"]
 # Only the curation service carries torch: service variables are visible at build time,
 # so the extra install is gated on FIELDKIT_MODE and every other service builds as before.
 # ultralytics brings the GUI build of OpenCV, which needs X11/GL libraries the slim image
