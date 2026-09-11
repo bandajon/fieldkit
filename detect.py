@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import threading
 import time
+import uuid
 from collections import Counter
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -41,6 +42,9 @@ RECOUNT_GUARD = 45.0     # a counted vehicle's resting place is remembered this 
 GUARD_IOU = 0.5
 DRAWN_IOU = 0.3          # looser than GUARD_IOU: a hand-drawn box is a curator's estimate
                          # of where a vehicle is, not a detector's box seen twice
+CENTRE = (0.25, 0.75)    # the middle half of each axis — "the centre of the frame"
+GUESS_AREA = 0.01        # ...or a box this large wherever it sits: that is a near vehicle
+GUESS_CONF = 0.02        # last resort for those: the model's best guess rather than silence
 CROP_CONF = 0.15         # a second look at the crop alone: the curator drew there because the
                          # detector missed it at CONF, so the crop is asked more leniently
 COUNT_LINE = 0.55        # where a vehicle is counted once a camera has a travel axis: a line
@@ -504,7 +508,20 @@ def review_frame(jpeg, cfg):
     return _under_review(jpeg, cfg, draw)
 
 
-def crop_class(m, img, xyxy):
+def worth_a_guess(box):
+    """Should a box the detector cannot see still get the model's best guess?
+
+    Yes in the middle of the frame, and yes for any box big enough to be a near vehicle:
+    a curator drawing there is looking at something real, and a wrong suggestion costs
+    them one tap while no suggestion costs them every field. A small box out at the edge
+    or up at the horizon is left alone — at that size the guesses measured wrong more
+    often than right, and a confident wrong class is worse than an empty one."""
+    cx, cy, w, h = box
+    lo, hi = CENTRE
+    return (lo <= cx <= hi and lo <= cy <= hi) or (w * h) >= GUESS_AREA
+
+
+def crop_class(m, img, xyxy, conf=CROP_CONF):
     """The vehicle filling a curator's crop, when the full frame showed none there. The
     crop is padded and scaled up so a distant vehicle the frame-level pass skipped is
     large enough to see, and the largest vehicle in it is the one that was drawn."""
@@ -513,7 +530,7 @@ def crop_class(m, img, xyxy):
     if scale > 1:
         c = c.resize((c.width * scale, c.height * scale))
     best = None
-    for r in m["model"].predict(c, imgsz=640, conf=CROP_CONF, agnostic_nms=True,
+    for r in m["model"].predict(c, imgsz=640, conf=conf, agnostic_nms=True,
                                 device=m["dev"], verbose=False, **m["extra"]):
         for b, cid in zip(r.boxes.xyxy.tolist(), r.boxes.cls.tolist()):
             cls = m["lookup"].get(int(cid))
@@ -537,6 +554,8 @@ def classify_box(jpeg, cfg, box):
         drawn = ((cx - w / 2) * img.width, (cy - h / 2) * img.height,
                  (cx + w / 2) * img.width, (cy + h / 2) * img.height)
         cls = best_match(dets, drawn) or crop_class(m, img, drawn)
+        if cls is None and worth_a_guess((cx, cy, w, h)):
+            cls = crop_class(m, img, drawn, conf=GUESS_CONF)
         return {"cls": cls,
                 "attrs": m["attrs"](crop(img, drawn), cls) if (cls and m["attrs"]) else {}}
     return _under_review(jpeg, cfg, pick)
@@ -606,7 +625,7 @@ class Reader:
 
 class Detector:
     def __init__(self, cameras, snapshot_fn, cfg, creds_fn=None, dataset_dir=None,
-                 counts_dir=None, events_dir=None):
+                 counts_dir=None, events_dir=None, source_key=None):
         self.cams = [dict(c) for c in (cameras or [])]
         self.snapshot = snapshot_fn     # unused here: app.py's frame() fallback while a reader is down
         self.creds_fn = creds_fn        # ip -> (user, password); else the cam dict's own
@@ -621,6 +640,11 @@ class Detector:
         self.tz = None                  # naive local, unless the footage's zone is known
         self.backend = str(cfg.get("detect_backend", "cpu") or "cpu").strip().lower()
         self.gate = str(cfg.get("toll_gate_id") or "").strip()
+        # Offline callers supply the recording object key, making a retry deterministic.
+        # Live sessions use a fresh UUID, so restarts and recycled tracker ids cannot collide.
+        seed = f"{self.gate}\0{source_key}" if source_key else uuid.uuid4().hex
+        self.event_ns = hashlib.sha256(seed.encode()).hexdigest()[:32]
+        self.event_ordinal = 0
         self.hef_path = cfg.get("hef_path", "")   # hailo model; read here, used once that backend lands
         # Fine-tuned weights bring their own taxonomy: model.names replaces the COCO four.
         self.weights = str(cfg.get("detect_weights", "") or "").strip()
@@ -980,7 +1004,9 @@ class Detector:
                     continue
                 t = ids.get(tid)
                 if t is None:
+                    self.event_ordinal += 1
                     t = ids[tid] = {"votes": Counter(), "label": cls, "hits": 0,
+                                    "observation_id": f"obs-{self.event_ns}-{self.event_ordinal:08x}",
                                     "counted_as": None, "last_seen": now,
                                     "first_seen": now, "counted_at": 0.0,
                                     "axles": 0, "best": (0.0, None), "attrs": {},
@@ -1002,13 +1028,10 @@ class Detector:
                 # expires. Upgrade path: spool them to the events dir as they are taken.
                 if (self.attrs or self.events_dir) and img is not None:
                     shot = t["front"] = t["front"] or jpeg_crop(img, box)
-                    if t["counted_as"] is None:
-                        # Attributes are classified once, at the count, so the best crop
-                        # stops moving there — cropping past it is work nobody reads.
-                        area = (box[2] - box[0]) * (box[3] - box[1])
-                        if area > t["best"][0]:
-                            t["best"] = (area, shot if t["hits"] == 1 else jpeg_crop(img, box))
-                    elif self.events_dir and not t.get("ghost"):
+                    area = (box[2] - box[0]) * (box[3] - box[1])
+                    if not t.get("ghost") and area > t["best"][0]:
+                        t["best"] = (area, shot if t["hits"] == 1 else jpeg_crop(img, box))
+                    if t["counted_as"] and self.events_dir and not t.get("ghost"):
                         t["rear"] = jpeg_crop(img, box)
                 # Votes and labels stay internal; only what leaves here is renamed.
                 disp = self.display[t["label"]]
@@ -1039,7 +1062,7 @@ class Detector:
                             t["counted_as"] = disp
                             t["ghost"] = True
                         else:
-                            t["attrs"] = self._classify(t)
+                            t["attrs"] = self._classify(t, disp)
                             t["counted_as"] = disp
                             t["counted_at"] = self.wall()
                             t["counted_mono"] = now
@@ -1051,6 +1074,7 @@ class Detector:
                     self.totals[t["counted_as"]] -= 1
                     self.totals[disp] += 1
                     self._bump(t["counted_as"], t["attrs"], -1)
+                    t["attrs"] = self._classify(t, disp)
                     self._bump(disp, t["attrs"], 1)
                     t["counted_as"] = disp
                 live.append(disp)
@@ -1071,6 +1095,10 @@ class Detector:
         if t["counted_as"] and t.get("box"):
             self.recent.setdefault(name, []).append(
                 (t["counted_as"], t["box"], now + RECOUNT_GUARD))
+        if t.get("counted_as") and not t.get("ghost") and t.get("classified_best") != t["best"][1]:
+            self._bump(t["counted_as"], t["attrs"], -1)
+            t["attrs"] = self._classify(t, t["counted_as"])
+            self._bump(t["counted_as"], t["attrs"], 1)
         self._event(name, t)
 
     def flush(self, name):
@@ -1095,13 +1123,14 @@ class Detector:
         d = self._direction(t, cam)
         when = datetime.fromtimestamp(t["counted_at"], tz=self.tz)
         day = when.strftime("%Y-%m-%d")
-        eid = f"{name}-{int(t['counted_at'] * 1000)}"
+        eid = t["observation_id"]
         blobs = {tag: b for tag, b in (("front", t["front"]), ("best", t["best"][1]),
                                        ("rear", t["rear"])) if b}
         crops = {tag: f"crops/{day}/{eid}-{tag}.jpg" for tag in blobs}
         doc = {"id": eid, "ts": when.isoformat(timespec="seconds"), "camera": name,
                "class": t["counted_as"], "letter": letter_of(t["counted_as"]),
                "attrs": t["attrs"],
+               "classification_error": t.get("classification_error"),
                "axles_source": ("wheels" if t["axles"] >= 2 else
                                 "classifier" if t["attrs"] else None),
                "hits": t["hits"],
@@ -1127,26 +1156,35 @@ class Detector:
         """Drop crop directories past the retention window. The jsonl files stay."""
         if not self.events_dir:
             return
+        if self.events_dir.is_symlink() or (self.events_dir / "crops").is_symlink():
+            return
         cutoff = (date.today() - timedelta(days=EVENTS_KEEP_DAYS)).isoformat()
         try:
             for d in (self.events_dir / "crops").glob("*"):
-                if d.is_dir() and d.name < cutoff:      # ISO dates sort lexicographically
-                    shutil.rmtree(d)
+                if d.is_dir() and not d.is_symlink() and d.name < cutoff:
+                    for f in d.iterdir():
+                        if f.is_file() and not f.is_symlink() and f.suffix.lower() == ".jpg" and not f.name.endswith("-best.jpg"):
+                            f.unlink()
+                    try: d.rmdir()
+                    except OSError: pass
         except OSError as e:
             with self.lock:
                 self.error = f"event crops not pruned: {e}"
 
-    def _classify(self, t):
+    def _classify(self, t, cls):
         """Attributes for an id at the moment it counts. Caller holds the lock.
         A wheel-derived axle count beats the classifier's guess whenever there is one."""
         a = {}
+        t["classification_error"] = None
         if self.attrs and t["best"][1]:
             try:
                 from PIL import Image
                 a = dict(self.attrs(Image.open(io.BytesIO(t["best"][1])).convert("RGB"),
-                                    t["counted_as"]))
+                                    cls))
             except Exception as e:      # a bad crop costs attributes, never the count
                 self.error = f"attrs: {e}"
+                t["classification_error"] = str(e)
+        t["classified_best"] = t["best"][1]
         if t["axles"] >= 2:
             a["axles"] = str(min(t["axles"], 9))   # 9 is the physical ceiling for legal traffic
         return a
@@ -1226,43 +1264,53 @@ class Detector:
             return
         pending = self.dataset_dir / "pending"
         try:
-            imgs = list((pending / "images").glob("*.jpg"))
-            if len(imgs) >= DATASET_CAP:
-                # By mtime, not by name: a camera name may contain dashes, so the stem's
-                # timestamp is not the lexicographic tail. Files are written once, so
-                # mtime is the capture time.
-                oldest = min(imgs, key=lambda p: p.stat().st_mtime)
-                oldest.unlink()
-                (pending / "labels" / f"{oldest.stem}.txt").unlink(missing_ok=True)
-            # The gate id rides in the sample name: a frame that reaches a shared queue
-            # from one of nine sites has to say which one without a lookup.
             stem = sample_stem(self.gate, name, self.wall(), RARE_STEP if rare else None)
-            # *_ : a counted vehicle carries a direction chip as a 4th element.
-            lines = [f"{self.display_ids[cls]} {(x1 + x2) / 2 / w:.6f} {(y1 + y2) / 2 / h:.6f} "
-                     f"{(x2 - x1) / w:.6f} {(y2 - y1) / h:.6f}"
-                     for cls, _conf, (x1, y1, x2, y2), *_ in shown if cls in self.display_ids]
-            (pending / "images" / f"{stem}.jpg").write_bytes(jpeg)
-            (pending / "labels" / f"{stem}.txt").write_text("\n".join(lines) + "\n")
-            self.last_boxes[name] = shown
-            self.captured.append(stem)
-        except OSError as e:
+            import dataset_retention
+            policy = dataset_retention.cached_policy(self.dataset_dir)
+            if policy and dataset_retention.expired(stem, policy):
+                return
+            with dataset_retention.DATASET_LOCK:
+                policy = dataset_retention.cached_policy(self.dataset_dir)
+                if policy and dataset_retention.expired(stem, policy):
+                    return
+                imgs = list((pending / "images").glob("*.jpg"))
+                if len(imgs) >= DATASET_CAP:
+                    oldest = min(imgs, key=lambda p: p.stat().st_mtime)
+                    oldest.unlink()
+                    (pending / "labels" / f"{oldest.stem}.txt").unlink(missing_ok=True)
+                lines = [f"{self.display_ids[cls]} {(x1 + x2) / 2 / w:.6f} {(y1 + y2) / 2 / h:.6f} "
+                         f"{(x2 - x1) / w:.6f} {(y2 - y1) / h:.6f}"
+                         for cls, _conf, (x1, y1, x2, y2), *_ in shown if cls in self.display_ids]
+                (pending / "images" / f"{stem}.jpg").write_bytes(jpeg)
+                (pending / "labels" / f"{stem}.txt").write_text("\n".join(lines) + "\n")
+                self.last_capture[name] = now
+                self.last_boxes[name] = shown
+                if rare:
+                    self.last_rare[name] = now
+                self.captured.append(stem)
+        except (OSError, ValueError) as e:
             self._set("running", f"dataset capture failed: {e}")
+        return
 
 
-def classify_segment(path, cam, cfg, tz, events_dir):
+def classify_segment(path, cam, cfg, tz, events_dir, source_key=None):
     """One recorded segment through the live pipeline, offline -> the day it was filmed.
 
     Same detector, same tracker, same counting, same events as the wire: only the clock
     is different, so a gate box that merely records still yields vehicle events. Both
-    clocks come off the footage, which is what makes a re-run of the same segment produce
-    the same event ids instead of a second set stamped with today.
+    clocks come off the footage. Observation ids are deterministic for the same source
+    and detection sequence, not immutable vehicle ids across changed model runs.
+
+    `source_key` should be the full stable recording key. The fallback uses only the
+    recording's last three path components, avoiding a download's changing temp root.
     """
     from PIL import Image
 
     import ingest_video          # imports detect: keep the import inside the call
 
+    source_key = source_key or "/".join(Path(path).parts[-3:])
     d = Detector([cam], None, cfg, events_dir=events_dir,
-                 dataset_dir=cfg.get("dataset_dir"))
+                 dataset_dir=cfg.get("dataset_dir"), source_key=source_key)
     d.tz = tz
     start = ingest_video.cam_and_start(path)[1]
     at = [start]
@@ -1351,6 +1399,27 @@ if __name__ == "__main__":
     assert d.totals["car"] == 1 and d.totals["truck"] == 1 and d.totals["bus"] == 0, d.totals
     assert len(shown) == 3 and shown[2][0] == "bus", shown
     assert d.counts()["visible"] == {"c": {"car": 1, "truck": 1}}, d.counts()
+    observations = [t["observation_id"] for t in d.tracks["c"].values()]
+    assert len(set(observations)) == 2, observations
+
+    # Observation identity follows creation order within a stable source namespace. It
+    # ignores tracker ids and download roots, while source/camera/gate/session changes do not collide.
+    cfg = {"toll_gate_id": "G"}
+    a = Detector([CAM], nosnap, cfg, source_key="G/north/seg.mkv")
+    b = Detector([CAM], nosnap, cfg, source_key="G/north/seg.mkv")
+    a._track("c", det("car", 91)); b._track("c", det("car", 7))
+    assert a.tracks["c"][91]["observation_id"] == b.tracks["c"][7]["observation_id"]
+    distinct = {
+        Detector([CAM], nosnap, {"toll_gate_id": gate}, source_key=source).event_ns
+        for gate, source in (("G", "G/north/seg.mkv"), ("G", "G/south/seg.mkv"),
+                             ("G", "G/north/next.mkv"), ("H", "G/north/seg.mkv"))}
+    assert len(distinct) == 4, distinct
+    assert fresh().event_ns != fresh().event_ns, "live restarts need fresh namespaces"
+    old = a.tracks["c"][91]["observation_id"]
+    a.tracks["c"][91]["last_seen"] -= ID_EXPIRY + 1
+    a._track("c", [])
+    a._track("c", det("car", 91))
+    assert a.tracks["c"][91]["observation_id"] != old, "recycled tracker id collided"
 
     # Drawing uses the voted label, not the raw per-frame class.
     d = fresh()
@@ -1595,6 +1664,13 @@ if __name__ == "__main__":
                        (WHEEL, 0.9, DRAWN)], DRAWN) == "truck", "a wheel never wins"
     assert best_match([], DRAWN) is None
 
+    # A box in the middle, or any large box, earns the model's best guess; a small one
+    # at the edge does not.
+    assert worth_a_guess((0.5, 0.5, 0.02, 0.02)), "dead centre always gets a guess"
+    assert worth_a_guess((0.05, 0.9, 0.2, 0.2)), "a big box anywhere is a near vehicle"
+    assert not worth_a_guess((0.05, 0.05, 0.02, 0.02)), "small and off in the corner: silent"
+    assert not worth_a_guess((0.5, 0.1, 0.03, 0.03)), "small up at the horizon: silent"
+
     # One predict per frame, however many boxes; a new frame or new weights redoes it.
     runs = []
     def stub():
@@ -1630,7 +1706,11 @@ if __name__ == "__main__":
 
     # Attributes: classified once at count time, wheel axles overriding the classifier.
     d = fresh()
-    d.attrs = lambda pil, cls=None: {"type": "articulated", "axles": "2", "cargo": "mineral"}
+    classified_as = []
+    def attrs(pil, cls=None):
+        classified_as.append(cls)
+        return {"type": cls, "axles": "2", "cargo": "mineral"}
+    d.attrs = attrs
     if jpeg:
         from PIL import Image
         pic = Image.new("RGB", (300, 200))
@@ -1640,18 +1720,20 @@ if __name__ == "__main__":
         d._track("c", [("truck", 0.9, VEH, 1)] + six, pic)   # bigger box, and 4 axles
         t = d.tracks["c"][1]
         assert t["best"][0] == 20000.0, t["best"][0]         # best crop is the largest box
-        assert t["attrs"] == {"type": "articulated", "axles": "4", "cargo": "mineral"}, t
+        assert classified_as == ["truck"], classified_as
+        assert t["attrs"] == {"type": "truck", "axles": "4", "cargo": "mineral"}, t
         assert d.counts()["breakdown"] == {
-            "truck": {"type": {"articulated": 1}, "axles": {"4": 1}, "cargo": {"mineral": 1}}}
+            "truck": {"type": {"truck": 1}, "axles": {"4": 1}, "cargo": {"mineral": 1}}}
         d._track("c", [("truck", 0.9, (0.0, 0.0, 300.0, 200.0), 1)], pic)
-        assert d.tracks["c"][1]["best"][0] == 20000.0, "counted ids stop cropping"
+        assert d.tracks["c"][1]["best"][0] == 60000.0, "best crop keeps updating after count"
 
         # A category flip moves the whole breakdown with the tally — no zeros left behind.
         for _ in range(4):              # outvote the three truck frames above
             d._track("c", [("bus", 0.9, VEH, 1)], pic)
         assert d.totals["bus"] == 1 and d.totals["truck"] == 0, d.totals
+        assert classified_as[-1] == "bus", classified_as
         assert d.counts()["breakdown"] == {
-            "bus": {"type": {"articulated": 1}, "axles": {"4": 1}, "cargo": {"mineral": 1}}}
+            "bus": {"type": {"bus": 1}, "axles": {"4": 1}, "cargo": {"mineral": 1}}}
         assert min(d.totals.values()) >= 0, d.totals
 
     # Attributes off: everything else still works, and no crops are taken.
@@ -1689,12 +1771,27 @@ if __name__ == "__main__":
         assert len(lines) == 1, lines
         e = json.loads(lines[0])
         assert e["camera"] == "c" and e["class"] == "e-heavy" and e["letter"] == "E", e
-        assert e["id"].startswith("c-") and e["ts"][:10] == day, e
+        assert e["id"].startswith("obs-") and e["ts"][:10] == day, e
         assert e["attrs"]["axles"] == "4" and e["axles_source"] == "wheels", e
         assert e["hits"] == 3 and e["dwell_s"] == 10.0, e
         assert sorted(e["crops"]) == ["best", "front", "rear"], e["crops"]
         for rel in e["crops"].values():
             assert (ev / rel).read_bytes().startswith(SOI), rel
+
+        # Two vehicles counted on the same offline frame retain two records and crop sets.
+        simultaneous = Path(tempfile.mkdtemp())
+        pair = Detector([CAM], nosnap, {}, events_dir=simultaneous,
+                        source_key="G/c/20260819-151108.mkv")
+        pair.tz, pair.clock, pair.wall = d.tz, d.clock, d.wall
+        other = (210.0, 10.0, 280.0, 100.0)
+        for _ in range(2):
+            pair._track("c", [("car", 0.9, VEH, 11), ("truck", 0.9, other, 22)], pic)
+        pair.flush("c")
+        docs = [json.loads(line) for line in
+                (simultaneous / f"{day}.jsonl").read_text().splitlines()]
+        assert len({doc["id"] for doc in docs}) == 2, docs
+        paths = [rel for doc in docs for rel in doc["crops"].values()]
+        assert len(paths) == len(set(paths)) and all((simultaneous / p).is_file() for p in paths), paths
 
         # A ghost is the same vehicle continuing: no second event, no second crop set.
         for _ in range(2):
@@ -1766,11 +1863,38 @@ if __name__ == "__main__":
         d.flush("c")                             # the footage ends here
         e = json.loads((ft / "2026-08-19.jsonl").read_text().splitlines()[0])
         assert e["ts"] == "2026-08-19T15:11:08+02:00", e["ts"]   # offset, not naive local
-        assert e["id"] == f"c-{int(base * 1000)}", e["id"]       # footage epoch, not now
+        assert e["id"].startswith("obs-") and len(e["id"]) == 45, e["id"]
         assert d.tracks.get("c", {}) == {}, d.tracks
         assert d.recent["c"], "a flushed vehicle still arms the recount guard"
         d.flush("c")                             # nothing left: flushing twice is harmless
         assert len((ft / "2026-08-19.jsonl").read_text().splitlines()) == 1
+
+        # Real offline entry point: changing download roots and tracker ids preserves
+        # identities through both the documented path fallback and an explicit object key.
+        import ingest_video
+
+        def offline(path, tid, source_key=None):
+            out = Path(tempfile.mkdtemp())
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.touch()
+            tracker = lambda name, img: [("truck", 0.9, VEH, tid)]
+            with patch.object(ingest_video, "cam_and_start", return_value=("c", base)), \
+                 patch.object(ingest_video, "frames", return_value=[jpeg, jpeg]), \
+                 patch.object(Detector, "_load", return_value=tracker):
+                classify_segment(path, CAM, {"toll_gate_id": "G"}, CAT, out,
+                                 source_key=source_key)
+            docs = [json.loads(line) for line in
+                    (out / "2026-08-19.jsonl").read_text().splitlines()]
+            return [doc["id"] for doc in docs], sorted(
+                Path(rel).name for doc in docs for rel in doc["crops"].values())
+
+        root1, root2 = Path(tempfile.mkdtemp()), Path(tempfile.mkdtemp())
+        fallback1 = offline(root1 / "site" / "c" / "20260819-151108.mkv", 101)
+        fallback2 = offline(root2 / "site" / "c" / "20260819-151108.mkv", 909)
+        assert fallback1 == fallback2, (fallback1, fallback2)
+        explicit1 = offline(root1 / "other" / "one.mkv", 3, "G/c/stable.mkv")
+        explicit2 = offline(root2 / "different" / "two.mkv", 77, "G/c/stable.mkv")
+        assert explicit1 == explicit2, (explicit1, explicit2)
 
     # Counting on a line. A vehicle queued short of the line is never counted, however long
     # it sits; it counts once when it crosses; a second id the tracker hands the same crawling
