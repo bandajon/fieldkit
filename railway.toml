@@ -11,7 +11,11 @@
 # authority activation is the exception: a failed activation must stop that service.
 [build]
 builder = "RAILPACK"
-# Pushes do NOT deploy. Deliberately: app.py at HEAD cannot boot — it calls
+# Pushes do NOT deploy, and NEITHER does a bare `railway up`: watch patterns gate CLI
+# deploys too (verified 2026-09-11 — two `railway up` runs came back SKIPPED). To deploy,
+# change the untracked trigger file first, which the CLI uploads and a push never carries:
+#     date -u > deploy.trigger && railway up
+# Deliberately: app.py at HEAD cannot boot — it calls
 # REC.file_active and passes CONSOLE_CREDS to an Offload built from modules that live
 # only in the operator's working tree, so a build from the commit crashes on import and
 # took the curation tool down twice on 2026-09-10. Deploy with `railway up`, which sends
