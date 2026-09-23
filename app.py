@@ -74,6 +74,8 @@ LOGINS = {}               # handle -> [failures, locked until]
 LOGINS_LOCK = threading.Lock()
 REVIEW_RATE = 0.10        # share of each curator's approvals an expert re-checks
 SYNC_EVERY = 120.0        # curation node -> R2: how often the ledgers are harvested
+CLOCK_EVERY = 3600.0      # cameras drift ~8 s/day (Katuba, measured 2026-09-23): hourly keeps the
+                          # burned-in clock within ~0.3 s of the recorder's
 MAX_UPLOAD = 500 * 1024**2                                 # ceiling on one uploaded video
 UPLOAD_NAME = re.compile(r"^[A-Za-z0-9._-]{1,80}$")        # becomes part of an R2 key
 REFRESH = {"running": False, "started_at": None, "last_result": None, "last_error": None}
@@ -1615,6 +1617,17 @@ def maintenance_loop():
         time.sleep(SYNC_EVERY)
 
 
+def clock_loop():
+    """Record Start sets the clocks once; they drift, and the burned-in time walks away
+    from the footage timeline. Hourly, every camera that should be recording is reset."""
+    while True:
+        time.sleep(CLOCK_EVERY)
+        try:
+            sync_clocks({n for n, s in REC.st.items() if s.get("desired")})
+        except Exception as e:
+            print(f"clock sync failed: {e}", flush=True)
+
+
 def stamp():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -2470,6 +2483,7 @@ if CURATION:
     threading.Thread(target=sync_loop, daemon=True).start()
 else:
     threading.Thread(target=maintenance_loop, daemon=True).start()
+    threading.Thread(target=clock_loop, daemon=True).start()
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
