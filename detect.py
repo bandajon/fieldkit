@@ -1413,7 +1413,7 @@ def classify_segment(path, cam, cfg, tz, events_dir, source_key=None):
     if events_dir and not d.events_dir:
         # A write failed and events went off mid-segment: returning would publish the
         # truncated segment as done. Raising leaves it unclassified, so it is retried.
-        raise RuntimeError(d.error)
+        raise RuntimeError(f"events went off mid-segment ({d.error})")   # d.error may be a later attrs error
     return datetime.fromtimestamp(start, tz=tz).strftime("%Y-%m-%d"), d.captured
 
 
@@ -2038,7 +2038,7 @@ if __name__ == "__main__":
                 classify_segment(Path("G/c/seg.mkv"), CAM, {}, CAT, blocked)
                 raise AssertionError("a lost events write must fail the segment")
             except RuntimeError as e:
-                assert "events off" in str(e), e
+                assert str(e).startswith("events went off mid-segment ("), e
 
     # Counting on a line. A vehicle queued short of the line is never counted, however long
     # it sits; it counts once when it crosses; a second id the tracker hands the same crawling
