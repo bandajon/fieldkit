@@ -267,8 +267,10 @@ def r2():
     return dataset_sync, dataset_sync.client(o), o["bucket"]
 
 
-def bucket_keys(cl, bucket, prefix=""):
-    for page in cl.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix):
+def bucket_keys(cl, bucket, prefix="", delimiter=None):
+    # A delimiter lists one level: the day's manifests without its thousands of crops.
+    by = {"Delimiter": delimiter} if delimiter else {}
+    for page in cl.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix, **by):
         for obj in page.get("Contents", []):
             yield obj["Key"]
 
@@ -561,8 +563,8 @@ def journeys_pass(cl, bucket, touched, cameras, tz):
         return 0
     import journeys
 
-    def docs(prefix):             # every manifest of the day; crops/ holds only jpegs
-        for key in sorted(k for k in bucket_keys(cl, bucket, prefix) if k.endswith(".jsonl")):
+    def docs(prefix):             # every manifest of the day; crops/ is never listed
+        for key in sorted(k for k in bucket_keys(cl, bucket, prefix, "/") if k.endswith(".jsonl")):
             body = cl.get_object(Bucket=bucket, Key=key)["Body"].read().decode()
             yield from (json.loads(l) for l in body.splitlines() if l.strip())
 
@@ -1053,13 +1055,16 @@ def journeys_check():
 
     class FakeS3:
         def __init__(self, objs):
-            self.objs, self.put = objs, {}
+            self.objs, self.put, self.listed = objs, {}, []
 
         def get_paginator(self, _):
             return self
 
-        def paginate(self, Bucket, Prefix):
-            return [{"Contents": [{"Key": k} for k in self.objs if k.startswith(Prefix)]}]
+        def paginate(self, Bucket, Prefix, Delimiter=None):
+            keys = [k for k in self.objs if k.startswith(Prefix)
+                    and not (Delimiter and Delimiter in k[len(Prefix):])]
+            self.listed += keys
+            return [{"Contents": [{"Key": k} for k in keys]}]
 
         def get_object(self, Bucket, Key):
             return {"Body": io.BytesIO(self.objs[Key])}
@@ -1080,7 +1085,7 @@ def journeys_check():
     day = "fieldkit-tracklets/G/20260819/"
     objs = {day + "a.jsonl": tracklet("cam3", [(96 + k, 0.5 + 0.1 * k, 0.5 + 0.075 * k) for k in range(5)]),
             day + "b.jsonl": tracklet("cam4", [(100.4 + k, 0.1 + 0.1 * k, 0.7 - 0.1 * k) for k in range(5)]),
-            day + "crops/obs-cam3-top.jpg": b"jpeg",      # listed beside the manifests, never parsed
+            day + "crops/obs-cam3-top.jpg": b"jpeg",      # beside the manifests, never listed
             "fieldkit-events/G/20260819/e.jsonl": json.dumps(
                 {"id": "obs-cam4", "class": "e-heavy", "hits": 5, "attrs": {"axles": "5"}}).encode()}
     cams = [{"name": "cam3", "heading": "south", "handoff": {"camera": "cam4", "zone": [0.80, 0.62, 0.20, 0.38]}},
@@ -1088,6 +1093,7 @@ def journeys_check():
     cl = FakeS3(objs)
     assert journeys_pass(cl, "buck", {("G", "2026-08-19")}, cams, timezone.utc) == 1
     assert list(cl.put) == ["fieldkit-journeys/G/20260819/journeys.jsonl"], cl.put
+    assert not any("/crops/" in k for k in cl.listed), cl.listed
     [j] = map(json.loads, cl.put["fieldkit-journeys/G/20260819/journeys.jsonl"].decode().splitlines())
     assert j["gate"] == "G" and j["link"] and j["attrs"] == {"axles": "5"}, j
     assert j["crops"] and all(v.startswith(day + "crops/") for v in j["crops"].values()), j["crops"]
