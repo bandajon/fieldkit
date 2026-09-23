@@ -267,6 +267,17 @@ def r2():
     return dataset_sync, dataset_sync.client(o), o["bucket"]
 
 
+def recording_keys(cl, bucket):
+    """Keys under the gates' recording folders only (site1/, RDA-TG-*/). The bucket is ~900k
+    objects, nearly all curation samples and evidence crops: listing it whole cost 15-20 min
+    of every pass and grew by the day. The top level is one Delimiter page."""
+    tops = [p["Prefix"] for page in cl.get_paginator("list_objects_v2").paginate(Bucket=bucket, Delimiter="/")
+            for p in page.get("CommonPrefixes", [])]
+    for top in tops:
+        if not top.startswith(SKIP + ("curation-", "fieldkit-", "classifier-crops-")):
+            yield from bucket_keys(cl, bucket, top)
+
+
 def bucket_keys(cl, bucket, prefix="", delimiter=None):
     # A delimiter lists one level: the day's manifests without its thousands of crops.
     by = {"Delimiter": delimiter} if delimiter else {}
@@ -425,7 +436,7 @@ def ingest_pass():
     with Lock():
         s = load_state()
         ds, cl, bucket = r2()
-        todo = pick(list(bucket_keys(cl, bucket)), s["ingested"])
+        todo = pick(list(recording_keys(cl, bucket)), s["ingested"])
         print(f"{now()} ingest: {len(todo)} new segment(s) across the cameras", flush=True)
         if not todo:
             return
@@ -483,7 +494,7 @@ def hunt_pass():
             return
         ds, cl, bucket = r2()
         since = (datetime.now(ZoneInfo(TZ)) - timedelta(hours=HUNT_HOURS)).strftime("%Y%m%d-%H%M%S")
-        todo = pick_hunt(list(bucket_keys(cl, bucket)), s.get("hunted", []), since)
+        todo = pick_hunt(list(recording_keys(cl, bucket)), s.get("hunted", []), since)
         print(f"{now()} hunt: {len(todo)} segment(s) since {since} to sweep", flush=True)
         if not todo:
             return
@@ -537,11 +548,15 @@ def publish(cl, bucket, out, gate, source_key, day):
         where = f"{TRACKLETS if tracklet else EVENTS}{gate}/{js.stem.replace('-', '')}"
         crops = sorted({Path(rel).name for doc in docs
                         for rel in [*doc["crops"].values(), (doc.get("plate") or {}).get("crop")] if rel})
-        for name in crops:
-            crop = js.parent / "crops" / js.stem / name
-            if not crop.is_file():
-                raise FileNotFoundError(f"crop missing: {crop}")
-            cl.upload_file(str(crop), bucket, f"{where}/crops/{name}")
+        here = js.parent / "crops" / js.stem
+        missing = [name for name in crops if not (here / name).is_file()]
+        if missing:           # all checked before any upload: no manifest cites a crop that is not up
+            raise FileNotFoundError(f"crop missing: {here / missing[0]}")
+        # In parallel: each upload waits ~0.8 s on the office link and a day segment has 300-500
+        # crops — one at a time, that was most of the segment's time in the pass.
+        import dataset_sync
+        dataset_sync.transfer(lambda name: cl.upload_file(str(here / name), bucket, f"{where}/crops/{name}"),
+                              [(name,) for name in crops], "crops up")
         cl.put_object(Bucket=bucket, Key=f"{where}/{manifest}.jsonl",
                       Body="".join(l + "\n" for l in lines).encode(),
                       ContentType="application/json")
@@ -601,7 +616,7 @@ def classify_pass():
     with Lock():
         s = load_state()
         ds, cl, bucket = r2()
-        todo = pick_classify(list(bucket_keys(cl, bucket)), s.get("classified", []))
+        todo = pick_classify(list(recording_keys(cl, bucket)), s.get("classified", []))
         print(f"{now()} classify: {len(todo)} segment(s)", flush=True)
         if not todo:
             return
@@ -1048,6 +1063,30 @@ def publish_check():
     assert len(cl.put) == 2, cl.put
 
 
+def listing_check():
+    """A pass lists the gates' recording folders, never curation, evidence or models."""
+    class Tops:
+        keys = ["site1/cam3/20260923-101636.mkv", "RDA-TG-X/north/20260923-101636.mkv",
+                "curation/pending/images/x.jpg", "curation-paired/v1/c.json", "models/champion.pt",
+                "fieldkit-events/G/20260923/m.jsonl", "classifier-crops-history/2026-09-09/c.jpg"]
+        listed = []
+
+        def get_paginator(self, _):
+            return self
+
+        def paginate(self, Bucket, Prefix="", Delimiter=None):
+            ks = [k for k in self.keys if k.startswith(Prefix)]
+            if Delimiter:
+                return [{"CommonPrefixes": [{"Prefix": p} for p in sorted({k.split("/")[0] + "/" for k in ks})]}]
+            self.listed.append(Prefix)
+            return [{"Contents": [{"Key": k} for k in ks]}]
+
+    t = Tops()
+    assert sorted(recording_keys(t, "b")) == ["RDA-TG-X/north/20260923-101636.mkv",
+                                              "site1/cam3/20260923-101636.mkv"], t.listed
+    assert sorted(t.listed) == ["RDA-TG-X/", "site1/"], t.listed
+
+
 def journeys_check():
     """A day rebuilt from the bucket alone: tracklets from two paired cameras become one
     journey citing its crops by key, with attrs from the day's events."""
@@ -1148,6 +1187,7 @@ def selfcheck():
     assert for_upload({"id": "q"}, "G")["crops"] == {}, "a crop-less event still uploads"
     lock_check()
     publish_check()
+    listing_check()
     journeys_check()
     suggest_check()
     print("selfloop self-check ok: cameras found under any gate prefix, newest unsampled segments "
