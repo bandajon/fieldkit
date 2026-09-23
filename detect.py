@@ -66,6 +66,8 @@ SAVE_EVERY = 60.0        # persist the day's tallies at most this often
 EVENTS_KEEP_DAYS = 30    # crops age out; the jsonl lines are tiny and stay
 TRACKLET_CROP_HITS = 5   # a 2-4 frame blip gets a tracklet line but no JPEGs: crops are the storage cost
 PATH_EVERY = 1.0         # seconds between a tracklet's path samples; the first and last box always stay
+PATH_MAX = 600           # ten minutes of samples; a longer track is parked, and journeys only read
+                         # its ends — path_last still keeps the exit box
 PLATE_SCALE = 3          # plates are ~20 px wide at 1080p: the plate model only finds them upscaled
 PLATE_CONF = 0.15        # ...and even then at 0.2-0.4, so it is asked leniently
 PLATE_PAD = 0.15         # a tight plate crop loses its edge characters
@@ -1047,7 +1049,8 @@ class Detector:
                     # kept aside so the exit box survives to retire.
                     s = t["path_last"] = [round(wall, 2)] + [
                         round(v / n, 4) for v, n in zip(box, t["dim"] * 2)]
-                    if not t["path"] or s[0] - t["path"][-1][0] >= PATH_EVERY:
+                    if not t["path"] or (s[0] - t["path"][-1][0] >= PATH_EVERY
+                                         and len(t["path"]) < PATH_MAX):
                         t["path"].append(s)
                 t["label"] = label_of(t)
                 t["axles"] = max(t["axles"], axles.get(i, 0))
@@ -1407,6 +1410,10 @@ def classify_segment(path, cam, cfg, tz, events_dir, source_key=None):
         # slice a sampling pass happens to land on.
         d._capture(name, jpeg, shown, img.width, img.height)
     d.flush(name)                # the last frame's vehicles are events too
+    if events_dir and not d.events_dir:
+        # A write failed and events went off mid-segment: returning would publish the
+        # truncated segment as done. Raising leaves it unclassified, so it is retried.
+        raise RuntimeError(d.error)
     return datetime.fromtimestamp(start, tz=tz).strftime("%Y-%m-%d"), d.captured
 
 
@@ -1929,6 +1936,19 @@ if __name__ == "__main__":
         assert long["plate"]["conf"] == 0.3 and (tk / long["plate"]["crop"]).is_file(), long["plate"]
         assert len((tk / f"{tday}.jsonl").read_text().splitlines()) == 3, "events: one per counted id"
 
+        # Parked all day is one id: its path stops at PATH_MAX, and the exit still lands.
+        d = fresh(events_dir=tk)
+        d.clock = d.wall = lambda: at[0]
+        d._track("c", [("car", 0.9, BOX, 5)], pic)
+        d.tracks["c"][5]["path"] *= PATH_MAX               # as if parked for ten minutes
+        at[0] += PATH_EVERY + 0.5                          # due a sample, were it not capped
+        d._track("c", [("car", 0.9, other, 5)], pic)
+        assert len(d.tracks["c"][5]["path"]) == PATH_MAX, "capped"
+        d.flush("c")
+        doc = json.loads((tk / "tracklets" / f"{tday}.jsonl").read_text().splitlines()[-1])
+        assert len(doc["path"]) == PATH_MAX + 1 and doc["path"][-1] == [
+            doc["t1"], 0.7, 0.05, 0.9333, 0.5], doc["path"][-1]
+
     # Direction and speed from the camera's own reference lines.
     if jpeg:
         TRAVEL = {"name": "c", "ip": "10.0.0.1", "user": "u", "password": "",
@@ -2007,6 +2027,18 @@ if __name__ == "__main__":
         explicit1 = offline(root1 / "other" / "one.mkv", 3, "G/c/stable.mkv")
         explicit2 = offline(root2 / "different" / "two.mkv", 77, "G/c/stable.mkv")
         assert explicit1 == explicit2, (explicit1, explicit2)
+
+        # A failed events write mid-segment fails the segment, never publishes it half-done.
+        blocked = Path(tempfile.mkdtemp()) / "events"
+        blocked.write_text("")                   # a file where the events dir should be
+        with patch.object(ingest_video, "cam_and_start", return_value=("c", base)), \
+             patch.object(ingest_video, "frames", return_value=[jpeg, jpeg]), \
+             patch.object(Detector, "_load", return_value=lambda name, img: [("truck", 0.9, VEH, 1)]):
+            try:
+                classify_segment(Path("G/c/seg.mkv"), CAM, {}, CAT, blocked)
+                raise AssertionError("a lost events write must fail the segment")
+            except RuntimeError as e:
+                assert "events off" in str(e), e
 
     # Counting on a line. A vehicle queued short of the line is never counted, however long
     # it sits; it counts once when it crosses; a second id the tracker hands the same crawling
