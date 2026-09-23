@@ -137,9 +137,7 @@ def _chains(tracklets, cameras):
     per = {}
     for t in by.values():
         per.setdefault(t["camera"], []).append(t)
-    cands = []
     for ts in per.values():
-        # A whole day is ~20k tracklets a camera: only those starting within STITCH_GAP of a's end.
         ts.sort(key=lambda t: t["t0"])
         for a in ts:
             # Forced like a ghost, any class (twins flicker), and no stitch slot used: detect's
@@ -148,6 +146,16 @@ def _chains(tracklets, cameras):
                         bisect_left(ts, a["t1"], key=lambda t: t["t0"])]:
                 if b is not a and _twin(a, b):
                     up[find(b["id"])] = find(a["id"])
+    end = {}
+    for t in by.values():
+        r = find(t["id"])
+        end[r] = max(end.get(r, t["t1"]), t["t1"])
+    cands = []
+    for ts in per.values():
+        # A whole day is ~20k tracklets a camera: only those starting within STITCH_GAP of a's end.
+        for a in ts:
+            if end[find(a["id"])] > a["t1"]:
+                continue    # its vehicle lived on under another id: a twin dying mid-frame left nowhere
             lo = bisect_left(ts, a["t1"], key=lambda t: t["t0"])
             for b in ts[lo:bisect_right(ts, a["t1"] + STITCH_GAP, key=lambda t: t["t0"])]:
                 if (b is not a and (iou(a["path"][-1][1:], b["path"][0][1:]) >= STITCH_IOU or _near(a, b))
@@ -401,6 +409,11 @@ def _selfcheck():
     assert len(build([first, _t("cam4", 2, "d-medium", crawl[3:], hits=8)], _CAMS)) == 1
     apart = [(t, _b(0.16 + 0.05 * (t - 103), 0.64)) for t in range(103, 111)]
     assert len(build([first, _t("cam4", 2, "c-small", apart, hits=8)], _CAMS)) == 2
+    # (q) a twin that dies mid-frame is no stitch anchor: the next vehicle starting on its
+    # last box, same class and way, stays its own journey.
+    after = [(105.5 + k, _b(0.2 + 0.05 * k, 0.6 - 0.05 * k)) for k in range(4)]
+    assert len(build([first, _t("cam4", 2, "c-small", crawl[3:6]),
+                      _t("cam4", 3, "c-small", after, counted=True)], _CAMS)) == 2
     # (j) a rebuild, in any input order, yields the same ids.
     assert [j["id"] for j in build(q, _CAMS)] == [j["id"] for j in build(q[::-1], _CAMS)]
     # A whole day at a gate: 10k passes, 20k tracklets, in windowed time rather than all pairs.
@@ -409,7 +422,7 @@ def _selfcheck():
     took = time.perf_counter() - start
     print("journeys self-check ok: handoff links front to rear, queues pair in order, long trucks "
           "link across the overlap, opposed fragments stay apart, parked vehicles never count, "
-          "classes fuse by votes, ghosts join, glare blips drop, far fast fragments join, twins merge, ids are stable; "
+          "classes fuse by votes, ghosts join, glare blips drop, far fast fragments join, twins merge and anchor nothing, ids are stable; "
           f"10k passes (20k tracklets) in {took:.1f} s")
 
 
