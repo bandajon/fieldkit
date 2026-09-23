@@ -14,6 +14,8 @@ bucket ─► selfloop classify (every 10 min)
         newest un-classified segments ─► the LIVE pipeline on footage time (champion +
         attrs champion + ByteTrack + the same counting) ─► one jsonl + crops per segment
         ─► fieldkit-events/<gate>/<YYYYMMDD>/ ─► the RDA importer
+        + every track as a tracklet ─► fieldkit-tracklets/<gate>/<YYYYMMDD>/
+        ─► journeys.py over the whole day ─► fieldkit-journeys/<gate>/<YYYYMMDD>/journeys.jsonl
 ```
 
 - `python selfloop.py status` — where it stands; `loop-ingest.log`, `loop-train.log` — what it did.
@@ -65,6 +67,52 @@ What it deliberately does not do: touch a toll gate. `models/champion.pt` in the
 is the offer; deploying it to a site box (`detect_weights`, restart) stays a human step,
 because a pre-labeller that got worse costs curators minutes and a gate detector that got
 worse costs revenue.
+
+## Journeys: one vehicle across a camera pair
+
+Katuba's cam3 (faces south) and cam4 (faces north) are back to back on one road, so every
+through vehicle passes both — and per-camera events count it twice, while a vehicle one
+camera misses (cam3 at night, cam4 on big trucks at its near edge) is only counted if the
+other's count line caught it. The classify pass therefore also writes every track, counted
+or not, as a tracklet (path, class votes, surest crop per class, largest crop, receding
+crop, plate crop), and `journeys.py` rebuilds the touched days into one line per vehicle:
+
+- **Chains** — a camera's fragments of one vehicle are joined: the recount guard's
+  `ghost_of`, then fragments that start where the last one ended (IoU) or where it was
+  heading (same class only — a big vehicle occluding a small one is the false merge that
+  rule exists to refuse), never two moving opposite ways.
+- **Links** — a chain leaving one camera's handoff zone is paired with one entering the
+  partner's, by zone-interval overlap and closeness to the measured ~0.5 s gap (a long
+  truck fills both zones at once; at night cam3 locks on up to ~5 s late).
+- **Counted** once if any chain crossed a count line, or crossed a handoff zone for at
+  least a second. Class is voted across both cameras; `best` is the surest crop of that
+  class; `front`/`rear` come from the camera the vehicle approaches / leaves.
+
+Config — only cameras with `handoff` take part (Katuba, measured 2026-09-23 from tracks):
+
+```yaml
+cameras:
+- {name: cam3, heading: south, handoff: {camera: cam4, zone: [0.80, 0.62, 0.20, 0.38]}}
+- {name: cam4, heading: north, handoff: {camera: cam3, zone: [0.0, 0.55, 0.22, 0.30]}}
+```
+
+`zone` is `[x, y, w, h]` of the frame. `dataset/plate.pt` (optional: a one-class plate
+YOLO, e.g. `morsetechlab/yolov11-license-plate-detection` `license-plate-finetune-v1s.pt`,
+AGPL-3.0) adds plate crops. At 1080p a plate is ~20 px wide: the crops are evidence, not
+readable, and about half are wheels or logos — a lane-facing ANPR camera is the real fix.
+
+Measured on 2026-09-22 10:16 (10 min, daytime): 55 cross-camera links, every sampled pair
+the same vehicle, 68 journeys against 26 + 45 per-camera events; night 00:46: 6 journeys
+(5 linked) against 1 + 3 events. Known residuals, one each: a vehicle whose model class
+flips between fragments of one camera (b-light/d-medium by day, d-medium/e-heavy at night)
+is not re-joined when it is lost for longer than an overlap — two journeys. Tuning further
+wants labelled pairs (the curation tool's Paired review). Evaluate any footage with
+`python journeys.py build config.yaml out/*/tracklets/*.jsonl`.
+
+Journeys are published **beside** events; the importer still reads `fieldkit-events/`.
+Switching it is a prefix change there, once the counts are compared — but the day file is
+rebuilt every pass (ids are deterministic, so unchanged journeys keep theirs), and crops are
+cited by full bucket key rather than `crops/<name>`.
 
 ## Comparing models like for like
 

@@ -53,6 +53,11 @@ ATTR_MODELS = MODELS + "attrs/"
 SKIP = ("curation/", MODELS)
 PENDING = ("pending/images", "pending/labels", "pending/attrs", "pending/suggest")
 EVENTS = "fieldkit-events/"   # bucket prefix the RDA importer reads
+TRACKLETS = "fieldkit-tracklets/"   # every track, counted or not: the journey builder's input
+# One line per vehicle across a camera pair — beside EVENTS, not instead of it, until the
+# counts are compared.
+JOURNEYS = "fieldkit-journeys/"
+PLATE = DATASET / "plate.pt"  # optional plate model: evidence crops only, never a count
 # The Katuba box still calls itself site1; anything already named RDA-TG-* is its own id.
 GATES = {"site1": "RDA-TG-KTB"}
 TZ = "Africa/Lusaka"          # the gates and this machine; segment names are local wallclock
@@ -206,13 +211,16 @@ def pick_classify(keys, classified, per_pass=CLASSIFY_PER_PASS):
     return sorted(todo, key=lambda k: (k.rsplit("/", 1)[1], k), reverse=True)[:per_pass]
 
 
-def for_upload(doc, gate):
-    """One event as the importer reads it: stamped with the gate it came from, and its
-    crop paths flattened — the bucket keeps one crops/ folder per day, not per day-inside-
-    a-day like the local events dir does."""
-    return {**doc, "gate": gate,
-            "crops": {tag: f"crops/{Path(rel).name}"
-                      for tag, rel in (doc.get("crops") or {}).items()}}
+def for_upload(doc, gate, to="crops/"):
+    """One event (or tracklet) as the importer reads it: stamped with the gate it came
+    from, and its crop paths flattened — the bucket keeps one crops/ folder per day, not
+    per day-inside-a-day like the local events dir does. `to` re-roots them: a journey
+    cites its crops by whole bucket key."""
+    up = {**doc, "gate": gate,
+          "crops": {tag: to + Path(rel).name for tag, rel in (doc.get("crops") or {}).items()}}
+    if doc.get("plate"):          # a tracklet's plate read; events carry none
+        up["plate"] = {**doc["plate"], "crop": to + Path(doc["plate"]["crop"]).name}
+    return up
 
 
 # ---- the machinery ----
@@ -259,8 +267,8 @@ def r2():
     return dataset_sync, dataset_sync.client(o), o["bucket"]
 
 
-def bucket_keys(cl, bucket):
-    for page in cl.get_paginator("list_objects_v2").paginate(Bucket=bucket):
+def bucket_keys(cl, bucket, prefix=""):
+    for page in cl.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix):
         for obj in page.get("Contents", []):
             yield obj["Key"]
 
@@ -510,27 +518,65 @@ def hunt_pass():
 
 def publish(cl, bucket, out, gate, source_key, day):
     """Send one segment's events and crops to fieldkit-events/<gate>/<YYYYMMDD>/, the
-    layout the RDA importer reads. -> events published."""
+    layout the RDA importer reads, and its tracklets and theirs to fieldkit-tracklets/
+    the same way. -> events published."""
     # A quiet segment still publishes an empty file: that is what marks it done, and it
     # tells the importer the gate was watched and idle rather than never processed.
     manifest = f"{Path(source_key).stem}-{hashlib.sha256(source_key.encode()).hexdigest()[:32]}"
     (out / f"{day}.jsonl").touch()
     total = 0
-    for js in sorted(out.glob("*.jsonl")):      # a segment can straddle midnight
+    # Tracklets first, so a published events manifest implies its tracklets are there. A
+    # segment can straddle midnight: two day files of each.
+    for js in sorted((out / "tracklets").glob("*.jsonl")) + sorted(out.glob("*.jsonl")):
+        tracklet = js.parent != out
         docs = [for_upload(json.loads(l), gate)
                 for l in js.read_text().splitlines() if l.strip()]
         lines = [json.dumps(doc) for doc in docs]
-        where = f"{EVENTS}{gate}/{js.stem.replace('-', '')}"
-        crops = sorted({Path(rel).name for doc in docs for rel in doc["crops"].values()})
+        where = f"{TRACKLETS if tracklet else EVENTS}{gate}/{js.stem.replace('-', '')}"
+        crops = sorted({Path(rel).name for doc in docs
+                        for rel in [*doc["crops"].values(), (doc.get("plate") or {}).get("crop")] if rel})
         for name in crops:
-            crop = out / "crops" / js.stem / name
+            crop = js.parent / "crops" / js.stem / name
             if not crop.is_file():
-                raise FileNotFoundError(f"event crop missing: {crop}")
+                raise FileNotFoundError(f"crop missing: {crop}")
             cl.upload_file(str(crop), bucket, f"{where}/crops/{name}")
         cl.put_object(Bucket=bucket, Key=f"{where}/{manifest}.jsonl",
                       Body="".join(l + "\n" for l in lines).encode(),
                       ContentType="application/json")
-        total += len(lines)
+        total += 0 if tracklet else len(lines)
+    return total
+
+
+def journeys_pass(cl, bucket, touched, cameras, tz):
+    """Rebuild each touched (gate, day) from ALL that day's tracklets into
+    fieldkit-journeys/<gate>/<YYYYMMDD>/journeys.jsonl, one line per vehicle across a
+    camera pair, with attrs from the day's events. Only cameras with `handoff` config
+    pair up; without any there is nothing to link. -> journeys written.
+
+    ponytail: the whole day is rebuilt every pass — journey ids are deterministic, so the
+    overwrite is idempotent; switching the importer to journeys will want finalized
+    windows instead. A vehicle crossing midnight splits in two: the neighbouring day's
+    tracklets aren't loaded. Crops are cited by bucket key, never copied."""
+    if not any(c.get("handoff") for c in cameras):
+        return 0
+    import journeys
+
+    def docs(prefix):             # every manifest of the day; crops/ holds only jpegs
+        for key in sorted(k for k in bucket_keys(cl, bucket, prefix) if k.endswith(".jsonl")):
+            body = cl.get_object(Bucket=bucket, Key=key)["Body"].read().decode()
+            yield from (json.loads(l) for l in body.splitlines() if l.strip())
+
+    total = 0
+    for gate, day in sorted(touched):
+        where = f"{gate}/{day.replace('-', '')}/"
+        tracklets = [for_upload(t, gate, f"{TRACKLETS}{where}crops/") for t in docs(TRACKLETS + where)]
+        events = {e["id"]: e for e in docs(EVENTS + where)}
+        js = journeys.build(tracklets, cameras, tz, events)
+        cl.put_object(Bucket=bucket, Key=f"{JOURNEYS}{where}journeys.jsonl",
+                      Body="".join(json.dumps({**j, "gate": gate}) + "\n" for j in js).encode(),
+                      ContentType="application/json")
+        print(f"    {len(js)} journey(s) -> {JOURNEYS}{where}", flush=True)
+        total += len(js)
     return total
 
 
@@ -563,13 +609,15 @@ def classify_pass():
         base["capture_wanted"], base["dataset_dir"] = hunting(), str(DATASET)
         VIDEOS.mkdir(parents=True, exist_ok=True)
         done = events = 0
-        stems = []
+        stems, touched = [], set()
         for key in todo:
             prefix, cam_name, seg = key.split("/")
             gate = gate_of(prefix)
             cfg = {**base, "detect_weights": str(CHAMPION), "toll_gate_id": gate}
             if ATTRS_CHAMPION.is_file():
                 cfg["attr_weights"] = str(ATTRS_CHAMPION)
+            if PLATE.is_file():
+                cfg["plate_weights"] = str(PLATE)
             # Heading rides on the camera's config entry; without one there is no
             # direction on these events, which is right — it is never guessed.
             cam = next((c for c in (base.get("cameras") or []) if c.get("name") == cam_name),
@@ -585,6 +633,7 @@ def classify_pass():
                                                         source_key=key)
                 stems += captured
                 n = publish(cl, bucket, out, gate, key, day)
+                touched |= {(gate, js.stem) for js in (out / "tracklets").glob("*.jsonl")}
                 # Recorded only once published: a segment that died mid-pass is retried
                 # next tick rather than lost, and re-running it rewrites the same keys.
                 s["classified"] = (s.get("classified", []) + [key])[-REMEMBER_CLASSIFIED:]
@@ -596,6 +645,10 @@ def classify_pass():
             finally:
                 video.unlink(missing_ok=True)
                 shutil.rmtree(out, ignore_errors=True)
+        try:
+            journeys_pass(cl, bucket, touched, base.get("cameras") or [], tz)
+        except Exception as e:       # journeys ride beside events; they never cost a classify
+            print(f"  ! journeys: {e}", flush=True)
         if stems:
             if ATTRS_CHAMPION.is_file():
                 suggest(stems)       # same courtesy the ingest pass does: correct, not type
@@ -929,6 +982,31 @@ def publish_check():
     assert doc["gate"] == "RDA-TG-KTB" and doc["crops"] == {"best": "crops/c-123-best.jpg"}, doc
     assert cl.sent == ["fieldkit-events/RDA-TG-KTB/20260819/crops/c-123-best.jpg"], cl.sent
 
+    # Tracklets go first, under their own prefix, every crop (the plate's too) flattened beside them.
+    tk, rel = Path(tempfile.mkdtemp()), "tracklets/crops/2026-08-19/t-1-"
+    (tk / "tracklets" / "crops" / "2026-08-19").mkdir(parents=True)
+    for tag in ("top", "best", "plate"):
+        (tk / f"{rel}{tag}.jpg").write_bytes(b"jpeg")
+    (tk / "tracklets" / "2026-08-19.jsonl").write_text(json.dumps(
+        {"id": "t-1", "crops": {"top": rel + "top.jpg", "best": rel + "best.jpg"},
+         "plate": {"conf": 0.3, "crop": rel + "plate.jpg"}}) + "\n")
+    cl, where = FakeS3(), "fieldkit-tracklets/G/20260819/"
+    assert publish(cl, "buck", tk, "G", source, "2026-08-19") == 0, "tracklets are not events"
+    assert list(cl.put) == [f"{where}{manifest}.jsonl",
+                            f"fieldkit-events/G/20260819/{manifest}.jsonl"], cl.put
+    doc = json.loads(cl.put[f"{where}{manifest}.jsonl"].decode())
+    assert doc == {"id": "t-1", "gate": "G", "crops": {"top": "crops/t-1-top.jpg", "best": "crops/t-1-best.jpg"},
+                   "plate": {"conf": 0.3, "crop": "crops/t-1-plate.jpg"}}, doc
+    assert sorted(cl.sent) == [f"{where}crops/t-1-{tag}.jpg" for tag in ("best", "plate", "top")], cl.sent
+    (tk / f"{rel}plate.jpg").unlink()
+    cl = FakeS3()
+    try:
+        publish(cl, "buck", tk, "G", source, "2026-08-19")
+        raise AssertionError("a tracklet missing its plate crop published")
+    except FileNotFoundError:
+        pass
+    assert cl.put == {}, cl.put
+
     # This publication exposes no manifest containing a missing or failed crop reference.
     for missing, client in ((True, FakeS3()), (False, FakeS3(fail_crop=True))):
         broken = Path(tempfile.mkdtemp())
@@ -966,6 +1044,56 @@ def publish_check():
                    "G/north/20260819-151108.mkv"):
         publish(cl, "buck", Path(tempfile.mkdtemp()), "G", source, "2026-08-19")
     assert len(cl.put) == 2, cl.put
+
+
+def journeys_check():
+    """A day rebuilt from the bucket alone: tracklets from two paired cameras become one
+    journey citing its crops by key, with attrs from the day's events."""
+    import io
+
+    class FakeS3:
+        def __init__(self, objs):
+            self.objs, self.put = objs, {}
+
+        def get_paginator(self, _):
+            return self
+
+        def paginate(self, Bucket, Prefix):
+            return [{"Contents": [{"Key": k} for k in self.objs if k.startswith(Prefix)]}]
+
+        def get_object(self, Bucket, Key):
+            return {"Body": io.BytesIO(self.objs[Key])}
+
+        def put_object(self, Bucket, Key, Body, ContentType=None):
+            self.put[Key] = Body
+
+    def tracklet(cam, samples):       # (t, centre x, centre y): a 0.2-wide box per sample
+        path = [[t, x - 0.1, y - 0.1, x + 0.1, y + 0.1] for t, x, y in samples]
+        return json.dumps({
+            "id": f"obs-{cam}", "camera": cam, "t0": path[0][0], "t1": path[-1][0], "hits": len(path),
+            "class": "e-heavy", "votes": {"e-heavy": len(path)}, "conf": {"e-heavy": 0.8},
+            "counted": True, "ghost_of": None, "direction": "northbound", "path": path,
+            "crops": {"top": f"crops/obs-{cam}-top.jpg", "best": f"crops/obs-{cam}-best.jpg"},
+            "plate": {"conf": 0.3, "crop": f"crops/obs-{cam}-plate.jpg"}}).encode() + b"\n"
+
+    # Northbound: cam3 watches it leave bottom-right at t=100, cam4 sees it enter bottom-left 0.4 s later.
+    day = "fieldkit-tracklets/G/20260819/"
+    objs = {day + "a.jsonl": tracklet("cam3", [(96 + k, 0.5 + 0.1 * k, 0.5 + 0.075 * k) for k in range(5)]),
+            day + "b.jsonl": tracklet("cam4", [(100.4 + k, 0.1 + 0.1 * k, 0.7 - 0.1 * k) for k in range(5)]),
+            day + "crops/obs-cam3-top.jpg": b"jpeg",      # listed beside the manifests, never parsed
+            "fieldkit-events/G/20260819/e.jsonl": json.dumps(
+                {"id": "obs-cam4", "class": "e-heavy", "hits": 5, "attrs": {"axles": "5"}}).encode()}
+    cams = [{"name": "cam3", "heading": "south", "handoff": {"camera": "cam4", "zone": [0.80, 0.62, 0.20, 0.38]}},
+            {"name": "cam4", "heading": "north", "handoff": {"camera": "cam3", "zone": [0.0, 0.55, 0.22, 0.30]}}]
+    cl = FakeS3(objs)
+    assert journeys_pass(cl, "buck", {("G", "2026-08-19")}, cams, timezone.utc) == 1
+    assert list(cl.put) == ["fieldkit-journeys/G/20260819/journeys.jsonl"], cl.put
+    [j] = map(json.loads, cl.put["fieldkit-journeys/G/20260819/journeys.jsonl"].decode().splitlines())
+    assert j["gate"] == "G" and j["link"] and j["attrs"] == {"axles": "5"}, j
+    assert j["crops"] and all(v.startswith(day + "crops/") for v in j["crops"].values()), j["crops"]
+    cl = FakeS3(objs)
+    assert journeys_pass(cl, "buck", {("G", "2026-08-19")}, [{"name": "cam3"}, {"name": "cam4"}],
+                         timezone.utc) == 0 and cl.put == {}, "no handoff, nothing to link"
 
 
 def selfcheck():
@@ -1014,6 +1142,7 @@ def selfcheck():
     assert for_upload({"id": "q"}, "G")["crops"] == {}, "a crop-less event still uploads"
     lock_check()
     publish_check()
+    journeys_check()
     suggest_check()
     print("selfloop self-check ok: cameras found under any gate prefix, newest unsampled segments "
           "picked per camera, training triggers on the cumulative threshold, promotion needs a "
