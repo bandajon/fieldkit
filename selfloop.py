@@ -2,7 +2,8 @@
 """The self-improving loop, for the always-on training machine.
 
   python selfloop.py ingest        newest mirrored segments, every camera -> pending -> bucket
-  python selfloop.py classify      newest un-classified segments -> vehicle events -> bucket
+  python selfloop.py classify      drains unclassified segments of the last CLASSIFY_HOURS,
+                                   oldest first -> vehicle events -> bucket
   python selfloop.py hunt          last HUNT_HOURS of footage, newest first -> only frames of
                                    wanted classes -> the queue
   python selfloop.py train         pull the curated set; train once enough is new; promote if better
@@ -53,6 +54,7 @@ ATTR_MODELS = MODELS + "attrs/"
 SKIP = ("curation/", MODELS)
 PENDING = ("pending/images", "pending/labels", "pending/attrs", "pending/suggest")
 EVENTS = "fieldkit-events/"   # bucket prefix the RDA importer reads
+COVERAGE = "fieldkit-coverage/"   # per-gate per-day manifests: recorded vs classified stems
 TRACKLETS = "fieldkit-tracklets/"   # every track, counted or not: the journey builder's input
 # One line per vehicle across a camera pair — beside EVENTS, not instead of it, until the
 # counts are compared.
@@ -65,6 +67,13 @@ WANT_BOXES = 300      # per-class floor for the next run; under it, a class is h
 HUNT_TOP = 6          # ...but only the thinnest few at once: with most classes under the
                       # floor a hunt kept every frame with a vehicle in it (400 per segment)
 CLASSIFY_PER_PASS = 12        # ~10 min of footage per camera per pass, at 600 s segments
+CLASSIFY_HOURS = 48           # what the gates keep mirrored: one backlog may span this;
+                              # older gaps are a backfill job, not this pass's problem
+CLASSIFY_BUDGET = 3 * 3600    # seconds one classify pass drains for before checkpointing
+                              # (state saved, lock released) — train and ingest wait out
+                              # a backlog via classify_behind() regardless; this just
+                              # bounds how long one pass can hold the lock. train --now
+                              # overrides the wait.
 HUNT_HOURS = 48               # how far back a hunt looks: what the gates keep mirrored
 HUNT_PER_PASS = 30            # segments per pass, ~25 s each at 1 fps on the GPU: the
                               # lock is back within classify's patience (WAIT)
@@ -194,6 +203,25 @@ def new_box_counts():
     return {n: counts.get(n, 0) for n in names}
 
 
+def classify_behind(s=None):
+    """True if classify still has a fresh backlog — checked by the other passes so
+    counting beats sampling: footage waiting to be classified matters more than another
+    round of curation sampling or a training run that can wait an hour."""
+    from datetime import timedelta
+    backlog = (s if s is not None else load_state()).get("classify_backlog")
+    if not backlog or not backlog.get("left"):
+        return False
+    at = datetime.strptime(backlog["at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    return datetime.now(timezone.utc) - at < timedelta(hours=2)
+
+
+def paused(keys, cfg):
+    """Drop keys whose gate (the bucket's first path component) is in config.yaml's
+    curation_paused — the owner's off switch for a gate that has plenty of data."""
+    off = set(cfg.get("curation_paused") or [])
+    return [k for k in keys if k.split("/", 1)[0] not in off]
+
+
 def gate_of(prefix):
     """The RDA gate id for a bucket prefix. The importer resolves events by gate, so a
     prefix with no mapping is passed through — a gate already named for itself is right,
@@ -201,14 +229,53 @@ def gate_of(prefix):
     return GATES.get(prefix, prefix)
 
 
-def pick_classify(keys, classified, per_pass=CLASSIFY_PER_PASS):
-    """The newest unclassified segments across every camera, newest first: the portal
-    wants today's traffic on screen, and the backlog drains whenever the gates are quiet.
-    Ordered by segment name, not by key — sorting whole keys would work one camera dry
-    before the other was touched."""
+def pick_classify(keys, classified, since, per_pass=CLASSIFY_PER_PASS):
+    """Unclassified segments recorded after `since` (a YYYYMMDD-HHMMSS stem, local
+    wallclock), OLDEST first across every camera: newest-first left permanent holes —
+    hours recorded while another pass held the lock were never the newest and so were
+    never picked, measured at 33-38% coverage. Ordered by (stem, key) so a camera pair's
+    two segments of the same ten minutes go together."""
     done = set(classified)
-    todo = [k for segs in cameras(keys).values() for k in segs if k not in done]
-    return sorted(todo, key=lambda k: (k.rsplit("/", 1)[1], k), reverse=True)[:per_pass]
+    todo = [k for segs in cameras(keys).values() for k in segs
+            if k not in done and Path(k).stem >= since]
+    todo.sort(key=lambda k: (Path(k).stem, k))
+    return todo if per_pass is None else todo[:per_pass]
+
+
+def coverage(keys, classified, since):
+    """{"<hour YYYYMMDD-HH>": {"<cam>": (classified, recorded)}} over the window — what
+    status() prints: classify's actual reach, not just whether the last pass emptied
+    its queue."""
+    done = set(classified)
+    out = {}
+    for cam, segs in cameras(keys).items():
+        for k in segs:
+            stem = Path(k).stem
+            if stem < since:
+                continue
+            slot = out.setdefault(stem[:11], {}).setdefault(cam, [0, 0])
+            slot[1] += 1
+            slot[0] += k in done
+    return {h: {c: tuple(v) for c, v in cams.items()} for h, cams in out.items()}
+
+
+def coverage_manifests(keys, classified, since):
+    """{(gate, day): {cam: {"recorded": [stems], "classified": [stems]}}} — the per-day
+    truth published to COVERAGE, so a dashboard never treats a partial day as whole."""
+    done = set(classified)
+    out = {}
+    for key, segs in cameras(keys).items():
+        prefix, cam = key.split("/")
+        gate = gate_of(prefix)
+        for k in segs:
+            stem = Path(k).stem
+            if stem < since:
+                continue
+            entry = out.setdefault((gate, stem[:8]), {}).setdefault(cam, {"recorded": [], "classified": []})
+            entry["recorded"].append(stem)
+            if k in done:
+                entry["classified"].append(stem)
+    return out
 
 
 def for_upload(doc, gate, to="crops/"):
@@ -433,14 +500,22 @@ def hunting():
 
 def ingest_pass():
     import ingest_video
+    if classify_behind():
+        print(f"{now()} ingest: yielding — classify has segment(s) to do", flush=True)
+        return
     with Lock():
         s = load_state()
         ds, cl, bucket = r2()
-        todo = pick(list(recording_keys(cl, bucket)), s["ingested"])
+        cfg = ingest_video.config()
+        keys = paused(list(recording_keys(cl, bucket)), cfg)
+        if not keys:
+            print(f"{now()} ingest: curation paused for {', '.join(cfg.get('curation_paused') or [])}",
+                  flush=True)
+            return
+        todo = pick(keys, s["ingested"])
         print(f"{now()} ingest: {len(todo)} new segment(s) across the cameras", flush=True)
         if not todo:
             return
-        cfg = ingest_video.config()
         if CHAMPION.is_file():
             cfg["detect_weights"] = str(CHAMPION)   # the loop's own model pre-labels
         cfg["capture_wanted"] = hunting()
@@ -487,18 +562,26 @@ def hunt_pass():
     """
     import ingest_video
     from datetime import timedelta
+    if classify_behind():
+        print(f"{now()} hunt: yielding — classify has segment(s) to do", flush=True)
+        return
     with Lock():
         s = load_state()
         wanted = hunting()
         if not wanted:
             return
         ds, cl, bucket = r2()
+        cfg = ingest_video.config()
         since = (datetime.now(ZoneInfo(TZ)) - timedelta(hours=HUNT_HOURS)).strftime("%Y%m%d-%H%M%S")
-        todo = pick_hunt(list(recording_keys(cl, bucket)), s.get("hunted", []), since)
+        keys = paused(list(recording_keys(cl, bucket)), cfg)
+        if not keys:
+            print(f"{now()} hunt: curation paused for {', '.join(cfg.get('curation_paused') or [])}",
+                  flush=True)
+            return
+        todo = pick_hunt(keys, s.get("hunted", []), since)
         print(f"{now()} hunt: {len(todo)} segment(s) since {since} to sweep", flush=True)
         if not todo:
             return
-        cfg = ingest_video.config()
         if CHAMPION.is_file():
             cfg["detect_weights"] = str(CHAMPION)
         cfg["capture_wanted"], cfg["capture_only_wanted"] = wanted, True
@@ -605,7 +688,10 @@ def classify_pass():
     still produces events. Ten to twenty minutes behind live, which the portal is happy
     with — and the alternative is a second detector to keep in step with the first.
     """
+    import concurrent.futures
+    import time
     import tempfile
+    from datetime import timedelta
 
     import detect
     import ingest_video
@@ -613,74 +699,105 @@ def classify_pass():
     if not CHAMPION.is_file():
         print(f"{now()} classify: no detector at {CHAMPION} — nothing to classify", flush=True)
         return
-    with Lock():
+    with Lock(), concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
         s = load_state()
         ds, cl, bucket = r2()
-        todo = pick_classify(list(recording_keys(cl, bucket)), s.get("classified", []))
-        print(f"{now()} classify: {len(todo)} segment(s)", flush=True)
-        if not todo:
-            return
         base, tz = ingest_video.config(), ZoneInfo(TZ)
-        # This pass decodes every mirrored segment anyway, so it sees all 48 h of footage
-        # — the widest net there is for a class that shows up twice a day.
-        base["capture_wanted"], base["dataset_dir"] = hunting(), str(DATASET)
+        # hunt is the curation sweep; classify only counts — no capture_wanted/dataset_dir,
+        # so detect.Detector's _dataset_init skips capture and this pass never captures
+        # frames or pushes to curation.
+        since = (datetime.now(ZoneInfo(TZ)) - timedelta(hours=CLASSIFY_HOURS)).strftime("%Y%m%d-%H%M%S")
         VIDEOS.mkdir(parents=True, exist_ok=True)
-        done = events = 0
-        stems, touched = [], set()
-        for key in todo:
-            prefix, cam_name, seg = key.split("/")
-            gate = gate_of(prefix)
-            cfg = {**base, "detect_weights": str(CHAMPION), "toll_gate_id": gate}
-            if ATTRS_CHAMPION.is_file():
-                cfg["attr_weights"] = str(ATTRS_CHAMPION)
-            if PLATE.is_file():
-                cfg["plate_weights"] = str(PLATE)
-            # Heading rides on the camera's config entry; without one there is no
-            # direction on these events, which is right — it is never guessed.
-            cam = next((c for c in (base.get("cameras") or []) if c.get("name") == cam_name),
-                       {"name": cam_name})
-            # The recorder's own filename is the footage clock: keep it, or cam_and_start
-            # falls back to mtime and every event is stamped with the download.
-            video, out = local_path(key), Path(tempfile.mkdtemp())
-            video.parent.mkdir(parents=True, exist_ok=True)
-            try:
+
+        def download(key):
+            dest = local_path(key)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            cl.download_file(bucket, key, str(dest))
+            return dest
+
+        done = events = left = 0
+        touched, failed, keys = set(), set(), []
+        deadline = time.monotonic() + CLASSIFY_BUDGET
+        while True:
+            keys = list(recording_keys(cl, bucket))   # re-listed each round: picks up arrivals
+            all_todo = pick_classify(keys, s.get("classified", []), since, per_pass=None)
+            left = len(all_todo)          # honest backlog count, failed segments included
+            todo = [k for k in all_todo if k not in failed][:CLASSIFY_PER_PASS]
+            if not todo or time.monotonic() > deadline:
+                break
+            print(f"{now()} classify: {len(todo)} segment(s), {left} left in the window", flush=True)
+            # Downloads run ~85-90s of a ~210s segment over the office link: the next
+            # segment's download overlaps this one's detection instead of stalling after it.
+            pending = pool.submit(download, todo[0])
+            for i, key in enumerate(todo):
+                prefix, cam_name, seg = key.split("/")
+                gate = gate_of(prefix)
+                cfg = {**base, "detect_weights": str(CHAMPION), "toll_gate_id": gate}
+                if ATTRS_CHAMPION.is_file():
+                    cfg["attr_weights"] = str(ATTRS_CHAMPION)
+                if PLATE.is_file():
+                    cfg["plate_weights"] = str(PLATE)
+                # Heading rides on the camera's config entry; without one there is no
+                # direction on these events, which is right — it is never guessed.
+                cam = next((c for c in (base.get("cameras") or []) if c.get("name") == cam_name),
+                           {"name": cam_name})
                 print(f"  v {key}", flush=True)
-                cl.download_file(bucket, key, str(video))
-                day, captured = detect.classify_segment(video, cam, cfg, tz, out,
-                                                        source_key=key)
-                stems += captured
-                n = publish(cl, bucket, out, gate, key, day)
-                touched |= {(gate, js.stem) for js in (out / "tracklets").glob("*.jsonl")}
-                # Recorded only once published: a segment that died mid-pass is retried
-                # next tick rather than lost, and re-running it rewrites the same keys.
-                s["classified"] = (s.get("classified", []) + [key])[-REMEMBER_CLASSIFIED:]
-                save_state(s)
-                done, events = done + 1, events + n
-                print(f"    {n} event(s) -> {EVENTS}{gate}/{day.replace('-', '')}/", flush=True)
-            except Exception as e:       # one bad segment must not strand the rest
-                print(f"  ! {key}: {e}", flush=True)
-            finally:
-                video.unlink(missing_ok=True)
-                shutil.rmtree(out, ignore_errors=True)
-        try:
-            journeys_pass(cl, bucket, touched, base.get("cameras") or [], tz)
-        except Exception as e:       # journeys ride beside events; they never cost a classify
-            print(f"  ! journeys: {e}", flush=True)
-        if stems:
-            if ATTRS_CHAMPION.is_file():
-                suggest(stems)       # same courtesy the ingest pass does: correct, not type
-            sent, _ = ds.push(cl, bucket, names=PENDING)
-            print(f"{now()} classify: {len(stems)} frame(s) captured for the queue, "
-                  f"{sent} file(s) pushed", flush=True)
-        s["last_classify"] = {"at": now(), "segments": done, "events": events,
-                              "captured": len(stems)}
+                try:
+                    video = pending.result()
+                except Exception as e:       # a download failure is this segment's error
+                    failed.add(key)
+                    print(f"  ! {key}: {e}", flush=True)
+                    video = None
+                # Submitted regardless of this segment's outcome: the next download must
+                # not wait on this one's detection, or the overlap is lost to a failure.
+                if i + 1 < len(todo):
+                    pending = pool.submit(download, todo[i + 1])
+                if video is None:
+                    continue
+                out = None
+                try:
+                    out = Path(tempfile.mkdtemp())
+                    # The recorder's own filename is the footage clock: keep it, or
+                    # cam_and_start falls back to mtime and every event is stamped
+                    # with the download.
+                    day, _ = detect.classify_segment(video, cam, cfg, tz, out, source_key=key)
+                    n = publish(cl, bucket, out, gate, key, day)
+                    touched |= {(gate, js.stem) for js in (out / "tracklets").glob("*.jsonl")}
+                    # Recorded only once published: a segment that died mid-pass is retried
+                    # next tick rather than lost, and re-running it rewrites the same keys.
+                    s["classified"] = (s.get("classified", []) + [key])[-REMEMBER_CLASSIFIED:]
+                    save_state(s)
+                    done, events = done + 1, events + n
+                    print(f"    {n} event(s) -> {EVENTS}{gate}/{day.replace('-', '')}/", flush=True)
+                except Exception as e:       # one bad segment must not strand the rest
+                    failed.add(key)
+                    print(f"  ! {key}: {e}", flush=True)
+                finally:
+                    video.unlink(missing_ok=True)   # never leave a prefetched file behind
+                    if out is not None:
+                        shutil.rmtree(out, ignore_errors=True)
+            try:
+                journeys_pass(cl, bucket, touched, base.get("cameras") or [], tz)
+                touched.clear()
+            except Exception as e:       # journeys ride beside events; they never cost a classify
+                print(f"  ! journeys: {e}", flush=True)
+        s["classify_backlog"] = {"at": now(), "left": left}
+        s["last_classify"] = {"at": now(), "segments": done, "events": events}
         save_state(s)
-        print(f"{now()} classify: {done}/{len(todo)} segment(s), {events} event(s) published",
-              flush=True)
+        for (gate, day), cams in coverage_manifests(keys, s.get("classified", []), since).items():
+            cl.put_object(Bucket=bucket, Key=f"{COVERAGE}{gate}/{day}.json",
+                          Body=json.dumps({"gate": gate, "day": day, "updated": now(),
+                                          "cameras": cams}).encode(),
+                          ContentType="application/json")
+        print(f"{now()} classify: {done} segment(s), {events} event(s) published, "
+              f"{left} left in the window", flush=True)
 
 
 def train_pass(force=False):
     import train as trainer
+    if not force and classify_behind():
+        print(f"{now()} train: yielding — classify has segment(s) to do", flush=True)
+        return
     with Lock():
         s = load_state()
         ds, cl, bucket = r2()
@@ -888,6 +1005,17 @@ def status():
         print(f"new frames:    {count} outside the reference set, {s.get('trained_frames', 0)} at the last run"
               f" — {'ready to train' if gap <= 0 else f'{gap} more before the next run'}")
     print(f"lock:          {(LOCK.read_text().strip() if LOCK.exists() else '') or 'free'}")
+    try:
+        from datetime import timedelta
+        _, cl, bucket = r2()
+        since = (datetime.now(ZoneInfo(TZ)) - timedelta(hours=CLASSIFY_HOURS)).strftime("%Y%m%d-%H%M%S")
+        cov = coverage(list(recording_keys(cl, bucket)), s.get("classified", []), since)
+        print(f"coverage (last {CLASSIFY_HOURS}h):")
+        for hour in sorted(cov):
+            parts = ", ".join(f"{cam} {c}/{r}" for cam, (c, r) in sorted(cov[hour].items()))
+            print(f"  {hour}  {parts}")
+    except Exception as e:
+        print(f"coverage:      unavailable ({e})")
 
 
 def suggest_check():
@@ -1170,11 +1298,38 @@ def selfcheck():
         "only the thinnest few are hunted at once"
     assert gate_of("site1") == "RDA-TG-KTB", "the Katuba box still calls itself site1"
     assert gate_of("RDA-TG-KTB") == "RDA-TG-KTB", "a gate already named for itself"
-    # Newest segment first, across cameras, so the portal gets current traffic first.
-    got = pick_classify(keys, classified=["site1/cam3/20260827-102000.mkv"], per_pass=2)
-    assert got == ["site1/cam3/20260827-101000.mkv", "site1/cam3/20260827-100000.mkv"], got
-    assert pick_classify(keys, classified=[])[0].endswith("102000.mkv"), "newest first"
-    assert pick_classify(keys, classified=keys) == [], "everything classified: nothing to do"
+    # Oldest unclassified first, across cameras, since the cutoff — newest-first left
+    # permanent holes when another pass held the lock through the newest hour.
+    got = pick_classify(keys, classified=["site1/cam3/20260827-100000.mkv"],
+                        since="20260101-000000", per_pass=2)
+    assert got == ["RDA-TG-KTB/north/20260827-100000.mkv",
+                   "site1/cam3/20260827-101000.mkv"], got
+    assert pick_classify(keys, classified=[], since="20260101-000000")[0].endswith("100000.mkv"), \
+        "oldest first"
+    assert pick_classify(keys, classified=keys, since="20260101-000000") == [], \
+        "everything classified: nothing to do"
+    assert pick_classify(keys, classified=[], since="20990101-000000") == [], \
+        "since excludes older segments"
+    assert pick_classify(keys, classified=[], since="20260101-000000", per_pass=None) == \
+        sorted((k for segs in cameras(keys).values() for k in segs), key=lambda k: (Path(k).stem, k)), \
+        "per_pass=None: the whole window, unbounded"
+    assert paused(keys, {"curation_paused": ["site1"]}) == \
+        [k for k in keys if not k.startswith("site1/")], "paused gate's keys dropped"
+    assert paused(keys, {}) == keys, "nothing paused by default"
+    cov = coverage(keys, classified=["site1/cam3/20260827-100000.mkv"], since="20260101-000000")
+    assert cov == {"20260827-10": {"site1/cam3": (1, 3), "RDA-TG-KTB/north": (0, 1)}}, cov
+    assert coverage(keys, classified=[], since="20990101-000000") == {}, "since excludes the whole hour"
+    man = coverage_manifests(keys, classified=["site1/cam3/20260827-100000.mkv"], since="20260101-000000")
+    assert set(man) == {("RDA-TG-KTB", "20260827")}, "site1 and RDA-TG-KTB are the same gate"
+    cams = man[("RDA-TG-KTB", "20260827")]
+    assert cams["cam3"]["recorded"] == ["20260827-100000", "20260827-101000", "20260827-102000"] \
+        and cams["cam3"]["classified"] == ["20260827-100000"], cams["cam3"]
+    assert cams["north"] == {"recorded": ["20260827-100000"], "classified": []}, cams["north"]
+    assert not classify_behind({"classify_backlog": {"at": now(), "left": 0}}), "nothing left"
+    assert classify_behind({"classify_backlog": {"at": now(), "left": 3}}), "fresh backlog"
+    from datetime import timedelta
+    stale_at = (datetime.now(timezone.utc) - timedelta(hours=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    assert not classify_behind({"classify_backlog": {"at": stale_at, "left": 3}}), "stale backlog"
     hunted = pick_hunt(keys, hunted=["site1/cam3/20260827-102000.mkv"], since="20260827-100000")
     assert hunted and all(Path(k).stem >= "20260827-100000" for k in hunted) \
         and "site1/cam3/20260827-102000.mkv" not in hunted, "hunt: newest un-hunted since the cutoff"
@@ -1193,8 +1348,8 @@ def selfcheck():
     print("selfloop self-check ok: cameras found under any gate prefix, newest unsampled segments "
           "picked per camera, training triggers on the cumulative threshold, promotion needs a "
           "strictly better reference score (detector) or mean val accuracy (attributes) unless "
-          "there is no comparable champion, newest segments classified first under their "
-          "gate's id")
+          "there is no comparable champion, unclassified segments drained oldest first "
+          "under their gate's id")
 
 
 if __name__ == "__main__":
