@@ -216,10 +216,12 @@ def classify_behind(s=None):
 
 
 def paused(keys, cfg):
-    """Drop keys whose gate (the bucket's first path component) is in config.yaml's
-    curation_paused — the owner's off switch for a gate that has plenty of data."""
+    """Drop keys whose gate is in config.yaml's curation_paused — matched against both
+    the bucket prefix and its gate id (RDA-TG-KTB and site1 name the same box), the
+    owner's off switch for a gate that has plenty of data."""
     off = set(cfg.get("curation_paused") or [])
-    return [k for k in keys if k.split("/", 1)[0] not in off]
+    live = lambda p: p not in off and gate_of(p) not in off
+    return [k for k in keys if live(k.split("/", 1)[0])]
 
 
 def gate_of(prefix):
@@ -261,20 +263,30 @@ def coverage(keys, classified, since):
 
 def coverage_manifests(keys, classified, since):
     """{(gate, day): {cam: {"recorded": [stems], "classified": [stems]}}} — the per-day
-    truth published to COVERAGE, so a dashboard never treats a partial day as whole."""
+    truth published to COVERAGE, so a dashboard never treats a partial day as whole.
+
+    Which days to write is decided by `since` (a day touched anywhere after the cutoff
+    is due a fresh manifest); each day written is filled from ALL its keys, cutoff or
+    not — otherwise the oldest day in the window shrinks to the one segment past `since`
+    and reads as fully covered."""
     done = set(classified)
-    out = {}
+    by_gate_cam = {}
     for key, segs in cameras(keys).items():
         prefix, cam = key.split("/")
-        gate = gate_of(prefix)
-        for k in segs:
-            stem = Path(k).stem
-            if stem < since:
-                continue
-            entry = out.setdefault((gate, stem[:8]), {}).setdefault(cam, {"recorded": [], "classified": []})
-            entry["recorded"].append(stem)
-            if k in done:
-                entry["classified"].append(stem)
+        by_gate_cam.setdefault(gate_of(prefix), {})[cam] = segs
+    days = {(gate_of(key.split("/", 1)[0]), Path(k).stem[:8])
+            for key, segs in cameras(keys).items() for k in segs if Path(k).stem >= since}
+    out = {}
+    for gate, day in days:
+        for cam, segs in by_gate_cam[gate].items():
+            entry = out.setdefault((gate, day), {}).setdefault(cam, {"recorded": [], "classified": []})
+            for k in segs:
+                stem = Path(k).stem
+                if stem[:8] != day:
+                    continue
+                entry["recorded"].append(stem)
+                if k in done:
+                    entry["classified"].append(stem)
     return out
 
 
@@ -304,10 +316,13 @@ class Lock:
     A kernel flock, not a pid file: the lock dies with its process, so there is no stale-
     holder takeover — and the takeover was the bug, three agents waking together each
     unlinked the other's freshly written lock and all three ran on the GPU at once."""
+    def __init__(self, wait=WAIT):
+        self.wait = wait
+
     def __enter__(self):
         import fcntl
         import time
-        deadline = time.monotonic() + WAIT
+        deadline = time.monotonic() + self.wait
         LOCK.parent.mkdir(parents=True, exist_ok=True)
         self.fd = os.open(LOCK, os.O_CREAT | os.O_RDWR)
         while True:
@@ -507,8 +522,9 @@ def ingest_pass():
         s = load_state()
         ds, cl, bucket = r2()
         cfg = ingest_video.config()
-        keys = paused(list(recording_keys(cl, bucket)), cfg)
-        if not keys:
+        raw = list(recording_keys(cl, bucket))
+        keys = paused(raw, cfg)
+        if raw and not keys:      # empty because paused, not because nothing was recorded
             print(f"{now()} ingest: curation paused for {', '.join(cfg.get('curation_paused') or [])}",
                   flush=True)
             return
@@ -573,8 +589,9 @@ def hunt_pass():
         ds, cl, bucket = r2()
         cfg = ingest_video.config()
         since = (datetime.now(ZoneInfo(TZ)) - timedelta(hours=HUNT_HOURS)).strftime("%Y%m%d-%H%M%S")
-        keys = paused(list(recording_keys(cl, bucket)), cfg)
-        if not keys:
+        raw = list(recording_keys(cl, bucket))
+        keys = paused(raw, cfg)
+        if raw and not keys:      # empty because paused, not because nothing was recorded
             print(f"{now()} hunt: curation paused for {', '.join(cfg.get('curation_paused') or [])}",
                   flush=True)
             return
@@ -716,20 +733,31 @@ def classify_pass():
             return dest
 
         done = events = left = 0
-        touched, failed, keys = set(), set(), []
+        touched, failed, keys, all_todo = set(), set(), [], []
         deadline = time.monotonic() + CLASSIFY_BUDGET
-        while True:
+        expired = False
+        while not expired:
             keys = list(recording_keys(cl, bucket))   # re-listed each round: picks up arrivals
             all_todo = pick_classify(keys, s.get("classified", []), since, per_pass=None)
             left = len(all_todo)          # honest backlog count, failed segments included
             todo = [k for k in all_todo if k not in failed][:CLASSIFY_PER_PASS]
-            if not todo or time.monotonic() > deadline:
+            if not todo:
                 break
             print(f"{now()} classify: {len(todo)} segment(s), {left} left in the window", flush=True)
             # Downloads run ~85-90s of a ~210s segment over the office link: the next
             # segment's download overlaps this one's detection instead of stalling after it.
             pending = pool.submit(download, todo[0])
             for i, key in enumerate(todo):
+                if time.monotonic() > deadline:
+                    # Checked per segment, not per round: a round is ~12 segments, and the
+                    # budget must not run 45 min over its own limit. The in-flight prefetch
+                    # is awaited and discarded rather than left downloaded on disk.
+                    try:
+                        pending.result().unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    expired = True
+                    break
                 prefix, cam_name, seg = key.split("/")
                 gate = gate_of(prefix)
                 cfg = {**base, "detect_weights": str(CHAMPION), "toll_gate_id": gate}
@@ -781,7 +809,11 @@ def classify_pass():
                 touched.clear()
             except Exception as e:       # journeys ride beside events; they never cost a classify
                 print(f"  ! journeys: {e}", flush=True)
-        s["classify_backlog"] = {"at": now(), "left": left}
+        # A segment that keeps failing must not starve hunt/ingest/train for 48h: it stays
+        # in `left` for status, but not in the count classify_behind() acts on — it will
+        # be retried next pass regardless, since it is never added to s["classified"].
+        stuck = len(failed & set(all_todo))
+        s["classify_backlog"] = {"at": now(), "left": left - stuck, "failed": stuck}
         s["last_classify"] = {"at": now(), "segments": done, "events": events}
         save_state(s)
         for (gate, day), cams in coverage_manifests(keys, s.get("classified", []), since).items():
@@ -798,7 +830,9 @@ def train_pass(force=False):
     if not force and classify_behind():
         print(f"{now()} train: yielding — classify has segment(s) to do", flush=True)
         return
-    with Lock():
+    # A forced run must not exit "busy" while classify drains its budget (up to
+    # CLASSIFY_BUDGET) — it queues behind the drain instead of failing.
+    with Lock(wait=CLASSIFY_BUDGET + 3600 if force else WAIT):
         s = load_state()
         ds, cl, bucket = r2()
         ds.pull(cl, bucket, names=ds.CONFIG)
@@ -1315,6 +1349,9 @@ def selfcheck():
         "per_pass=None: the whole window, unbounded"
     assert paused(keys, {"curation_paused": ["site1"]}) == \
         [k for k in keys if not k.startswith("site1/")], "paused gate's keys dropped"
+    assert paused(keys, {"curation_paused": ["RDA-TG-KTB"]}) == \
+        [k for k in keys if not k.startswith(("site1/", "RDA-TG-KTB/"))], \
+        "paused by gate id: site1 is RDA-TG-KTB too"
     assert paused(keys, {}) == keys, "nothing paused by default"
     cov = coverage(keys, classified=["site1/cam3/20260827-100000.mkv"], since="20260101-000000")
     assert cov == {"20260827-10": {"site1/cam3": (1, 3), "RDA-TG-KTB/north": (0, 1)}}, cov
@@ -1325,6 +1362,11 @@ def selfcheck():
     assert cams["cam3"]["recorded"] == ["20260827-100000", "20260827-101000", "20260827-102000"] \
         and cams["cam3"]["classified"] == ["20260827-100000"], cams["cam3"]
     assert cams["north"] == {"recorded": ["20260827-100000"], "classified": []}, cams["north"]
+    # since cuts mid-day (only 102000 is >= it) but the day it selects is still filled whole,
+    # or the oldest day in a window reads as fully covered when it is really mostly missing.
+    mid = coverage_manifests(keys, classified=["site1/cam3/20260827-100000.mkv"], since="20260827-101500")
+    assert mid[("RDA-TG-KTB", "20260827")]["cam3"]["recorded"] == \
+        ["20260827-100000", "20260827-101000", "20260827-102000"], "day filled whole, not clipped by since"
     assert not classify_behind({"classify_backlog": {"at": now(), "left": 0}}), "nothing left"
     assert classify_behind({"classify_backlog": {"at": now(), "left": 3}}), "fresh backlog"
     from datetime import timedelta
