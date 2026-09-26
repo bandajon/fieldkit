@@ -2,7 +2,8 @@
 """The self-improving loop, for the always-on training machine.
 
   python selfloop.py ingest        newest mirrored segments, every camera -> pending -> bucket
-  python selfloop.py classify      newest un-classified segments -> vehicle events -> bucket
+  python selfloop.py classify      drains unclassified segments of the last CLASSIFY_HOURS,
+                                   oldest first -> vehicle events -> bucket
   python selfloop.py hunt          last HUNT_HOURS of footage, newest first -> only frames of
                                    wanted classes -> the queue
   python selfloop.py train         pull the curated set; train once enough is new; promote if better
@@ -53,6 +54,12 @@ ATTR_MODELS = MODELS + "attrs/"
 SKIP = ("curation/", MODELS)
 PENDING = ("pending/images", "pending/labels", "pending/attrs", "pending/suggest")
 EVENTS = "fieldkit-events/"   # bucket prefix the RDA importer reads
+COVERAGE = "fieldkit-coverage/"   # per-gate per-day manifests: recorded vs classified stems
+TRACKLETS = "fieldkit-tracklets/"   # every track, counted or not: the journey builder's input
+# One line per vehicle across a camera pair — beside EVENTS, not instead of it, until the
+# counts are compared.
+JOURNEYS = "fieldkit-journeys/"
+PLATE = DATASET / "plate.pt"  # optional plate model: evidence crops only, never a count
 # The Katuba box still calls itself site1; anything already named RDA-TG-* is its own id.
 GATES = {"site1": "RDA-TG-KTB"}
 TZ = "Africa/Lusaka"          # the gates and this machine; segment names are local wallclock
@@ -60,6 +67,13 @@ WANT_BOXES = 300      # per-class floor for the next run; under it, a class is h
 HUNT_TOP = 6          # ...but only the thinnest few at once: with most classes under the
                       # floor a hunt kept every frame with a vehicle in it (400 per segment)
 CLASSIFY_PER_PASS = 12        # ~10 min of footage per camera per pass, at 600 s segments
+CLASSIFY_HOURS = 48           # what the gates keep mirrored: one backlog may span this;
+                              # older gaps are a backfill job, not this pass's problem
+CLASSIFY_BUDGET = 3 * 3600    # seconds one classify pass drains for before checkpointing
+                              # (state saved, lock released) — train and ingest wait out
+                              # a backlog via classify_behind() regardless; this just
+                              # bounds how long one pass can hold the lock. train --now
+                              # overrides the wait.
 HUNT_HOURS = 48               # how far back a hunt looks: what the gates keep mirrored
 HUNT_PER_PASS = 30            # segments per pass, ~25 s each at 1 fps on the GPU: the
                               # lock is back within classify's patience (WAIT)
@@ -189,6 +203,77 @@ def new_box_counts():
     return {n: counts.get(n, 0) for n in names}
 
 
+def classify_behind(s=None):
+    """True if classify still has a fresh backlog — checked by the other passes so
+    counting beats sampling: footage waiting to be classified matters more than another
+    round of curation sampling or a training run that can wait an hour."""
+    from datetime import timedelta
+    backlog = (s if s is not None else load_state()).get("classify_backlog")
+    if not backlog or not backlog.get("left"):
+        return False
+    at = datetime.strptime(backlog["at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    return datetime.now(timezone.utc) - at < timedelta(hours=2)
+
+
+def paused(keys, cfg):
+    """Drop keys whose gate is in config.yaml's curation_paused — matched against both
+    the bucket prefix and its gate id (RDA-TG-KTB and site1 name the same box), the
+    owner's off switch for a gate that has plenty of data."""
+    off = set(cfg.get("curation_paused") or [])
+    live = lambda p: p not in off and gate_of(p) not in off
+    return [k for k in keys if live(k.split("/", 1)[0])]
+
+
+def curation_settings(cl, bucket):
+    """The curation server's curation/curation.yaml as {"cap": int|None, "paused": [gate
+    ids]} — same shape as curation_cap.load_settings, fetched fresh each pass since that
+    server owns the file. Missing key or any error is the safe default: no cap, nothing
+    paused."""
+    import tempfile
+    import curation_cap
+    try:
+        body = cl.get_object(Bucket=bucket, Key=f"curation/{curation_cap.SETTINGS}")["Body"].read()
+    except Exception as e:
+        print(f"{now()} curation settings: unavailable ({e}) — no cap, nothing paused", flush=True)
+        return {"cap": None, "paused": []}
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / curation_cap.SETTINGS).write_bytes(body)
+        return curation_cap.load_settings(tmp)
+
+
+def prune_pending(cl, bucket, cap):
+    """Delete local pending/{images,labels,attrs,suggest} samples that fall in the cap's
+    eviction set, before this pass pushes. Ranked over LOCAL stems union the BUCKET's
+    pending stems, not local alone — a sample the bucket already holds past cap for its
+    gate is older than everything local, and ranking local stems by themselves would
+    call it safe and push a copy right back. -> (samples pruned, ok to push).
+
+    A failed bucket listing prunes nothing and tells the caller to skip its push this
+    pass too: pushing unpruned against a stale (empty) view would resurrect exactly what
+    this exists to stop."""
+    import curation_cap
+    if cap is None:
+        return 0, True
+    local = {p.stem for p in (DATASET / "pending" / "images").glob("*.jpg")}
+    try:
+        remote = {Path(k).stem for k in bucket_keys(cl, bucket, "curation/pending/images/")}
+    except Exception as e:
+        print(f"{now()} curation prune: bucket listing failed ({e}) — push skipped this pass",
+              flush=True)
+        return 0, False
+    import dataset_sync
+    # Finished (approved/discarded) originals still sit in the bucket's pending/: the server
+    # leaves them out of its count, so this must too, or it prunes new, never-pushed samples.
+    done = dataset_sync.consumed(DATASET)
+    evicted = {sid for sids in curation_cap.evictions((local | remote) - done, cap).values() for sid in sids}
+    pruned = 0
+    for sid in local & evicted:
+        for part in curation_cap.PARTS:
+            (DATASET / "pending" / part / f"{sid}.{curation_cap.EXT[part]}").unlink(missing_ok=True)
+        pruned += 1
+    return pruned, True
+
+
 def gate_of(prefix):
     """The RDA gate id for a bucket prefix. The importer resolves events by gate, so a
     prefix with no mapping is passed through — a gate already named for itself is right,
@@ -196,23 +281,75 @@ def gate_of(prefix):
     return GATES.get(prefix, prefix)
 
 
-def pick_classify(keys, classified, per_pass=CLASSIFY_PER_PASS):
-    """The newest unclassified segments across every camera, newest first: the portal
-    wants today's traffic on screen, and the backlog drains whenever the gates are quiet.
-    Ordered by segment name, not by key — sorting whole keys would work one camera dry
-    before the other was touched."""
+def pick_classify(keys, classified, since, per_pass=CLASSIFY_PER_PASS):
+    """Unclassified segments recorded after `since` (a YYYYMMDD-HHMMSS stem, local
+    wallclock), OLDEST first across every camera: newest-first left permanent holes —
+    hours recorded while another pass held the lock were never the newest and so were
+    never picked, measured at 33-38% coverage. Ordered by (stem, key) so a camera pair's
+    two segments of the same ten minutes go together."""
     done = set(classified)
-    todo = [k for segs in cameras(keys).values() for k in segs if k not in done]
-    return sorted(todo, key=lambda k: (k.rsplit("/", 1)[1], k), reverse=True)[:per_pass]
+    todo = [k for segs in cameras(keys).values() for k in segs
+            if k not in done and Path(k).stem >= since]
+    todo.sort(key=lambda k: (Path(k).stem, k))
+    return todo if per_pass is None else todo[:per_pass]
 
 
-def for_upload(doc, gate):
-    """One event as the importer reads it: stamped with the gate it came from, and its
-    crop paths flattened — the bucket keeps one crops/ folder per day, not per day-inside-
-    a-day like the local events dir does."""
-    return {**doc, "gate": gate,
-            "crops": {tag: f"crops/{Path(rel).name}"
-                      for tag, rel in (doc.get("crops") or {}).items()}}
+def coverage(keys, classified, since):
+    """{"<hour YYYYMMDD-HH>": {"<cam>": (classified, recorded)}} over the window — what
+    status() prints: classify's actual reach, not just whether the last pass emptied
+    its queue."""
+    done = set(classified)
+    out = {}
+    for cam, segs in cameras(keys).items():
+        for k in segs:
+            stem = Path(k).stem
+            if stem < since:
+                continue
+            slot = out.setdefault(stem[:11], {}).setdefault(cam, [0, 0])
+            slot[1] += 1
+            slot[0] += k in done
+    return {h: {c: tuple(v) for c, v in cams.items()} for h, cams in out.items()}
+
+
+def coverage_manifests(keys, classified, since):
+    """{(gate, day): {cam: {"recorded": [stems], "classified": [stems]}}} — the per-day
+    truth published to COVERAGE, so a dashboard never treats a partial day as whole.
+
+    Which days to write is decided by `since` (a day touched anywhere after the cutoff
+    is due a fresh manifest); each day written is filled from ALL its keys, cutoff or
+    not — otherwise the oldest day in the window shrinks to the one segment past `since`
+    and reads as fully covered."""
+    done = set(classified)
+    by_gate_cam = {}
+    for key, segs in cameras(keys).items():
+        prefix, cam = key.split("/")
+        by_gate_cam.setdefault(gate_of(prefix), {}).setdefault(cam, []).extend(segs)   # one gate, two prefixes
+    days = {(gate_of(key.split("/", 1)[0]), Path(k).stem[:8])
+            for key, segs in cameras(keys).items() for k in segs if Path(k).stem >= since}
+    out = {}
+    for gate, day in days:
+        for cam, segs in by_gate_cam[gate].items():
+            entry = out.setdefault((gate, day), {}).setdefault(cam, {"recorded": [], "classified": []})
+            for k in segs:
+                stem = Path(k).stem
+                if stem[:8] != day:
+                    continue
+                entry["recorded"].append(stem)
+                if k in done:
+                    entry["classified"].append(stem)
+    return out
+
+
+def for_upload(doc, gate, to="crops/"):
+    """One event (or tracklet) as the importer reads it: stamped with the gate it came
+    from, and its crop paths flattened — the bucket keeps one crops/ folder per day, not
+    per day-inside-a-day like the local events dir does. `to` re-roots them: a journey
+    cites its crops by whole bucket key."""
+    up = {**doc, "gate": gate,
+          "crops": {tag: to + Path(rel).name for tag, rel in (doc.get("crops") or {}).items()}}
+    if doc.get("plate"):          # a tracklet's plate read; events carry none
+        up["plate"] = {**doc["plate"], "crop": to + Path(doc["plate"]["crop"]).name}
+    return up
 
 
 # ---- the machinery ----
@@ -229,10 +366,13 @@ class Lock:
     A kernel flock, not a pid file: the lock dies with its process, so there is no stale-
     holder takeover — and the takeover was the bug, three agents waking together each
     unlinked the other's freshly written lock and all three ran on the GPU at once."""
+    def __init__(self, wait=None):
+        self.wait = WAIT if wait is None else wait   # read at call time: tests patch WAIT
+
     def __enter__(self):
         import fcntl
         import time
-        deadline = time.monotonic() + WAIT
+        deadline = time.monotonic() + self.wait
         LOCK.parent.mkdir(parents=True, exist_ok=True)
         self.fd = os.open(LOCK, os.O_CREAT | os.O_RDWR)
         while True:
@@ -259,8 +399,21 @@ def r2():
     return dataset_sync, dataset_sync.client(o), o["bucket"]
 
 
-def bucket_keys(cl, bucket):
-    for page in cl.get_paginator("list_objects_v2").paginate(Bucket=bucket):
+def recording_keys(cl, bucket):
+    """Keys under the gates' recording folders only (site1/, RDA-TG-*/). The bucket is ~900k
+    objects, nearly all curation samples and evidence crops: listing it whole cost 15-20 min
+    of every pass and grew by the day. The top level is one Delimiter page."""
+    tops = [p["Prefix"] for page in cl.get_paginator("list_objects_v2").paginate(Bucket=bucket, Delimiter="/")
+            for p in page.get("CommonPrefixes", [])]
+    for top in tops:
+        if not top.startswith(SKIP + ("curation-", "fieldkit-", "classifier-crops-")):
+            yield from bucket_keys(cl, bucket, top)
+
+
+def bucket_keys(cl, bucket, prefix="", delimiter=None):
+    # A delimiter lists one level: the day's manifests without its thousands of crops.
+    by = {"Delimiter": delimiter} if delimiter else {}
+    for page in cl.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix, **by):
         for obj in page.get("Contents", []):
             yield obj["Key"]
 
@@ -412,14 +565,27 @@ def hunting():
 
 def ingest_pass():
     import ingest_video
+    if classify_behind():
+        print(f"{now()} ingest: yielding — classify has segment(s) to do", flush=True)
+        return
     with Lock():
         s = load_state()
         ds, cl, bucket = r2()
-        todo = pick(list(bucket_keys(cl, bucket)), s["ingested"])
+        cfg = ingest_video.config()
+        settings = curation_settings(cl, bucket)
+        # config.yaml's own switch and the curation server's Pause button, either stops a
+        # gate — paused() already matches a bucket prefix or its gate id.
+        cfg["curation_paused"] = sorted(set(cfg.get("curation_paused") or []) | set(settings["paused"]))
+        raw = list(recording_keys(cl, bucket))
+        keys = paused(raw, cfg)
+        if raw and not keys:      # empty because paused, not because nothing was recorded
+            print(f"{now()} ingest: curation paused for {', '.join(cfg['curation_paused'])}",
+                  flush=True)
+            return
+        todo = pick(keys, s["ingested"])
         print(f"{now()} ingest: {len(todo)} new segment(s) across the cameras", flush=True)
         if not todo:
             return
-        cfg = ingest_video.config()
         if CHAMPION.is_file():
             cfg["detect_weights"] = str(CHAMPION)   # the loop's own model pre-labels
         cfg["capture_wanted"] = hunting()
@@ -452,6 +618,11 @@ def ingest_pass():
         s["ingested"] = (s["ingested"] + todo)[-REMEMBER:]
         s["last_ingest"] = {"at": now(), "segments": len(todo), "samples": written}
         save_state(s)
+        pruned, ok = prune_pending(cl, bucket, settings["cap"])
+        if pruned:
+            print(f"{now()} ingest: pruned {pruned} local pending sample(s) over cap", flush=True)
+        if not ok:
+            return
         sent, _ = ds.push(cl, bucket, names=PENDING)
         print(f"{now()} ingest: {s['last_ingest']['samples']} samples written, {sent} files pushed", flush=True)
 
@@ -466,18 +637,29 @@ def hunt_pass():
     """
     import ingest_video
     from datetime import timedelta
+    if classify_behind():
+        print(f"{now()} hunt: yielding — classify has segment(s) to do", flush=True)
+        return
     with Lock():
         s = load_state()
         wanted = hunting()
         if not wanted:
             return
         ds, cl, bucket = r2()
+        cfg = ingest_video.config()
+        settings = curation_settings(cl, bucket)
+        cfg["curation_paused"] = sorted(set(cfg.get("curation_paused") or []) | set(settings["paused"]))
         since = (datetime.now(ZoneInfo(TZ)) - timedelta(hours=HUNT_HOURS)).strftime("%Y%m%d-%H%M%S")
-        todo = pick_hunt(list(bucket_keys(cl, bucket)), s.get("hunted", []), since)
+        raw = list(recording_keys(cl, bucket))
+        keys = paused(raw, cfg)
+        if raw and not keys:      # empty because paused, not because nothing was recorded
+            print(f"{now()} hunt: curation paused for {', '.join(cfg['curation_paused'])}",
+                  flush=True)
+            return
+        todo = pick_hunt(keys, s.get("hunted", []), since)
         print(f"{now()} hunt: {len(todo)} segment(s) since {since} to sweep", flush=True)
         if not todo:
             return
-        cfg = ingest_video.config()
         if CHAMPION.is_file():
             cfg["detect_weights"] = str(CHAMPION)
         cfg["capture_wanted"], cfg["capture_only_wanted"] = wanted, True
@@ -504,33 +686,80 @@ def hunt_pass():
         s["hunted"] = (s.get("hunted", []) + todo)[-REMEMBER:]
         s["last_hunt"] = {"at": now(), "segments": len(todo), "samples": written, "wanted": wanted}
         save_state(s)
+        pruned, ok = prune_pending(cl, bucket, settings["cap"])
+        if pruned:
+            print(f"{now()} hunt: pruned {pruned} local pending sample(s) over cap", flush=True)
+        if not ok:
+            return
         sent, _ = ds.push(cl, bucket, names=PENDING)
         print(f"{now()} hunt: {written} wanted-class samples written, {sent} files pushed", flush=True)
 
 
 def publish(cl, bucket, out, gate, source_key, day):
     """Send one segment's events and crops to fieldkit-events/<gate>/<YYYYMMDD>/, the
-    layout the RDA importer reads. -> events published."""
+    layout the RDA importer reads, and its tracklets and theirs to fieldkit-tracklets/
+    the same way. -> events published."""
     # A quiet segment still publishes an empty file: that is what marks it done, and it
     # tells the importer the gate was watched and idle rather than never processed.
     manifest = f"{Path(source_key).stem}-{hashlib.sha256(source_key.encode()).hexdigest()[:32]}"
     (out / f"{day}.jsonl").touch()
     total = 0
-    for js in sorted(out.glob("*.jsonl")):      # a segment can straddle midnight
+    # Tracklets first, so a published events manifest implies its tracklets are there. A
+    # segment can straddle midnight: two day files of each.
+    for js in sorted((out / "tracklets").glob("*.jsonl")) + sorted(out.glob("*.jsonl")):
+        tracklet = js.parent != out
         docs = [for_upload(json.loads(l), gate)
                 for l in js.read_text().splitlines() if l.strip()]
         lines = [json.dumps(doc) for doc in docs]
-        where = f"{EVENTS}{gate}/{js.stem.replace('-', '')}"
-        crops = sorted({Path(rel).name for doc in docs for rel in doc["crops"].values()})
-        for name in crops:
-            crop = out / "crops" / js.stem / name
-            if not crop.is_file():
-                raise FileNotFoundError(f"event crop missing: {crop}")
-            cl.upload_file(str(crop), bucket, f"{where}/crops/{name}")
+        where = f"{TRACKLETS if tracklet else EVENTS}{gate}/{js.stem.replace('-', '')}"
+        crops = sorted({Path(rel).name for doc in docs
+                        for rel in [*doc["crops"].values(), (doc.get("plate") or {}).get("crop")] if rel})
+        here = js.parent / "crops" / js.stem
+        missing = [name for name in crops if not (here / name).is_file()]
+        if missing:           # all checked before any upload: no manifest cites a crop that is not up
+            raise FileNotFoundError(f"crop missing: {here / missing[0]}")
+        # In parallel: each upload waits ~0.8 s on the office link and a day segment has 300-500
+        # crops — one at a time, that was most of the segment's time in the pass.
+        import dataset_sync
+        dataset_sync.transfer(lambda name: cl.upload_file(str(here / name), bucket, f"{where}/crops/{name}"),
+                              [(name,) for name in crops], "crops up")
         cl.put_object(Bucket=bucket, Key=f"{where}/{manifest}.jsonl",
                       Body="".join(l + "\n" for l in lines).encode(),
                       ContentType="application/json")
-        total += len(lines)
+        total += 0 if tracklet else len(lines)
+    return total
+
+
+def journeys_pass(cl, bucket, touched, cameras, tz):
+    """Rebuild each touched (gate, day) from ALL that day's tracklets into
+    fieldkit-journeys/<gate>/<YYYYMMDD>/journeys.jsonl, one line per vehicle across a
+    camera pair, with attrs from the day's events. Only cameras with `handoff` config
+    pair up; without any there is nothing to link. -> journeys written.
+
+    ponytail: the whole day is rebuilt every pass — journey ids are deterministic, so the
+    overwrite is idempotent; switching the importer to journeys will want finalized
+    windows instead. A vehicle crossing midnight splits in two: the neighbouring day's
+    tracklets aren't loaded. Crops are cited by bucket key, never copied."""
+    if not any(c.get("handoff") for c in cameras):
+        return 0
+    import journeys
+
+    def docs(prefix):             # every manifest of the day; crops/ is never listed
+        for key in sorted(k for k in bucket_keys(cl, bucket, prefix, "/") if k.endswith(".jsonl")):
+            body = cl.get_object(Bucket=bucket, Key=key)["Body"].read().decode()
+            yield from (json.loads(l) for l in body.splitlines() if l.strip())
+
+    total = 0
+    for gate, day in sorted(touched):
+        where = f"{gate}/{day.replace('-', '')}/"
+        tracklets = [for_upload(t, gate, f"{TRACKLETS}{where}crops/") for t in docs(TRACKLETS + where)]
+        events = {e["id"]: e for e in docs(EVENTS + where)}
+        js = journeys.build(tracklets, cameras, tz, events)
+        cl.put_object(Bucket=bucket, Key=f"{JOURNEYS}{where}journeys.jsonl",
+                      Body="".join(json.dumps({**j, "gate": gate}) + "\n" for j in js).encode(),
+                      ContentType="application/json")
+        print(f"    {len(js)} journey(s) -> {JOURNEYS}{where}", flush=True)
+        total += len(js)
     return total
 
 
@@ -542,7 +771,10 @@ def classify_pass():
     still produces events. Ten to twenty minutes behind live, which the portal is happy
     with — and the alternative is a second detector to keep in step with the first.
     """
+    import concurrent.futures
+    import time
     import tempfile
+    from datetime import timedelta
 
     import detect
     import ingest_video
@@ -550,68 +782,123 @@ def classify_pass():
     if not CHAMPION.is_file():
         print(f"{now()} classify: no detector at {CHAMPION} — nothing to classify", flush=True)
         return
-    with Lock():
+    with Lock(), concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
         s = load_state()
         ds, cl, bucket = r2()
-        todo = pick_classify(list(bucket_keys(cl, bucket)), s.get("classified", []))
-        print(f"{now()} classify: {len(todo)} segment(s)", flush=True)
-        if not todo:
-            return
         base, tz = ingest_video.config(), ZoneInfo(TZ)
-        # This pass decodes every mirrored segment anyway, so it sees all 48 h of footage
-        # — the widest net there is for a class that shows up twice a day.
-        base["capture_wanted"], base["dataset_dir"] = hunting(), str(DATASET)
+        # hunt is the curation sweep; classify only counts — no capture_wanted/dataset_dir,
+        # so detect.Detector's _dataset_init skips capture and this pass never captures
+        # frames or pushes to curation.
+        since = (datetime.now(ZoneInfo(TZ)) - timedelta(hours=CLASSIFY_HOURS)).strftime("%Y%m%d-%H%M%S")
         VIDEOS.mkdir(parents=True, exist_ok=True)
-        done = events = 0
-        stems = []
-        for key in todo:
-            prefix, cam_name, seg = key.split("/")
-            gate = gate_of(prefix)
-            cfg = {**base, "detect_weights": str(CHAMPION), "toll_gate_id": gate}
-            if ATTRS_CHAMPION.is_file():
-                cfg["attr_weights"] = str(ATTRS_CHAMPION)
-            # Heading rides on the camera's config entry; without one there is no
-            # direction on these events, which is right — it is never guessed.
-            cam = next((c for c in (base.get("cameras") or []) if c.get("name") == cam_name),
-                       {"name": cam_name})
-            # The recorder's own filename is the footage clock: keep it, or cam_and_start
-            # falls back to mtime and every event is stamped with the download.
-            video, out = local_path(key), Path(tempfile.mkdtemp())
-            video.parent.mkdir(parents=True, exist_ok=True)
-            try:
+
+        def download(key):
+            dest = local_path(key)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            cl.download_file(bucket, key, str(dest))
+            return dest
+
+        done = events = left = 0
+        touched, failed, keys, all_todo = set(), set(), [], []
+        deadline = time.monotonic() + CLASSIFY_BUDGET
+        expired = False
+        while not expired:
+            keys = list(recording_keys(cl, bucket))   # re-listed each round: picks up arrivals
+            all_todo = pick_classify(keys, s.get("classified", []), since, per_pass=None)
+            left = len(all_todo)          # honest backlog count, failed segments included
+            todo = [k for k in all_todo if k not in failed][:CLASSIFY_PER_PASS]
+            if not todo:
+                break
+            print(f"{now()} classify: {len(todo)} segment(s), {left} left in the window", flush=True)
+            # Downloads run ~85-90s of a ~210s segment over the office link: the next
+            # segment's download overlaps this one's detection instead of stalling after it.
+            pending = pool.submit(download, todo[0])
+            for i, key in enumerate(todo):
+                if time.monotonic() > deadline:
+                    # Checked per segment, not per round: a round is ~12 segments, and the
+                    # budget must not run 45 min over its own limit. The in-flight prefetch
+                    # is awaited and discarded rather than left downloaded on disk.
+                    try:
+                        pending.result().unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    expired = True
+                    break
+                prefix, cam_name, seg = key.split("/")
+                gate = gate_of(prefix)
+                cfg = {**base, "detect_weights": str(CHAMPION), "toll_gate_id": gate}
+                if ATTRS_CHAMPION.is_file():
+                    cfg["attr_weights"] = str(ATTRS_CHAMPION)
+                if PLATE.is_file():
+                    cfg["plate_weights"] = str(PLATE)
+                # Heading rides on the camera's config entry; without one there is no
+                # direction on these events, which is right — it is never guessed.
+                cam = next((c for c in (base.get("cameras") or []) if c.get("name") == cam_name),
+                           {"name": cam_name})
                 print(f"  v {key}", flush=True)
-                cl.download_file(bucket, key, str(video))
-                day, captured = detect.classify_segment(video, cam, cfg, tz, out,
-                                                        source_key=key)
-                stems += captured
-                n = publish(cl, bucket, out, gate, key, day)
-                # Recorded only once published: a segment that died mid-pass is retried
-                # next tick rather than lost, and re-running it rewrites the same keys.
-                s["classified"] = (s.get("classified", []) + [key])[-REMEMBER_CLASSIFIED:]
-                save_state(s)
-                done, events = done + 1, events + n
-                print(f"    {n} event(s) -> {EVENTS}{gate}/{day.replace('-', '')}/", flush=True)
-            except Exception as e:       # one bad segment must not strand the rest
-                print(f"  ! {key}: {e}", flush=True)
-            finally:
-                video.unlink(missing_ok=True)
-                shutil.rmtree(out, ignore_errors=True)
-        if stems:
-            if ATTRS_CHAMPION.is_file():
-                suggest(stems)       # same courtesy the ingest pass does: correct, not type
-            sent, _ = ds.push(cl, bucket, names=PENDING)
-            print(f"{now()} classify: {len(stems)} frame(s) captured for the queue, "
-                  f"{sent} file(s) pushed", flush=True)
-        s["last_classify"] = {"at": now(), "segments": done, "events": events,
-                              "captured": len(stems)}
+                try:
+                    video = pending.result()
+                except Exception as e:       # a download failure is this segment's error
+                    failed.add(key)
+                    print(f"  ! {key}: {e}", flush=True)
+                    video = None
+                # Submitted regardless of this segment's outcome: the next download must
+                # not wait on this one's detection, or the overlap is lost to a failure.
+                if i + 1 < len(todo):
+                    pending = pool.submit(download, todo[i + 1])
+                if video is None:
+                    continue
+                out = None
+                try:
+                    out = Path(tempfile.mkdtemp())
+                    # The recorder's own filename is the footage clock: keep it, or
+                    # cam_and_start falls back to mtime and every event is stamped
+                    # with the download.
+                    day, _ = detect.classify_segment(video, cam, cfg, tz, out, source_key=key)
+                    n = publish(cl, bucket, out, gate, key, day)
+                    touched |= {(gate, js.stem) for js in (out / "tracklets").glob("*.jsonl")}
+                    # Recorded only once published: a segment that died mid-pass is retried
+                    # next tick rather than lost, and re-running it rewrites the same keys.
+                    s["classified"] = (s.get("classified", []) + [key])[-REMEMBER_CLASSIFIED:]
+                    save_state(s)
+                    done, events = done + 1, events + n
+                    print(f"    {n} event(s) -> {EVENTS}{gate}/{day.replace('-', '')}/", flush=True)
+                except Exception as e:       # one bad segment must not strand the rest
+                    failed.add(key)
+                    print(f"  ! {key}: {e}", flush=True)
+                finally:
+                    video.unlink(missing_ok=True)   # never leave a prefetched file behind
+                    if out is not None:
+                        shutil.rmtree(out, ignore_errors=True)
+            try:
+                journeys_pass(cl, bucket, touched, base.get("cameras") or [], tz)
+                touched.clear()
+            except Exception as e:       # journeys ride beside events; they never cost a classify
+                print(f"  ! journeys: {e}", flush=True)
+        # A segment that keeps failing must not starve hunt/ingest/train for 48h: it stays
+        # in `left` for status, but not in the count classify_behind() acts on — it will
+        # be retried next pass regardless, since it is never added to s["classified"].
+        stuck = len(failed & set(all_todo))
+        s["classify_backlog"] = {"at": now(), "left": left - stuck, "failed": stuck}
+        s["last_classify"] = {"at": now(), "segments": done, "events": events}
         save_state(s)
-        print(f"{now()} classify: {done}/{len(todo)} segment(s), {events} event(s) published",
-              flush=True)
+        for (gate, day), cams in coverage_manifests(keys, s.get("classified", []), since).items():
+            cl.put_object(Bucket=bucket, Key=f"{COVERAGE}{gate}/{day}.json",
+                          Body=json.dumps({"gate": gate, "day": day, "updated": now(),
+                                          "cameras": cams}).encode(),
+                          ContentType="application/json")
+        print(f"{now()} classify: {done} segment(s), {events} event(s) published, "
+              f"{left} left in the window", flush=True)
 
 
 def train_pass(force=False):
     import train as trainer
-    with Lock():
+    if not force and classify_behind():
+        print(f"{now()} train: yielding — classify has segment(s) to do", flush=True)
+        return
+    # A forced run must not exit "busy" while classify drains its budget (up to
+    # CLASSIFY_BUDGET) — it queues behind the drain instead of failing.
+    with Lock(wait=CLASSIFY_BUDGET + 3600 if force else WAIT):
         s = load_state()
         ds, cl, bucket = r2()
         ds.pull(cl, bucket, names=ds.CONFIG)
@@ -818,6 +1105,17 @@ def status():
         print(f"new frames:    {count} outside the reference set, {s.get('trained_frames', 0)} at the last run"
               f" — {'ready to train' if gap <= 0 else f'{gap} more before the next run'}")
     print(f"lock:          {(LOCK.read_text().strip() if LOCK.exists() else '') or 'free'}")
+    try:
+        from datetime import timedelta
+        _, cl, bucket = r2()
+        since = (datetime.now(ZoneInfo(TZ)) - timedelta(hours=CLASSIFY_HOURS)).strftime("%Y%m%d-%H%M%S")
+        cov = coverage(list(recording_keys(cl, bucket)), s.get("classified", []), since)
+        print(f"coverage (last {CLASSIFY_HOURS}h):")
+        for hour in sorted(cov):
+            parts = ", ".join(f"{cam} {c}/{r}" for cam, (c, r) in sorted(cov[hour].items()))
+            print(f"  {hour}  {parts}")
+    except Exception as e:
+        print(f"coverage:      unavailable ({e})")
 
 
 def suggest_check():
@@ -871,6 +1169,88 @@ def suggest_check():
     assert list(got) == ["0", "1"], got           # keyed by label line, the box index
     assert all(set(v) == set(heads) and v["type"] in heads["type"]
                and v["axles"] in heads["axles"] for v in got.values()), got
+
+
+def curation_check():
+    """prune_pending() must delete exactly what curation_cap.evictions() would, ranked
+    over LOCAL stems union the BUCKET's — a sample that alone looks safe locally (under
+    cap) must still be pruned when the bucket already holds `cap` newer ones for its
+    gate, or a push would resurrect what the curation server just evicted. Never touches
+    an external import (no capture timestamp to evict by). A failed bucket listing prunes
+    nothing and tells the caller to skip its push. curation_settings() must fall back
+    safely when the bucket has no file or a bad client."""
+    import contextlib
+    import io
+    import tempfile
+    from unittest.mock import patch
+    import curation_cap
+
+    me = sys.modules[__name__]
+
+    class FakeCl:
+        def __init__(self, listing=None, body=None, fail_list=False, fail_get=False):
+            self.listing, self.body = listing or {}, body
+            self.fail_list, self.fail_get = fail_list, fail_get
+
+        def get_paginator(self, _):
+            listing, fail = self.listing, self.fail_list
+
+            class P:
+                def paginate(self, Bucket, Prefix="", **_kw):
+                    if fail:
+                        raise RuntimeError("listing failed")
+                    yield {"Contents": [{"Key": k} for k in listing if k.startswith(Prefix)]}
+            return P()
+
+        def get_object(self, Bucket, Key):
+            if self.fail_get:
+                raise RuntimeError("no such key")
+            return {"Body": io.BytesIO(self.body)}
+
+    def write_local(tmp, stems):
+        for part in curation_cap.PARTS:
+            (tmp / "pending" / part).mkdir(parents=True, exist_ok=True)
+        for sid in stems:
+            for part in curation_cap.PARTS:
+                (tmp / "pending" / part / f"{sid}.{curation_cap.EXT[part]}").write_text("x")
+
+    # No bucket samples: ranked over local alone, same as a plain local-only cap.
+    tmp = Path(tempfile.mkdtemp())
+    write_local(tmp, [f"A-{d}" for d in ("20260101-000000", "20260102-000000", "20260103-000000")] +
+                ["external-deadbeef"])
+    with patch.object(me, "DATASET", tmp):
+        assert prune_pending(FakeCl(), "bucket", cap=None) == (0, True), "cap unset: nothing pruned"
+        pruned, ok = prune_pending(FakeCl(), "bucket", cap=2)
+    assert (pruned, ok) == (1, True), (pruned, ok)
+    assert all(not (tmp / "pending" / part / f"A-20260101-000000.{curation_cap.EXT[part]}").is_file()
+               for part in curation_cap.PARTS), "oldest not pruned across every part"
+    assert (tmp / "pending" / "images" / "A-20260102-000000.jpg").is_file(), "newest kept"
+    assert (tmp / "pending" / "images" / "external-deadbeef.jpg").is_file(), "external never evicted"
+
+    # The bucket already holds cap newer samples for A; the one local sample is older
+    # than all of them and must be pruned even though it is alone (under cap) locally.
+    tmp2 = Path(tempfile.mkdtemp())
+    write_local(tmp2, ["A-20260101-000000"])
+    remote = {f"curation/pending/images/A-{d}.jpg": 1
+              for d in ("20260102-000000", "20260103-000000", "20260104-000000")}
+    with patch.object(me, "DATASET", tmp2):
+        pruned, ok = prune_pending(FakeCl(listing=remote), "bucket", cap=2)
+        assert (pruned, ok) == (1, True), (pruned, ok)
+        assert not (tmp2 / "pending" / "images" / "A-20260101-000000.jpg").is_file(), \
+            "resurrection: local-only ranking would have kept this"
+        # A listing failure must prune nothing and tell the caller to skip its push.
+        write_local(tmp2, ["A-20260105-000000"])
+        with contextlib.redirect_stdout(io.StringIO()):
+            pruned, ok = prune_pending(FakeCl(fail_list=True), "bucket", cap=2)
+        assert (pruned, ok) == (0, False), (pruned, ok)
+        assert (tmp2 / "pending" / "images" / "A-20260105-000000.jpg").is_file(), \
+            "a failed listing must not prune"
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        got = curation_settings(FakeCl(body=b"cap: 500\npaused: [RDA-TG-KTB]\n"), "bucket")
+        assert got == {"cap": 500, "paused": ["RDA-TG-KTB"]}, got
+        assert curation_settings(FakeCl(fail_get=True), "bucket") == {"cap": None, "paused": []}, \
+            "any fetch error is the safe default"
 
 
 def lock_check():
@@ -929,6 +1309,31 @@ def publish_check():
     assert doc["gate"] == "RDA-TG-KTB" and doc["crops"] == {"best": "crops/c-123-best.jpg"}, doc
     assert cl.sent == ["fieldkit-events/RDA-TG-KTB/20260819/crops/c-123-best.jpg"], cl.sent
 
+    # Tracklets go first, under their own prefix, every crop (the plate's too) flattened beside them.
+    tk, rel = Path(tempfile.mkdtemp()), "tracklets/crops/2026-08-19/t-1-"
+    (tk / "tracklets" / "crops" / "2026-08-19").mkdir(parents=True)
+    for tag in ("top", "best", "plate"):
+        (tk / f"{rel}{tag}.jpg").write_bytes(b"jpeg")
+    (tk / "tracklets" / "2026-08-19.jsonl").write_text(json.dumps(
+        {"id": "t-1", "crops": {"top": rel + "top.jpg", "best": rel + "best.jpg"},
+         "plate": {"conf": 0.3, "crop": rel + "plate.jpg"}}) + "\n")
+    cl, where = FakeS3(), "fieldkit-tracklets/G/20260819/"
+    assert publish(cl, "buck", tk, "G", source, "2026-08-19") == 0, "tracklets are not events"
+    assert list(cl.put) == [f"{where}{manifest}.jsonl",
+                            f"fieldkit-events/G/20260819/{manifest}.jsonl"], cl.put
+    doc = json.loads(cl.put[f"{where}{manifest}.jsonl"].decode())
+    assert doc == {"id": "t-1", "gate": "G", "crops": {"top": "crops/t-1-top.jpg", "best": "crops/t-1-best.jpg"},
+                   "plate": {"conf": 0.3, "crop": "crops/t-1-plate.jpg"}}, doc
+    assert sorted(cl.sent) == [f"{where}crops/t-1-{tag}.jpg" for tag in ("best", "plate", "top")], cl.sent
+    (tk / f"{rel}plate.jpg").unlink()
+    cl = FakeS3()
+    try:
+        publish(cl, "buck", tk, "G", source, "2026-08-19")
+        raise AssertionError("a tracklet missing its plate crop published")
+    except FileNotFoundError:
+        pass
+    assert cl.put == {}, cl.put
+
     # This publication exposes no manifest containing a missing or failed crop reference.
     for missing, client in ((True, FakeS3()), (False, FakeS3(fail_crop=True))):
         broken = Path(tempfile.mkdtemp())
@@ -968,6 +1373,84 @@ def publish_check():
     assert len(cl.put) == 2, cl.put
 
 
+def listing_check():
+    """A pass lists the gates' recording folders, never curation, evidence or models."""
+    class Tops:
+        keys = ["site1/cam3/20260923-101636.mkv", "RDA-TG-X/north/20260923-101636.mkv",
+                "curation/pending/images/x.jpg", "curation-paired/v1/c.json", "models/champion.pt",
+                "fieldkit-events/G/20260923/m.jsonl", "classifier-crops-history/2026-09-09/c.jpg"]
+        listed = []
+
+        def get_paginator(self, _):
+            return self
+
+        def paginate(self, Bucket, Prefix="", Delimiter=None):
+            ks = [k for k in self.keys if k.startswith(Prefix)]
+            if Delimiter:
+                return [{"CommonPrefixes": [{"Prefix": p} for p in sorted({k.split("/")[0] + "/" for k in ks})]}]
+            self.listed.append(Prefix)
+            return [{"Contents": [{"Key": k} for k in ks]}]
+
+    t = Tops()
+    assert sorted(recording_keys(t, "b")) == ["RDA-TG-X/north/20260923-101636.mkv",
+                                              "site1/cam3/20260923-101636.mkv"], t.listed
+    assert sorted(t.listed) == ["RDA-TG-X/", "site1/"], t.listed
+
+
+def journeys_check():
+    """A day rebuilt from the bucket alone: tracklets from two paired cameras become one
+    journey citing its crops by key, with attrs from the day's events."""
+    import io
+
+    class FakeS3:
+        def __init__(self, objs):
+            self.objs, self.put, self.listed = objs, {}, []
+
+        def get_paginator(self, _):
+            return self
+
+        def paginate(self, Bucket, Prefix, Delimiter=None):
+            keys = [k for k in self.objs if k.startswith(Prefix)
+                    and not (Delimiter and Delimiter in k[len(Prefix):])]
+            self.listed += keys
+            return [{"Contents": [{"Key": k} for k in keys]}]
+
+        def get_object(self, Bucket, Key):
+            return {"Body": io.BytesIO(self.objs[Key])}
+
+        def put_object(self, Bucket, Key, Body, ContentType=None):
+            self.put[Key] = Body
+
+    def tracklet(cam, samples):       # (t, centre x, centre y): a 0.2-wide box per sample
+        path = [[t, x - 0.1, y - 0.1, x + 0.1, y + 0.1] for t, x, y in samples]
+        return json.dumps({
+            "id": f"obs-{cam}", "camera": cam, "t0": path[0][0], "t1": path[-1][0], "hits": len(path),
+            "class": "e-heavy", "votes": {"e-heavy": len(path)}, "conf": {"e-heavy": 0.8},
+            "counted": True, "ghost_of": None, "direction": "northbound", "path": path,
+            "crops": {"top": f"crops/obs-{cam}-top.jpg", "best": f"crops/obs-{cam}-best.jpg"},
+            "plate": {"conf": 0.3, "crop": f"crops/obs-{cam}-plate.jpg"}}).encode() + b"\n"
+
+    # Northbound: cam3 watches it leave bottom-right at t=100, cam4 sees it enter bottom-left 0.4 s later.
+    day = "fieldkit-tracklets/G/20260819/"
+    objs = {day + "a.jsonl": tracklet("cam3", [(96 + k, 0.5 + 0.1 * k, 0.5 + 0.075 * k) for k in range(5)]),
+            day + "b.jsonl": tracklet("cam4", [(100.4 + k, 0.1 + 0.1 * k, 0.7 - 0.1 * k) for k in range(5)]),
+            day + "crops/obs-cam3-top.jpg": b"jpeg",      # beside the manifests, never listed
+            "fieldkit-events/G/20260819/e.jsonl": json.dumps(
+                {"id": "obs-cam4", "class": "e-heavy", "hits": 5, "attrs": {"axles": "5"}}).encode()}
+    cams = [{"name": "cam3", "heading": "south", "handoff": {"camera": "cam4", "zone": [0.80, 0.62, 0.20, 0.38]}},
+            {"name": "cam4", "heading": "north", "handoff": {"camera": "cam3", "zone": [0.0, 0.55, 0.22, 0.30]}}]
+    cl = FakeS3(objs)
+    assert journeys_pass(cl, "buck", {("G", "2026-08-19")}, cams, timezone.utc) == 1
+    assert list(cl.put) == ["fieldkit-journeys/G/20260819/journeys.jsonl"], cl.put
+    assert not any("/crops/" in k for k in cl.listed), cl.listed
+    [j] = map(json.loads, cl.put["fieldkit-journeys/G/20260819/journeys.jsonl"].decode().splitlines())
+    assert j["gate"] == "G" and j["link"] and j["attrs"] == {"axles": "5"}, j
+    assert j["crops"] and all(v.startswith(day + "crops/") for v in j["crops"].values()), j["crops"]
+    cl = FakeS3(objs)
+    assert journeys_pass(cl, "buck", {("G", "2026-08-19")}, [{"name": "cam3"}, {"name": "cam4"}],
+                         timezone.utc) == 0 and cl.put == {}, "no handoff, nothing to link"
+
+
 def selfcheck():
     keys = ["curation/pending/images/x.jpg", "models/champion.pt",
             "site1/cam3/20260827-100000.mkv", "site1/cam3/20260827-101000.mkv", "site1/cam3/20260827-102000.mkv",
@@ -997,11 +1480,46 @@ def selfcheck():
         "only the thinnest few are hunted at once"
     assert gate_of("site1") == "RDA-TG-KTB", "the Katuba box still calls itself site1"
     assert gate_of("RDA-TG-KTB") == "RDA-TG-KTB", "a gate already named for itself"
-    # Newest segment first, across cameras, so the portal gets current traffic first.
-    got = pick_classify(keys, classified=["site1/cam3/20260827-102000.mkv"], per_pass=2)
-    assert got == ["site1/cam3/20260827-101000.mkv", "site1/cam3/20260827-100000.mkv"], got
-    assert pick_classify(keys, classified=[])[0].endswith("102000.mkv"), "newest first"
-    assert pick_classify(keys, classified=keys) == [], "everything classified: nothing to do"
+    # Oldest unclassified first, across cameras, since the cutoff — newest-first left
+    # permanent holes when another pass held the lock through the newest hour.
+    got = pick_classify(keys, classified=["site1/cam3/20260827-100000.mkv"],
+                        since="20260101-000000", per_pass=2)
+    assert got == ["RDA-TG-KTB/north/20260827-100000.mkv",
+                   "site1/cam3/20260827-101000.mkv"], got
+    assert pick_classify(keys, classified=[], since="20260101-000000")[0].endswith("100000.mkv"), \
+        "oldest first"
+    assert pick_classify(keys, classified=keys, since="20260101-000000") == [], \
+        "everything classified: nothing to do"
+    assert pick_classify(keys, classified=[], since="20990101-000000") == [], \
+        "since excludes older segments"
+    assert pick_classify(keys, classified=[], since="20260101-000000", per_pass=None) == \
+        sorted((k for segs in cameras(keys).values() for k in segs), key=lambda k: (Path(k).stem, k)), \
+        "per_pass=None: the whole window, unbounded"
+    assert paused(keys, {"curation_paused": ["site1"]}) == \
+        [k for k in keys if not k.startswith("site1/")], "paused gate's keys dropped"
+    assert paused(keys, {"curation_paused": ["RDA-TG-KTB"]}) == \
+        [k for k in keys if not k.startswith(("site1/", "RDA-TG-KTB/"))], \
+        "paused by gate id: site1 is RDA-TG-KTB too"
+    assert paused(keys, {}) == keys, "nothing paused by default"
+    cov = coverage(keys, classified=["site1/cam3/20260827-100000.mkv"], since="20260101-000000")
+    assert cov == {"20260827-10": {"site1/cam3": (1, 3), "RDA-TG-KTB/north": (0, 1)}}, cov
+    assert coverage(keys, classified=[], since="20990101-000000") == {}, "since excludes the whole hour"
+    man = coverage_manifests(keys, classified=["site1/cam3/20260827-100000.mkv"], since="20260101-000000")
+    assert set(man) == {("RDA-TG-KTB", "20260827")}, "site1 and RDA-TG-KTB are the same gate"
+    cams = man[("RDA-TG-KTB", "20260827")]
+    assert cams["cam3"]["recorded"] == ["20260827-100000", "20260827-101000", "20260827-102000"] \
+        and cams["cam3"]["classified"] == ["20260827-100000"], cams["cam3"]
+    assert cams["north"] == {"recorded": ["20260827-100000"], "classified": []}, cams["north"]
+    # since cuts mid-day (only 102000 is >= it) but the day it selects is still filled whole,
+    # or the oldest day in a window reads as fully covered when it is really mostly missing.
+    mid = coverage_manifests(keys, classified=["site1/cam3/20260827-100000.mkv"], since="20260827-101500")
+    assert mid[("RDA-TG-KTB", "20260827")]["cam3"]["recorded"] == \
+        ["20260827-100000", "20260827-101000", "20260827-102000"], "day filled whole, not clipped by since"
+    assert not classify_behind({"classify_backlog": {"at": now(), "left": 0}}), "nothing left"
+    assert classify_behind({"classify_backlog": {"at": now(), "left": 3}}), "fresh backlog"
+    from datetime import timedelta
+    stale_at = (datetime.now(timezone.utc) - timedelta(hours=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    assert not classify_behind({"classify_backlog": {"at": stale_at, "left": 3}}), "stale backlog"
     hunted = pick_hunt(keys, hunted=["site1/cam3/20260827-102000.mkv"], since="20260827-100000")
     assert hunted and all(Path(k).stem >= "20260827-100000" for k in hunted) \
         and "site1/cam3/20260827-102000.mkv" not in hunted, "hunt: newest un-hunted since the cutoff"
@@ -1014,12 +1532,15 @@ def selfcheck():
     assert for_upload({"id": "q"}, "G")["crops"] == {}, "a crop-less event still uploads"
     lock_check()
     publish_check()
+    listing_check()
+    journeys_check()
     suggest_check()
+    curation_check()
     print("selfloop self-check ok: cameras found under any gate prefix, newest unsampled segments "
           "picked per camera, training triggers on the cumulative threshold, promotion needs a "
           "strictly better reference score (detector) or mean val accuracy (attributes) unless "
-          "there is no comparable champion, newest segments classified first under their "
-          "gate's id")
+          "there is no comparable champion, unclassified segments drained oldest first "
+          "under their gate's id")
 
 
 if __name__ == "__main__":

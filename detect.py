@@ -69,6 +69,15 @@ SETTLED = 5.0            # a reader that survives this long resets its backoff
 MAX_BACKOFF = 30.0
 SAVE_EVERY = 60.0        # persist the day's tallies at most this often
 EVENTS_KEEP_DAYS = 30    # crops age out; the jsonl lines are tiny and stay
+TRACKLET_CROP_HITS = 5   # a 2-4 frame blip gets a tracklet line but no JPEGs: crops are the storage cost
+PATH_EVERY = 1.0         # seconds between a tracklet's path samples; the first and last box always stay
+PATH_MAX = 600           # ten minutes of samples; a longer track is parked, and journeys only read
+                         # its ends — path_last still keeps the exit box
+PLATE_SCALE = 3          # plates are ~20 px wide at 1080p: the plate model only finds them upscaled
+PLATE_CONF = 0.15        # ...and even then at 0.2-0.4, so it is asked leniently
+PLATE_PAD = 0.15         # a tight plate crop loses its edge characters
+RECEDE = 0.5             # a receding vehicle shows its rear once its box has shrunk to this share
+                         # of its peak area; the peak itself is the side-on pass
 DIRECTION_MIN = 0.03     # displacement under this fraction of the frame is not travel
 SPEED_MIN, SPEED_MAX = 1.0, 160.0        # outside: a tracking artifact, not a vehicle
 CAPTURE_EVERY = 10.0     # dataset samples per camera; dedup already skips unchanged scenes
@@ -249,6 +258,31 @@ def attr_classifier(path, dev="cpu"):
             a["axles"] = str(min(n, 9))
         return a
     return classify
+
+
+def plate_reader(path, dev="cpu"):
+    """-> fn(vehicle jpeg) -> (conf, plate jpeg) | None. The plate is evidence, not a
+    reading: at these sizes it is found only on the crop upscaled PLATE_SCALE x, and a
+    failure is None — a plate never costs a track."""
+    from PIL import Image
+    from ultralytics import YOLO
+    model = YOLO(path)
+
+    def read(jpeg):
+        try:
+            img = Image.open(io.BytesIO(jpeg)).convert("RGB")
+            img = img.resize((img.width * PLATE_SCALE, img.height * PLATE_SCALE), Image.LANCZOS)
+            boxes = model.predict(img, imgsz=1280, conf=PLATE_CONF, device=dev, verbose=False)[0].boxes
+            confs = boxes.conf.tolist()
+            if not confs:
+                return None
+            i = confs.index(max(confs))
+            buf = io.BytesIO()
+            crop(img, boxes.xyxy.tolist()[i], PLATE_PAD).save(buf, "JPEG", quality=90)
+            return confs[i], buf.getvalue()
+        except Exception:
+            return None
+    return read
 
 
 def attr_constraints(weights_path):
@@ -643,6 +677,9 @@ class Detector:
         # Stage 2: attributes off the counted vehicle's best crop (type/axles/cargo).
         self.attr_weights = str(cfg.get("attr_weights", "") or "").strip()
         self.attrs = None
+        # Plate evidence on each tracklet's best crops, for linking a vehicle across cameras.
+        self.plate_weights = str(cfg.get("plate_weights", "") or "").strip()
+        self.plates = None
         # Classes the curated set is still short of. A frame holding one is worth more
         # than the cadence, so it is captured off-schedule (selfloop.wanted_classes).
         self.wanted = set(cfg.get("capture_wanted") or [])
@@ -663,7 +700,7 @@ class Detector:
         self.last_capture = {}
         self.last_rare = {}             # camera -> wallclock of its last off-cadence capture
         self.last_boxes = {}  # camera name -> last captured `shown`, for scene dedup
-        self.recent = {}      # camera name -> [(label, box, expires)]: the recount guard
+        self.recent = {}      # camera name -> [(label, box, expires, root observation id)]: the recount guard
         self.lock = threading.Lock()
         self.thread = None
         self.stopping = threading.Event()
@@ -854,6 +891,8 @@ class Detector:
             raise RuntimeError(f"detect_weights not found: {self.weights}")
         if self.attr_weights and not Path(self.attr_weights).exists():
             raise RuntimeError(f"attr_weights not found: {self.attr_weights}")
+        if self.plate_weights and not Path(self.plate_weights).exists():
+            raise RuntimeError(f"plate_weights not found: {self.plate_weights}")
         from ultralytics import YOLO
         try:
             import torch
@@ -872,6 +911,8 @@ class Detector:
         COLORS.update(palette(lookup.values()))   # both modes: every class gets its colour
         if self.attr_weights:
             self.attrs = attr_classifier(self.attr_weights, dev)   # worker thread only
+        if self.plate_weights:
+            self.plates = plate_reader(self.plate_weights, dev)
 
         def track(name, img):
             model = self.models.get(name)
@@ -977,7 +1018,7 @@ class Detector:
         cross unseen. Upgrade path: per-camera fps tuning, or the Hailo backend so
         inference stops competing with the recorder for CPU.
         """
-        now = self.clock()
+        now, wall = self.clock(), self.wall()
         shown = []
         wheels = [d for d in dets if not is_vehicle(d[0])]
         dets = [d for d in dets if is_vehicle(d[0])]
@@ -1003,16 +1044,24 @@ class Detector:
                                     "first_seen": now, "counted_at": 0.0,
                                     "axles": 0, "best": (0.0, None), "attrs": {},
                                     "front": None, "rear": None,
-                                    "first_c": None, "c": None, "cross": {}, "dim": (0, 0)}
+                                    "first_c": None, "c": None, "cross": {}, "dim": (0, 0),
+                                    "first_wall": wall, "path": [], "top": {}}
                 t["votes"][cls] += 1
                 t["hits"] += 1
-                t["last_seen"] = now
+                t["last_seen"], t["last_wall"] = now, wall
                 t["box"] = box                    # resting place, for the recount guard
                 prev, t["c"] = t["c"], ((box[0] + box[2]) / 2, (box[1] + box[3]) / 2)
                 t["first_c"] = t["first_c"] or t["c"]
                 if img is not None:
                     t["dim"] = (img.width, img.height)
                     self._cross(t, cam, prev, now)
+                    # The tracklet's path: a sample per PATH_EVERY, and the latest always
+                    # kept aside so the exit box survives to retire.
+                    s = t["path_last"] = [round(wall, 2)] + [
+                        round(v / n, 4) for v, n in zip(box, t["dim"] * 2)]
+                    if not t["path"] or (s[0] - t["path"][-1][0] >= PATH_EVERY
+                                         and len(t["path"]) < PATH_MAX):
+                        t["path"].append(s)
                 t["label"] = label_of(t)
                 t["axles"] = max(t["axles"], axles.get(i, 0))
                 # Evidence: approach (first sighting), best (largest), departure (last).
@@ -1021,10 +1070,16 @@ class Detector:
                 if (self.attrs or self.events_dir) and img is not None:
                     shot = t["front"] = t["front"] or jpeg_crop(img, box)
                     area = (box[2] - box[0]) * (box[3] - box[1])
-                    if not t.get("ghost") and area > t["best"][0]:
+                    if area > t["best"][0]:          # ghosts too: their tracklet needs a look
                         t["best"] = (area, shot if t["hits"] == 1 else jpeg_crop(img, box))
                     if t["counted_as"] and self.events_dir and not t.get("ghost"):
                         t["rear"] = jpeg_crop(img, box)
+                    k = self.display[cls]
+                    if self.events_dir and conf > t["top"].get(k, (0.0, None))[0]:
+                        t["top"][k] = (conf, jpeg_crop(img, box))   # the surest look per class
+                    if (self.events_dir and t.get("recede") is None and t["best"][0] > 0
+                            and area <= RECEDE * t["best"][0]):
+                        t["recede"] = jpeg_crop(img, box)   # once: the first look back after the peak
                 # Votes and labels stay internal; only what leaves here is renamed.
                 disp = self.display[t["label"]]
                 if t["counted_as"] is None:
@@ -1040,11 +1095,11 @@ class Detector:
                         # A live twin: another id of the same class, counted moments ago,
                         # still on this very box — slow traffic splits one crawling vehicle
                         # into two ids before the first has even expired.
-                        twin = ghost is None and any(
-                            o is not t and o["counted_as"] == disp and not o.get("ghost")
+                        twin = None if ghost else next((
+                            o for o in ids.values()
+                            if o is not t and o["counted_as"] == disp and not o.get("ghost")
                             and now - o.get("counted_mono", -1e9) < RECOUNT_GUARD
-                            and o.get("box") and iou(o["box"], box) >= GUARD_IOU
-                            for o in ids.values())
+                            and o.get("box") and iou(o["box"], box) >= GUARD_IOU), None)
                         if ghost or twin:
                             # Same class, same place, within the guard window: this is the
                             # vehicle we already counted — never a second tally, never a
@@ -1053,6 +1108,8 @@ class Detector:
                                 mem.remove(ghost)
                             t["counted_as"] = disp
                             t["ghost"] = True
+                            # Which observation this continues — a twin is never a ghost itself.
+                            t["ghost_of"] = ghost[3] if ghost else twin["observation_id"]
                         else:
                             t["attrs"] = self._classify(t, disp)
                             t["counted_as"] = disp
@@ -1085,13 +1142,14 @@ class Detector:
         through several track lives) leave their resting place behind for the recount
         guard, then the event is written. Caller holds the lock."""
         if t["counted_as"] and t.get("box"):
-            self.recent.setdefault(name, []).append(
-                (t["counted_as"], t["box"], now + RECOUNT_GUARD))
+            self.recent.setdefault(name, []).append(   # a ghost of a ghost points at the root
+                (t["counted_as"], t["box"], now + RECOUNT_GUARD, t.get("ghost_of") or t["observation_id"]))
         if t.get("counted_as") and not t.get("ghost") and t.get("classified_best") != t["best"][1]:
             self._bump(t["counted_as"], t["attrs"], -1)
             t["attrs"] = self._classify(t, t["counted_as"])
             self._bump(t["counted_as"], t["attrs"], 1)
         self._event(name, t)
+        self._tracklet(name, t)
 
     def flush(self, name):
         """Retire every track of this camera, counted or not — the end of a segment.
@@ -1144,21 +1202,64 @@ class Detector:
             self.events_dir = None
             self.error = f"events off: {e}"
 
+    def _tracklet(self, name, t):
+        """One line per track that was ever a vehicle (COUNT_AT_HITS sightings), counted,
+        ghost or neither: its path through the frame and its surest looks. The journey
+        builder links these across cameras, so a vehicle this camera never counted is
+        still a leg of its journey. Caller holds the lock.
+
+        ponytail: the plate model runs here, under the lock, up to twice per retiring
+        track. Upgrade path: queue plate reads off the worker if the console stalls."""
+        if not self.events_dir or t["hits"] < COUNT_AT_HITS:
+            return
+        day = datetime.fromtimestamp(t["first_wall"], tz=self.tz).strftime("%Y-%m-%d")
+        tid, k = t["observation_id"], self.display[t["label"]]
+        path = t["path"] + [t["path_last"]] if t["path"] and t["path"][-1] != t["path_last"] else t["path"]
+        shots = {}
+        if t["hits"] >= TRACKLET_CROP_HITS:
+            top = t["top"].get(k) or max(t["top"].values(), key=lambda v: v[0], default=(0.0, None))
+            shots = {tag: b for tag, b in (("top", top[1]), ("best", t["best"][1]),
+                                           ("recede", t.get("recede"))) if b}
+        reads = [r for r in map(self.plates, set(shots.values())) if r] if self.plates else []
+        plate = max(reads, key=lambda r: r[0], default=None)
+        blobs = {**shots, **({"plate": plate[1]} if plate else {})}
+        rel = {tag: f"tracklets/crops/{day}/{tid}-{tag}.jpg" for tag in blobs}
+        doc = {"id": tid, "camera": name, "t0": round(t["first_wall"], 2),
+               "t1": round(t["last_wall"], 2), "hits": t["hits"], "dim": list(t["dim"]),
+               "class": k, "votes": {self.display[c]: n for c, n in t["votes"].items()},
+               "conf": {c: round(v[0], 3) for c, v in t["top"].items()},
+               "counted": bool(t["counted_as"]) and not t.get("ghost"),
+               "ghost_of": t.get("ghost_of"), "direction": self._direction(t, self._cam(name)),
+               "path": path, "crops": {tag: rel[tag] for tag in shots},
+               "plate": plate and {"conf": round(plate[0], 3), "crop": rel["plate"]}}
+        try:
+            (self.events_dir / "tracklets" / "crops" / day).mkdir(parents=True, exist_ok=True)
+            for tag, blob in blobs.items():
+                (self.events_dir / rel[tag]).write_bytes(blob)
+            with (self.events_dir / "tracklets" / f"{day}.jsonl").open("a") as f:
+                f.write(json.dumps(doc) + "\n")
+        except OSError as e:              # a full disk loses evidence, not detection
+            self.events_dir = None
+            self.error = f"events off: {e}"
+
     def _prune_events(self):
         """Drop crop directories past the retention window. The jsonl files stay."""
-        if not self.events_dir:
-            return
-        if self.events_dir.is_symlink() or (self.events_dir / "crops").is_symlink():
+        if not self.events_dir or self.events_dir.is_symlink():
             return
         cutoff = (date.today() - timedelta(days=EVENTS_KEEP_DAYS)).isoformat()
         try:
-            for d in (self.events_dir / "crops").glob("*"):
-                if d.is_dir() and not d.is_symlink() and d.name < cutoff:
-                    for f in d.iterdir():
-                        if f.is_file() and not f.is_symlink() and f.suffix.lower() == ".jpg" and not f.name.endswith("-best.jpg"):
-                            f.unlink()
-                    try: d.rmdir()
-                    except OSError: pass
+            # Event crops keep their -best.jpg; tracklet crops all go.
+            for root, keep in ((self.events_dir / "crops", "-best.jpg"),
+                               (self.events_dir / "tracklets" / "crops", None)):
+                if root.is_symlink() or root.parent.is_symlink():
+                    continue
+                for d in root.glob("*"):
+                    if d.is_dir() and not d.is_symlink() and d.name < cutoff:
+                        for f in d.iterdir():
+                            if f.is_file() and not f.is_symlink() and f.suffix.lower() == ".jpg" and not (keep and f.name.endswith(keep)):
+                                f.unlink()
+                        try: d.rmdir()
+                        except OSError: pass
         except OSError as e:
             with self.lock:
                 self.error = f"event crops not pruned: {e}"
@@ -1319,6 +1420,10 @@ def classify_segment(path, cam, cfg, tz, events_dir, source_key=None):
         # slice a sampling pass happens to land on.
         d._capture(name, jpeg, shown, img.width, img.height)
     d.flush(name)                # the last frame's vehicles are events too
+    if events_dir and not d.events_dir:
+        # A write failed and events went off mid-segment: returning would publish the
+        # truncated segment as done. Raising leaves it unclassified, so it is retried.
+        raise RuntimeError(f"events went off mid-segment ({d.error})")   # d.error may be a later attrs error
     return datetime.fromtimestamp(start, tz=tz).strftime("%Y-%m-%d"), d.captured
 
 
@@ -1420,6 +1525,7 @@ if __name__ == "__main__":
     assert d._track("c", det("truck"))[0][0] == "car", "one truck frame must not relabel"
 
     # Ids unseen for ID_EXPIRY are forgotten (ByteTrack recycles them; this caps memory).
+    root = d.tracks["c"][1]["observation_id"]
     d.tracks["c"][1]["last_seen"] -= ID_EXPIRY + 1
     d._track("c", [])
     assert d.tracks["c"] == {}, d.tracks
@@ -1432,6 +1538,7 @@ if __name__ == "__main__":
         d._track("c", det("car", tid))
     assert d.totals["car"] == 1, "same class, same spot: no second count"
     assert d.tracks["c"][9]["ghost"] and not d.recent["c"], "memory consumed"
+    assert d.tracks["c"][9]["ghost_of"] == root, "a ghost knows which vehicle it continues"
     # A ghost's label flip must not move totals or breakdown.
     d.tracks["c"][9]["votes"]["truck"] += 5
     d._track("c", det("truck", 9))
@@ -1439,7 +1546,7 @@ if __name__ == "__main__":
     # A ghost's expiry re-arms the guard: a long stop chains through track lives.
     d.tracks["c"][9]["last_seen"] -= ID_EXPIRY + 1
     d._track("c", [])
-    assert d.recent["c"], "ghost re-remembered"
+    assert d.recent["c"] and d.recent["c"][0][3] == root, "ghost re-remembered, as the root"
     # A DIFFERENT class in the same spot is a new vehicle and counts.
     for tid in (10, 10):
         d._track("c", det("bus", tid))
@@ -1449,7 +1556,7 @@ if __name__ == "__main__":
         d._track("c", det("truck", tid, FAR))
     assert d.totals["truck"] == 1, d.totals
     # An expired guard entry no longer suppresses.
-    d.recent["c"] = [(m[0], m[1], time.monotonic() - 1) for m in d.recent["c"]]
+    d.recent["c"] = [(m[0], m[1], time.monotonic() - 1, *m[3:]) for m in d.recent["c"]]
     for tid in (12, 12):
         d._track("c", det("car", tid))
     assert d.totals["car"] == 2, "expired memory must not suppress"
@@ -1794,12 +1901,13 @@ if __name__ == "__main__":
         assert len((ev / f"{day}.jsonl").read_text().splitlines()) == 1, "ghosts write nothing"
         assert len(list((ev / "crops" / day).glob("*.jpg"))) == 3, "one vehicle, three crops"
 
-        # Retention drops old crop days and leaves today's alone.
-        old = ev / "crops" / "2000-01-01"
-        old.mkdir()
-        (old / "x.jpg").write_bytes(b"x")
+        # Retention drops old crop days and leaves today's alone; tracklets keep no -best.
+        olds = (ev / "crops" / "2000-01-01", ev / "tracklets" / "crops" / "2000-01-01")
+        for old, junk in zip(olds, ("x.jpg", "x-best.jpg")):
+            old.mkdir(parents=True)
+            (old / junk).write_bytes(b"x")
         d._prune_events()
-        assert not old.exists() and (ev / "crops" / day).is_dir()
+        assert not any(o.exists() for o in olds) and (ev / "crops" / day).is_dir()
 
         # Feature off: a counted track expires with no directory and no complaint.
         off = fresh()
@@ -1808,6 +1916,55 @@ if __name__ == "__main__":
         off.tracks["c"][1]["last_seen"] -= 20
         off._track("c", [])
         assert off.info()["error"] == "", off.info()
+
+        # Tracklets: every track of COUNT_AT_HITS+ hits leaves its path and surest looks;
+        # a blip gets the line but no crops. Frames 0.4 s apart sample the path at 0 and
+        # 1.2 s, and the exit box at 1.6 s is kept anyway. Events are untouched. A box that
+        # peaks and shrinks under RECEDE of it leaves a rear view; one that only grows, none.
+        tk = Path(tempfile.mkdtemp())
+        d = fresh(events_dir=tk)
+        at = [time.time()]
+        tday = datetime.fromtimestamp(at[0]).strftime("%Y-%m-%d")
+        d.clock = d.wall = lambda: at[0]
+        d.plates = lambda jpeg: (0.3, b"\xff\xd8fake")
+        for i, w in enumerate((60.0, 100.0, 140.0, 100.0, 60.0)[:TRACKLET_CROP_HITS]):
+            d._track("c", [("truck", 0.5 + i / 10, (0.0, 0.0, 40.0 * (i + 1), 20.0 * (i + 1)), 1),
+                           ("bus", 0.9, (150.0, 100.0, 150.0 + w, 100.0 + w / 2), 3)]
+                     + [("car", 0.9, other, 2)] * (i < 2), pic)
+            at[0] += 0.4
+        d.flush("c")
+        docs = {doc["class"]: doc for doc in map(json.loads,
+                (tk / "tracklets" / f"{tday}.jsonl").read_text().splitlines())}
+        assert sorted(docs) == ["bus", "car", "truck"], docs
+        long, short = docs["truck"], docs["car"]
+        assert long["hits"] == TRACKLET_CROP_HITS and short["hits"] == 2, docs
+        assert "recede" not in long["crops"], "only ever approached: no rear view"
+        assert (tk / docs["bus"]["crops"]["recede"]).read_bytes().startswith(SOI), docs["bus"]
+        for doc in docs.values():
+            assert all(0 <= v <= 1 for s in doc["path"] for v in s[1:]), doc["path"]
+            assert (doc["path"][0][0], doc["path"][-1][0]) == (doc["t0"], doc["t1"]), doc
+        assert [round(s[0] - long["t0"], 1) for s in long["path"]] == [0.0, 1.2, 1.6], long["path"]
+        assert long["votes"] == {"truck": 5} and long["conf"] == {"truck": 0.9}, long
+        assert long["counted"] and long["ghost_of"] is None and short["class"] == "car", docs
+        assert sorted(long["crops"]) == ["best", "top"], long["crops"]
+        assert all((tk / rel).read_bytes().startswith(SOI) for rel in long["crops"].values())
+        assert short["crops"] == {} and short["plate"] is None, short
+        assert not list((tk / "tracklets" / "crops" / tday).glob(short["id"] + "-*")), "a blip keeps no jpeg"
+        assert long["plate"]["conf"] == 0.3 and (tk / long["plate"]["crop"]).is_file(), long["plate"]
+        assert len((tk / f"{tday}.jsonl").read_text().splitlines()) == 3, "events: one per counted id"
+
+        # Parked all day is one id: its path stops at PATH_MAX, and the exit still lands.
+        d = fresh(events_dir=tk)
+        d.clock = d.wall = lambda: at[0]
+        d._track("c", [("car", 0.9, BOX, 5)], pic)
+        d.tracks["c"][5]["path"] *= PATH_MAX               # as if parked for ten minutes
+        at[0] += PATH_EVERY + 0.5                          # due a sample, were it not capped
+        d._track("c", [("car", 0.9, other, 5)], pic)
+        assert len(d.tracks["c"][5]["path"]) == PATH_MAX, "capped"
+        d.flush("c")
+        doc = json.loads((tk / "tracklets" / f"{tday}.jsonl").read_text().splitlines()[-1])
+        assert len(doc["path"]) == PATH_MAX + 1 and doc["path"][-1] == [
+            doc["t1"], 0.7, 0.05, 0.9333, 0.5], doc["path"][-1]
 
     # Direction and speed from the camera's own reference lines.
     if jpeg:
@@ -1888,6 +2045,18 @@ if __name__ == "__main__":
         explicit2 = offline(root2 / "different" / "two.mkv", 77, "G/c/stable.mkv")
         assert explicit1 == explicit2, (explicit1, explicit2)
 
+        # A failed events write mid-segment fails the segment, never publishes it half-done.
+        blocked = Path(tempfile.mkdtemp()) / "events"
+        blocked.write_text("")                   # a file where the events dir should be
+        with patch.object(ingest_video, "cam_and_start", return_value=("c", base)), \
+             patch.object(ingest_video, "frames", return_value=[jpeg, jpeg]), \
+             patch.object(Detector, "_load", return_value=lambda name, img: [("truck", 0.9, VEH, 1)]):
+            try:
+                classify_segment(Path("G/c/seg.mkv"), CAM, {}, CAT, blocked)
+                raise AssertionError("a lost events write must fail the segment")
+            except RuntimeError as e:
+                assert str(e).startswith("events went off mid-segment ("), e
+
     # Counting on a line. A vehicle queued short of the line is never counted, however long
     # it sits; it counts once when it crosses; a second id the tracker hands the same crawling
     # vehicle is a twin, not a tally; an id that first appears past the line never crosses
@@ -1905,6 +2074,7 @@ if __name__ == "__main__":
     d._track("n", [("truck", 0.9, hi, 1), ("truck", 0.9, lo, 2)], big)
     d._track("n", [("truck", 0.9, hi, 1), ("truck", 0.9, hi, 2)], big)   # id 2 crosses onto id 1
     assert d.totals["truck"] == 1, "a twin id on a just-counted vehicle is not a second vehicle"
+    assert d.tracks["n"][2]["ghost_of"] == d.tracks["n"][1]["observation_id"], "a twin names its original"
     for _ in range(3):
         d._track("n", [("truck", 0.9, far, 3)], big)
     assert d.totals["truck"] == 1, "appeared past the line: never crosses, never counts"
