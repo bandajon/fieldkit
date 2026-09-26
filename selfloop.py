@@ -224,6 +224,56 @@ def paused(keys, cfg):
     return [k for k in keys if live(k.split("/", 1)[0])]
 
 
+def curation_settings(cl, bucket):
+    """The curation server's curation/curation.yaml as {"cap": int|None, "paused": [gate
+    ids]} — same shape as curation_cap.load_settings, fetched fresh each pass since that
+    server owns the file. Missing key or any error is the safe default: no cap, nothing
+    paused."""
+    import tempfile
+    import curation_cap
+    try:
+        body = cl.get_object(Bucket=bucket, Key=f"curation/{curation_cap.SETTINGS}")["Body"].read()
+    except Exception as e:
+        print(f"{now()} curation settings: unavailable ({e}) — no cap, nothing paused", flush=True)
+        return {"cap": None, "paused": []}
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / curation_cap.SETTINGS).write_bytes(body)
+        return curation_cap.load_settings(tmp)
+
+
+def prune_pending(cl, bucket, cap):
+    """Delete local pending/{images,labels,attrs,suggest} samples that fall in the cap's
+    eviction set, before this pass pushes. Ranked over LOCAL stems union the BUCKET's
+    pending stems, not local alone — a sample the bucket already holds past cap for its
+    gate is older than everything local, and ranking local stems by themselves would
+    call it safe and push a copy right back. -> (samples pruned, ok to push).
+
+    A failed bucket listing prunes nothing and tells the caller to skip its push this
+    pass too: pushing unpruned against a stale (empty) view would resurrect exactly what
+    this exists to stop."""
+    import curation_cap
+    if cap is None:
+        return 0, True
+    local = {p.stem for p in (DATASET / "pending" / "images").glob("*.jpg")}
+    try:
+        remote = {Path(k).stem for k in bucket_keys(cl, bucket, "curation/pending/images/")}
+    except Exception as e:
+        print(f"{now()} curation prune: bucket listing failed ({e}) — push skipped this pass",
+              flush=True)
+        return 0, False
+    import dataset_sync
+    # Finished (approved/discarded) originals still sit in the bucket's pending/: the server
+    # leaves them out of its count, so this must too, or it prunes new, never-pushed samples.
+    done = dataset_sync.consumed(DATASET)
+    evicted = {sid for sids in curation_cap.evictions((local | remote) - done, cap).values() for sid in sids}
+    pruned = 0
+    for sid in local & evicted:
+        for part in curation_cap.PARTS:
+            (DATASET / "pending" / part / f"{sid}.{curation_cap.EXT[part]}").unlink(missing_ok=True)
+        pruned += 1
+    return pruned, True
+
+
 def gate_of(prefix):
     """The RDA gate id for a bucket prefix. The importer resolves events by gate, so a
     prefix with no mapping is passed through — a gate already named for itself is right,
@@ -522,10 +572,14 @@ def ingest_pass():
         s = load_state()
         ds, cl, bucket = r2()
         cfg = ingest_video.config()
+        settings = curation_settings(cl, bucket)
+        # config.yaml's own switch and the curation server's Pause button, either stops a
+        # gate — paused() already matches a bucket prefix or its gate id.
+        cfg["curation_paused"] = sorted(set(cfg.get("curation_paused") or []) | set(settings["paused"]))
         raw = list(recording_keys(cl, bucket))
         keys = paused(raw, cfg)
         if raw and not keys:      # empty because paused, not because nothing was recorded
-            print(f"{now()} ingest: curation paused for {', '.join(cfg.get('curation_paused') or [])}",
+            print(f"{now()} ingest: curation paused for {', '.join(cfg['curation_paused'])}",
                   flush=True)
             return
         todo = pick(keys, s["ingested"])
@@ -564,6 +618,11 @@ def ingest_pass():
         s["ingested"] = (s["ingested"] + todo)[-REMEMBER:]
         s["last_ingest"] = {"at": now(), "segments": len(todo), "samples": written}
         save_state(s)
+        pruned, ok = prune_pending(cl, bucket, settings["cap"])
+        if pruned:
+            print(f"{now()} ingest: pruned {pruned} local pending sample(s) over cap", flush=True)
+        if not ok:
+            return
         sent, _ = ds.push(cl, bucket, names=PENDING)
         print(f"{now()} ingest: {s['last_ingest']['samples']} samples written, {sent} files pushed", flush=True)
 
@@ -588,11 +647,13 @@ def hunt_pass():
             return
         ds, cl, bucket = r2()
         cfg = ingest_video.config()
+        settings = curation_settings(cl, bucket)
+        cfg["curation_paused"] = sorted(set(cfg.get("curation_paused") or []) | set(settings["paused"]))
         since = (datetime.now(ZoneInfo(TZ)) - timedelta(hours=HUNT_HOURS)).strftime("%Y%m%d-%H%M%S")
         raw = list(recording_keys(cl, bucket))
         keys = paused(raw, cfg)
         if raw and not keys:      # empty because paused, not because nothing was recorded
-            print(f"{now()} hunt: curation paused for {', '.join(cfg.get('curation_paused') or [])}",
+            print(f"{now()} hunt: curation paused for {', '.join(cfg['curation_paused'])}",
                   flush=True)
             return
         todo = pick_hunt(keys, s.get("hunted", []), since)
@@ -625,6 +686,11 @@ def hunt_pass():
         s["hunted"] = (s.get("hunted", []) + todo)[-REMEMBER:]
         s["last_hunt"] = {"at": now(), "segments": len(todo), "samples": written, "wanted": wanted}
         save_state(s)
+        pruned, ok = prune_pending(cl, bucket, settings["cap"])
+        if pruned:
+            print(f"{now()} hunt: pruned {pruned} local pending sample(s) over cap", flush=True)
+        if not ok:
+            return
         sent, _ = ds.push(cl, bucket, names=PENDING)
         print(f"{now()} hunt: {written} wanted-class samples written, {sent} files pushed", flush=True)
 
@@ -1105,6 +1171,88 @@ def suggest_check():
                and v["axles"] in heads["axles"] for v in got.values()), got
 
 
+def curation_check():
+    """prune_pending() must delete exactly what curation_cap.evictions() would, ranked
+    over LOCAL stems union the BUCKET's — a sample that alone looks safe locally (under
+    cap) must still be pruned when the bucket already holds `cap` newer ones for its
+    gate, or a push would resurrect what the curation server just evicted. Never touches
+    an external import (no capture timestamp to evict by). A failed bucket listing prunes
+    nothing and tells the caller to skip its push. curation_settings() must fall back
+    safely when the bucket has no file or a bad client."""
+    import contextlib
+    import io
+    import tempfile
+    from unittest.mock import patch
+    import curation_cap
+
+    me = sys.modules[__name__]
+
+    class FakeCl:
+        def __init__(self, listing=None, body=None, fail_list=False, fail_get=False):
+            self.listing, self.body = listing or {}, body
+            self.fail_list, self.fail_get = fail_list, fail_get
+
+        def get_paginator(self, _):
+            listing, fail = self.listing, self.fail_list
+
+            class P:
+                def paginate(self, Bucket, Prefix="", **_kw):
+                    if fail:
+                        raise RuntimeError("listing failed")
+                    yield {"Contents": [{"Key": k} for k in listing if k.startswith(Prefix)]}
+            return P()
+
+        def get_object(self, Bucket, Key):
+            if self.fail_get:
+                raise RuntimeError("no such key")
+            return {"Body": io.BytesIO(self.body)}
+
+    def write_local(tmp, stems):
+        for part in curation_cap.PARTS:
+            (tmp / "pending" / part).mkdir(parents=True, exist_ok=True)
+        for sid in stems:
+            for part in curation_cap.PARTS:
+                (tmp / "pending" / part / f"{sid}.{curation_cap.EXT[part]}").write_text("x")
+
+    # No bucket samples: ranked over local alone, same as a plain local-only cap.
+    tmp = Path(tempfile.mkdtemp())
+    write_local(tmp, [f"A-{d}" for d in ("20260101-000000", "20260102-000000", "20260103-000000")] +
+                ["external-deadbeef"])
+    with patch.object(me, "DATASET", tmp):
+        assert prune_pending(FakeCl(), "bucket", cap=None) == (0, True), "cap unset: nothing pruned"
+        pruned, ok = prune_pending(FakeCl(), "bucket", cap=2)
+    assert (pruned, ok) == (1, True), (pruned, ok)
+    assert all(not (tmp / "pending" / part / f"A-20260101-000000.{curation_cap.EXT[part]}").is_file()
+               for part in curation_cap.PARTS), "oldest not pruned across every part"
+    assert (tmp / "pending" / "images" / "A-20260102-000000.jpg").is_file(), "newest kept"
+    assert (tmp / "pending" / "images" / "external-deadbeef.jpg").is_file(), "external never evicted"
+
+    # The bucket already holds cap newer samples for A; the one local sample is older
+    # than all of them and must be pruned even though it is alone (under cap) locally.
+    tmp2 = Path(tempfile.mkdtemp())
+    write_local(tmp2, ["A-20260101-000000"])
+    remote = {f"curation/pending/images/A-{d}.jpg": 1
+              for d in ("20260102-000000", "20260103-000000", "20260104-000000")}
+    with patch.object(me, "DATASET", tmp2):
+        pruned, ok = prune_pending(FakeCl(listing=remote), "bucket", cap=2)
+        assert (pruned, ok) == (1, True), (pruned, ok)
+        assert not (tmp2 / "pending" / "images" / "A-20260101-000000.jpg").is_file(), \
+            "resurrection: local-only ranking would have kept this"
+        # A listing failure must prune nothing and tell the caller to skip its push.
+        write_local(tmp2, ["A-20260105-000000"])
+        with contextlib.redirect_stdout(io.StringIO()):
+            pruned, ok = prune_pending(FakeCl(fail_list=True), "bucket", cap=2)
+        assert (pruned, ok) == (0, False), (pruned, ok)
+        assert (tmp2 / "pending" / "images" / "A-20260105-000000.jpg").is_file(), \
+            "a failed listing must not prune"
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        got = curation_settings(FakeCl(body=b"cap: 500\npaused: [RDA-TG-KTB]\n"), "bucket")
+        assert got == {"cap": 500, "paused": ["RDA-TG-KTB"]}, got
+        assert curation_settings(FakeCl(fail_get=True), "bucket") == {"cap": None, "paused": []}, \
+            "any fetch error is the safe default"
+
+
 def lock_check():
     """The lock is the only thing between two GPU jobs. A dead holder must be taken over;
     a live one must be waited for; and the take must be atomic."""
@@ -1387,6 +1535,7 @@ def selfcheck():
     listing_check()
     journeys_check()
     suggest_check()
+    curation_check()
     print("selfloop self-check ok: cameras found under any gate prefix, newest unsampled segments "
           "picked per camera, training triggers on the cumulative threshold, promotion needs a "
           "strictly better reference score (detector) or mean val accuracy (attributes) unless "
