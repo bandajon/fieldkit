@@ -273,7 +273,7 @@ def coverage_manifests(keys, classified, since):
     by_gate_cam = {}
     for key, segs in cameras(keys).items():
         prefix, cam = key.split("/")
-        by_gate_cam.setdefault(gate_of(prefix), {})[cam] = segs
+        by_gate_cam.setdefault(gate_of(prefix), {}).setdefault(cam, []).extend(segs)   # one gate, two prefixes
     days = {(gate_of(key.split("/", 1)[0]), Path(k).stem[:8])
             for key, segs in cameras(keys).items() for k in segs if Path(k).stem >= since}
     out = {}
@@ -316,8 +316,8 @@ class Lock:
     A kernel flock, not a pid file: the lock dies with its process, so there is no stale-
     holder takeover — and the takeover was the bug, three agents waking together each
     unlinked the other's freshly written lock and all three ran on the GPU at once."""
-    def __init__(self, wait=WAIT):
-        self.wait = wait
+    def __init__(self, wait=None):
+        self.wait = WAIT if wait is None else wait   # read at call time: tests patch WAIT
 
     def __enter__(self):
         import fcntl
