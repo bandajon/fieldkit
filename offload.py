@@ -22,8 +22,8 @@ from pathlib import Path
 from hive import enrolled
 from recorder import SEGMENT_SECONDS
 
-# ffmpeg only ever appends to the newest segment, so anything older than one segment
-# plus a margin is closed and safe to ship.
+# Age limits candidates for standalone use; the recorder callback is the authority on
+# which old file ffmpeg still has open.
 FINISHED = SEGMENT_SECONDS + 60
 SWEEP_SECONDS = 60
 CRED_KEYS = ("account_id", "access_key_id", "secret_access_key")
@@ -49,12 +49,13 @@ def sha256_b64(path):
 
 
 class Offload:
-    def __init__(self, cfg, rec_root, console_creds=None):
+    def __init__(self, cfg, rec_root, console_creds=None, active_file=None):
         self.cfg = cfg              # the live CONFIG dict: config edits land without a reload
         # Creds the ops console pushed (hive.py writes this same dict). Separate from
         # cfg because cfg gets dumped back to config.yaml; a pushed secret must not.
         self.console_creds = {} if console_creds is None else console_creds
         self.rec_root = Path(rec_root)
+        self.active_file = active_file
         self.client = None
         self.client_creds = None    # the triple self.client was built with
         self.uploaded = 0
@@ -136,11 +137,25 @@ class Offload:
         return shutil.disk_usage(self.rec_root).free / 1e9
 
     def finished(self):
-        """Closed segments under <record_dir>/<site>/<cam>/, oldest first."""
+        """Old, non-active segments under <record_dir>/<site>/<cam>/, oldest first."""
         cutoff = time.time() - FINISHED
-        files = [f for f in self.rec_root.glob("*/*/*.mkv")
-                 if f.stat().st_mtime < cutoff and f.stat().st_size]
-        return sorted(files, key=lambda f: f.stat().st_mtime)
+        files = []
+        for f in self.rec_root.glob("*/*/*.mkv"):
+            try:
+                stat = f.stat()
+                if stat.st_size and stat.st_mtime < cutoff and not self._active(f):
+                    files.append((stat.st_mtime, f))
+            except OSError:
+                continue
+        return [f for _, f in sorted(files)]
+
+    def _active(self, f):
+        if not self.active_file:
+            return False
+        try:
+            return bool(self.active_file(f))
+        except Exception:
+            return True                 # recorder uncertainty must never cost footage
 
     def _get_client(self, o):
         creds = tuple(o.get(k) or "" for k in CRED_KEYS)
@@ -185,6 +200,8 @@ class Offload:
         """Upload one segment. -> False with last_error set on any failure — network,
         credentials, checksum mismatch — so the local copy always survives it."""
         key = self.storage_key(f)
+        if self._active(f):
+            return False
         try:
             with open(f, "rb") as body:
                 client.put_object(Bucket=bucket, Key=key, Body=body,
@@ -240,24 +257,50 @@ class Offload:
         """The footage passes. Every early return means "keep it local, retry next sweep"."""
         if mirror and client is not None:
             for f in self.finished():
+                if self._active(f) or not f.exists():
+                    continue
                 if marker(f).exists():
                     continue
                 if not self._put(client, bucket, f):
                     return                    # keep everything local; next sweep retries
-                marker(f).touch()
+                if not self._active(f) and f.exists():
+                    try:
+                        marker(f).touch()
+                    except OSError:
+                        pass
             below = self.free_gb() < floor     # the mirror pass took time; re-read the drive
         if not below:
             return
         for f in self.finished():
+            if self._active(f) or not f.exists():
+                continue
             if marker(f).exists():            # already in the bucket: just reclaim the space
-                marker(f).unlink()            # marker first: a crash here re-uploads, never orphans
-                f.unlink()
+                try:
+                    marker(f).unlink()        # marker first: a crash here re-uploads, never orphans
+                except FileNotFoundError:
+                    continue
+                if self._active(f):
+                    continue
+                try:
+                    f.unlink()
+                except FileNotFoundError:
+                    continue
                 print(f"offload: freed {'/'.join(f.parts[-3:])} (mirrored)", flush=True)
             elif recycle:                     # the ring buffer: gone, and never sent
-                f.unlink()
+                if self._active(f):
+                    continue
+                try:
+                    f.unlink()
+                except FileNotFoundError:
+                    continue
                 print(f"offload: recycled {'/'.join(f.parts[-3:])} (not uploaded)", flush=True)
             elif self._put(client, bucket, f):
-                f.unlink()
+                if self._active(f):
+                    continue
+                try:
+                    f.unlink()
+                except FileNotFoundError:
+                    continue
             else:
                 return
             if self.free_gb() >= floor:
@@ -382,6 +425,31 @@ if __name__ == "__main__":
     assert not (d / "seg-a.mkv").exists() and not (d / "seg-a.mkv.uploaded").exists()
     assert (d / "seg-b.mkv").exists(), "kept deleting past the floor"
     assert o.uploaded == 2, "counted a delete as an upload"
+
+    # Recorder knowledge outranks an old mtime, including recycle and callback failure.
+    root, d = tree()
+    recycle_cfg = {"offload": dict(CFG["offload"], recycle=True)}
+    protected = Offload(recycle_cfg, root, active_file=lambda f: f.name == "seg-a.mkv")
+    seq = [0.0, 99.0]
+    protected.free_gb = lambda: seq.pop(0) if seq else 99.0
+    protected.sweep()
+    assert (d / "seg-a.mkv").exists() and not (d / "seg-b.mkv").exists()
+    uncertain = Offload(recycle_cfg, root, active_file=lambda _f: 1 / 0)
+    uncertain.free_gb = lambda: 0.0
+    uncertain.sweep()
+    assert (d / "seg-a.mkv").exists(), "recorder uncertainty deleted footage"
+
+    # Even a stale candidate list is checked at the upload boundary.
+    root, d = tree()
+    active = set()
+    guarded = Offload(CFG, root, active_file=lambda f: f.name in active)
+    guarded.client, guarded.client_creds, guarded.free_gb = FakeClient(), TRIPLE, lambda: 0.0
+    candidates = guarded.finished()
+    active.add("seg-a.mkv")
+    guarded.finished = lambda: candidates
+    guarded.sweep()
+    assert "site1/cam1/seg-a.mkv" not in guarded.client.puts, "uploaded the active writer"
+    assert (d / "seg-a.mkv").exists(), "deleted a candidate that became active"
 
     # A failed mirror upload leaves no marker — the next sweep must try again.
     root, d = tree()

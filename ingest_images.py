@@ -90,8 +90,14 @@ def ingest(files, as_class=None):
         blob = f.read_bytes()
         stem = "external-" + hashlib.sha1(blob).hexdigest()[:12]
         fetched_for = as_class or (f.parent.name if f.parent.parent == EXTERNAL else None)
-        if fetched_for:
-            manifest[stem] = fetched_for
+        import dataset_retention
+        try:
+            with dataset_retention.DATASET_LOCK:
+                policy = dataset_retention.cached_policy(DATASET)
+                if policy and dataset_retention.expired(stem, policy):
+                    continue
+        except ValueError:
+            continue
         try:
             img = Image.open(io.BytesIO(blob)).convert("RGB")
         except Exception as e:          # a truncated download costs one sample, not the run
@@ -103,11 +109,20 @@ def ingest(files, as_class=None):
                  for cls, _conf, (x1, y1, x2, y2) in run(img) if cls in keep]
         buf = io.BytesIO()
         img.save(buf, "JPEG", quality=90)     # PNG or CMYK in, one jpeg convention out
-        (imgs / f"{stem}.jpg").write_bytes(buf.getvalue())
-        (labels / f"{stem}.txt").write_text("".join(ln + "\n" for ln in lines))
-        stems.append(stem)
+        try:
+            with dataset_retention.DATASET_LOCK:
+                policy = dataset_retention.cached_policy(DATASET)
+                if policy and dataset_retention.expired(stem, policy):
+                    continue
+                if fetched_for:
+                    manifest[stem] = fetched_for
+                (imgs / f"{stem}.jpg").write_bytes(buf.getvalue())
+                (labels / f"{stem}.txt").write_text("".join(ln + "\n" for ln in lines))
+                save_manifest(manifest)
+                stems.append(stem)
+        except ValueError:
+            continue
         print(f"  {f.name} -> {stem}  {len(lines)} box(es)", flush=True)
-    save_manifest(manifest)
     return stems
 
 

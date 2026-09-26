@@ -168,16 +168,24 @@ class Sink:
             return False
         if detect.same_scene(shown, self.dets.get(cam, [])):
             return False
-        self.at[cam], self.dets[cam] = ts, shown
-        if rare:
-            self.rare_at[cam] = ts
-        self._evict()
         stem = detect.sample_stem(self.gate, cam, ts, detect.RARE_STEP if rare else None)
         lines = [f"{self.ids[cls]} {(x1 + x2) / 2 / w:.6f} {(y1 + y2) / 2 / h:.6f} "
                  f"{(x2 - x1) / w:.6f} {(y2 - y1) / h:.6f}"
                  for cls, _conf, (x1, y1, x2, y2) in shown if cls in self.ids]
-        (self.images / f"{stem}.jpg").write_bytes(jpeg)      # re-ingest overwrites: idempotent
-        (self.labels / f"{stem}.txt").write_text("\n".join(lines) + "\n")
+        import dataset_retention
+        policy = dataset_retention.cached_policy(self.images.parents[1])
+        if policy and dataset_retention.expired(stem, policy):
+            return False
+        with dataset_retention.DATASET_LOCK:
+            policy = dataset_retention.cached_policy(self.images.parents[1])
+            if policy and dataset_retention.expired(stem, policy):
+                return False
+            self._evict()
+            (self.images / f"{stem}.jpg").write_bytes(jpeg)      # re-ingest overwrites: idempotent
+            (self.labels / f"{stem}.txt").write_text("\n".join(lines) + "\n")
+            self.at[cam], self.dets[cam] = ts, shown
+            if rare:
+                self.rare_at[cam] = ts
         self.written[cam] += 1
         self.hits.update({cls for cls, _c, _b in shown if cls in self.wanted})
         self.stems.append(stem)

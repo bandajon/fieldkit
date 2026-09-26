@@ -25,6 +25,7 @@ import sys
 from pathlib import Path
 
 import yaml
+import dataset_retention as retention
 
 ROOT = Path(__file__).resolve().parent
 DATASET = ROOT / "dataset"
@@ -87,6 +88,66 @@ def remote(cl, bucket, prefix):
     return out
 
 
+def load_policy(cl, bucket, prefix, root, listing):
+    """Fetch and atomically cache the authoritative policy, or fail closed."""
+    key, cached = prefix + retention.POLICY_NAME, Path(root) / retention.POLICY_NAME
+    if key in listing:
+        try:
+            if hasattr(cl, "get_object"):
+                raw = cl.get_object(Bucket=bucket, Key=key)["Body"].read()
+            else:
+                import tempfile
+                with tempfile.NamedTemporaryFile() as f:
+                    cl.download_file(bucket, key, f.name); f.seek(0); raw = f.read()
+            policy = retention.validate_policy(json.loads(raw))
+        except Exception:
+            raise ValueError("invalid or unreadable retention policy") from None
+        cached.parent.mkdir(parents=True, exist_ok=True)
+        import tempfile
+        fd, name = tempfile.mkstemp(prefix=".retention-", dir=cached.parent)
+        tmp = Path(name)
+        with os.fdopen(fd, "w") as f:
+            json.dump(policy, f, indent=2); f.write("\n"); f.flush(); os.fsync(f.fileno())
+        with retention.DATASET_LOCK:
+            if cached.is_symlink(): raise ValueError("retention policy cache is symlink")
+            try:
+                local = (retention.validate_policy(json.loads(cached.read_text(encoding="utf-8")))
+                         if cached.exists() else None)
+            except Exception: raise ValueError("invalid local retention policy") from None
+            if local and _policy_regressed(local, policy):
+                raise ValueError("retention policy regressed")
+            os.replace(tmp, cached)
+        return policy
+    with retention.DATASET_LOCK:
+        if cached.is_symlink(): raise ValueError("retention policy cache is symlink")
+        try:
+            local = (retention.validate_policy(json.loads(cached.read_text(encoding="utf-8")))
+                     if cached.exists() else None)
+        except Exception: raise ValueError("invalid local retention policy") from None
+    if local is not None:
+        raise ValueError("authoritative retention policy disappeared")
+    return None
+
+
+def _policy_regressed(local, policy):
+    return (retention._dt(policy["updated_at"]) < retention._dt(local["updated_at"])
+            or retention._dt(policy["expires_before"]) < retention._dt(local["expires_before"])
+            or not set(local["unknown_admitted_at"]).issubset(policy["unknown_admitted_at"])
+            or any(retention._dt(policy["unknown_admitted_at"][k]) != retention._dt(v)
+                   for k, v in local["unknown_admitted_at"].items()))
+
+
+def safe_dest(root, rel):
+    root = Path(root).resolve()
+    retention.sample_id(rel)
+    dest = root / rel
+    parents = [root] + [root.joinpath(*dest.relative_to(root).parts[:i])
+                         for i in range(1, len(dest.relative_to(root).parts))]
+    if any(p.is_symlink() for p in parents) or dest.is_symlink():
+        raise ValueError("symlink dataset path")
+    return dest
+
+
 def walk(root, names):
     """(key-relative path, file) for each named file or directory that exists."""
     for n in names:
@@ -119,18 +180,29 @@ def push(cl, bucket, prefix=PREFIX, root=DATASET, names=PUSH, force=False):
     these are write-once samples, never edited in place. Pending samples go further —
     see once(): an id already in the bucket is left exactly as it is, so two nodes
     watching one camera contribute one frame between them rather than two."""
-    # A forced publish is one deliberate file: upload it, no questions — the full-prefix
-    # listing below is ninety thousand keys, and a roster edit must not pay for it.
-    if force:
-        sent = transfer(lambda f, key: cl.upload_file(str(f), bucket, key),
-                        [(f, prefix + rel) for rel, f in walk(Path(root), names)], "pushed")
+    entries = list(walk(Path(root), names))
+    if force and entries and all(not (rel.startswith(("pending/", "holding/", "approved/", "gold/", "archive/", "classifier-crops/"))) for rel, _ in entries):
+        if any(rel == retention.POLICY_NAME for rel, _ in entries): raise ValueError("retention policy is authority-owned")
+        def metadata_upload(f, key):
+            safe_dest(root, key[len(prefix):])
+            if f.is_symlink(): raise ValueError("symlink upload source")
+            cl.upload_file(str(f), bucket, key)
+        sent = transfer(metadata_upload, [(f, prefix + rel) for rel, f in entries], "pushed")
         print(f"push: {sent} uploaded, forced ({prefix} on {bucket})")
         return sent, 0
     have = remote(cl, bucket, prefix)
+    policy = load_policy(cl, bucket, prefix, root, have)
     todo, skipped = [], 0
-    for rel, f in walk(Path(root), names):
+    for rel, f in entries:
+        if rel == retention.POLICY_NAME: raise ValueError("retention policy is authority-owned")
+        sid = retention.sample_id(rel)
+        if sid and policy and retention.expired(sid, policy):
+            skipped += 1
+            continue
         key = prefix + rel
-        if key not in have or (always(rel) and not once(rel)):
+        if force:
+            todo.append((f, key))
+        elif key not in have or (always(rel) and not once(rel)):
             todo.append((f, key))
         elif once(rel) or have[key] == f.stat().st_size:
             skipped += 1
@@ -138,7 +210,18 @@ def push(cl, bucket, prefix=PREFIX, root=DATASET, names=PUSH, force=False):
             todo.append((f, key))
     # Thousands of small files over a home uplink: latency-bound, so parallel
     # transfers are the whole speed-up. boto3 clients are thread-safe for this.
-    sent = transfer(lambda f, key: cl.upload_file(str(f), bucket, key), todo, "pushed")
+    def upload(f, key):
+        base = Path(root).resolve()
+        rel = f.relative_to(Path(root))
+        if any((base / part).is_symlink() for i in range(len(rel.parts)) for part in [Path(*rel.parts[:i + 1])]):
+            raise ValueError("symlink upload source")
+        sid = retention.sample_id(key[len(prefix):])
+        with retention.DATASET_LOCK:
+            latest = retention.cached_policy(root)
+            if policy and latest is None: return
+            if sid and latest and retention.expired(sid, latest): return
+            cl.upload_file(str(f), bucket, key)
+    sent = transfer(upload, todo, "pushed")
     print(f"push: {sent} uploaded, {skipped} already there ({prefix} on {bucket})")
     return sent, skipped
 
@@ -168,7 +251,7 @@ def always(rel):
     """Config is compared by name and size like everything else, and a one-character edit
     — "2" to "3" in a default — keeps the size identical, so the change would never move.
     These files are a few KB: send them every pass and let content decide, not length."""
-    return rel.split("/", 1)[0] in CONFIG or rel in CONFIG
+    return rel.split("/", 1)[0] in CONFIG or rel in CONFIG or rel.startswith("classifier-crops/") and rel.endswith("/manifest.json")
 
 
 def have(dest, size):
@@ -201,8 +284,10 @@ def merge_jsonl(dest, extra):
     os.replace(tmp, dest)               # a torn ledger would be worse than a stale one
 
 
-def fetch(cl, bucket, dest, key):
+def fetch(cl, bucket, dest, key, root=None, policy=None, sid=None):
     """One object down. An existing ledger is merged; everything else is write-once."""
+    if root is not None:
+        dest = safe_dest(root, dest.relative_to(root).as_posix())
     if dest.suffix == ".jsonl" and dest.exists():
         extra = dest.with_name(dest.name + ".incoming")
         cl.download_file(bucket, key, str(extra))
@@ -211,7 +296,21 @@ def fetch(cl, bucket, dest, key):
         finally:
             extra.unlink(missing_ok=True)
     else:
-        cl.download_file(bucket, key, str(dest))
+        import tempfile
+        with tempfile.NamedTemporaryFile(prefix=".incoming-", dir=dest.parent, delete=False) as f:
+            tmp = Path(f.name)
+        try:
+            cl.download_file(bucket, key, str(tmp))
+            if root is not None:
+                dest = safe_dest(root, dest.relative_to(root).as_posix())
+            with retention.DATASET_LOCK:
+                latest = retention.cached_policy(root)
+                if policy and latest is None: return
+                if sid and latest and retention.expired(sid, latest): return
+                safe_dest(root, dest.relative_to(root).as_posix())
+                os.replace(tmp, dest)
+        finally:
+            tmp.unlink(missing_ok=True)
 
 
 FINISHED = ("approve", "discard", "review")   # last-action-wins: unapprove/reject reopen
@@ -285,24 +384,33 @@ def sweep_consumed(root, in_bucket=()):
 
 def pull(cl, bucket, prefix=PREFIX, root=DATASET, names=None):
     """Download the curation instance's work. names limits it to the daily harvest."""
-    root = Path(root)
+    root = Path(root).resolve()
     done = consumed(root)
     todo, skipped = [], 0
     listing = remote(cl, bucket, prefix)
+    policy = load_policy(cl, bucket, prefix, root, listing)
     for key, size in sorted(listing.items()):
         rel = key[len(prefix):]
         if not rel or (names and not rel.startswith(tuple(names))):
             continue
+        if rel == retention.POLICY_NAME:
+            continue
+        sid = retention.sample_id(rel)
+        if sid and policy and retention.expired(sid, policy):
+            skipped += 1
+            continue
         if rel.startswith("pending/") and Path(rel).stem in done:
             skipped += 1                  # already labelled: do not hand it back
             continue
-        dest = root / rel
+        dest = safe_dest(root, rel)
         if have(dest, size) and not always(rel):
             skipped += 1
             continue
         dest.parent.mkdir(parents=True, exist_ok=True)
-        todo.append((dest, key))
-    got = transfer(lambda dest, key: fetch(cl, bucket, dest, key), todo, "pulled")
+        todo.append((dest, key, sid))
+    def download(dest, key, sid):
+        fetch(cl, bucket, dest, key, root, policy, sid)
+    got = transfer(download, todo, "pulled")
     swept = sweep_consumed(root, {Path(k).stem for k in listing
                                   if k.startswith(prefix + "pending/images/")})
     print(f"pull: {got} downloaded, {skipped} already local"
