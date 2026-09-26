@@ -224,6 +224,40 @@ def paused(keys, cfg):
     return [k for k in keys if live(k.split("/", 1)[0])]
 
 
+def curation_settings(cl, bucket):
+    """The curation server's curation/curation.yaml as {"cap": int|None, "paused": [gate
+    ids]} — same shape as curation_cap.load_settings, fetched fresh each pass since that
+    server owns the file. Missing key or any error is the safe default: no cap, nothing
+    paused."""
+    import tempfile
+    import curation_cap
+    try:
+        body = cl.get_object(Bucket=bucket, Key=f"curation/{curation_cap.SETTINGS}")["Body"].read()
+    except Exception as e:
+        print(f"{now()} curation settings: unavailable ({e}) — no cap, nothing paused", flush=True)
+        return {"cap": None, "paused": []}
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / curation_cap.SETTINGS).write_bytes(body)
+        return curation_cap.load_settings(tmp)
+
+
+def prune_pending(cap):
+    """Delete local pending/{images,labels,attrs,suggest} samples curation_cap.evictions()
+    would evict, before this pass pushes: otherwise a push re-uploads any sample the
+    curation server is about to (or already did) evict on its side. -> samples pruned."""
+    import curation_cap
+    if cap is None:
+        return 0
+    stems = [p.stem for p in (DATASET / "pending" / "images").glob("*.jpg")]
+    pruned = 0
+    for sids in curation_cap.evictions(stems, cap).values():
+        for sid in sids:
+            for part in curation_cap.PARTS:
+                (DATASET / "pending" / part / f"{sid}.{curation_cap.EXT[part]}").unlink(missing_ok=True)
+            pruned += 1
+    return pruned
+
+
 def gate_of(prefix):
     """The RDA gate id for a bucket prefix. The importer resolves events by gate, so a
     prefix with no mapping is passed through — a gate already named for itself is right,
@@ -522,10 +556,14 @@ def ingest_pass():
         s = load_state()
         ds, cl, bucket = r2()
         cfg = ingest_video.config()
+        settings = curation_settings(cl, bucket)
+        # config.yaml's own switch and the curation server's Pause button, either stops a
+        # gate — paused() already matches a bucket prefix or its gate id.
+        cfg["curation_paused"] = sorted(set(cfg.get("curation_paused") or []) | set(settings["paused"]))
         raw = list(recording_keys(cl, bucket))
         keys = paused(raw, cfg)
         if raw and not keys:      # empty because paused, not because nothing was recorded
-            print(f"{now()} ingest: curation paused for {', '.join(cfg.get('curation_paused') or [])}",
+            print(f"{now()} ingest: curation paused for {', '.join(cfg['curation_paused'])}",
                   flush=True)
             return
         todo = pick(keys, s["ingested"])
@@ -564,6 +602,9 @@ def ingest_pass():
         s["ingested"] = (s["ingested"] + todo)[-REMEMBER:]
         s["last_ingest"] = {"at": now(), "segments": len(todo), "samples": written}
         save_state(s)
+        pruned = prune_pending(settings["cap"])
+        if pruned:
+            print(f"{now()} ingest: pruned {pruned} local pending sample(s) over cap", flush=True)
         sent, _ = ds.push(cl, bucket, names=PENDING)
         print(f"{now()} ingest: {s['last_ingest']['samples']} samples written, {sent} files pushed", flush=True)
 
@@ -588,11 +629,13 @@ def hunt_pass():
             return
         ds, cl, bucket = r2()
         cfg = ingest_video.config()
+        settings = curation_settings(cl, bucket)
+        cfg["curation_paused"] = sorted(set(cfg.get("curation_paused") or []) | set(settings["paused"]))
         since = (datetime.now(ZoneInfo(TZ)) - timedelta(hours=HUNT_HOURS)).strftime("%Y%m%d-%H%M%S")
         raw = list(recording_keys(cl, bucket))
         keys = paused(raw, cfg)
         if raw and not keys:      # empty because paused, not because nothing was recorded
-            print(f"{now()} hunt: curation paused for {', '.join(cfg.get('curation_paused') or [])}",
+            print(f"{now()} hunt: curation paused for {', '.join(cfg['curation_paused'])}",
                   flush=True)
             return
         todo = pick_hunt(keys, s.get("hunted", []), since)
@@ -625,6 +668,9 @@ def hunt_pass():
         s["hunted"] = (s.get("hunted", []) + todo)[-REMEMBER:]
         s["last_hunt"] = {"at": now(), "segments": len(todo), "samples": written, "wanted": wanted}
         save_state(s)
+        pruned = prune_pending(settings["cap"])
+        if pruned:
+            print(f"{now()} hunt: pruned {pruned} local pending sample(s) over cap", flush=True)
         sent, _ = ds.push(cl, bucket, names=PENDING)
         print(f"{now()} hunt: {written} wanted-class samples written, {sent} files pushed", flush=True)
 
@@ -1105,6 +1151,52 @@ def suggest_check():
                and v["axles"] in heads["axles"] for v in got.values()), got
 
 
+def curation_check():
+    """prune_pending() must delete exactly what curation_cap.evictions() would, across
+    every part, and never touch an external import (no capture timestamp to evict by).
+    curation_settings() must fall back safely when the bucket has no file or a bad
+    client."""
+    import contextlib
+    import io
+    import tempfile
+    from unittest.mock import patch
+    import curation_cap
+
+    me = sys.modules[__name__]
+    tmp = Path(tempfile.mkdtemp())
+    for part in curation_cap.PARTS:
+        (tmp / "pending" / part).mkdir(parents=True)
+    stems = [f"A-{d}" for d in ("20260101-000000", "20260102-000000", "20260103-000000")] + \
+        ["external-deadbeef"]
+    for sid in stems:
+        for part in curation_cap.PARTS:
+            (tmp / "pending" / part / f"{sid}.{curation_cap.EXT[part]}").write_text("x")
+
+    with patch.object(me, "DATASET", tmp):
+        assert prune_pending(cap=None) == 0, "cap unset: nothing pruned"
+        pruned = prune_pending(cap=2)
+    assert pruned == 1, pruned
+    assert all(not (tmp / "pending" / part / f"A-20260101-000000.{curation_cap.EXT[part]}").is_file()
+               for part in curation_cap.PARTS), "oldest not pruned across every part"
+    assert (tmp / "pending" / "images" / "A-20260102-000000.jpg").is_file(), "newest kept"
+    assert (tmp / "pending" / "images" / "external-deadbeef.jpg").is_file(), "external never evicted"
+
+    class FakeCl:
+        def __init__(self, body=None, fail=False):
+            self.body, self.fail = body, fail
+
+        def get_object(self, Bucket, Key):
+            if self.fail:
+                raise RuntimeError("no such key")
+            return {"Body": io.BytesIO(self.body)}
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        got = curation_settings(FakeCl(body=b"cap: 500\npaused: [RDA-TG-KTB]\n"), "bucket")
+        assert got == {"cap": 500, "paused": ["RDA-TG-KTB"]}, got
+        assert curation_settings(FakeCl(fail=True), "bucket") == {"cap": None, "paused": []}, \
+            "any fetch error is the safe default"
+
+
 def lock_check():
     """The lock is the only thing between two GPU jobs. A dead holder must be taken over;
     a live one must be waited for; and the take must be atomic."""
@@ -1387,6 +1479,7 @@ def selfcheck():
     listing_check()
     journeys_check()
     suggest_check()
+    curation_check()
     print("selfloop self-check ok: cameras found under any gate prefix, newest unsampled segments "
           "picked per camera, training triggers on the cumulative threshold, promotion needs a "
           "strictly better reference score (detector) or mean val accuracy (attributes) unless "
