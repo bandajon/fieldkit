@@ -19,6 +19,7 @@ side ever removes the other's files; real two-way sync needs tombstones and conf
 rules, which is a different program nobody has asked for.
 """
 
+import hashlib
 import json
 import os
 import sys
@@ -37,7 +38,8 @@ PUSH = ("pending/images", "pending/labels", "pending/attrs", "pending/suggest", 
         "reference.txt", "external.json")
 # ...the small part of that a node must have IN HAND before it can serve anything...
 CONFIG = ("curators.yaml", "classes.txt", "attributes.yaml", "assignments.yaml",
-          "trusted.yaml", "gold", "reference.txt", "external.json", "trained.txt")
+          "trusted.yaml", "gold", "reference.txt", "external.json", "trained.txt",
+          "curation.yaml")
 # ...and what it produces: the daily harvest.
 LEDGERS = ("approved/images", "approved/labels", "approved/attrs",
            "audit.jsonl", "scores.jsonl", "gold-served.jsonl")
@@ -79,13 +81,24 @@ def client(o):
                       response_checksum_validation="when_required"))
 
 
-def remote(cl, bucket, prefix):
-    """{key: size} under the prefix — one paginated list beats a HEAD per file."""
+def remote(cl, bucket, prefix, etags=None):
+    """{key: size} under the prefix — one paginated list beats a HEAD per file. Pass a
+    dict as etags to collect each key's ETag from the same listing, for free."""
     out = {}
     for page in cl.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix):
         for obj in page.get("Contents", []):
             out[obj["Key"]] = obj["Size"]
+            if etags is not None and obj.get("ETag"):
+                etags[obj["Key"]] = obj["ETag"].strip('"')
     return out
+
+
+def same(f, etag):
+    """Does the local file already hold exactly what the bucket does? A single-part
+    upload's ETag is the MD5 of its bytes, so the listing settles it without a download.
+    A multipart ETag ("…-N") is not an MD5: treat it as different and move the file."""
+    return bool(etag) and "-" not in etag and f.exists() \
+        and hashlib.md5(f.read_bytes()).hexdigest() == etag
 
 
 def load_policy(cl, bucket, prefix, root, listing):
@@ -190,7 +203,8 @@ def push(cl, bucket, prefix=PREFIX, root=DATASET, names=PUSH, force=False):
         sent = transfer(metadata_upload, [(f, prefix + rel) for rel, f in entries], "pushed")
         print(f"push: {sent} uploaded, forced ({prefix} on {bucket})")
         return sent, 0
-    have = remote(cl, bucket, prefix)
+    etags = {}
+    have = remote(cl, bucket, prefix, etags)
     policy = load_policy(cl, bucket, prefix, root, have)
     todo, skipped = [], 0
     for rel, f in entries:
@@ -202,7 +216,7 @@ def push(cl, bucket, prefix=PREFIX, root=DATASET, names=PUSH, force=False):
         key = prefix + rel
         if force:
             todo.append((f, key))
-        elif key not in have or (always(rel) and not once(rel)):
+        elif key not in have or (always(rel) and not once(rel) and not same(f, etags.get(key))):
             todo.append((f, key))
         elif once(rel) or have[key] == f.stat().st_size:
             skipped += 1
@@ -226,7 +240,7 @@ def push(cl, bucket, prefix=PREFIX, root=DATASET, names=PUSH, force=False):
     return sent, skipped
 
 
-ROSTER = ("curators.yaml", "trusted.yaml", "assignments.yaml", "trained.txt")
+ROSTER = ("curators.yaml", "trusted.yaml", "assignments.yaml", "trained.txt", "curation.yaml")
 
 
 def once(rel):
@@ -387,7 +401,8 @@ def pull(cl, bucket, prefix=PREFIX, root=DATASET, names=None):
     root = Path(root).resolve()
     done = consumed(root)
     todo, skipped = [], 0
-    listing = remote(cl, bucket, prefix)
+    etags = {}
+    listing = remote(cl, bucket, prefix, etags)
     policy = load_policy(cl, bucket, prefix, root, listing)
     for key, size in sorted(listing.items()):
         rel = key[len(prefix):]
@@ -403,7 +418,7 @@ def pull(cl, bucket, prefix=PREFIX, root=DATASET, names=None):
             skipped += 1                  # already labelled: do not hand it back
             continue
         dest = safe_dest(root, rel)
-        if have(dest, size) and not always(rel):
+        if have(dest, size) and (not always(rel) or same(dest, etags.get(key))):
             skipped += 1
             continue
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -432,8 +447,8 @@ def selfcheck():
             return self
 
         def paginate(self, Bucket, Prefix):
-            yield {"Contents": [{"Key": k, "Size": len(v)} for k, v in self.objects.items()
-                                if k.startswith(Prefix)]}
+            yield {"Contents": [{"Key": k, "Size": len(v), "ETag": f'"{hashlib.md5(v).hexdigest()}"'}
+                                for k, v in self.objects.items() if k.startswith(Prefix)]}
 
         def upload_file(self, path, Bucket, Key):
             self.objects[Key] = Path(path).read_bytes()
@@ -454,9 +469,10 @@ def selfcheck():
     assert push(cl, "buck", "curation/", src) == (3, 0)
     assert sorted(cl.objects) == ["curation/classes.txt", "curation/pending/images/a.jpg",
                                   "curation/pending/images/b.jpg"], sorted(cl.objects)
-    # Samples are write-once, so same name and size means skip; config is re-sent every
-    # pass because a one-character edit does not change its length.
-    assert push(cl, "buck", "curation/", src) == (1, 2), "samples skip, config always moves"
+    # Samples are write-once, so same name and size means skip; config is compared by
+    # content (the listing's ETag is its MD5), because a one-character edit does not
+    # change its length — and an unchanged one must not move every pass.
+    assert push(cl, "buck", "curation/", src) == (0, 3), "nothing changed, nothing moves"
     (src / "classes.txt").write_text("van\n")        # same size, different content
     push(cl, "buck", "curation/", src)
     assert cl.objects["curation/classes.txt"] == b"van\n", "a same-size config edit must propagate"
@@ -475,7 +491,10 @@ def selfcheck():
     assert (dst / "pending" / "images" / "b.jpg").exists()
     # Same asymmetry on the way back: samples already here are left alone, config is
     # re-read every pass so an edit made on the other node cannot hide behind its length.
-    assert pull(cl, "buck", "curation/", dst) == (1, 6), "samples left alone, config re-read"
+    assert pull(cl, "buck", "curation/", dst) == (0, 7), "unchanged config is not re-fetched"
+    cl.objects["curation/classes.txt"] = b"bus\ntruck\n"   # same size, edited remotely
+    assert pull(cl, "buck", "curation/", dst) == (1, 6), "a same-size remote edit comes down"
+    assert (dst / "classes.txt").read_bytes() == b"bus\ntruck\n"
 
     # --ledgers: the fast daily harvest skips the pending pile it seeded itself.
     day = Path(tempfile.mkdtemp())
@@ -512,7 +531,7 @@ def selfcheck():
     # A non-ledger is still replaced wholesale — merging is for append-only files only.
     (day / "classes.txt").write_text("car\n")
     pull(cl, "buck", "curation/", day, CONFIG)
-    assert (day / "classes.txt").read_text() == "car\ntruck\n", "a non-ledger must replace"
+    assert (day / "classes.txt").read_bytes() == cl.objects["curation/classes.txt"], "a non-ledger must replace"
 
     # Nothing is ever removed: a file only one side has survives both directions.
     (dst / "pending" / "images" / "local-only.jpg").write_bytes(b"keep")
