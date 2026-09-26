@@ -42,8 +42,13 @@ RECOUNT_GUARD = 45.0     # a counted vehicle's resting place is remembered this 
 GUARD_IOU = 0.5
 DRAWN_IOU = 0.3          # looser than GUARD_IOU: a hand-drawn box is a curator's estimate
                          # of where a vehicle is, not a detector's box seen twice
-CROP_CONF = 0.15         # a second look at the crop alone: the curator drew there because the
-                         # detector missed it at CONF, so the crop is asked more leniently
+CENTRE = (0.25, 0.75)    # the middle half of each axis — "the centre of the frame"
+GUESS_AREA = 0.01        # ...or a box this large wherever it sits: that is a near vehicle
+LOW_CONF = 0.10          # a box the normal pass missed, asked of the WHOLE frame again:
+                         # measured 80% right on curator-checked boxes (2026-09-12)
+GUESS_CONF = 0.05        # ...and lower still for a central or large box: 70% right, against
+                         # 25% for the upscaled-crop pass this replaced. A crop at 3x is
+                         # outside what the model trained on; the full frame is not.
 COUNT_LINE = 0.55        # where a vehicle is counted once a camera has a travel axis: a line
                          # across that axis, as a fraction of the frame. Counting on a crossing
                          # is what survives a queue — a vehicle that crawls, stops, is hidden
@@ -449,10 +454,10 @@ def memo_dets(key, jpeg, predict):
     return _memo[2]
 
 
-def review_predict(m, img):
+def review_predict(m, img, conf=CONF):
     """Every detection the review model sees in one frame -> [(cls, conf, xyxy)]."""
     dets = []
-    for r in m["model"].predict(img, imgsz=IMGSZ, conf=CONF, agnostic_nms=True,
+    for r in m["model"].predict(img, imgsz=IMGSZ, conf=conf, agnostic_nms=True,
                                 device=m["dev"], verbose=False, **m["extra"]):
         for box, cid, conf in zip(r.boxes.xyxy.tolist(), r.boxes.cls.tolist(),
                                   r.boxes.conf.tolist()):
@@ -471,7 +476,7 @@ def best_match(dets, xyxy, floor=DRAWN_IOU):
     return cls if score >= floor else None
 
 
-def _under_review(jpeg, cfg, fn):
+def _under_review(jpeg, cfg, fn, conf=CONF):
     """Load the models, decode the frame, run `fn(m, img, dets)` -> (result, None) | (None, error).
 
     predict(), not track(): stills have no continuity, and the live models belong to the
@@ -487,7 +492,10 @@ def _under_review(jpeg, cfg, fn):
         try:
             from PIL import Image
             img = Image.open(io.BytesIO(jpeg)).convert("RGB")
-            return fn(m, img, memo_dets(m["path"], jpeg, lambda: review_predict(m, img))), None
+            # Memo keyed on the confidence too: the Review tab must keep seeing only
+            # CONF detections, never the lenient set classify asks for.
+            dets = memo_dets((m["path"], conf), jpeg, lambda: review_predict(m, img, conf))
+            return fn(m, img, dets), None
         except ImportError:
             return None, PIP_HINT
         except Exception as e:
@@ -505,23 +513,17 @@ def review_frame(jpeg, cfg):
     return _under_review(jpeg, cfg, draw)
 
 
-def crop_class(m, img, xyxy):
-    """The vehicle filling a curator's crop, when the full frame showed none there. The
-    crop is padded and scaled up so a distant vehicle the frame-level pass skipped is
-    large enough to see, and the largest vehicle in it is the one that was drawn."""
-    c = crop(img, xyxy, pad=0.25)
-    scale = max(1, 320 // max(1, min(c.width, c.height)))
-    if scale > 1:
-        c = c.resize((c.width * scale, c.height * scale))
-    best = None
-    for r in m["model"].predict(c, imgsz=640, conf=CROP_CONF, agnostic_nms=True,
-                                device=m["dev"], verbose=False, **m["extra"]):
-        for b, cid in zip(r.boxes.xyxy.tolist(), r.boxes.cls.tolist()):
-            cls = m["lookup"].get(int(cid))
-            area = (b[2] - b[0]) * (b[3] - b[1])
-            if cls and is_vehicle(cls) and (best is None or area > best[0]):
-                best = (area, cls)
-    return best[1] if best else None
+def worth_a_guess(box):
+    """Should a box the detector cannot see still get the model's best guess?
+
+    Yes in the middle of the frame, and yes for any box big enough to be a near vehicle:
+    a curator drawing there is looking at something real, and a wrong suggestion costs
+    them one tap while no suggestion costs them every field. A small box out at the edge
+    or up at the horizon is left alone — at that size the guesses measured wrong more
+    often than right, and a confident wrong class is worse than an empty one."""
+    cx, cy, w, h = box
+    lo, hi = CENTRE
+    return (lo <= cx <= hi and lo <= cy <= hi) or (w * h) >= GUESS_AREA
 
 
 def classify_box(jpeg, cfg, box):
@@ -537,10 +539,18 @@ def classify_box(jpeg, cfg, box):
         cx, cy, w, h = (float(v) for v in box)
         drawn = ((cx - w / 2) * img.width, (cy - h / 2) * img.height,
                  (cx + w / 2) * img.width, (cy + h / 2) * img.height)
-        cls = best_match(dets, drawn) or crop_class(m, img, drawn)
+        # One lenient pass over the frame, read at three confidences: the detector's own
+        # bar first, then lower for a box it missed, and lowest only for a box in the
+        # middle of the frame or big enough to be a near vehicle.
+        tiers = [CONF, LOW_CONF] + ([GUESS_CONF] if worth_a_guess((cx, cy, w, h)) else [])
+        cls = None
+        for floor in tiers:
+            cls = best_match([d for d in dets if d[1] >= floor], drawn)
+            if cls:
+                break
         return {"cls": cls,
                 "attrs": m["attrs"](crop(img, drawn), cls) if (cls and m["attrs"]) else {}}
-    return _under_review(jpeg, cfg, pick)
+    return _under_review(jpeg, cfg, pick, conf=GUESS_CONF)
 
 
 class Reader:
@@ -1645,6 +1655,13 @@ if __name__ == "__main__":
     assert best_match([("truck", 0.6, (105.0, 105.0, 195.0, 195.0)),
                        (WHEEL, 0.9, DRAWN)], DRAWN) == "truck", "a wheel never wins"
     assert best_match([], DRAWN) is None
+
+    # A box in the middle, or any large box, earns the model's best guess; a small one
+    # at the edge does not.
+    assert worth_a_guess((0.5, 0.5, 0.02, 0.02)), "dead centre always gets a guess"
+    assert worth_a_guess((0.05, 0.9, 0.2, 0.2)), "a big box anywhere is a near vehicle"
+    assert not worth_a_guess((0.05, 0.05, 0.02, 0.02)), "small and off in the corner: silent"
+    assert not worth_a_guess((0.5, 0.1, 0.03, 0.03)), "small up at the horizon: silent"
 
     # One predict per frame, however many boxes; a new frame or new weights redoes it.
     runs = []

@@ -285,6 +285,7 @@
       <button class="btn" id="l-skip10" title="skip the next ten frames">Skip 10</button>
       <button class="btn" id="l-skip50" title="skip the next fifty frames">Skip 50</button>
       <button class="btn" id="l-skip100" title="skip the next hundred frames">Skip 100</button>
+      <button class="btn" id="l-classify" title="ask the model about the selected box again">Classify</button>
       <button class="btn" id="l-clear" title="delete every box to draw afresh">Clear boxes</button>
       <button class="btn halt" id="l-no">Discard</button>
       <button class="btn halt" id="l-rej" hidden>Reject</button>
@@ -1080,7 +1081,7 @@ function labShow() {
   // The row survives an empty queue while Back can still reopen the last approval.
   document.getElementById('l-acts').hidden = !s && !labDone.length;
   document.getElementById('l-back').disabled = !labDone.length;
-  ['l-ok', 'l-skip', 'l-skip10', 'l-skip50', 'l-skip100', 'l-clear', 'l-no', 'l-rej'].forEach(id => document.getElementById(id).disabled = !s);
+  ['l-ok', 'l-skip', 'l-skip10', 'l-skip50', 'l-skip100', 'l-classify', 'l-clear', 'l-no', 'l-rej'].forEach(id => document.getElementById(id).disabled = !s);
   // Reviewers correct, they do not delete or rewind.
   document.getElementById('l-ok').textContent = labOne() ? 'Submit review' : 'Approve';
   document.getElementById('l-no').hidden = document.getElementById('l-back').hidden = labOne();
@@ -1450,7 +1451,9 @@ async function labClassify(b, i) {
   try {
     r = await post('/api/dataset/classify',
                    {id: s.id, tree, who: labWho, box: {cx: b.cx, cy: b.cy, w: b.w, h: b.h}});
-  } catch (e) { return; }                    // network gone: the box is drawn, that is what matters
+  } catch (e) {                              // the box is drawn either way; say so and offer the retry
+    return labNote('could not reach the classifier — press Classify to try that box again');
+  }
   if (labBoxes[i] !== b || b.del) return;    // the curator moved on; nothing left to suggest onto
   if (b.cls >= labClasses.length) return;    // an explicit removal outranks a late suggestion
   // Said once: a node with no champion fails on every box, and the queue note is worth more
@@ -1472,7 +1475,8 @@ async function labClassify(b, i) {
   labFill(b, (labImplies.axles || {})[b.attrs.axles], true);
   if (labSel === i) labSelect(i);
   const said = [r.name, ...Object.values(r.attrs || {})].filter(Boolean);
-  labNote(said.length ? 'suggested: ' + said.join(' · ') : 'no suggestion for this box');
+  labNote(said.length ? 'suggested: ' + said.join(' · ')
+        : 'no suggestion — the model sees no vehicle there, so set the class yourself');
 }
 
 // Press on the image itself: rubber-band a new box for a vehicle the detector missed.
@@ -1577,6 +1581,17 @@ document.getElementById('l-skip50').onclick = () => labSkip(50);
 document.getElementById('l-skip100').onclick = () => labSkip(100);
 // Wipe the slate to redraw: the same per-box delete, all at once. Local until Approve —
 // leaving the frame and reopening it brings the original boxes back.
+// Drawing a box asks the model automatically, but an answer can be missed: the request
+// failed, the box was adjusted afterwards, or a class was tapped while it was in flight.
+// This button is the guaranteed way to ask again for whichever box is selected.
+document.getElementById('l-classify').onclick = () => {
+  const b = labBoxes[labSel];
+  if (!b || b.del) return labNote('tap a box first, then press Classify');
+  labClassifySaid = false;          // an explicit request always deserves an answer
+  labNote('classifying…');
+  labClassify(b, labSel);
+};
+
 document.getElementById('l-clear').onclick = () => {
   labBoxes.forEach(b => b.del = true);
   document.querySelectorAll('#l-wrap .box').forEach(d => d.remove());

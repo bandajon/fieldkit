@@ -316,6 +316,14 @@ def index():
     return FileResponse(ROOT / "static" / "index.html")
 
 
+@app.get("/healthz")
+def healthz():
+    """The platform's liveness probe. Outside /api/, so the curation gate lets it
+    through without a token, and shared with ops.py so one healthcheckPath serves
+    every service built from this repo."""
+    return {"ok": True, "app": "fieldkit"}
+
+
 @app.get("/api/status")
 def status():
     return {

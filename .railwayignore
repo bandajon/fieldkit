@@ -1,0 +1,13 @@
+# What a deploy must not carry. .gitignore already excludes dataset/, recordings/ and
+# *.pt; these are the untracked local artefacts that are not repo content and pushed the
+# code upload past Railway's 400 MB limit (413 Payload Too Large).
+output/
+weights/
+dist/
+runs/
+events/
+counts/
+train_runs/
+*.log
+*.jsonl
+__pycache__/

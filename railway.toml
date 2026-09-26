@@ -11,6 +11,18 @@
 # authority activation is the exception: a failed activation must stop that service.
 [build]
 builder = "RAILPACK"
+# Pushes do NOT deploy, and NEITHER does a bare `railway up`: watch patterns gate CLI
+# deploys too (verified 2026-09-11 — two `railway up` runs came back SKIPPED). To deploy,
+# change the untracked trigger file first, which the CLI uploads and a push never carries:
+#     date -u > deploy.trigger && railway up
+# Deliberately: app.py at HEAD cannot boot — it calls
+# REC.file_active and passes CONSOLE_CREDS to an Offload built from modules that live
+# only in the operator's working tree, so a build from the commit crashes on import and
+# took the curation tool down twice on 2026-09-10. Deploy with `railway up`, which sends
+# the working tree. No pushed file matches this pattern, so Railway skips the build.
+# Remove this line once HEAD can boot on its own (recorder.py, dataset_sync.py, selfloop.py
+# and the retention modules all need to be committed together).
+watchPatterns = ["deploy.trigger"]
 # Only the curation service carries torch: service variables are visible at build time,
 # so the extra install is gated on FIELDKIT_MODE and every other service builds as before.
 # ultralytics brings the GUI build of OpenCV, which needs X11/GL libraries the slim image
@@ -20,7 +32,16 @@ builder = "RAILPACK"
 buildCommand = "if [ \"$FIELDKIT_MODE\" = curation ]; then pip install -r requirements-curation.txt; fi"
 
 [deploy]
-startCommand = "{ mkdir -p /data/dataset && rm -rf dataset && ln -s /data/dataset dataset; } || echo 'boot: no /data volume — using the repo dataset dir'; if [ \"$FIELDKIT_RETENTION_AUTHORITY\" = 1 ] && [ \"$FIELDKIT_RETENTION_PAUSED\" = 1 ]; then python -c 'import sys; import dataset_retention as r; sys.exit(0 if r.cached_policy(\"/data/dataset\") else \"published retention policy required while paused\")' || exit 1; else python dataset_sync.py pull --config || echo 'boot: no dataset pulled — serving what is already here'; if [ \"$FIELDKIT_RETENTION_AUTHORITY\" = 1 ]; then python retention_maintenance.py activate --dataset /data/dataset || exit 1; fi; fi; exec python app.py"
-healthcheckPath = "/"
+# FIELDKIT_MODE picks the program, the way it already picks the build above: `ops` runs
+# the fleet console (its /data volume holds OPS_STATE and it wants no dataset, so it exits
+# before the retention boot below), anything else runs a FieldKit console. This file
+# applies to EVERY service in the project and takes precedence over railway.json, so a
+# service whose start command lived only in that file never started what it was meant to
+# — which is how the ops console spent a week serving a FieldKit page and stopped handing
+# R2 credentials to the gates.
+startCommand = "if [ \"$FIELDKIT_MODE\" = ops ]; then exec python ops.py; fi; { mkdir -p /data/dataset && rm -rf dataset && ln -s /data/dataset dataset; } || echo 'boot: no /data volume — using the repo dataset dir'; if [ \"$FIELDKIT_RETENTION_AUTHORITY\" = 1 ] && [ \"$FIELDKIT_RETENTION_PAUSED\" = 1 ]; then python -c 'import sys; import dataset_retention as r; sys.exit(0 if r.cached_policy(\"/data/dataset\") else \"published retention policy required while paused\")' || exit 1; else python dataset_sync.py pull --config || echo 'boot: no dataset pulled — serving what is already here'; if [ \"$FIELDKIT_RETENTION_AUTHORITY\" = 1 ]; then python retention_maintenance.py activate --dataset /data/dataset || exit 1; fi; fi; exec python app.py"
+# Both programs answer /healthz unauthenticated. ops.py's "/" is a 401 login page, which
+# a healthcheck reads as a dead container.
+healthcheckPath = "/healthz"
 healthcheckTimeout = 1200
 restartPolicyType = "ON_FAILURE"
