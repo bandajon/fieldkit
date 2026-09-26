@@ -39,7 +39,7 @@ def main():
     def invoke(state, ids, attrs_result=True, run_result=None):
         ds = DS(); attrs_calls = []
         with patch.object(selfloop, "THRESHOLD", 2), \
-             patch.object(selfloop, "Lock", lambda: contextlib.nullcontext()), \
+             patch.object(selfloop, "Lock", lambda **kw: contextlib.nullcontext()), \
              patch.object(selfloop, "load_state", return_value=state), \
              patch.object(selfloop, "save_state"), \
              patch.object(selfloop, "r2", return_value=(ds, object(), "bucket")), \
