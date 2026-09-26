@@ -59,6 +59,8 @@ GOLD_RATE = float(os.environ.get("GOLD_RATE", 0.05))       # how often a check s
 # FIELDKIT_MODE=curation: an internet-facing labelling server — dataset endpoints only,
 # every one of them token-gated, and none of the camera/recorder/cloud machinery.
 CURATION = os.environ.get("FIELDKIT_MODE", "console") == "curation"
+if CURATION:
+    import curation_cap
 REVIEWERS = [w.strip() for w in os.environ.get("REVIEWERS", "").split(",") if w.strip()]
 # Break-glass supervisor: PASSWORD in the environment beats the stored hash, so a
 # forgotten password is reset by editing one variable on the host instead of deleting
@@ -87,6 +89,8 @@ GOLD_TOKENS = {}          # disguised id -> gold id; refilled from gold-served.j
 CLAIM_TTL = 1800.0        # a slice someone walked away from frees itself after this
 CLAIMS = {}               # sample id -> (who, expiry as wall-clock); mirrored to claims.json
 CLAIMS_LOCK = threading.Lock()
+INTAKE = {"at": None, "report": {}}   # last curation_cap.enforce() pass, for /api/dataset/intake
+INTAKE_EVERY = 900.0      # enforce() lists ~674k objects — only worth a full pass this often
 DATASET_LOCK = retention.DATASET_LOCK
 
 
@@ -915,6 +919,14 @@ def purge_claims():
         return {sid: w for sid, (w, _) in CLAIMS.items()}
 
 
+def claimed_ids():
+    """Live snapshot of held sample ids, for curation_cap.enforce() to re-check between
+    delete batches — a slice claimed mid-listing must survive, not just one claimed
+    before the listing started."""
+    with CLAIMS_LOCK:
+        return set(CLAIMS)
+
+
 def hold(ids, who):
     """Claim this slice for `who` (refreshing the TTL). -> how many they now hold."""
     exp = time.time() + CLAIM_TTL
@@ -1580,6 +1592,29 @@ def sync_both(ds, cl, bucket):
     retention_maintenance.maintenance_once(DATASET.resolve(), cl, bucket)
     sent, _ = ds.push(cl, bucket, names=ds.LEDGERS)
     got, _ = ds.pull(cl, bucket)
+    try:
+        settings = curation_cap.bucket_settings(cl, bucket, ds.PREFIX + curation_cap.SETTINGS)
+        now = time.monotonic()
+        stale = INTAKE.get("checked_mono") is None or now - INTAKE["checked_mono"] >= INTAKE_EVERY
+        # enforce() lists all of pending/ — ~11 minutes at the current queue size. Only
+        # worth paying for on a schedule, or right after the reviewer changes a setting
+        # (the POST route resets checked_mono to force this branch on the next pass).
+        if stale or settings != INTAKE.get("settings"):
+            # Reset before running, not after: a pass that raises still counts against
+            # the throttle, or a broken enforce would retry every 120s forever instead
+            # of every 15 minutes like everything else here.
+            INTAKE["checked_mono"] = now
+            INTAKE["settings"] = settings   # also before: a failing first run must throttle too
+            consumed = ds.consumed(DATASET)
+            out = curation_cap.enforce(cl, bucket, DATASET, ds.PREFIX, keep=claimed_ids, consumed=consumed)
+            INTAKE.update(at=stamp(), report=out["report"], settings=out["settings"])
+            if out["settings"]["cap"] is None:
+                would = sum(v["over"] for v in out["report"].values())
+                print(f"intake: would evict {would} (cap unset)", flush=True)
+            else:
+                print(f"intake: evicted {sum(out['evicted'].values())}", flush=True)
+    except Exception as e:   # the queue's overgrown before — a bad pass must not wedge sync
+        print(f"intake failed: {e}", flush=True)
     # The crowned weights ride along so /api/dataset/classify has something to run. A
     # missing object is already a skip inside models(), so anything raised here is a
     # failed download — let it out, or the Status tab calls the pass healthy while
@@ -1753,6 +1788,60 @@ def publish(name):
     something else. Only the curation instance publishes: a site box or the laptop
     editing its own copy is not an authority, and classes.txt ids are positional."""
     return push_file(name) if CURATION else False
+
+
+@app.get("/api/dataset/intake")
+def intake_state(x_curator_token: str = Header("")):
+    """Queue depth and pause state per gate, for the curation UI. Reviewer only, same as
+    the roster: it shows exactly what a Pause or a cap change would affect."""
+    require_reviewer(token_who(x_curator_token))
+    settings = curation_cap.load_settings(DATASET)
+    gates = {gate: {**rep, "paused": gate in settings["paused"]}
+             for gate, rep in INTAKE["report"].items()}
+    return {"cap": settings["cap"], "paused": settings["paused"], "at": INTAKE["at"],
+            "gates": gates}
+
+
+@app.post("/api/dataset/intake")
+def intake_edit(body: dict = Body(default={}), x_curator_token: str = Header("")):
+    """Pause/unpause a gate, or set the fleet-wide cap. Reviewer only: this throttles or
+    (once a cap is set) deletes other people's pending work. A non-null cap must carry
+    confirm: true — the UI only sends that from its confirmation step, so a bare POST
+    can never be the delete."""
+    me = require_reviewer(token_who(x_curator_token))
+    settings = curation_cap.load_settings(DATASET)
+    if "gate" in body:
+        gate, paused = str(body["gate"]), bool(body.get("paused"))
+        have = set(settings["paused"])
+        have.add(gate) if paused else have.discard(gate)
+        settings["paused"] = sorted(have)
+    if "cap" in body:
+        cap = body["cap"]
+        if cap is not None:
+            if not isinstance(cap, int) or isinstance(cap, bool) or not 100 <= cap <= 100000:
+                raise HTTPException(400, "cap must be an integer 100..100000, or null")
+            if not body.get("confirm"):
+                raise HTTPException(400, "setting a cap requires confirm: true")
+        settings["cap"] = cap
+    path = DATASET / curation_cap.SETTINGS
+    previous = path.read_text() if path.exists() else None
+    write_yaml(curation_cap.SETTINGS, settings)
+    if not push_file(curation_cap.SETTINGS):
+        # The bucket is the authority (enforce() reads it, not this file) — an edit
+        # that never reached the bucket must not sit on disk looking like it took.
+        if previous is None:
+            path.unlink(missing_ok=True)
+        else:
+            path.write_text(previous)
+        raise HTTPException(502, "could not publish curation.yaml — nothing changed")
+    # Audited only once the bucket has it: a 502 must not leave a record of a change
+    # that never happened.
+    if "gate" in body:
+        audit(me, gate, "intake-pause" if paused else "intake-unpause")
+    if "cap" in body:
+        audit(me, "", "intake-cap", {"cap": cap})
+    INTAKE["checked_mono"] = None   # force the next sync pass to re-enforce, not wait 15 min
+    return intake_state(x_curator_token)
 
 
 @app.get("/api/dataset/curators")

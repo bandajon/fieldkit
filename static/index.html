@@ -314,6 +314,18 @@
       </div>
       <div id="l-roster"></div>
       <div class="res" id="l-hold-help" hidden>probation: this curator's work waits in a holding area until a supervisor releases it in review — it never reaches the training set before that.</div>
+      <div id="l-intake" hidden>
+        <div class="res"><b>Curation intake</b></div>
+        <div class="res" id="l-intake-cap"></div>
+        <div class="acts">
+          <input id="l-intake-capval" type="number" min="100" max="100000" placeholder="cap e.g. 5000">
+          <button class="btn" id="l-intake-setcap">Set cap</button>
+          <button class="btn" id="l-intake-stopcap">Stop enforcing</button>
+        </div>
+        <div class="res bad" id="l-intake-confirm" hidden></div>
+        <div class="res" id="l-intake-checked"></div>
+        <div id="l-intake-gates"></div>
+      </div>
       <div class="acts" id="l-assign" hidden>
         <select id="l-acur"></select>
         <select id="l-acls" multiple size="6" title="cmd/ctrl-click for more than one"></select>
@@ -1719,7 +1731,7 @@ document.getElementById('l-vid').onchange = async e => {
 
 // --- Supervisor: a password in, curator tokens out ---
 // Only on open: the roster is the supervisor's business, not something every labLoad fetches.
-document.getElementById('l-team').ontoggle = e => { if (e.target.open) labRoster(); };
+document.getElementById('l-team').ontoggle = e => { if (e.target.open) { labRoster(); labIntake(); } };
 
 // Roster and assignments arrive from two endpoints but draw as one list, so the last
 // roster payload is kept to redraw against fresh assignments without refetching it.
@@ -1776,6 +1788,82 @@ function labRosterShow(d) {
     '</div>').join('');
   document.getElementById('l-hold-help').hidden = false;
 }
+
+// --- Supervisor: pause a gate's intake, or cap the pending queue fleet-wide ---
+let labIntakeGates = {}, labIntakeConfirming = null;   // the cap value the confirm row is for
+
+async function labIntake() {
+  const r = await labFetch('/api/dataset/intake');
+  if (!r.ok) return document.getElementById('l-intake').hidden = true;   // not a reviewer
+  labIntakeShow(await r.json());
+}
+
+function labIntakeShow(d) {
+  document.getElementById('l-intake').hidden = false;
+  labIntakeGates = d.gates || {};
+  labIntakeConfirming = null;
+  document.getElementById('l-intake-confirm').hidden = true;
+  const gates = Object.values(labIntakeGates);
+  const would = gates.reduce((s, g) => s + (g.over || 0), 0);
+  const overN = gates.filter(g => g.over > 0).length;
+  document.getElementById('l-intake-cap').textContent = d.cap == null
+    ? `Not enforced — report only. Would evict ${would} across ${overN} gate${overN === 1 ? '' : 's'}.`
+    : `Cap: ${d.cap} per gate. ${would} over cap right now.`;
+  document.getElementById('l-intake-checked').textContent =
+    d.at ? `last checked ${new Date(d.at).toLocaleString()}` : 'last checked — never';
+  const rows = Object.entries(labIntakeGates).sort((a, b) => b[1].pending - a[1].pending);
+  document.getElementById('l-intake-gates').innerHTML = rows.map(([gate, g]) =>
+    `<div class="acts toggle"><b>${esc(gate)}</b><i class="res">${g.pending} pending</i>` +
+    (g.over ? `<i class="res">${g.over} over cap</i>` : '') +
+    chip(g.paused ? 'Paused' : 'Sending') +
+    `<button class="btn${g.paused ? ' on' : ''}" data-pause="${esc(gate)}">${g.paused ? 'Resume' : 'Pause'}</button>` +
+    '</div>').join('') || '<div class="res">no pending samples</div>';
+}
+
+document.getElementById('l-intake-gates').onclick = async e => {
+  const b = e.target.closest('[data-pause]');
+  if (!b) return;
+  const d = await post('/api/dataset/intake', {gate: b.dataset.pause, paused: !labIntakeGates[b.dataset.pause].paused});
+  if (d.detail) return labNote(String(d.detail));
+  labIntakeShow(d);
+};
+
+document.getElementById('l-intake-setcap').onclick = async () => {
+  const val = document.getElementById('l-intake-capval').value.trim();
+  const cap = val === '' ? null : parseInt(val, 10);
+  if (cap !== null && (!Number.isFinite(cap) || cap < 100 || cap > 100000))
+    return labNote('cap must be an integer 100..100000');
+  // Every non-null cap needs its own confirm, even one that reports zero or no data
+  // yet (the report can be stale or empty) — a changed number always gets a fresh ask.
+  if (cap !== null && labIntakeConfirming !== cap) {
+    const gates = Object.entries(labIntakeGates);
+    const total = gates.reduce((s, [, g]) => s + Math.max(0, g.pending - cap), 0);
+    const affected = gates.filter(([, g]) => g.pending > cap).length;
+    labIntakeConfirming = cap;
+    const c = document.getElementById('l-intake-confirm');
+    c.hidden = false;
+    c.textContent = total > 0
+      ? `This permanently deletes ${total} pending samples (oldest first) across ` +
+        `${affected} gate${affected === 1 ? '' : 's'}. Click Set cap again to confirm.`
+      : 'This queue depth is not yet known or shows nothing over cap — a cap can still ' +
+        'delete pending samples once the next check counts them. Click Set cap again to confirm.';
+    return;
+  }
+  labIntakeConfirming = null;
+  document.getElementById('l-intake-confirm').hidden = true;
+  const d = await post('/api/dataset/intake', cap === null ? {cap} : {cap, confirm: true});
+  if (d.detail) return labNote(String(d.detail));
+  document.getElementById('l-intake-capval').value = '';
+  labIntakeShow(d);
+};
+
+document.getElementById('l-intake-stopcap').onclick = async () => {
+  labIntakeConfirming = null;
+  document.getElementById('l-intake-confirm').hidden = true;
+  const d = await post('/api/dataset/intake', {cap: null});
+  if (d.detail) return labNote(String(d.detail));
+  labIntakeShow(d);
+};
 
 document.getElementById('l-in').onclick = async () => {
   const who = document.getElementById('l-sup').value.trim().toLowerCase(),

@@ -37,7 +37,8 @@ PUSH = ("pending/images", "pending/labels", "pending/attrs", "pending/suggest", 
         "reference.txt", "external.json")
 # ...the small part of that a node must have IN HAND before it can serve anything...
 CONFIG = ("curators.yaml", "classes.txt", "attributes.yaml", "assignments.yaml",
-          "trusted.yaml", "gold", "reference.txt", "external.json", "trained.txt")
+          "trusted.yaml", "gold", "reference.txt", "external.json", "trained.txt",
+          "curation.yaml")
 # ...and what it produces: the daily harvest.
 LEDGERS = ("approved/images", "approved/labels", "approved/attrs",
            "audit.jsonl", "scores.jsonl", "gold-served.jsonl")
@@ -226,7 +227,7 @@ def push(cl, bucket, prefix=PREFIX, root=DATASET, names=PUSH, force=False):
     return sent, skipped
 
 
-ROSTER = ("curators.yaml", "trusted.yaml", "assignments.yaml", "trained.txt")
+ROSTER = ("curators.yaml", "trusted.yaml", "assignments.yaml", "trained.txt", "curation.yaml")
 
 
 def once(rel):
