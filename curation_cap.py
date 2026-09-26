@@ -114,7 +114,7 @@ def evictions(stems, cap, keep=()):
     for gate, sids in by_gate.items():
         if gate in ("external", "unknown"):
             continue
-        sids.sort(key=_ts)
+        sids.sort(key=lambda s: (_ts(s), s))   # ties by name: every node must agree which goes
         if len(sids) > cap:
             out[gate] = sids[:len(sids) - cap]
     return out

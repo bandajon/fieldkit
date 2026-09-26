@@ -261,7 +261,11 @@ def prune_pending(cl, bucket, cap):
         print(f"{now()} curation prune: bucket listing failed ({e}) — push skipped this pass",
               flush=True)
         return 0, False
-    evicted = {sid for sids in curation_cap.evictions(local | remote, cap).values() for sid in sids}
+    import dataset_sync
+    # Finished (approved/discarded) originals still sit in the bucket's pending/: the server
+    # leaves them out of its count, so this must too, or it prunes new, never-pushed samples.
+    done = dataset_sync.consumed(DATASET)
+    evicted = {sid for sids in curation_cap.evictions((local | remote) - done, cap).values() for sid in sids}
     pruned = 0
     for sid in local & evicted:
         for part in curation_cap.PARTS:
