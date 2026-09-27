@@ -36,6 +36,7 @@ import shutil
 import subprocess
 import sys
 from datetime import datetime, timezone
+from itertools import islice
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -301,6 +302,51 @@ def pick_classify(keys, classified, since, per_pass=CLASSIFY_PER_PASS):
     return todo if per_pass is None else todo[:per_pass]
 
 
+def classify_since(now_dt, cfg, floor=""):
+    from datetime import timedelta
+    default = (now_dt - timedelta(hours=CLASSIFY_HOURS)).strftime("%Y%m%d-%H%M%S")
+    # Retain the highest cutoff so abandoned or frozen segments aren't revisited.
+    default = max(default, floor)
+    if "classify_from" not in cfg:
+        return default
+    configured = cfg["classify_from"]
+    try:
+        parsed = datetime.strptime(configured, "%Y%m%d-%H%M%S")
+        if parsed.strftime("%Y%m%d-%H%M%S") != configured:
+            raise ValueError
+    except (TypeError, ValueError):
+        print("WARNING config classify_from must be YYYYMMDD-HHMMSS; ignoring it", flush=True)
+        return default
+    if parsed.replace(tzinfo=now_dt.tzinfo) > now_dt:
+        print("WARNING config classify_from is in the future; ignoring it", flush=True)
+        return default
+    return max(default, configured)
+
+
+def live_lane(keys, classified, since, now, failed=(), limit=CLASSIFY_PER_PASS // 2):
+    """Keep live clips available while oldest-first classification drains a backlog.
+    Round-robin each camera's newest eligible segments, leaving room for the backlog."""
+    import ingest_video
+    excluded = set(classified) | set(failed)
+    per_camera = []
+    for segs in cameras(keys).values():
+        eligible = []
+        for key in reversed(segs):
+            if key in excluded or Path(key).stem < since:
+                continue
+            try:
+                start = ingest_video.cam_and_start(Path(key))[1]
+            except (OSError, ValueError, OverflowError):
+                continue
+            if 0 <= now - start < LIVE_HOURS * 3600 - 1800:
+                eligible.append(key)
+        if eligible:
+            per_camera.append(eligible)
+    per_camera.sort(key=lambda segs: (Path(segs[0]).stem, segs[0]), reverse=True)
+    return list(islice((segs[i] for i in range(max(map(len, per_camera), default=0))
+                        for segs in per_camera if i < len(segs)), limit))
+
+
 def coverage(keys, classified, since):
     """{"<hour YYYYMMDD-HH>": {"<cam>": (classified, recorded)}} over the window — what
     status() prints: classify's actual reach, not just whether the last pass emptied
@@ -420,6 +466,7 @@ def horizon(keys, classified, gate, day, since, cam_cfg, now=None):
         if not relevant:
             out[cam] = float("-inf")     # not dead — just not yet known to be caught up
             continue
+        # Segments before since are abandoned and do not block freezing.
         live = [k for k in relevant if k not in done and Path(k).stem >= since]
         abandoned += sum(1 for k in relevant if k not in done and k not in live)
         gap = min((starts[a] for a, b in zip(relevant, relevant[1:])
@@ -1053,7 +1100,6 @@ def classify_pass():
     import concurrent.futures
     import time
     import tempfile
-    from datetime import timedelta
 
     import detect
     import ingest_video
@@ -1068,7 +1114,9 @@ def classify_pass():
         # hunt is the curation sweep; classify only counts — no capture_wanted/dataset_dir,
         # so detect.Detector's _dataset_init skips capture and this pass never captures
         # frames or pushes to curation.
-        since = (datetime.now(ZoneInfo(TZ)) - timedelta(hours=CLASSIFY_HOURS)).strftime("%Y%m%d-%H%M%S")
+        since = classify_since(datetime.now(ZoneInfo(TZ)), base, s.get("classify_floor", ""))
+        s["classify_floor"] = since
+        save_state(s)
         VIDEOS.mkdir(parents=True, exist_ok=True)
         # cam_and_start parses a segment's stem in the HOST's own local tz, not Lusaka's —
         # every horizon computed from a segment start is wrong if this machine isn't set to
@@ -1125,7 +1173,8 @@ def classify_pass():
                 keys = list(recording_keys(cl, bucket))   # re-listed each round: picks up arrivals
                 all_todo = pick_classify(keys, s.get("classified", []), since, per_pass=None)
                 left = len(all_todo)          # honest backlog count, failed segments included
-                todo = [k for k in all_todo if k not in failed][:CLASSIFY_PER_PASS]
+                live = live_lane(keys, s.get("classified", []), since, time.time(), failed)
+                todo = list(dict.fromkeys(live + [k for k in all_todo if k not in failed]))[:CLASSIFY_PER_PASS]
                 if not todo:
                     break
                 print(f"{now()} classify: {len(todo)} segment(s), {left} left in the window", flush=True)
@@ -1469,11 +1518,14 @@ def status():
               f" — {'ready to train' if gap <= 0 else f'{gap} more before the next run'}")
     print(f"lock:          {(LOCK.read_text().strip() if LOCK.exists() else '') or 'free'}")
     try:
-        from datetime import timedelta
+        import ingest_video
         _, cl, bucket = r2()
-        since = (datetime.now(ZoneInfo(TZ)) - timedelta(hours=CLASSIFY_HOURS)).strftime("%Y%m%d-%H%M%S")
+        now_dt = datetime.now(ZoneInfo(TZ))
+        since = classify_since(now_dt, ingest_video.config(), s.get("classify_floor", ""))
         cov = coverage(list(recording_keys(cl, bucket)), s.get("classified", []), since)
-        print(f"coverage (last {CLASSIFY_HOURS}h):")
+        default_since = classify_since(now_dt, {})
+        label = (f"since {since}" if since != default_since else f"last {CLASSIFY_HOURS}h")
+        print(f"coverage ({label}):")
         for hour in sorted(cov):
             parts = ", ".join(f"{cam} {c}/{r}" for cam, (c, r) in sorted(cov[hour].items()))
             print(f"  {hour}  {parts}")
@@ -1895,6 +1947,22 @@ def journeys_check():
 
 
 def selfcheck():
+    from datetime import timedelta
+    classify_now = datetime(2026, 9, 27, 12)
+    classify_default = "20260925-120000"
+    assert classify_since(classify_now, {}) == classify_default
+    assert classify_since(classify_now + timedelta(hours=1), {}) == "20260925-130000"
+    assert classify_since(classify_now, {"classify_from": "20260926-000000"}) == "20260926-000000"
+    assert classify_since(classify_now, {"classify_from": "20260924-000000"}) == classify_default
+    assert classify_since(classify_now, {"classify_from": "2026092-000000"}) == classify_default
+    assert classify_since(classify_now, {"classify_from": None}) == classify_default
+    assert classify_since(classify_now, {"classify_from": "20260927-130000"}) == classify_default
+    assert classify_since(classify_now.replace(tzinfo=ZoneInfo(TZ)),
+                          {"classify_from": "20260927-130000"}) == classify_default
+    floor = classify_since(classify_now, {"classify_from": "20260926-120000"})
+    assert classify_since(classify_now, {"classify_from": "20260925-120000"}, floor) == floor
+    assert classify_since(classify_now, {"classify_from": "bad"}, floor) == floor
+    assert classify_since(classify_now, {}, floor) == floor
     keys = ["curation/pending/images/x.jpg", "models/champion.pt",
             "site1/cam3/20260827-100000.mkv", "site1/cam3/20260827-101000.mkv", "site1/cam3/20260827-102000.mkv",
             "RDA-TG-KTB/north/20260827-100000.mkv", "site1/cam3/notes.txt", "loose.mkv"]
@@ -1938,6 +2006,58 @@ def selfcheck():
     assert pick_classify(keys, classified=[], since="20260101-000000", per_pass=None) == \
         sorted((k for segs in cameras(keys).values() for k in segs), key=lambda k: (Path(k).stem, k)), \
         "per_pass=None: the whole window, unbounded"
+    # Live clips get the first slots; the oldest backlog keeps all remaining slots.
+    lane_now = datetime(2026, 9, 27, 12).timestamp()  # same local clock as cam_and_start
+    lane_since = "20260925-120000"
+    old = [f"site1/cam3/20260926-00{i:02d}00.mkv" for i in range(CLASSIFY_PER_PASS)]
+    fresh = ["site1/cam4/20260927-112000.mkv", "site1/cam3/20260927-110000.mkv"]
+
+    def round_picks(ks, classified=(), failed=()):
+        live = live_lane(ks, classified, lane_since, lane_now, failed)
+        drain = pick_classify(ks, classified, lane_since, per_pass=None)
+        return list(dict.fromkeys(live + [k for k in drain if k not in failed]))[:CLASSIFY_PER_PASS]
+
+    assert round_picks(old + fresh) == fresh + old[:CLASSIFY_PER_PASS - len(fresh)], \
+        "fresh cameras newest first, then oldest backlog, within the total cap"
+    assert live_lane(old + fresh, fresh[:1], lane_since, lane_now) == fresh[1:], \
+        "already classified fresh footage is not picked again"
+    assert round_picks(old + fresh, failed=fresh[:1]) == fresh[1:] + old[:CLASSIFY_PER_PASS - 1], \
+        "failed live footage is skipped by both lanes"
+    assert round_picks(old) == pick_classify(old, [], lane_since), "no live footage: same oldest-first drain"
+    assert round_picks(fresh) == fresh, "live picks are not duplicated in the drain"
+    earlier = "site1/cam3/20260927-105000.mkv"
+    assert live_lane(fresh + [earlier], [], lane_since, lane_now) == fresh + [earlier], \
+        "round-robin continues to each camera's next newest segment"
+    assert live_lane(fresh + [earlier], fresh, lane_since, lane_now) == [earlier], \
+        "pick the newest unclassified segment, even if a later one is already done"
+    assert live_lane([earlier, fresh[1]], [], lane_since, lane_now, failed=fresh) == [earlier], \
+        "a failed newest segment does not hide the next eligible one"
+    assert live_lane(fresh, [], "20260927-120000", lane_now) == [], "since still applies"
+    assert live_lane(["site1/cam3/20260927-060000.mkv"], [], lane_since, lane_now) == [], \
+        "exactly LIVE_HOURS old is outside the render window"
+    many = [f"gate{i}/cam/20260927-110000.mkv" for i in range(CLASSIFY_PER_PASS + 1)]
+    crowded = round_picks(old + many)
+    assert crowded == sorted(many, reverse=True)[:CLASSIFY_PER_PASS // 2] + old[:CLASSIFY_PER_PASS // 2], \
+        "live lane is capped at half the pass, then oldest backlog fills the rest"
+    lanes = ["site1/camA/20260927-115000.mkv", "site1/camA/20260927-114000.mkv",
+             "site1/camA/20260927-113000.mkv", "site1/camB/20260927-112000.mkv",
+             "site1/camB/20260927-111000.mkv", "site1/camB/20260927-110000.mkv"]
+    expected_lanes = [lanes[0], lanes[3], lanes[1], lanes[4], lanes[2], lanes[5]]
+    assert live_lane(lanes, [], lane_since, lane_now) == expected_lanes, \
+        "cameras take turns through all three newest clips each"
+    assert live_lane(lanes, [], lane_since, lane_now, limit=3) == expected_lanes[:3]
+    assert live_lane(lanes, [], lane_since, lane_now, limit=0) == []
+    edge = ["site1/cam3/20260927-063001.mkv", "site1/cam3/20260927-063000.mkv",
+            "site1/cam3/20260927-062959.mkv", "site1/cam3/20260927-120001.mkv"]
+    assert live_lane(edge, [], lane_since, lane_now) == [edge[0]], \
+        "30-minute margin is strict; older and future clips are ineligible"
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix="selfloop-bad-key-") as tmp:
+        prefix = Path(tmp).name
+    bad, sibling = f"{prefix}/cam3/invalid.mkv", f"{prefix}/cam3/20260927-110000.mkv"
+    assert len(bad.split("/")) == 3 and not Path(prefix).exists()
+    assert live_lane([bad, sibling], [], lane_since, lane_now) == [sibling], \
+        "an unparseable key must not strand a valid sibling in its camera"
     assert paused(keys, {"curation_paused": ["site1"]}) == \
         [k for k in keys if not k.startswith("site1/")], "paused gate's keys dropped"
     assert paused(keys, {"curation_paused": ["RDA-TG-KTB"]}) == \
