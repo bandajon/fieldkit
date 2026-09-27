@@ -70,6 +70,9 @@ CLASSIFY_PER_PASS = 12        # ~10 min of footage per camera per pass, at 600 s
 CLASSIFY_HOURS = 48           # what the gates keep mirrored: one backlog may span this;
                               # older gaps are a backfill job, not this pass's problem
 CLASSIFY_BUDGET = 3 * 3600    # seconds one classify pass drains for before checkpointing
+JOURNEYS_EVERY_S = 1200       # journeys_pass also runs mid-pass at this cadence: the RDA
+                              # dashboard should lag by tens of minutes, not by up to a
+                              # whole CLASSIFY_BUDGET waiting for the pass to finish.
                               # (state saved, lock released) — train and ingest wait out
                               # a backlog via classify_behind() regardless; this just
                               # bounds how long one pass can hold the lock. train --now
@@ -391,7 +394,14 @@ def horizon(keys, classified, gate, day, since, cam_cfg, now=None):
         prefix, cam = key_prefix.split("/")
         if gate_of(prefix) == gate and cam in handoff:
             by_cam.setdefault(cam, []).extend(segs)   # merge, never overwrite
-    starts = {k: ingest_video.cam_and_start(Path(k))[1] for segs in by_cam.values() for k in segs}
+    starts = {}
+    for segs in by_cam.values():
+        for k in segs:
+            try:
+                starts[k] = ingest_video.cam_and_start(Path(k))[1]
+            except Exception as e:     # not a real local file here (a bucket key) — mtime
+                print(f"  ! horizon: can't read {k}'s start ({e}) — skipping it", flush=True)
+    by_cam = {cam: [k for k in segs if k in starts] for cam, segs in by_cam.items()}
     newest = {cam: max((starts[k] for k in segs), default=float("-inf")) for cam, segs in by_cam.items()}
     gate_newest = max(newest.values(), default=float("-inf"))
     out = {}
@@ -878,7 +888,18 @@ def finalize(provisional, cutoff):
     return [j for j in provisional if max_t1[j["id"]] + FINAL_MARGIN <= watermark]
 
 
-def journeys_pass(cl, bucket, touched, cameras, tz, keys=(), classified=(), since=""):
+def cleared(built, provisional, cutoff):
+    """Which of `provisional` (the journeys owned by the day being rebuilt) may freeze,
+    given EVERY journey `built` from the same tracklets (including ones owned by a
+    neighbouring day, at the midnight boundary) — the watermark in finalize() must see all
+    of them: a still-open journey `d` whose own ts lands on the neighbouring day can hold
+    back a same-day `c` exactly as an open same-day journey would, or `c` freezes while `d`
+    is still free to grow and steal `c`'s rightful partner."""
+    ids = {j["id"] for j in finalize(built, cutoff)}
+    return [j for j in provisional if j["id"] in ids]
+
+
+def journeys_pass(cl, bucket, touched, cameras, tz, keys=(), classified=(), since="", classified_now=()):
     """Rebuild each touched (gate, day)'s fieldkit-journeys/<gate>/<YYYYMMDD>/journeys.jsonl
     from ALL its tracklets not already claimed by a frozen final/ batch, plus the WHOLE of
     the neighbouring days' (a vehicle can cross midnight, and a queued chain can span several
@@ -894,11 +915,13 @@ def journeys_pass(cl, bucket, touched, cameras, tz, keys=(), classified=(), sinc
     A provisional journey freezes only once BOTH: (a) its latest member clears FINAL_MARGIN
     against every camera `gate` owns (horizon()), not just the cameras it happens to touch,
     since an as-yet-uncaught-up partner could still hand it a new link, AND (b) it started
-    before every other still-open journey of the day (the time watermark, `b` below) —
-    freezing journey-by-journey instead let an early greedy link decision (chain `d` queued
-    past the cutoff steals lone `c`'s rightful partner `r`) become permanent once `c` froze
-    on its own, before `d` grew long enough to reclaim `r`. A journey parked over PARKED_S
-    is excluded from the watermark so it can't stall every other journey's freeze forever.
+    before every other still-open journey built from the SAME tracklets (the time watermark
+    in finalize()) — checked over every journey `journeys.build` produced here, not just the
+    ones this day owns: an open chain `d` whose own ts happens to land on the neighbouring
+    day (built from these same boundary tracklets) still has to hold a same-day `c` back, or
+    `c` freezes while `d` is free to grow and steal `c`'s rightful partner — one vehicle, two
+    final journeys, on two different days. A journey parked over PARKED_S is excluded from
+    the watermark so it can't stall every other journey's freeze forever.
     Final batches are put BEFORE journeys.jsonl, so a reader racing the two puts sees either
     the old journeys.jsonl (safe: it doesn't yet know the batch happened) or the new one
     alongside it — never a batch with no record of what it froze.
@@ -911,10 +934,17 @@ def journeys_pass(cl, bucket, touched, cameras, tz, keys=(), classified=(), sinc
     from datetime import timedelta
     import journeys
 
+    _cache = {}          # a day's docs read once per journeys_pass call, not once per (day
+                          # it's touched) x (day it's a neighbour of) — same day, same body.
+
     def docs(prefix):             # every manifest of the day; crops/ is never listed
-        for key in sorted(k for k in bucket_keys(cl, bucket, prefix, "/") if k.endswith(".jsonl")):
-            body = cl.get_object(Bucket=bucket, Key=key)["Body"].read().decode()
-            yield from (json.loads(l) for l in body.splitlines() if l.strip())
+        if prefix not in _cache:
+            _cache[prefix] = [json.loads(l)
+                               for key in sorted(k for k in bucket_keys(cl, bucket, prefix, "/")
+                                                  if k.endswith(".jsonl"))
+                               for l in cl.get_object(Bucket=bucket, Key=key)["Body"].read().decode()
+                                            .splitlines() if l.strip()]
+        return iter(_cache[prefix])
 
     def frozen_ids(where):
         return {m["id"] for j in docs(f"{JOURNEYS}{where}final/") for m in j["members"]}
@@ -925,75 +955,86 @@ def journeys_pass(cl, bucket, touched, cameras, tz, keys=(), classified=(), sinc
 
     total, still_open = 0, set()
     for gate, day in sorted(touched):
-        yyyymmdd = day.replace("-", "")
-        where = f"{gate}/{yyyymmdd}/"
-        d = datetime.strptime(yyyymmdd, "%Y%m%d")
-        prev8, next8 = (d - timedelta(days=1)).strftime("%Y%m%d"), (d + timedelta(days=1)).strftime("%Y%m%d")
-        own_raw, _ = side(yyyymmdd)
-        prev_raw, prev_w = side(prev8)
-        next_raw, next_w = side(next8)
-        # A vehicle's tracklet can be frozen under a NEIGHBOURING day's final/ batch (its
-        # journey's ts landed there) even though the tracklet file itself lives under this
-        # day — so the exclusion set is the union of all three days' frozen ids, applied to
-        # all three days' tracklets alike, never each day's own final/ against only its own.
-        fids = frozen_ids(where) | frozen_ids(prev_w) | frozen_ids(next_w)
-        tracklets = [for_upload(t, gate, f"{TRACKLETS}{w}crops/")
-                     for raw, w in ((own_raw, where), (prev_raw, prev_w), (next_raw, next_w))
-                     for t in raw if t["id"] not in fids]
-        events = {e["id"]: e for e in docs(EVENTS + where)}
-        events.update({e["id"]: e for e in docs(EVENTS + prev_w)})
-        events.update({e["id"]: e for e in docs(EVENTS + next_w)})
-        built = journeys.build(tracklets, cameras, tz, events)
-        # A boundary tracklet can pull in a journey that really belongs to the neighbouring
-        # day (it's rebuilt there too, from its own side of the same boundary) — keep only
-        # the ones whose own ts (Lusaka) lands on THIS day, or a vehicle crossing midnight
-        # would be double-built rather than merely double-read.
-        provisional = [j for j in built
-                       if datetime.fromisoformat(j["ts"]).astimezone(ZoneInfo(TZ)).strftime("%Y%m%d")
-                       == yyyymmdd]
-        frozen = list(docs(f"{JOURNEYS}{where}final/"))
-        if frozen:
-            # Sanity check, not routine: everything before a freeze's cutoff should already
-            # have been classified BEFORE it froze — a classified segment surfacing behind
-            # that point now means footage arrived late, and the journeys it belongs to may
-            # already have a final counterpart that never saw it. Loud, since it's the exact
-            # shape of the double-count these freezes exist to prevent.
-            import ingest_video as _iv
-            frozen_ts = max(datetime.fromisoformat(j["ts"]).timestamp() for j in frozen)
-            done = set(classified)
-            for k in keys:      # note: `cameras` here is the camera-config param, not the
-                                 # module helper — walk `keys` directly rather than group them
-                if (k in done and gate_of(k.split("/")[0]) == gate and Path(k).stem[:8] == yyyymmdd
-                        and _iv.cam_and_start(Path(k))[1] < frozen_ts - FINAL_MARGIN):
-                    print(f"  ! LATE FOOTAGE — possible duplicate journeys: {k} classified "
-                          f"behind {gate}/{yyyymmdd}'s latest frozen journey ts", flush=True)
+        try:
+            yyyymmdd = day.replace("-", "")
+            where = f"{gate}/{yyyymmdd}/"
+            d = datetime.strptime(yyyymmdd, "%Y%m%d")
+            prev8 = (d - timedelta(days=1)).strftime("%Y%m%d")
+            next8 = (d + timedelta(days=1)).strftime("%Y%m%d")
+            own_raw, _ = side(yyyymmdd)
+            prev_raw, prev_w = side(prev8)
+            next_raw, next_w = side(next8)
+            # A vehicle's tracklet can be frozen under a NEIGHBOURING day's final/ batch (its
+            # journey's ts landed there) even though the tracklet file itself lives under this
+            # day — so the exclusion set is the union of all three days' frozen ids, applied to
+            # all three days' tracklets alike, never each day's own final/ against only its own.
+            fids = frozen_ids(where) | frozen_ids(prev_w) | frozen_ids(next_w)
+            tracklets = [for_upload(t, gate, f"{TRACKLETS}{w}crops/")
+                         for raw, w in ((own_raw, where), (prev_raw, prev_w), (next_raw, next_w))
+                         for t in raw if t["id"] not in fids]
+            events = {e["id"]: e for e in docs(EVENTS + where)}
+            events.update({e["id"]: e for e in docs(EVENTS + prev_w)})
+            events.update({e["id"]: e for e in docs(EVENTS + next_w)})
+            built = journeys.build(tracklets, cameras, tz, events)
+            # A boundary tracklet can pull in a journey that really belongs to the neighbouring
+            # day (it's rebuilt there too, from its own side of the same boundary) — keep only
+            # the ones whose own ts (Lusaka) lands on THIS day, or a vehicle crossing midnight
+            # would be double-built rather than merely double-read.
+            on_day = (lambda j: datetime.fromisoformat(j["ts"]).astimezone(ZoneInfo(TZ))
+                      .strftime("%Y%m%d") == yyyymmdd)
+            provisional = [j for j in built if on_day(j)]
+            frozen = list(docs(f"{JOURNEYS}{where}final/"))
+            if frozen:
+                # Sanity check, not routine: everything classified BEFORE a freeze's cutoff
+                # should already have been in it — a segment classified just now (this pass,
+                # not ever) surfacing behind that point means footage arrived late, and the
+                # journeys it belongs to may already have a final counterpart that never saw
+                # it. Loud, since it's the exact shape of the double-count freezes prevent.
+                import ingest_video as _iv
+                frozen_ts = max(datetime.fromisoformat(j["ts"]).timestamp() for j in frozen)
+                for k in classified_now:      # only what THIS pass classified — every OLD
+                                               # classified segment is behind frozen_ts by
+                                               # construction, and would false-alarm on every day
+                    if (gate_of(k.split("/")[0]) == gate and Path(k).stem[:8] == yyyymmdd
+                            and _iv.cam_and_start(Path(k))[1] < frozen_ts - FINAL_MARGIN):
+                        print(f"  ! LATE FOOTAGE — possible duplicate journeys: {k} classified "
+                              f"behind {gate}/{yyyymmdd}'s latest frozen journey ts", flush=True)
 
-        h, abandoned = horizon(keys, classified, gate, yyyymmdd, since, cameras)
-        # min(h.values()): a journey freezes only once EVERY camera the gate owns is past it
-        # by FINAL_MARGIN — an uncaught-up partner could still hand a lone chain a new link.
-        # An empty h (no cameras at all) or any -inf (a camera not yet known caught up) both
-        # make this comparison fail for every journey, as they must.
-        cutoff = min(h.values(), default=float("-inf"))
-        newly_final = finalize(provisional, cutoff)
-        if newly_final:
-            existing = set(bucket_keys(cl, bucket, f"{JOURNEYS}{where}final/"))
-            ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-            key, n = f"{JOURNEYS}{where}final/{ts}.jsonl", 2
-            while key in existing:            # never overwrite an existing batch
-                key, n = f"{JOURNEYS}{where}final/{ts}-{n}.jsonl", n + 1
-            cl.put_object(Bucket=bucket, Key=key,
-                          Body="".join(json.dumps({**j, "gate": gate}) + "\n" for j in newly_final).encode(),
+            h, abandoned = horizon(keys, classified, gate, yyyymmdd, since, cameras)
+            # min(h.values()): a journey freezes only once EVERY camera the gate owns is past it
+            # by FINAL_MARGIN — an uncaught-up partner could still hand a lone chain a new link.
+            # An empty h (no cameras at all) or any -inf (a camera not yet known caught up) both
+            # make this comparison fail for every journey, as they must.
+            cutoff = min(h.values(), default=float("-inf"))
+            # The watermark (finalize()'s `b`) must see EVERY built journey, not just the ones
+            # owned by this day — an open chain `d` whose OWN ts lands on the neighbouring day
+            # (built from the same boundary tracklets) still has to hold back a same-day `c`,
+            # or `c` freezes while `d` is still free to grow and steal `c`'s rightful partner.
+            # Only journeys actually owned by this day are ever candidates to freeze, though.
+            newly_final = cleared(built, provisional, cutoff)
+            if newly_final:
+                existing = set(bucket_keys(cl, bucket, f"{JOURNEYS}{where}final/"))
+                ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                key, n = f"{JOURNEYS}{where}final/{ts}.jsonl", 2
+                while key in existing:            # never overwrite an existing batch
+                    key, n = f"{JOURNEYS}{where}final/{ts}-{n}.jsonl", n + 1
+                cl.put_object(Bucket=bucket, Key=key,
+                              Body="".join(json.dumps({**j, "gate": gate}) + "\n"
+                                           for j in newly_final).encode(),
+                              ContentType="application/json")
+
+            js = frozen + provisional
+            cl.put_object(Bucket=bucket, Key=f"{JOURNEYS}{where}journeys.jsonl",
+                          Body="".join(json.dumps({**j, "gate": gate}) + "\n" for j in js).encode(),
                           ContentType="application/json")
-
-        js = frozen + provisional
-        cl.put_object(Bucket=bucket, Key=f"{JOURNEYS}{where}journeys.jsonl",
-                      Body="".join(json.dumps({**j, "gate": gate}) + "\n" for j in js).encode(),
-                      ContentType="application/json")
-        print(f"    {len(provisional)} journey(s), {len(newly_final)} final, "
-              f"{abandoned} abandoned segment(s) -> {JOURNEYS}{where}", flush=True)
-        total += len(provisional)
-        if len(provisional) > len(newly_final):
-            still_open.add((gate, day))
+            print(f"    {len(provisional)} journey(s), {len(newly_final)} final, "
+                  f"{abandoned} abandoned segment(s) -> {JOURNEYS}{where}", flush=True)
+            total += len(provisional)
+            if len(provisional) > len(newly_final):
+                still_open.add((gate, day))
+        except Exception as e:    # one bad key or JSON line must not stop every other day
+            print(f"  ! journeys {gate} {day}: {e}", flush=True)
+            still_open.add((gate, day))     # leave it in open_days: retry next pass
     return total, still_open
 
 
@@ -1057,91 +1098,111 @@ def classify_pass():
                           for k in fresh for s8 in [Path(k).stem[:8]]}
             s["open_days"] = sorted(list(p) for p in open_days)
             save_state(s)
-        deadline = time.monotonic() + CLASSIFY_BUDGET
-        expired = False
-        while not expired:
-            keys = list(recording_keys(cl, bucket))   # re-listed each round: picks up arrivals
-            all_todo = pick_classify(keys, s.get("classified", []), since, per_pass=None)
-            left = len(all_todo)          # honest backlog count, failed segments included
-            todo = [k for k in all_todo if k not in failed][:CLASSIFY_PER_PASS]
-            if not todo:
-                break
-            print(f"{now()} classify: {len(todo)} segment(s), {left} left in the window", flush=True)
-            # Downloads run ~85-90s of a ~210s segment over the office link: the next
-            # segment's download overlaps this one's detection instead of stalling after it.
-            pending = pool.submit(download, todo[0])
-            for i, key in enumerate(todo):
-                if time.monotonic() > deadline:
-                    # Checked per segment, not per round: a round is ~12 segments, and the
-                    # budget must not run 45 min over its own limit. The in-flight prefetch
-                    # is awaited and discarded rather than left downloaded on disk.
-                    try:
-                        pending.result().unlink(missing_ok=True)
-                    except Exception:
-                        pass
-                    expired = True
-                    break
-                prefix, cam_name, seg = key.split("/")
-                gate = gate_of(prefix)
-                cfg = {**base, "detect_weights": str(CHAMPION), "toll_gate_id": gate}
-                if ATTRS_CHAMPION.is_file():
-                    cfg["attr_weights"] = str(ATTRS_CHAMPION)
-                if PLATE.is_file():
-                    cfg["plate_weights"] = str(PLATE)
-                # Heading rides on the camera's config entry; without one there is no
-                # direction on these events, which is right — it is never guessed.
-                cam = next((c for c in (base.get("cameras") or []) if c.get("name") == cam_name),
-                           {"name": cam_name})
-                print(f"  v {key}", flush=True)
-                try:
-                    video = pending.result()
-                except Exception as e:       # a download failure is this segment's error
-                    failed.add(key)
-                    print(f"  ! {key}: {e}", flush=True)
-                    video = None
-                # Submitted regardless of this segment's outcome: the next download must
-                # not wait on this one's detection, or the overlap is lost to a failure.
-                if i + 1 < len(todo):
-                    pending = pool.submit(download, todo[i + 1])
-                if video is None:
-                    continue
-                out = None
-                try:
-                    out = Path(tempfile.mkdtemp())
-                    # The recorder's own filename is the footage clock: keep it, or
-                    # cam_and_start falls back to mtime and every event is stamped
-                    # with the download.
-                    day, _ = detect.classify_segment(video, cam, cfg, tz, out, source_key=key)
-                    n = publish(cl, bucket, out, gate, key, day)
-                    new_days = {(gate, js.stem) for js in (out / "tracklets").glob("*.jsonl")}
-                    touched |= new_days
-                    open_days |= new_days
-                    # Recorded only once published: a segment that died mid-pass is retried
-                    # next tick rather than lost, and re-running it rewrites the same keys.
-                    # open_days saved in the SAME call, not only after journeys_pass succeeds
-                    # later: a crash between here and there must not lose track of a day that
-                    # now has provisional journeys to revisit.
-                    s["classified"] = (s.get("classified", []) + [key])[-REMEMBER_CLASSIFIED:]
-                    s["open_days"] = sorted(list(p) for p in open_days)
-                    save_state(s)
-                    done, events = done + 1, events + n
-                    print(f"    {n} event(s) -> {EVENTS}{gate}/{day.replace('-', '')}/", flush=True)
-                except Exception as e:       # one bad segment must not strand the rest
-                    failed.add(key)
-                    print(f"  ! {key}: {e}", flush=True)
-                finally:
-                    video.unlink(missing_ok=True)   # never leave a prefetched file behind
-                    if out is not None:
-                        shutil.rmtree(out, ignore_errors=True)
+        classified_now = set()
+        last_journeys = time.monotonic()
+
+        def run_journeys():
+            nonlocal open_days, touched, last_journeys
             try:
                 _, still_open = journeys_pass(cl, bucket, touched | open_days, base.get("cameras") or [], tz,
-                                              keys, s.get("classified", []), since)
+                                              keys, s.get("classified", []), since, classified_now)
                 open_days = prune_open_days(open_days | touched, still_open, datetime.now(ZoneInfo(TZ)).date())
                 s["open_days"] = sorted(list(p) for p in open_days)
                 save_state(s)
                 touched.clear()
             except Exception as e:       # journeys ride beside events; they never cost a classify
                 print(f"  ! journeys: {e}", flush=True)
+            last_journeys = time.monotonic()
+
+        deadline = time.monotonic() + CLASSIFY_BUDGET
+        expired = False
+        try:
+            while not expired:
+                keys = list(recording_keys(cl, bucket))   # re-listed each round: picks up arrivals
+                all_todo = pick_classify(keys, s.get("classified", []), since, per_pass=None)
+                left = len(all_todo)          # honest backlog count, failed segments included
+                todo = [k for k in all_todo if k not in failed][:CLASSIFY_PER_PASS]
+                if not todo:
+                    break
+                print(f"{now()} classify: {len(todo)} segment(s), {left} left in the window", flush=True)
+                # Downloads run ~85-90s of a ~210s segment over the office link: the next
+                # segment's download overlaps this one's detection instead of stalling after it.
+                pending = pool.submit(download, todo[0])
+                for i, key in enumerate(todo):
+                    if time.monotonic() > deadline:
+                        # Checked per segment, not per round: a round is ~12 segments, and the
+                        # budget must not run 45 min over its own limit. The in-flight prefetch
+                        # is awaited and discarded rather than left downloaded on disk.
+                        try:
+                            pending.result().unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                        expired = True
+                        break
+                    prefix, cam_name, seg = key.split("/")
+                    gate = gate_of(prefix)
+                    cfg = {**base, "detect_weights": str(CHAMPION), "toll_gate_id": gate}
+                    if ATTRS_CHAMPION.is_file():
+                        cfg["attr_weights"] = str(ATTRS_CHAMPION)
+                    if PLATE.is_file():
+                        cfg["plate_weights"] = str(PLATE)
+                    # Heading rides on the camera's config entry; without one there is no
+                    # direction on these events, which is right — it is never guessed.
+                    cam = next((c for c in (base.get("cameras") or []) if c.get("name") == cam_name),
+                               {"name": cam_name})
+                    print(f"  v {key}", flush=True)
+                    try:
+                        video = pending.result()
+                    except Exception as e:       # a download failure is this segment's error
+                        failed.add(key)
+                        print(f"  ! {key}: {e}", flush=True)
+                        video = None
+                    # Submitted regardless of this segment's outcome: the next download must
+                    # not wait on this one's detection, or the overlap is lost to a failure.
+                    if i + 1 < len(todo):
+                        pending = pool.submit(download, todo[i + 1])
+                    if video is None:
+                        continue
+                    out = None
+                    try:
+                        out = Path(tempfile.mkdtemp())
+                        # The recorder's own filename is the footage clock: keep it, or
+                        # cam_and_start falls back to mtime and every event is stamped
+                        # with the download.
+                        day, _ = detect.classify_segment(video, cam, cfg, tz, out, source_key=key)
+                        n = publish(cl, bucket, out, gate, key, day)
+                        new_days = {(gate, js.stem) for js in (out / "tracklets").glob("*.jsonl")}
+                        touched |= new_days
+                        open_days |= new_days
+                        classified_now.add(key)
+                        # Recorded only once published: a segment that died mid-pass is retried
+                        # next tick rather than lost, and re-running it rewrites the same keys.
+                        # open_days saved in the SAME call, not only after journeys_pass succeeds
+                        # later: a crash between here and there must not lose track of a day that
+                        # now has provisional journeys to revisit.
+                        s["classified"] = (s.get("classified", []) + [key])[-REMEMBER_CLASSIFIED:]
+                        s["open_days"] = sorted(list(p) for p in open_days)
+                        save_state(s)
+                        done, events = done + 1, events + n
+                        print(f"    {n} event(s) -> {EVENTS}{gate}/{day.replace('-', '')}/", flush=True)
+                    except Exception as e:       # one bad segment must not strand the rest
+                        failed.add(key)
+                        print(f"  ! {key}: {e}", flush=True)
+                    finally:
+                        video.unlink(missing_ok=True)   # never leave a prefetched file behind
+                        if out is not None:
+                            shutil.rmtree(out, ignore_errors=True)
+                # Not every round — journeys_pass re-reads whole days, so calling it on
+                # every ~12-segment round multiplied that cost for no benefit. But not only
+                # in `finally` either: with CLASSIFY_BUDGET at 3h, that alone could leave the
+                # RDA dashboard up to 3h stale when it should lag by tens of minutes.
+                if time.monotonic() - last_journeys >= JOURNEYS_EVERY_S:
+                    run_journeys()
+        finally:
+            # Always once more here: touched/open_days accumulate round by round precisely
+            # so a crash or an uncaught exception in the loop still gets a chance to freeze
+            # what's already classified, instead of losing it until the next pass notices.
+            run_journeys()
         # A segment that keeps failing must not starve hunt/ingest/train for 48h: it stays
         # in `left` for status, but not in the count classify_behind() acts on — it will
         # be retried next pass regardless, since it is never added to s["classified"].
@@ -1918,6 +1979,12 @@ def selfcheck():
     # watermark: it can't hold c back the way d did, even though it hasn't cleared itself.
     d_parked = {"id": "dp", "members": [{"t0": 90, "t1": 999_800}], "dwell_s": PARKED_S + 1}
     assert finalize([c, d_parked], cutoff=1_000_000) == [c], "a parked journey can't stall the watermark"
+    # cleared(): d's ts lands on the NEIGHBOURING day (it's not in `provisional`, only in
+    # `built`) but must still hold c back — the regression the midnight change introduced,
+    # where the watermark only saw the day's own journeys and missed a boundary d entirely.
+    assert cleared(built=[c, d], provisional=[c], cutoff=1_000_000) == [], \
+        "d not owned by this day, but still open: c held back all the same"
+    assert cleared(built=[c], provisional=[c], cutoff=1_000_000) == [c], "no d at all: c freezes"
 
     today0819 = datetime(2026, 8, 26).date()
     assert prune_open_days(set(), {("G", "2026-08-19")}, today0819) == set(), \
