@@ -340,6 +340,30 @@ def coverage_manifests(keys, classified, since):
     return out
 
 
+def settled_until(keys, classified, gate, day, tz):
+    """until[cam] = the local-time (unix epoch) moment after which `gate`/`day`'s journeys
+    can no longer gain or lose a link from `cam`: the start of the earliest of that day's
+    recorded segments still unclassified, or — once every recorded segment is classified —
+    the start of the last one plus its 600s length. Cameras with nothing recorded that day
+    are omitted; `day` is "YYYYMMDD"."""
+    done = set(classified)
+    out = {}
+    for key, segs in cameras(keys).items():
+        prefix, cam = key.split("/")
+        if gate_of(prefix) != gate:
+            continue
+        todo = sorted((Path(k).stem, k) for k in segs if Path(k).stem[:8] == day)
+        if not todo:
+            continue
+        stems = [s for s, _ in todo]
+        unclassified = [s for s, k in todo if k not in done]
+        stem = unclassified[0] if unclassified else stems[-1]
+        epoch = datetime.strptime(stem, "%Y%m%d-%H%M%S").replace(tzinfo=tz).timestamp()
+        epoch += 0 if unclassified else 600
+        out[cam] = min(epoch, out[cam]) if cam in out else epoch
+    return out
+
+
 def for_upload(doc, gate, to="crops/"):
     """One event (or tracklet) as the importer reads it: stamped with the gate it came
     from, and its crop paths flattened — the bucket keeps one crops/ folder per day, not
@@ -730,7 +754,7 @@ def publish(cl, bucket, out, gate, source_key, day):
     return total
 
 
-def journeys_pass(cl, bucket, touched, cameras, tz):
+def journeys_pass(cl, bucket, touched, cameras, tz, keys=(), classified=()):
     """Rebuild each touched (gate, day) from ALL that day's tracklets into
     fieldkit-journeys/<gate>/<YYYYMMDD>/journeys.jsonl, one line per vehicle across a
     camera pair, with attrs from the day's events. Only cameras with `handoff` config
@@ -739,7 +763,12 @@ def journeys_pass(cl, bucket, touched, cameras, tz):
     ponytail: the whole day is rebuilt every pass — journey ids are deterministic, so the
     overwrite is idempotent; switching the importer to journeys will want finalized
     windows instead. A vehicle crossing midnight splits in two: the neighbouring day's
-    tracklets aren't loaded. Crops are cited by bucket key, never copied."""
+    tracklets aren't loaded. Crops are cited by bucket key, never copied.
+
+    Right after journeys.jsonl, also puts settled.json: the horizon (settled_until, per
+    camera) past which that day's journeys can no longer change. Written second so a reader
+    racing the two puts sees new journeys with an older, more conservative horizon — never
+    the reverse."""
     if not any(c.get("handoff") for c in cameras):
         return 0
     import journeys
@@ -751,7 +780,8 @@ def journeys_pass(cl, bucket, touched, cameras, tz):
 
     total = 0
     for gate, day in sorted(touched):
-        where = f"{gate}/{day.replace('-', '')}/"
+        yyyymmdd = day.replace("-", "")
+        where = f"{gate}/{yyyymmdd}/"
         tracklets = [for_upload(t, gate, f"{TRACKLETS}{where}crops/") for t in docs(TRACKLETS + where)]
         events = {e["id"]: e for e in docs(EVENTS + where)}
         js = journeys.build(tracklets, cameras, tz, events)
@@ -760,6 +790,10 @@ def journeys_pass(cl, bucket, touched, cameras, tz):
                       ContentType="application/json")
         print(f"    {len(js)} journey(s) -> {JOURNEYS}{where}", flush=True)
         total += len(js)
+        until = settled_until(keys, classified, gate, yyyymmdd, tz)
+        cl.put_object(Bucket=bucket, Key=f"{JOURNEYS}{where}settled.json",
+                      Body=json.dumps({"gate": gate, "day": yyyymmdd, "built": now(), "until": until}).encode(),
+                      ContentType="application/json")
     return total
 
 
@@ -871,7 +905,8 @@ def classify_pass():
                     if out is not None:
                         shutil.rmtree(out, ignore_errors=True)
             try:
-                journeys_pass(cl, bucket, touched, base.get("cameras") or [], tz)
+                journeys_pass(cl, bucket, touched, base.get("cameras") or [], tz,
+                              keys, s.get("classified", []))
                 touched.clear()
             except Exception as e:       # journeys ride beside events; they never cost a classify
                 print(f"  ! journeys: {e}", flush=True)
@@ -1441,7 +1476,11 @@ def journeys_check():
             {"name": "cam4", "heading": "north", "handoff": {"camera": "cam3", "zone": [0.0, 0.55, 0.22, 0.30]}}]
     cl = FakeS3(objs)
     assert journeys_pass(cl, "buck", {("G", "2026-08-19")}, cams, timezone.utc) == 1
-    assert list(cl.put) == ["fieldkit-journeys/G/20260819/journeys.jsonl"], cl.put
+    assert set(cl.put) == {"fieldkit-journeys/G/20260819/journeys.jsonl",
+                           "fieldkit-journeys/G/20260819/settled.json"}, cl.put
+    settled = json.loads(cl.put["fieldkit-journeys/G/20260819/settled.json"])
+    assert settled == {"gate": "G", "day": "20260819", "built": settled["built"], "until": {}}, \
+        "no keys/classified given: nothing recorded, so no camera is due a horizon"
     assert not any("/crops/" in k for k in cl.listed), cl.listed
     [j] = map(json.loads, cl.put["fieldkit-journeys/G/20260819/journeys.jsonl"].decode().splitlines())
     assert j["gate"] == "G" and j["link"] and j["attrs"] == {"axles": "5"}, j
@@ -1515,6 +1554,18 @@ def selfcheck():
     mid = coverage_manifests(keys, classified=["site1/cam3/20260827-100000.mkv"], since="20260827-101500")
     assert mid[("RDA-TG-KTB", "20260827")]["cam3"]["recorded"] == \
         ["20260827-100000", "20260827-101000", "20260827-102000"], "day filled whole, not clipped by since"
+    until = settled_until(keys, classified=["site1/cam3/20260827-100000.mkv"],
+                          gate="RDA-TG-KTB", day="20260827", tz=timezone.utc)
+    assert until["cam3"] == datetime(2026, 8, 27, 10, 10, tzinfo=timezone.utc).timestamp(), \
+        "10:10 unclassified: until is its own start"
+    until_all = settled_until(keys, classified=[k for k in keys if "site1/cam3" in k],
+                              gate="RDA-TG-KTB", day="20260827", tz=timezone.utc)
+    assert until_all["cam3"] == datetime(2026, 8, 27, 10, 20, tzinfo=timezone.utc).timestamp() + 600, \
+        "every segment classified: until is the last one's start + segment length"
+    other_day = keys + ["site1/cam3/20260828-100000.mkv"]
+    assert settled_until(other_day, classified=["site1/cam3/20260827-100000.mkv"], gate="RDA-TG-KTB",
+                         day="20260827", tz=timezone.utc)["cam3"] == until["cam3"], \
+        "a segment from another day is ignored"
     assert not classify_behind({"classify_backlog": {"at": now(), "left": 0}}), "nothing left"
     assert classify_behind({"classify_backlog": {"at": now(), "left": 3}}), "fresh backlog"
     from datetime import timedelta
