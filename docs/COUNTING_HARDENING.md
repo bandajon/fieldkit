@@ -87,10 +87,20 @@ There is no ground truth yet, and no change can be judged without it. Build it b
 - **`fieldkit-journeys/<gate>/<day>/final/*.jsonl`** is the importer's no-double-count guarantee, not `journeys.jsonl`. Each batch is
   immutable and append-only (a new timestamped file per pass that freezes anything, never a rewrite of an old one); a tracklet belongs
   to at most one final journey, ever. `journeys_pass()` only builds provisional journeys from tracklets NOT already claimed by a final
-  batch, so re-linking one later (once its partner camera catches up) can never re-import it. A provisional journey freezes once
-  `max(member t1) + FINAL_MARGIN (300 s) ≤ horizon()` for every camera the gate owns, not just the ones it happens to touch — an
-  as-yet-uncaught-up partner could still hand a lone chain a new link. `journeys.jsonl` (frozen + provisional) is informational only —
-  status/eval, never the importer.
+  batch (of the day, and of the day either side of it, so a vehicle crossing midnight is not double-built), so re-linking one later
+  (once its partner camera catches up) can never re-import it.
+  - **classify_pass never re-classifies a segment R2 already has an events manifest for** (`published_manifests()`), regardless of
+    what local state remembers — re-classifying mints new tracklet ids and would re-freeze vehicles already counted.
+  - A provisional journey freezes only once BOTH: `max(member t1) + FINAL_MARGIN (300 s) ≤ horizon()` for every handoff camera the
+    gate owns (not just the ones it happens to touch — an as-yet-uncaught-up partner could still hand a lone chain a new link), AND
+    it started before every other still-open journey of the day (the time watermark in `finalize()`) — freezing journey-by-journey
+    let an early greedy link decision become permanent instead. A journey parked over `PARKED_S` (1800 s) is excluded from that
+    watermark so it can't stall every other journey's freeze.
+  - `horizon()` treats a handoff camera as dead (non-blocking) once every other handoff camera of the gate has moved on without it
+    for `DEAD_AFTER_S` (6 h) — silent or renamed equipment must not stall or drop a day forever.
+  - `classify_pass` tracks `open_days` (days that still had provisional journeys after a pass) and revisits them until they freeze
+    or turn 7 days old; a day dropped at 7 days with journeys still open logs "LOST COUNTS" — that is a real gap, not noise.
+  - `journeys.jsonl` (frozen + provisional) is informational only — status/eval, never the importer.
 - **Changing ids of journeys that were already imported** creates duplicates in RDA. That happens if you change the member set of a
   final journey, the id scheme, or the tracklet ids of a day whose final batches have already been imported. The importer logs
   `FieldKit journeys changed id after import`. A deliberate re-count of past days needs a coordinated RDA-side replace (ask; don't
