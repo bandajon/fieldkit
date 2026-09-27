@@ -86,9 +86,10 @@ There is no ground truth yet, and no change can be judged without it. Build it b
   - Journey ids must stay **deterministic** (sha256 of sorted member tracklet ids). The importer imports each id once.
 - **`fieldkit-journeys/<gate>/<day>/final/*.jsonl`** is the importer's no-double-count guarantee, not `journeys.jsonl`. Each batch is
   immutable and append-only (a new timestamped file per pass that freezes anything, never a rewrite of an old one); a tracklet belongs
-  to at most one final journey, ever. `journeys_pass()` only builds provisional journeys from tracklets NOT already claimed by a final
-  batch (of the day, and of the day either side of it, so a vehicle crossing midnight is not double-built), so re-linking one later
-  (once its partner camera catches up) can never re-import it.
+  to at most one final journey, ever. `journeys_pass()` loads the FULL day either side of the touched one too (not just a boundary
+  sliver — a queued truck's chain can span several minutes across midnight) and excludes tracklets frozen in ANY of the three days'
+  final/ batches from ALL three, since a boundary vehicle's journey can be frozen under either day's dir while its tracklet file
+  lives under the other's; re-linking one later (once its partner camera catches up) can never re-import it.
   - **classify_pass never re-classifies a segment R2 already has an events manifest for** (`published_manifests()`), regardless of
     what local state remembers — re-classifying mints new tracklet ids and would re-freeze vehicles already counted.
   - A provisional journey freezes only once BOTH: `max(member t1) + FINAL_MARGIN (300 s) ≤ horizon()` for every handoff camera the
@@ -97,9 +98,18 @@ There is no ground truth yet, and no change can be judged without it. Build it b
     let an early greedy link decision become permanent instead. A journey parked over `PARKED_S` (1800 s) is excluded from that
     watermark so it can't stall every other journey's freeze.
   - `horizon()` treats a handoff camera as dead (non-blocking) once every other handoff camera of the gate has moved on without it
-    for `DEAD_AFTER_S` (6 h) — silent or renamed equipment must not stall or drop a day forever.
-  - `classify_pass` tracks `open_days` (days that still had provisional journeys after a pass) and revisits them until they freeze
-    or turn 7 days old; a day dropped at 7 days with journeys still open logs "LOST COUNTS" — that is a real gap, not noise.
+    for `DEAD_AFTER_S` — **24 h**, checked before anything else (a camera can go dead mid-day, not just never catch up). Raised from
+    an earlier 6 h because Katuba's own upload lag has exceeded 6 h; 24 h still leaves late-but-arriving footage able to block
+    before the 7-day open-days window (below) would drop the day. The same constant bounds gap recency (a >`GAP_S` gap inside a
+    camera's segments only blocks if the segment after it is <24h old — an older gap is a real outage, not a live one).
+  - `journeys_pass` logs a loud "LATE FOOTAGE — possible duplicate journeys" line when a day being rebuilt has a classified segment
+    starting behind that day's latest frozen journey's `ts` minus `FINAL_MARGIN` — footage that arrived after that day was already
+    frozen past it, which the freeze design assumes can't happen; if it fires, check for a duplicate import by hand.
+  - `classify_pass` tracks `open_days` (days that still had provisional journeys after a pass, updated in the SAME `save_state` call
+    as `s["classified"]` — recovered R2 manifests too — so a crash can't separate "classified" from "still needs watching for a
+    freeze") and revisits them until they freeze or turn 7 days old; a day dropped at 7 days with journeys still open logs
+    "LOST COUNTS" — that is a real gap, not noise. **The RDA importer's scan window must exceed 7 days**, or it can miss a final
+    batch that lands after classify_pass has already stopped tracking that day.
   - `journeys.jsonl` (frozen + provisional) is informational only — status/eval, never the importer.
 - **Changing ids of journeys that were already imported** creates duplicates in RDA. That happens if you change the member set of a
   final journey, the id scheme, or the tracklet ids of a day whose final batches have already been imported. The importer logs
