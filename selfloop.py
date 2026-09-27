@@ -59,6 +59,10 @@ TRACKLETS = "fieldkit-tracklets/"   # every track, counted or not: the journey b
 # One line per vehicle across a camera pair — beside EVENTS, not instead of it, until the
 # counts are compared.
 JOURNEYS = "fieldkit-journeys/"
+ANNOTATED = "fieldkit-annotated/"   # DeepStream-style rendered clips, for the RDA dashboard's live view
+LIVE_HOURS = 6         # only this recent a segment is worth rendering — a backlog must
+                       # never slow classification down waiting on video encodes
+ANNOTATED_KEEP_DAYS = 3
 PLATE = DATASET / "plate.pt"  # optional plate model: evidence crops only, never a count
 # The Katuba box still calls itself site1; anything already named RDA-TG-* is its own id.
 GATES = {"site1": "RDA-TG-KTB"}
@@ -1081,7 +1085,7 @@ def classify_pass():
             return dest
 
         done = events = left = 0
-        touched, failed, keys, all_todo = set(), set(), [], []
+        touched, failed, keys, all_todo, rendered = set(), set(), [], [], set()
         open_days = {tuple(p) for p in s.get("open_days", [])}
         # R2, not local state, is the authority on "classified" (published_manifests'
         # docstring): merge in anything the bucket already has that local state forgot,
@@ -1163,13 +1167,21 @@ def classify_pass():
                         pending = pool.submit(download, todo[i + 1])
                     if video is None:
                         continue
-                    out = None
+                    out = clip = None
                     try:
                         out = Path(tempfile.mkdtemp())
+                        # Only footage recent enough to still matter as a "live view" is worth
+                        # the encode time — a backlog must classify at full speed regardless.
+                        seg_start = ingest_video.cam_and_start(video)[1]
+                        live = seg_start > time.time() - LIVE_HOURS * 3600
+                        clip = out / "annotated.mp4" if live else None
+                        t0 = time.monotonic()
                         # The recorder's own filename is the footage clock: keep it, or
                         # cam_and_start falls back to mtime and every event is stamped
                         # with the download.
-                        day, _ = detect.classify_segment(video, cam, cfg, tz, out, source_key=key)
+                        day, _, render_ok = detect.classify_segment(video, cam, cfg, tz, out, source_key=key,
+                                                                    render_to=clip, gate=gate)
+                        render_s = time.monotonic() - t0 if live else 0
                         n = publish(cl, bucket, out, gate, key, day)
                         new_days = {(gate, js.stem) for js in (out / "tracklets").glob("*.jsonl")}
                         touched |= new_days
@@ -1184,7 +1196,18 @@ def classify_pass():
                         s["open_days"] = sorted(list(p) for p in open_days)
                         save_state(s)
                         done, events = done + 1, events + n
-                        print(f"    {n} event(s) -> {EVENTS}{gate}/{day.replace('-', '')}/", flush=True)
+                        # The clip is a bonus, uploaded only once the segment itself is safely
+                        # classified: a failed upload must never fail (or retry) the segment.
+                        if render_ok:
+                            try:
+                                cl.upload_file(str(clip), bucket,
+                                               f"{ANNOTATED}{gate}/{cam_name}/{Path(key).stem}.mp4",
+                                               ExtraArgs={"ContentType": "video/mp4"})
+                                rendered.add((gate, cam_name))
+                            except Exception as e:
+                                print(f"  ! annotated upload {key}: {e}", flush=True)
+                        print(f"    {n} event(s) -> {EVENTS}{gate}/{day.replace('-', '')}/"
+                              + (f" ({render_s:.0f}s to render)" if live else ""), flush=True)
                     except Exception as e:       # one bad segment must not strand the rest
                         failed.add(key)
                         print(f"  ! {key}: {e}", flush=True)
@@ -1215,8 +1238,20 @@ def classify_pass():
                           Body=json.dumps({"gate": gate, "day": day, "updated": now(),
                                           "cameras": cams}).encode(),
                           ContentType="application/json")
+        for gate, cam_name in rendered:
+            prune_annotated(cl, bucket, gate, cam_name)
         print(f"{now()} classify: {done} segment(s), {events} event(s) published, "
               f"{left} left in the window", flush=True)
+
+
+def prune_annotated(cl, bucket, gate, cam_name):
+    """Delete this camera's annotated clips older than ANNOTATED_KEEP_DAYS — listed by
+    its own gate/cam prefix only, never the whole bucket."""
+    from datetime import timedelta
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=ANNOTATED_KEEP_DAYS)).strftime("%Y%m%d-%H%M%S")
+    for key in bucket_keys(cl, bucket, f"{ANNOTATED}{gate}/{cam_name}/"):
+        if Path(key).stem < cutoff:
+            cl.delete_object(Bucket=bucket, Key=key)
 
 
 def train_pass(force=False):
@@ -2011,6 +2046,17 @@ def selfcheck():
     assert up == {"id": "c-1", "gate": "RDA-TG-KTB",
                   "crops": {"best": "crops/c-1-best.jpg"}}, up
     assert for_upload({"id": "q"}, "G")["crops"] == {}, "a crop-less event still uploads"
+    # Live-render gate: only a segment started within LIVE_HOURS is worth encoding.
+    now_ts = datetime.now(timezone.utc).timestamp()
+    assert now_ts - (now_ts - 3600) < LIVE_HOURS * 3600, "1h old: still live"
+    assert not (now_ts - (now_ts - (LIVE_HOURS + 1) * 3600) < LIVE_HOURS * 3600), \
+        f"{LIVE_HOURS + 1}h old: backlog, not live"
+    # Retention: only clips past ANNOTATED_KEEP_DAYS are selected for deletion.
+    from datetime import timedelta
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=ANNOTATED_KEEP_DAYS)).strftime("%Y%m%d-%H%M%S")
+    fresh = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y%m%d-%H%M%S")
+    stale = (datetime.now(timezone.utc) - timedelta(days=ANNOTATED_KEEP_DAYS + 1)).strftime("%Y%m%d-%H%M%S")
+    assert fresh >= cutoff and stale < cutoff, "the stems the prune keeps vs. drops"
     lock_check()
     publish_check()
     listing_check()

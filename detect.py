@@ -422,6 +422,80 @@ def annotate(img, dets, quality=85):
     return buf.getvalue()
 
 
+def render_frame(img, tracks, display, trails, cam, header):
+    """One classified frame with a DeepStream-style overlay, for the live annotated clip:
+    boxes + "#id class conf%" chips, a dotted trail per track, the count line and handoff
+    zone faint in the background, and a header strip. `tracks` is {tid: t} for the ids
+    seen THIS frame only; `trails` is {tid: (display class, [(x, y), ...])}, oldest first.
+    Matches annotate()'s look (translucent alpha-composited layer) rather than duplicating
+    a second style. Returns a new RGB image at RENDER_SIZE.
+
+    `img` is resized to RENDER_SIZE FIRST and every coordinate scaled to match, so the
+    alpha-composite (the expensive part) runs on ~1/4 the pixels of a 1080p frame instead
+    of compositing full-res then throwing the detail away on the caller's resize.
+    """
+    from PIL import Image, ImageDraw, ImageFont
+
+    sx, sy = RENDER_SIZE[0] / img.width, RENDER_SIZE[1] / img.height
+    if img.size == (RENDER_SIZE[0] * 2, RENDER_SIZE[1] * 2):
+        img = img.reduce(2)          # exact 2x, an integer box reduce: a few ms vs. bilinear's
+    else:
+        img = img.resize(RENDER_SIZE, Image.BILINEAR)   # bilinear: half the cost of the
+                                                         # default resample, and this is a live preview
+
+    try:
+        font = ImageFont.load_default(size=max(14, img.width // 60))
+    except TypeError:
+        font = ImageFont.load_default()
+    layer = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    d = ImageDraw.Draw(layer)
+
+    travel = travel_of(cam) or {}
+    axis = 0 if travel.get("axis") == "x" else 1
+    line = count_line(cam)
+    if line is not None:
+        pos = line * (img.width if axis == 0 else img.height)
+        pts = [(pos, 0), (pos, img.height)] if axis == 0 else [(0, pos), (img.width, pos)]
+        d.line(pts, fill=(255, 255, 0, 90), width=2)
+    zone = (cam.get("handoff") or {}).get("zone")
+    if zone:
+        x, y, w, h = zone
+        d.rectangle([x * img.width, y * img.height, (x + w) * img.width, (y + h) * img.height],
+                    outline=(255, 255, 0, 70), width=2)
+
+    dot = max(3, img.width // 240)
+    for cls, pts in trails.values():
+        color = COLORS.get(cls, (255, 255, 255))
+        pts = [(x * sx, y * sy) for x, y in pts]
+        if len(pts) > 1:
+            d.line(pts, fill=color + (120,), width=max(1, dot // 2))
+        for x, y in pts:
+            d.ellipse([x - dot, y - dot, x + dot, y + dot], fill=color + (220,))
+
+    for tid, t in tracks.items():
+        cls = display[t["label"]]
+        color = COLORS.get(cls, (255, 255, 255))
+        x1, y1, x2, y2 = t["box"]
+        x1, y1, x2, y2 = x1 * sx, y1 * sy, x2 * sx, y2 * sy
+        counted = bool(t["counted_as"]) and not t.get("ghost")
+        width = max(3, img.width // 320) if counted else 2
+        d.rectangle([x1, y1, x2, y2], outline=color + (230 if counted else 170,), width=width)
+        chip = f"#{tid} {cls} {t.get('conf', 0.0):.0%}"
+        lx1, ly1, lx2, ly2 = d.textbbox((0, 0), chip, font=font)
+        tw, th = lx2 - lx1, ly2 - ly1
+        ch = th + 5
+        top = y1 - ch if y1 >= ch else y1
+        d.rectangle([x1, top, x1 + tw + 7, top + ch], fill=color + (200,))
+        d.text((x1 + 4, top + 3), chip, font=font, fill=(0, 0, 0, 230))
+        d.text((x1 + 3, top + 2), chip, font=font, fill=(255, 255, 255, 255))
+
+    _, _, _, hb = d.textbbox((0, 0), header, font=font)
+    d.rectangle([0, 0, img.width, hb + 12], fill=(0, 0, 0, 160))
+    d.text((10, 6), header, font=font, fill=(255, 255, 255, 255))
+
+    return Image.alpha_composite(img.convert("RGBA"), layer).convert("RGB")
+
+
 _review = {}                      # lazy singleton: model + class lookup, built on first call
 _review_lock = threading.Lock()
 
@@ -1048,6 +1122,7 @@ class Detector:
                                     "first_wall": wall, "path": [], "top": {}}
                 t["votes"][cls] += 1
                 t["hits"] += 1
+                t["conf"] = conf              # this frame's score, for the live overlay chip
                 t["last_seen"], t["last_wall"] = now, wall
                 t["box"] = box                    # resting place, for the recount guard
                 prev, t["c"] = t["c"], ((box[0] + box[2]) / 2, (box[1] + box[3]) / 2)
@@ -1386,7 +1461,32 @@ class Detector:
         return
 
 
-def classify_segment(path, cam, cfg, tz, events_dir, source_key=None):
+_ENCODER = None     # lazy: which ffmpeg h264 encoder is actually available, checked once
+
+
+def _h264_encoder():
+    global _ENCODER
+    if _ENCODER is None:
+        try:
+            out = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"],
+                                 capture_output=True, text=True, timeout=5).stdout
+        except (OSError, subprocess.SubprocessError):
+            out = ""
+        # Capped bitrate: uncapped 5fps/960x540 ran ~7.6 MB/min, ~11 GB/day/camera.
+        # -g 50 (10s keyframes at FPS) keeps seeking on the dashboard usable.
+        _ENCODER = (["-c:v", "h264_videotoolbox", "-b:v", "600k", "-maxrate", "900k",
+                    "-bufsize", "1800k", "-g", "50"] if "h264_videotoolbox" in out else
+                    ["-c:v", "libx264", "-preset", "veryfast", "-crf", "30",
+                    "-maxrate", "900k", "-bufsize", "1800k", "-g", "50"])
+    return _ENCODER
+
+
+RENDER_SIZE = (960, 540)
+TRAIL_MAX = 30       # centres kept per track — enough trail to read, not a frame's worth of history
+RENDER_DEADLINE_S = 900   # a wedged ffmpeg must never hold up classification this long
+
+
+def classify_segment(path, cam, cfg, tz, events_dir, source_key=None, render_to=None, gate=""):
     """One recorded segment through the live pipeline, offline -> the day it was filmed.
 
     Same detector, same tracker, same counting, same events as the wire: only the clock
@@ -1396,6 +1496,11 @@ def classify_segment(path, cam, cfg, tz, events_dir, source_key=None):
 
     `source_key` should be the full stable recording key. The fallback uses only the
     recording's last three path components, avoiding a download's changing temp root.
+
+    `render_to`, if given, is a path to write a DeepStream-style annotated MP4 to (for the
+    RDA dashboard's live view). Any render failure — a wedged ffmpeg included, via the
+    RENDER_DEADLINE_S watchdog — is logged and the partial file dropped, never raised:
+    counting must be identical whether or not this is set. -> (day, captured, render_ok).
     """
     from PIL import Image
 
@@ -1411,6 +1516,41 @@ def classify_segment(path, cam, cfg, tz, events_dir, source_key=None):
     track = d._load()
     d._dataset_init()            # makes pending/ when capturing; hands off classes.txt
     name = cam["name"]
+    proc = timer = None
+
+    def abort_render(reason):
+        # Single exit for every failure: write error, bad exit, or the watchdog's kill.
+        # Never raises — a broken clip must not strand the segment's counts.
+        nonlocal proc
+        print(f"render failed, dropping the clip: {reason}")
+        if timer is not None:
+            timer.cancel()
+        if proc is not None:
+            try:
+                proc.kill()
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+        if render_to:
+            Path(render_to).unlink(missing_ok=True)
+        proc = None
+
+    if render_to:
+        try:
+            proc = subprocess.Popen(
+                ["ffmpeg", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24",
+                 "-s", f"{RENDER_SIZE[0]}x{RENDER_SIZE[1]}", "-r", str(FPS), "-i", "-",
+                 *_h264_encoder(), "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(render_to)],
+                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            # A hung ffmpeg (full pipe, no reader) would otherwise wedge stdin.write()
+            # forever; the kill makes that write raise instead, which abort_render catches.
+            timer = threading.Timer(RENDER_DEADLINE_S, proc.kill)
+            timer.daemon = True
+            timer.start()
+        except Exception as e:
+            print(f"render skipped, ffmpeg would not start: {e}")
+            proc = None
+    trails = {}
     for i, jpeg in enumerate(ingest_video.frames(path, fps=FPS)):
         at[0] = start + i / FPS
         img = Image.open(io.BytesIO(jpeg)).convert("RGB")
@@ -1419,12 +1559,35 @@ def classify_segment(path, cam, cfg, tz, events_dir, source_key=None):
         # to hunt the classes the curated set is short of — 48 h of footage, not the
         # slice a sampling pass happens to land on.
         d._capture(name, jpeg, shown, img.width, img.height)
+        if proc is not None:
+            try:
+                live = d.tracks.get(name, {})
+                trails = {tid: (d.display[t["label"]], (trails.get(tid, (None, []))[1] + [t["c"]])[-TRAIL_MAX:])
+                         for tid, t in live.items() if t.get("c")}
+                seen = {tid: t for tid, t in live.items() if t["last_seen"] == at[0]}
+                when = datetime.fromtimestamp(at[0], tz=tz).strftime("%Y-%m-%d %H:%M:%S")
+                header = f"{gate} · {name} · {when} · counted {sum(d.totals.values())}"
+                frame = render_frame(img, seen, d.display, trails, cam, header)
+                proc.stdin.write(frame.tobytes())
+            except Exception as e:      # any render-side error, or a write against a wedged/dead ffmpeg
+                abort_render(e)
     d.flush(name)                # the last frame's vehicles are events too
+    render_ok = False
+    if proc is not None:
+        try:
+            proc.stdin.close()
+            proc.wait(timeout=30)
+            timer.cancel()
+            if proc.returncode:
+                raise OSError(f"ffmpeg exited {proc.returncode}")
+            render_ok = True
+        except Exception as e:
+            abort_render(e)
     if events_dir and not d.events_dir:
         # A write failed and events went off mid-segment: returning would publish the
         # truncated segment as done. Raising leaves it unclassified, so it is retried.
         raise RuntimeError(f"events went off mid-segment ({d.error})")   # d.error may be a later attrs error
-    return datetime.fromtimestamp(start, tz=tz).strftime("%Y-%m-%d"), d.captured
+    return datetime.fromtimestamp(start, tz=tz).strftime("%Y-%m-%d"), d.captured, render_ok
 
 
 if __name__ == "__main__":
@@ -2220,6 +2383,51 @@ if __name__ == "__main__":
     h.thread.join(timeout=3)
     assert h.info()["state"] == "error" and "hailo" in h.info()["error"], h.info()
 
+    # render_frame: right size out, trail capped at TRAIL_MAX, ghosts never drawn counted.
+    try:
+        from PIL import Image
+        frame = Image.new("RGB", (200, 100))
+        t = {"label": "truck", "box": (10, 10, 50, 50), "counted_as": "truck", "ghost": False, "conf": 0.8}
+        out = render_frame(frame, {1: t}, {"truck": "truck"},
+                           {1: ("truck", [(0.0, 0.0)] * 40)}, {}, "hdr")
+        assert out.size == RENDER_SIZE, out.size          # always output-sized now, whatever came in
+        pts = []
+        for c in range(40):
+            pts = (pts + [(c, c)])[-TRAIL_MAX:]
+        assert len(pts) == TRAIL_MAX, pts
+    except ImportError:
+        pass          # Pillow absent: annotate/review_frame are already untested above too
+
+    # A wedged render (ffmpeg never drains stdin) must not hang classify_segment, must
+    # never leave a partial clip behind, and must not change what got counted.
+    import tempfile as _tempfile
+
+    with _tempfile.TemporaryDirectory() as tmp:
+        video = Path(tmp) / "seg.mkv"
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi",
+                        "-i", f"testsrc=size=64x64:rate={FPS}:duration=1", str(video)], check=True)
+        cam = {"name": "c", "ip": "10.0.0.1", "user": "u", "password": ""}
+        clip = Path(tmp) / "clip.mp4"
+        real_popen = subprocess.Popen
+
+        def wedged_popen(cmd, **kw):
+            # Same pipes, but a process that never reads stdin: the encoder never runs.
+            if "-movflags" in cmd:
+                return real_popen(["python3", "-c", "import time; time.sleep(30)"], **kw)
+            return real_popen(cmd, **kw)
+
+        with patch.object(Detector, "_load", return_value=lambda name, img: []), \
+             patch("detect.subprocess.Popen", side_effect=wedged_popen), \
+             patch("detect.RENDER_DEADLINE_S", 0.2):
+            events = Path(tmp) / "events"
+            day, cap, ok = classify_segment(video, cam, {}, timezone.utc, events,
+                                            source_key="c/seg.mkv", render_to=clip, gate="G")
+            day2, cap2, ok2 = classify_segment(video, cam, {}, timezone.utc, events,
+                                               source_key="c/seg.mkv")   # no render, for comparison
+            assert not ok and cap == cap2 and day == day2, (ok, cap, cap2)
+            assert not clip.exists(), "a wedged render must not leave a partial clip behind"
+
     print("detect self-check ok: mjpeg split keeps the newest frame, ids count once at",
           COUNT_AT_HITS, "hits, class flips outvoted, ids expire after", ID_EXPIRY,
-          "s, daily reset + dataset capture ok")
+          "s, daily reset + dataset capture ok, render_frame sized right with a capped trail, "
+          "a wedged render is killed by its deadline and never changes what was counted")
