@@ -28,11 +28,11 @@ gate node zambia8 (records only, no detector)          office MacBook (M1 Max), 
   R2 fieldkit-recordings/site1/cam{3,4}/                 detect.classify_segment(): YOLO + ByteTrack @ 5 fps, 1280
   YYYYMMDD-HHMMSS.mkv (local Lusaka time)                   -> fieldkit-events/<gate>/<day>/*.jsonl  (per camera, counted-on-line)
                                                             -> fieldkit-tracklets/<gate>/<day>/*.jsonl + crops/  (every track)
-                                                         journeys_pass(): journeys.build(day's tracklets)
-                                                            -> fieldkit-journeys/<gate>/<day>/journeys.jsonl  (one line per vehicle)
-                                                            -> fieldkit-journeys/<gate>/<day>/settled.json     (see §5)
+                                                         journeys_pass(): journeys.build(day's unfrozen tracklets)
+                                                            -> fieldkit-journeys/<gate>/<day>/journeys.jsonl        (informational: frozen + provisional)
+                                                            -> fieldkit-journeys/<gate>/<day>/final/<ts>.jsonl      (append-only; see §5)
                                                          coverage -> fieldkit-coverage/<gate>/<day>.json (recorded vs classified stems)
-RDA dashboard-api importer (Go, every 5 min) reads journeys + settled.json -> public.vehicles source='fieldkit'
+RDA dashboard-api importer (Go, every 5 min) reads final/*.jsonl -> public.vehicles source='fieldkit'
 ```
 
 - `detect.py`: detection, tracking, per-camera counting (`COUNT_LINE`, `COUNT_AT_HITS`, `RECOUNT_GUARD`, `GUARD_IOU`),
@@ -41,7 +41,7 @@ RDA dashboard-api importer (Go, every 5 min) reads journeys + settled.json -> pu
   twin merge `TWIN_IOU`/`TWIN_SNAP`, motion guard `MOVE`/`SPAN`), then links cam3↔cam4 through handoff zones
   (`ZONE_SHARE`, `LEAD`, `LAG`, `MU`, `CLASS_PEN`). A lone chain counts if a member was line-counted, or if it crossed a
   zone with ≥ `MIN_EDGE_HITS`. Its self-check (`python3 journeys.py`) documents the cases (a)–(g).
-- `selfloop.py`: orchestration, the per-day rebuild, `settled_until`, coverage manifests. Self-check: `python3 selfloop.py`.
+- `selfloop.py`: orchestration, the per-day rebuild, `horizon`, coverage manifests. Self-check: `python3 selfloop.py`.
 - Camera geometry: handoff zones in the office Mac's `config.yaml` — cam3 `[0.80, 0.62, 0.20, 0.38]` (bottom-right),
   cam4 `[0.0, 0.55, 0.22, 0.30]` (bottom-left). Northbound traffic: cam3 sees fronts, cam4 sees rears. There is a blind strip between
   them (measured gap 0.2–2.2 s). Camera clocks are synced hourly (a crontab on zambia8). The recording timeline is authoritative.
@@ -84,12 +84,17 @@ There is no ground truth yet, and no change can be judged without it. Build it b
   members[{id,camera,t0,t1}], gate`.
   - Crop values must be full bucket keys under `fieldkit-tracklets/`.
   - Journey ids must stay **deterministic** (sha256 of sorted member tracklet ids). The importer imports each id once.
-- **`settled.json`** (`{"gate","day","built","until":{cam: epoch}}`) is the importer's no-double-count guarantee. A journey is imported
-  only when, for every camera in `until`, `max(member t1) + 120 s ≤ until[cam]`. Write it AFTER `journeys.jsonl`, and never advance
-  `until` past footage that the published `journeys.jsonl` did not include.
-- **Changing ids of journeys that were already imported** creates duplicates in RDA. That happens if you change the member set of a settled
-  journey, the id scheme, or the tracklet ids of a day that has already been imported. The importer logs `FieldKit journeys changed id
-  after import`. A deliberate re-count of past days needs a coordinated RDA-side replace (ask; don't improvise).
+- **`fieldkit-journeys/<gate>/<day>/final/*.jsonl`** is the importer's no-double-count guarantee, not `journeys.jsonl`. Each batch is
+  immutable and append-only (a new timestamped file per pass that freezes anything, never a rewrite of an old one); a tracklet belongs
+  to at most one final journey, ever. `journeys_pass()` only builds provisional journeys from tracklets NOT already claimed by a final
+  batch, so re-linking one later (once its partner camera catches up) can never re-import it. A provisional journey freezes once
+  `max(member t1) + FINAL_MARGIN (300 s) ≤ horizon()` for every camera the gate owns, not just the ones it happens to touch — an
+  as-yet-uncaught-up partner could still hand a lone chain a new link. `journeys.jsonl` (frozen + provisional) is informational only —
+  status/eval, never the importer.
+- **Changing ids of journeys that were already imported** creates duplicates in RDA. That happens if you change the member set of a
+  final journey, the id scheme, or the tracklet ids of a day whose final batches have already been imported. The importer logs
+  `FieldKit journeys changed id after import`. A deliberate re-count of past days needs a coordinated RDA-side replace (ask; don't
+  improvise).
 
 ## 6. Rules
 
