@@ -795,6 +795,23 @@ eq(b.attrs['axle-config'], '1+1', 'axles 2 -> 1+1 even over a suggested config')
 b = box(Z, {...Zdef, 'axle-config': '1+2'}, ['axle-config']);
 labFill(b, labImplies.axles['2'], true);
 eq(b.attrs['axle-config'], '1+2', "the operator's own config is never overridden by implies");
+// Three-axle medium truck towing a two-axle container trailer, in either edit order.
+for (const order of [['trailers', 'axles'], ['axles', 'trailers']]) {
+  b = box(cls('d-medium')); labDefault(b);
+  const wanted = {trailers: '1', axles: '5', cargo: 'container'};
+  for (const head of [...order, 'cargo']) {
+    const value = wanted[head];
+    eq(labVocab(head, 'd-medium', null, b.attrs).some(([v, stale]) => v === value && !stale),
+       true, `medium truck offers ${head}=${value}`);
+    b.attrs[head] = value; b.touched.add(head);
+    labFill(b, (labImplies[head] || {})[value], true);
+  }
+  eq(b.attrs, {type: 'rigid-truck', ...wanted, 'axle-config': '1+2+2'},
+     'medium truck and trailer retain five total axles');
+  eq(labVocab('axle-config', 'd-medium', null, b.attrs), [['1+2+2', false]],
+     'five-axle configuration is selectable');
+  eq(labGap([b]), null, 'medium truck and trailer can be submitted');
+}
 console.log('  js rules ok');
 """
     r = subprocess.run(["node", "-e", js], capture_output=True, text=True)
