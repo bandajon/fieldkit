@@ -1,4 +1,5 @@
 from contextlib import nullcontext
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,6 +11,12 @@ import selfloop
 
 class Client:
     fail_key = None
+
+    def __init__(self):
+        self.puts = {}
+
+    def put_object(self, Bucket, Key, Body, **kw):
+        self.puts[Key] = Body
 
     def download_file(self, bucket, key, dest):
         if key == self.fail_key:
@@ -28,12 +35,12 @@ class ClassifyPassTest(unittest.TestCase):
         self.root = root
 
     def run_pass(self, keys, journeys, budget=3600, monotonic=None, live=None, save=None,
-                 per_pass=1):
-        cl = Client()
+                 per_pass=1, state=None):
+        cl = self.cl = Client()
         detect = SimpleNamespace(classify_segment=lambda *a, **kw: ("2026-09-27", 0, False))
         ingest = SimpleNamespace(config=lambda: {"cameras": []},
                                  cam_and_start=lambda path: ("cam", 1790500000))
-        state = {"classified": [], "open_days": []}
+        state = state or {"classified": [], "open_days": []}
         with patch.multiple(selfloop, STATE=self.state, CHAMPION=self.champion,
                             VIDEOS=self.root / "videos", CLASSIFY_PER_PASS=per_pass,
                             CLASSIFY_BUDGET=budget, JOURNEYS_EVERY_S=0), \
@@ -115,6 +122,38 @@ class ClassifyPassTest(unittest.TestCase):
         state = self.run_pass(keys, lambda *a: (0, set(), set()))
         self.assertEqual(state["classify_backlog"]["failed"], 1)
         self.assertEqual(state["classify_backlog"]["left"], 0)
+
+    def test_raising_loop_still_recounts_backlog_and_saves(self):
+        keys = [f"site1/cam/20260927-110{i}00.mkv" for i in range(3)]
+        state = {"classified": [], "open_days": [], "classify_backlog": {"at": "x", "left": 12, "failed": 0}}
+        saved = []
+        with self.assertRaises(RuntimeError):
+            self.run_pass(keys, lambda *a: (0, set(), set()), state=state,
+                          live=lambda *a: (_ for _ in ()).throw(RuntimeError("boom")),
+                          save=lambda s: saved.append(dict(s.get("classify_backlog", {}))))
+        self.assertEqual(state["classify_backlog"]["left"], 3)
+        self.assertEqual(saved[-1]["left"], 3)
+
+    def test_caught_up_pass_with_live_segment_is_not_behind(self):
+        state = self.run_pass(["site1/cam/20260927-110000.mkv"], lambda *a: (0, set(), set()))
+        self.assertEqual(state["classify_backlog"]["left"], 0)
+        self.assertFalse(selfloop.classify_behind(state))
+
+    def test_alerts_fold_and_health_json(self):
+        selfloop.ALERTS.clear()
+        selfloop.alert("lost_counts", "RDA-TG-KTB", "dropped a")
+        selfloop.alert("lost_counts", "RDA-TG-KTB", "dropped a")   # identical: deduped
+        selfloop.alert("late_footage", "other", "late b")
+        old = {"at": "2020-01-01T00:00:00Z", "kind": "dead_camera", "gate": "RDA-TG-KTB", "detail": "stale"}
+        state = {"classified": [], "open_days": [], "alerts": [old]}
+        self.run_pass(["site1/cam/20260927-110000.mkv"], lambda *a: (0, set(), set()), state=state)
+        self.assertEqual(sorted(a["kind"] for a in state["alerts"]), ["late_footage", "lost_counts"])
+        self.assertEqual(selfloop.ALERTS, [])
+        doc = json.loads(self.cl.puts["fieldkit-health/RDA-TG-KTB.json"])
+        self.assertEqual(set(doc), {"gate", "updated", "backlog", "last_classify", "lag_s", "newest", "alerts"})
+        self.assertEqual([a["kind"] for a in doc["alerts"]], ["lost_counts"])
+        self.assertEqual(doc["lag_s"], {"cam": 0})
+        self.assertEqual(doc["newest"]["cam"]["recorded"], doc["newest"]["cam"]["classified"])
 
 
 class _Tick:
