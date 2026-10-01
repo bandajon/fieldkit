@@ -83,7 +83,7 @@ PATH_MAX = 600           # ten minutes of samples; a longer track is parked, and
                          # its ends — path_last still keeps the exit box
 PLATE_SCALE = 3          # plates are ~20 px wide at 1080p: the plate model only finds them upscaled
 PLATE_CONF = 0.15        # ...and even then at 0.2-0.4, so it is asked leniently
-PLATE_ASPECT = 1.5       # w/h floor: a tyre is ~1:1, a plate ~4:1 (two-line ~2:1) — the lenient conf accepts wheels
+PLATE_ASPECT = 1.2       # w/h floor: a tyre is ~1:1, a plate ~4:1 (two-line ~1.5-2:1, more at an angle) — the lenient conf accepts wheels
 PLATE_PAD = 0.15         # a tight plate crop loses its edge characters
 RECEDE = 0.5             # a receding vehicle shows its rear once its box has shrunk to this share
                          # of its peak area; the peak itself is the side-on pass
@@ -219,7 +219,8 @@ def attr_classifier(path, dev="cpu"):
 
     # weights_only: the checkpoint is tensors, strings and ints — never unpickle a model
     # file as arbitrary code just because it sits in the operator's dataset directory.
-    ck = torch.load(path, map_location=dev, weights_only=True)
+    raw = Path(path).read_bytes()        # one read: the tag below names exactly these weights
+    ck = torch.load(io.BytesIO(raw), map_location=dev, weights_only=True)
     vocab = ck["heads"]
     names = list(vocab)
     # A class-conditioned checkpoint (train_attrs.py from 2026-09) lists the classes whose
@@ -273,26 +274,37 @@ def attr_classifier(path, dev="cpu"):
             f = pool(net.features(prep(pil).unsqueeze(0).to(dev))).flatten(1)[0]
         return (f / f.norm().clamp_min(1e-8)).cpu().numpy()
     classify.embed = embed
+    classify.tag = hashlib.sha256(raw).hexdigest()[:12]
     return classify
 
 
-def appearance_pca(weights):
-    """-> (mu, P, champion tag) | None. The projection is fitted on one champion's
+_APP_WARNED = False
+
+
+def _app_off(why):
+    """Said once per process: a Detector is built per segment and would repeat it."""
+    global _APP_WARNED
+    if not _APP_WARNED:
+        _APP_WARNED = True
+        print(f"  ! {why} — appearance off")
+
+
+def appearance_pca(weights, tag):
+    """-> (mu, P, champion tag) | None. `tag` is the loaded classifier's own. The projection is fitted on one champion's
     features, so it is used only beside that exact file; any mismatch turns appearance
     off, loudly once, rather than comparing codes from different spaces."""
     f = Path(weights).with_name("appearance-pca.npz")
     try:
         import numpy as np
         z = np.load(f)
-        tag = hashlib.sha256(Path(weights).read_bytes()).hexdigest()[:12]
         if str(z["champion"]) != tag:
-            print(f"  ! {f.name}: fitted on {z['champion']}, champion is {tag} — appearance off")
+            _app_off(f"{f.name}: fitted on {z['champion']}, champion is {tag}")
             return None
         return z["mu"], z["P"], tag
     except FileNotFoundError:
         return None                       # never fitted: appearance simply isn't offered
     except Exception as e:
-        print(f"  ! {f.name}: {e} — appearance off")
+        _app_off(f"{f.name}: {e}")
         return None
 
 
@@ -1041,7 +1053,7 @@ class Detector:
         COLORS.update(palette(lookup.values()))   # both modes: every class gets its colour
         if self.attr_weights:
             self.attrs = attr_classifier(self.attr_weights, dev)   # worker thread only
-            self.app = appearance_pca(self.attr_weights)
+            self.app = appearance_pca(self.attr_weights, self.attrs.tag)
         if self.plate_weights:
             self.plates = plate_reader(self.plate_weights, dev)
 
@@ -2596,12 +2608,13 @@ if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as td:
         w = Path(td) / "attrs-champion.pt"
         w.write_bytes(b"weights")
-        assert appearance_pca(w) is None                       # never fitted
+        assert appearance_pca(w, "x") is None                  # never fitted
         tag = hashlib.sha256(b"weights").hexdigest()[:12]
         np.savez(Path(td) / "appearance-pca.npz", mu=pca[0], P=pca[1], champion=tag)
-        assert appearance_pca(w)[2] == tag
+        assert appearance_pca(w, tag)[2] == tag
         np.savez(Path(td) / "appearance-pca.npz", mu=pca[0], P=pca[1], champion="other")
-        assert appearance_pca(w) is None, "champion mismatch turns appearance off"
+        assert appearance_pca(w, tag) is None, "champion mismatch turns appearance off"
+        assert _APP_WARNED
     d = fresh(events_dir=Path(tempfile.mkdtemp()))
     d.clock = d.wall = lambda: at[0]
     d.attrs = lambda img, cls=None: {}
@@ -2625,6 +2638,7 @@ if __name__ == "__main__":
     # Plate boxes that are round (tyres) are dropped.
     assert _best_plate_box([(0, 0, 50, 50)], [0.9]) is None, "a tyre is not a plate"
     assert _best_plate_box([(0, 0, 50, 50), (0, 0, 80, 20)], [0.9, 0.2]) == 1
+    assert _best_plate_box([(0, 0, 50, 50), (0, 0, 60, 40)], [0.9, 0.2]) == 1, "angled two-line plate"
     assert _best_plate_box([], []) is None
 
     print("detect self-check ok: mjpeg split keeps the newest frame, ids count once at",

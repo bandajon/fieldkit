@@ -43,6 +43,8 @@ CLASS_PEN = 1.0      # s-equivalent cost of pairing two different classes
 APP_PEN = 2.5        # s-equivalent cost per unit of (1 - cosine) between appearance codes, so 0..5 s.
                      # Measured at Katuba 2026-10-01 10:30-11:30: at 2.5 the crossed near-simultaneous
                      # pickups pair correctly and ~80% of changed links are visually right (~14% before)
+APP_TYPICAL = 0.7    # cosine of a typical true match (Katuba median ~0.79): an uncoded candidate pays
+                     # the penalty of a typical match, so it never beats a coded one at equal timing
 MIN_EDGE_HITS = 5    # ~1 s at 5 fps: a zone crossing alone must last this long; night glare blips don't
 
 
@@ -248,14 +250,37 @@ def _links(chains, cameras):
                 r = chains[j]
                 if r["z"][1] >= d["z"][0] - LEAD:
                     sim = _similar(d["app"], r["app"])
-                    cands.append((abs(r["arr"] - d["dep"] - MU) + CLASS_PEN * (d["class"] != r["class"])
-                                  + (0 if sim is None else APP_PEN * (1 - sim)), i, j))
-    cands.sort()
-    used, links = set(), []
-    for _, i, j in cands:
-        if i not in used and j not in used:
-            used |= {i, j}
-            links.append((chains[i], chains[j]))
+                    t = abs(r["arr"] - d["dep"] - MU) + CLASS_PEN * (d["class"] != r["class"])
+                    cands.append((t, t + APP_PEN * (1 - (APP_TYPICAL if sim is None else sim)), i, j))
+
+    def greedy(cs, k):
+        used, out = set(), []
+        for *_, i, j in sorted(cs, key=lambda c: (c[k], c[2], c[3])):
+            if i not in used and j not in used:
+                used |= {i, j}
+                out.append((chains[i], chains[j]))
+        return out
+
+    # Appearance only re-pairs within a connected set of candidates, and only if that costs no
+    # link: a re-pairing that strands a chain would turn one vehicle into two journeys.
+    root = list(range(len(chains)))
+
+    def find(x):
+        while root[x] != x:
+            root[x] = root[root[x]]
+            x = root[x]
+        return x
+
+    for *_, i, j in cands:
+        root[find(i)] = find(j)
+    comps = {}
+    for c in cands:
+        comps.setdefault(find(c[2]), []).append(c)
+    links = []
+    for cs in comps.values():
+        by_time = greedy(cs, 0)
+        by_look = greedy(cs, 1)
+        links += by_look if len(by_look) == len(by_time) else by_time
     return links
 
 
@@ -394,6 +419,11 @@ def _selfcheck():
             + _north(2, 101.0, gap=1.5, k3=k([0, 1], v3), k4=k([0, 1], v4))
         assert ids(build(pair, _CAMS)) == want, (v3, v4, ids(build(pair, _CAMS)))
     assert _app([{"hits": 1, "app": "!!", "app_v": "m1"}]) is None == _app([{"hits": 1, "app": "AAAA"}])
+    # (b3) appearance may never strand a chain: d2 only reaches r2, and r1's rear view looks
+    # nothing like d1, so looks alone would send d1 to r2 and leave d2 and r1 lone. Timing's two links stay.
+    pair = _north(1, 100.0, gap=0.5, k3={"app": code(1), "app_v": "m1"}, k4={"app": code(-1), "app_v": "m1"}) \
+        + _north(2, 105.0, gap=-1.0, k3={"app": code(0, 1), "app_v": "m1"}, k4={"app": code(1), "app_v": "m1"})
+    assert ids(build(pair, _CAMS)) == [["obs-cam3-1", "obs-cam4-1"], ["obs-cam3-2", "obs-cam4-2"]]
     # (c) a long truck southbound: its cam3 arrival starts 8 s before its cam4 departure ends.
     t4 = _t("cam4", 1, "e-heavy", [(100, _b(0.5, 0.4))] + [(t, _b(0.1, 0.7)) for t in range(101, 113)])
     t3 = _t("cam3", 1, "e-heavy", [(104, _b(0.9, 0.8)), (105, _b(0.9, 0.8)), (106, _b(0.88, 0.78)),

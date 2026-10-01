@@ -1,7 +1,7 @@
 """Refit the appearance PCA after an attrs retrain (the codes are only comparable within
 one champion's feature space — detect.appearance_pca refuses a mismatched file).
 
-  python3 appearance_pca.py --weights dataset/attrs-champion.pt --crops DIR [--out ...] [--dims 32]
+  python3 appearance_pca.py --weights dataset/attrs-champion.pt --crops DIR [--out ...]
   python3 appearance_pca.py --weights ... --gate <gate>     # newest crops from R2 today
   python3 appearance_pca.py --self-check
 """
@@ -18,7 +18,10 @@ MIN_CROPS = 200
 NEWEST = 1500
 
 
-def fit(X, dims):
+DIMS = 32                # journeys decodes exactly 32 fp16 values
+
+
+def fit(X, dims=DIMS):
     """-> (mu, P (dims x D), explained variance fraction)."""
     mu = X.mean(0)
     _, s, vt = np.linalg.svd(X - mu, full_matrices=False)
@@ -72,7 +75,7 @@ def self_check():
         w.write_bytes(b"w")
         tag = hashlib.sha256(b"w").hexdigest()[:12]
         np.savez(Path(td) / "appearance-pca.npz", mu=mu, P=P, champion=tag)
-        assert detect.appearance_pca(w)[2] == tag
+        assert detect.appearance_pca(w, tag)[2] == tag
     print("appearance_pca self-check ok")
 
 
@@ -82,7 +85,6 @@ def main():
     ap.add_argument("--crops")
     ap.add_argument("--gate")
     ap.add_argument("--out")
-    ap.add_argument("--dims", type=int, default=32)
     ap.add_argument("--self-check", action="store_true")
     a = ap.parse_args()
     if a.self_check:
@@ -93,12 +95,13 @@ def main():
     import detect
     blobs = ([p.read_bytes() for p in sorted(Path(a.crops).glob("*.jpg"))] if a.crops
              else r2_crops(a.gate))
-    embed = detect.attr_classifier(a.weights).embed
+    classify = detect.attr_classifier(a.weights)
+    embed = classify.embed
     X = np.stack([embed(Image.open(io.BytesIO(b)).convert("RGB")) for b in blobs])
-    if len(X) <= a.dims:
-        sys.exit(f"{len(X)} crops is too few for {a.dims} dims")
-    mu, P, ev = fit(X, a.dims)
-    tag = hashlib.sha256(Path(a.weights).read_bytes()).hexdigest()[:12]
+    if len(X) <= DIMS:
+        sys.exit(f"{len(X)} crops is too few for {DIMS} dims")
+    mu, P, ev = fit(X, DIMS)
+    tag = classify.tag
     out = Path(a.out) if a.out else Path(a.weights).with_name("appearance-pca.npz")
     np.savez(out, mu=mu, P=P, champion=tag)
     print(f"{len(X)} crops, explained variance {ev:.3f}, champion {tag} -> {out}")

@@ -1573,6 +1573,18 @@ def crown_attrs(s, run, rep, cl, bucket):
                   Body=json.dumps(s["attrs_champion"]).encode())
     print(f"{now()}: {run.name} is the attrs champion (mean val accuracy "
           f"{rep['mean_acc'] if rep else 'n/a'}) — published under {ATTR_MODELS}", flush=True)
+    # The appearance PCA is fitted to one champion's features: refit now, or live
+    # detection silently drops appearance codes. Best-effort — never fails the pass.
+    gate = next(iter(GATES.values()))
+    try:
+        r = subprocess.run([sys.executable, str(ROOT / "appearance_pca.py"), "--weights",
+                            str(ATTRS_CHAMPION), "--gate", gate], cwd=ROOT, timeout=1800,
+                           capture_output=True, text=True)
+        err = r.returncode and (r.stderr or r.stdout).strip()[-300:]
+    except Exception as e:
+        err = str(e)
+    if err:
+        alert("appearance_off", gate, f"  ! appearance PCA refit failed after crowning {run.name}: {err}")
 
 
 def adopt(name):
