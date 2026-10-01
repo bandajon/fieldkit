@@ -166,14 +166,14 @@ class Sink:
             return False
         rare = any(d[0] in self.wanted for d in shown) \
             and ts - self.rare_at.get(cam, float("-inf")) >= detect.RARE_EVERY
-        dense = bool(self.congested) and len(shown) >= self.congested \
+        dense = bool(self.congested) and len(shown) >= self.congested and self.dense < detect.CONGESTED_PER_PASS \
             and ts - self.dense_at.get(cam, float("-inf")) >= detect.CONGESTED_EVERY
         if not (rare or dense) and (self.only_wanted
                          or ts - self.at.get(cam, float("-inf")) < detect.CAPTURE_EVERY):
             return False
         if detect.same_scene(shown, self.dets.get(cam, [])):
             return False
-        stem = detect.sample_stem(self.gate, cam, ts, detect.RARE_STEP if rare or dense else None)
+        stem = detect.sample_stem(self.gate, cam, ts, detect.RARE_STEP if rare else None)
         lines = [f"{self.ids[cls]} {(x1 + x2) / 2 / w:.6f} {(y1 + y2) / 2 / h:.6f} "
                  f"{(x2 - x1) / w:.6f} {(y2 - y1) / h:.6f}"
                  for cls, _conf, (x1, y1, x2, y2) in shown if cls in self.ids]
@@ -450,6 +450,8 @@ def selfcheck():
     assert not jam.offer("c", base + 1, b"b", row(0.0)[:2], 64, 64), "...but not two cars"
     assert not jam.offer("c", base + 2, b"c", row(20.0), 64, 64), "one queue frame per CONGESTED_EVERY"
     assert jam.offer("c", base + detect.CONGESTED_EVERY, b"d", row(20.0), 64, 64) and jam.dense == 2
+    jam.dense = detect.CONGESTED_PER_PASS
+    assert not jam.offer("c", base + 3 * detect.CONGESTED_EVERY, b"e", row(0.0), 64, 64), "a pass's queue quota holds"
 
     assert segments([str(tmp)]) == [odd, seg], segments([str(tmp)])
 
