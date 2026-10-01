@@ -1183,6 +1183,10 @@ def classify_pass():
         return
     with Lock(), concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
         s = load_state()
+        why = appearance_stale()
+        if why:
+            alert("appearance_off", next(iter(GATES.values())),
+                  f"  ! appearance off: {why} — refits after the next train pass")
         ds, cl, bucket = r2()
         base, tz = ingest_video.config(), ZoneInfo(TZ)
         # hunt is the curation sweep; classify only counts — no capture_wanted/dataset_dir,
@@ -1573,18 +1577,39 @@ def crown_attrs(s, run, rep, cl, bucket):
                   Body=json.dumps(s["attrs_champion"]).encode())
     print(f"{now()}: {run.name} is the attrs champion (mean val accuracy "
           f"{rep['mean_acc'] if rep else 'n/a'}) — published under {ATTR_MODELS}", flush=True)
-    # The appearance PCA is fitted to one champion's features: refit now, or live
-    # detection silently drops appearance codes. Best-effort — never fails the pass.
-    gate = next(iter(GATES.values()))
+    # the appearance PCA refit runs after the lock is released: refresh_appearance()
+
+
+def appearance_stale():
+    """None when fresh (or there is no attrs model); else why appearance codes are off."""
+    if not ATTRS_CHAMPION.is_file():
+        return None
+    try:
+        import numpy as np
+        with np.load(DATASET / "appearance-pca.npz") as z:
+            have = str(z["champion"])
+    except FileNotFoundError:
+        return "no appearance-pca.npz"
+    except Exception as e:
+        return f"appearance-pca.npz unreadable ({e})"
+    want = hashlib.sha256(ATTRS_CHAMPION.read_bytes()).hexdigest()[:12]
+    return None if have == want else f"appearance-pca.npz fitted on {have}, champion is {want}"
+
+
+def refresh_appearance():
+    """Refit the appearance PCA if stale. Called after the lock is released — the fit
+    fetches crops and embeds them, minutes of work. Best-effort; every train retries."""
+    if appearance_stale() is None:
+        return
     try:
         r = subprocess.run([sys.executable, str(ROOT / "appearance_pca.py"), "--weights",
-                            str(ATTRS_CHAMPION), "--gate", gate], cwd=ROOT, timeout=1800,
-                           capture_output=True, text=True)
-        err = r.returncode and (r.stderr or r.stdout).strip()[-300:]
+                            str(ATTRS_CHAMPION), "--gate", next(iter(GATES.values()))],
+                           cwd=ROOT, timeout=1800, capture_output=True, text=True)
+        err = r.returncode and ((r.stderr or r.stdout).strip()[-300:] or f"exit {r.returncode}")
     except Exception as e:
         err = str(e)
     if err:
-        alert("appearance_off", gate, f"  ! appearance PCA refit failed after crowning {run.name}: {err}")
+        print(f"  ! appearance PCA refit failed: {err}", flush=True)
 
 
 def adopt(name):
@@ -2354,11 +2379,13 @@ if __name__ == "__main__":
         hunt_pass()
     elif a[0] == "train":
         train_pass(force="--now" in a)
+        refresh_appearance()
     elif a[0] == "status":
         status()
     elif a[0] == "adopt" and len(a) == 2:
         adopt(a[1])
     elif a[0] == "adopt-attrs" and len(a) == 2:
         adopt_attrs(a[1])
+        refresh_appearance()
     else:
         sys.exit(__doc__)

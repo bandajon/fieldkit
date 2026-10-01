@@ -315,7 +315,10 @@ def appearance_code(pil, embed, pca):
         import base64
         import numpy as np
         z = (embed(pil) - pca[0]) @ pca[1].T
-        return base64.b64encode((z / np.linalg.norm(z)).astype(np.float16).tobytes()).decode()
+        n = np.linalg.norm(z)
+        if not n > 0 or not np.isfinite(n):
+            return None
+        return base64.b64encode((z / n).astype(np.float16).tobytes()).decode()
     except Exception:
         return None
 

@@ -8,13 +8,14 @@ one champion's feature space — detect.appearance_pca refuses a mismatched file
 import argparse
 import hashlib
 import io
+import os
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
 
-MIN_CROPS = 200
+MIN_CROPS = 300
 NEWEST = 1500
 
 
@@ -56,8 +57,8 @@ def r2_crops(gate):
         got = list(ex.map(get, objs[:NEWEST]))
     blobs = [b for b in got if b]
     print(f"fetched {len(blobs)}, skipped {len(got) - len(blobs)}")
-    if len(blobs) < 300:
-        sys.exit(f"only {len(blobs)} crops fetched from R2 — need at least 300")
+    if len(blobs) < MIN_CROPS:
+        sys.exit(f"only {len(blobs)} crops fetched from R2 — need at least {MIN_CROPS}")
     return blobs
 
 
@@ -103,7 +104,9 @@ def main():
     mu, P, ev = fit(X, DIMS)
     tag = classify.tag
     out = Path(a.out) if a.out else Path(a.weights).with_name("appearance-pca.npz")
-    np.savez(out, mu=mu, P=P, champion=tag)
+    tmp = out.with_name(out.stem + ".tmp.npz")   # atomic: a reader never sees half a file
+    np.savez(tmp, mu=mu, P=P, champion=tag)
+    os.replace(tmp, out)
     print(f"{len(X)} crops, explained variance {ev:.3f}, champion {tag} -> {out}")
 
 
