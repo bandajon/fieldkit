@@ -55,8 +55,9 @@ def _centre(b):
 
 
 def _app(ms):
-    """(unit vector, model version) of the member with the most hits that has a code, else None."""
-    t = max((t for t in ms if t.get("app")), key=lambda t: t["hits"], default=None)
+    """(unit vector, model version) of the member with the most hits that has a code, else None.
+    A mixed member's code may be the other vehicle's: it never speaks for the chain."""
+    t = max((t for t in ms if t.get("app") and not t.get("mixed")), key=lambda t: t["hits"], default=None)
     try:
         return t and (struct.unpack("<32e", base64.b64decode(t["app"])), t.get("app_v"))
     except (TypeError, ValueError, struct.error):  # ValueError covers binascii.Error
@@ -434,6 +435,8 @@ def _selfcheck():
     pair = _north(1, 100.0, k3={"app": code(1), "app_v": "m1", "counted": True},
                   k4={"app": code(-1), "app_v": "m1", "counted": True})
     assert len(build(pair, _CAMS)) == 2
+    pair[0]["mixed"] = pair[1]["mixed"] = True        # ...unless a code may belong to a switched track
+    assert len(build(pair, _CAMS)) == 1
     # (b5) a mixed member's crops lose to a clean member's.
     shot = lambda c: {"top": c + "-top.jpg", "best": c + "-best.jpg"}
     [j] = build(_north(1, 100.0, k3={"crops": shot("cam3-1"), "mixed": True}, k4={"crops": shot("cam4-1")}), _CAMS)
