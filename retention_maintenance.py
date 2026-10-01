@@ -6,6 +6,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor
 import threading
 from contextlib import contextmanager, nullcontext
@@ -19,6 +20,7 @@ PREFIX = "curation/"
 RECEIPTS = "retention-receipts.jsonl"
 PLAN = "retention-plan.json"
 STATUS = "retention-last-run.json"
+RETENTION_WAIT_S = 6 * 3600   # classify may hold loop.lock up to 3 h; a daily run waits rather than skips
 _CYCLE_LOCK = threading.Lock()
 RAW_PARTS = {"images": ".jpg", "labels": ".txt", "attrs": ".json"}
 
@@ -45,13 +47,15 @@ def _authority():
 
 
 @contextmanager
-def dataset_lock(root, filename="loop.lock"):
-    """Nonblocking shared process lock; unsupported locking fails closed."""
+def dataset_lock(root, filename="loop.lock", label=None):
+    """Nonblocking shared process lock; unsupported locking fails closed. A label is written
+    as the holder text (selfloop Lock format) and cleared on release."""
     path = Path(root) / filename
     if path.is_symlink():
         yield False
         return
     f = path.open("a+")
+    held = False
     try:
         if os.name == "nt":
             import msvcrt
@@ -62,12 +66,13 @@ def dataset_lock(root, filename="loop.lock"):
                 import fcntl
                 fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             except (ImportError, OSError): yield False; return
-        # Same text as selfloop's Lock, so a classify that finds this held prints who has it.
-        try: f.truncate(0); f.write(f"{os.getpid()} ['retention'] since {datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}"); f.flush()
-        except OSError: pass
+        if label:
+            try: f.truncate(0); f.write(f"{os.getpid()} ['{label}'] since {datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}"); f.flush(); held = True
+            except OSError: pass
         yield True
     finally:
         try:
+            if held: f.truncate(0)    # reads "free" from an empty file, like selfloop's Lock
             if os.name == "nt":
                 import msvcrt
                 f.seek(0); msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
@@ -427,18 +432,25 @@ def maintenance_once(root, cl, bucket, prefix=PREFIX):
                 return {"disabled": True}
             # Unlocked on purpose: a concurrent train could read crops mid-pull, but pull is idempotent and train is rare.
             dataset_sync.pull(cl, bucket, prefix, root, names=("classifier-crops",))
-        with dataset_lock(root) as locked:
-            if not locked: return {"busy": True}
-            if authority:
-                with policy.DATASET_LOCK:
-                    activate(root, cl, bucket, prefix)
-            policy.DATASET_LOCK.acquire()
-            try:
-                plan = run(root, cl=cl, bucket=bucket, prefix=prefix, mode="plan", internal_locked=True)
-                out = run(root, cl=cl, bucket=bucket, prefix=prefix, mode="apply", plan_path=root / PLAN, expected_sha=plan["plan_sha256"], internal_locked=True)
-            finally:
-                policy.DATASET_LOCK.release()
-        status = {"disabled": False, "plan": plan, "apply": out}
+        deadline = time.monotonic() + RETENTION_WAIT_S
+        while True:   # nothing is held while waiting; the pre-lock work above is not repeated
+            with dataset_lock(root, label="retention") as locked:
+                if locked:
+                    if authority:
+                        with policy.DATASET_LOCK:
+                            activate(root, cl, bucket, prefix)
+                    policy.DATASET_LOCK.acquire()
+                    try:
+                        plan = run(root, cl=cl, bucket=bucket, prefix=prefix, mode="plan", internal_locked=True)
+                        out = run(root, cl=cl, bucket=bucket, prefix=prefix, mode="apply", plan_path=root / PLAN, expected_sha=plan["plan_sha256"], internal_locked=True)
+                    finally:
+                        policy.DATASET_LOCK.release()
+                    status = {"disabled": False, "plan": plan, "apply": out}
+                    break
+            if time.monotonic() >= deadline:
+                status = {"busy": True, "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+                break
+            time.sleep(60)
         if not (root / STATUS).is_symlink(): (root / STATUS).write_text(json.dumps(status, sort_keys=True))
         return status
     finally: _CYCLE_LOCK.release()

@@ -18,7 +18,9 @@ FIELDKIT_RETENTION_AUTHORITY=1 python retention_maintenance.py activate --datase
 
 `run apply` also requires `--quiesced`; it acquires the serving lease before
 credentials or cloud work. The in-process callback runs every 120 seconds, while
-the office job runs hourly. The seven-day cutoff advances on each sweep, with
+the office job runs daily at 02:15, waits (up to 6 h) for the loop lock, and holds
+it only for plan+apply (two full bucket listings). If the lock never frees, it
+records `{"busy": true}` in `retention-last-run.json`. The seven-day cutoff advances on each sweep, with
 the initial floor at `2026-09-02T22:00Z`.
 
 `classifier-crops/` and best-evidence artifacts are permanent. Raw videos live

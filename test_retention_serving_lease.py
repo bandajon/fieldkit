@@ -98,6 +98,37 @@ def main():
         assert result["disabled"] is False
         assert (root / "classifier-crops/a/manifest.json").read_bytes() == b"{}"
 
+    # Busy lock: retries without holding anything; a free lock then runs; a held-forever lock records busy.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td); sleeps = []; clock = [0]
+        raw = (__import__("json").dumps(policy.advance_policy(None, "2026-09-09T00:00:00+00:00")) + "\n").encode()
+        (root / policy.POLICY_NAME).write_bytes(raw)
+        fake = types.SimpleNamespace(remote=lambda *a: {}, load_policy=lambda *a: {}, pull=lambda *a, **k: None)
+        busy = [True, True]
+        real_lock = rm.dataset_lock
+        @__import__("contextlib").contextmanager
+        def flaky(r, **kw):
+            if kw.get("label") == "retention" and busy and busy.pop():
+                yield False; return
+            with real_lock(r, **kw) as ok: yield ok
+        def fake_sleep(n): sleeps.append(n); clock[0] += n
+        sys.modules["dataset_sync"] = fake
+        try:
+            with patch.object(rm, "dataset_lock", flaky), patch.object(rm.time, "sleep", fake_sleep), \
+                 patch.object(rm.time, "monotonic", lambda: clock[0]), \
+                 patch.object(rm, "run", lambda *a, **kw: {"plan_sha256": "x", "mode": kw["mode"]}):
+                result = rm.maintenance_once(root, object(), "b")
+                assert sleeps == [60, 60] and result["disabled"] is False, (sleeps, result)
+                assert (root / "loop.lock").read_text() == ""        # holder cleared on release
+                sleeps.clear(); clock[0] = 0; busy[:] = [True] * 10**6
+                result = rm.maintenance_once(root, object(), "b")
+                assert result["busy"] is True and clock[0] >= rm.RETENTION_WAIT_S
+                assert __import__("json").loads((root / rm.STATUS).read_text())["busy"] is True
+        finally:
+            sys.modules["dataset_sync"] = real_dataset_sync
+        with rm.serving_lease(root) as ok:
+            assert ok and not (root / "serving.lock").read_text()    # no label from the lease
+
     tree = ast.parse(Path(__file__).with_name("app.py").read_text())
     node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "dataset_mutation")
     ns = {"functools": functools, "HTTPException": type("HTTPException", (Exception,), {}),
