@@ -37,10 +37,11 @@ ID_EXPIRY = 10.0         # forget an id unseen this long (ByteTrack recycles ids
 HIJACK_IOU = 0.05        # ByteTrack can hand one id from a vehicle to the next one passing it:
 HIJACK_JUMP = 1.0        # a box that shares nothing with its last sighting and whose centre
 HIJACK_GAP = 1.5 / FPS   # moved a whole vehicle-length is another vehicle, but only if it also
-HIJACK_SIZE = 1.5        # changed size by this factor or class (a fast same-size mover is not
-                         # a swap). Only consecutive frames are judged: a longer gap is an
-                         # occlusion, and expiry/ghost handle that. ponytail: assumes frames
-                         # arrive at FPS; a slow node simply never splits (a miss, not a loss).
+HIJACK_SIZE = 1.5        # changed size by this factor (a fast same-size mover is not a swap;
+                         # class is no signal — YOLO flickers it). Only consecutive frames are
+                         # judged: a longer gap is an occlusion, and expiry/ghost handle that.
+                         # Offline only (Detector.split_hijacks): live frame timing is the
+                         # processing clock plus dropped frames, so "consecutive" can't be trusted.
 RECOUNT_GUARD = 45.0     # a counted vehicle's resting place is remembered this long: a new
                          # id of the same class in the same spot is the same vehicle, not
                          # a second count. ponytail: IoU-at-rest is the assumption — one
@@ -744,6 +745,7 @@ class Detector:
         # time: an event must say when the vehicle passed the camera, not when we looked.
         self.clock = time.monotonic     # elapsed time: expiry, dwell, speed, the guard
         self.wall = time.time           # the stamp an event carries
+        self.split_hijacks = False      # offline only (classify_segment): see HIJACK_GAP
         self.tz = None                  # naive local, unless the footage's zone is known
         self.backend = str(cfg.get("detect_backend", "cpu") or "cpu").strip().lower()
         self.gate = str(cfg.get("toll_gate_id") or "").strip()
@@ -1117,10 +1119,10 @@ class Detector:
                     shown.append((self.display[cls], conf, box))
                     continue
                 t = ids.get(tid)
-                if t and t.get("box") and now - t["last_seen"] <= HIJACK_GAP:
+                if self.split_hijacks and t and t.get("box") and now - t["last_seen"] <= HIJACK_GAP:
                     pb = t["box"]
                     ar = ((box[2] - box[0]) * (box[3] - box[1])) / max((pb[2] - pb[0]) * (pb[3] - pb[1]), 1e-9)
-                    if ((ar > HIJACK_SIZE or ar < 1 / HIJACK_SIZE or cls != t["label"]) and iou(pb, box) < HIJACK_IOU and
+                    if ((ar > HIJACK_SIZE or ar < 1 / HIJACK_SIZE) and iou(pb, box) < HIJACK_IOU and
                             ((t["c"][0] - (box[0] + box[2]) / 2) ** 2 + (t["c"][1] - (box[1] + box[3]) / 2) ** 2) ** 0.5
                             >= HIJACK_JUMP * max(pb[2] - pb[0], pb[3] - pb[1])):
                         # The id jumped to another vehicle: close the first one's life.
@@ -1527,6 +1529,7 @@ def classify_segment(path, cam, cfg, tz, events_dir, source_key=None, render_to=
     d = Detector([cam], None, cfg, events_dir=events_dir,
                  dataset_dir=cfg.get("dataset_dir"), source_key=source_key)
     d.tz = tz
+    d.split_hijacks = True       # frames sit exactly 1/FPS apart on the footage clock
     start = ingest_video.cam_and_start(path)[1]
     at = [start]
     d.clock = d.wall = lambda: at[0]
@@ -1782,13 +1785,15 @@ if __name__ == "__main__":
     except ImportError:
         print("detect self-check: Pillow absent, drawing + capture checks skipped")
 
-    # Hijack: on consecutive frames an id that jumps to a far, disjoint box of another size
-    # (or class) is two vehicles; a same-size same-class jump, however fast, or any jump
+    # Hijack (offline, split_hijacks): on consecutive frames an id that jumps to a far, disjoint box
+    # of another size is two vehicles; a same-size jump (even with a class flicker), however fast, or any jump
     # after a gap, is one — splitting those loses or doubles counts.
     if jpeg:
         pic = Image.new("RGB", (640, 480))
+        big = Image.new("RGB", (1280, 720))
         tk = Path(tempfile.mkdtemp())
         d = fresh(events_dir=tk)
+        d.split_hijacks = True
         at = [time.time()]
         hday = datetime.fromtimestamp(at[0]).strftime("%Y-%m-%d")
         d.clock = d.wall = lambda: at[0]
@@ -1807,16 +1812,28 @@ if __name__ == "__main__":
         swapped = [x for x in docs if x["hits"] == TRACKLET_CROP_HITS]
         assert len(swapped) == 2 and swapped[0]["id"] != swapped[1]["id"], docs
         assert all(x["crops"] for x in swapped), swapped
+        # The same swap on the live clock is left alone.
+        d = fresh()
+        run([BOX] * 2 + [(400.0, 400.0, 500.0, 500.0)] * 2, d=d)
+        assert len(d.tracks["c"]) == 1, d.tracks
+        # A fast same-size car with a one-frame class flicker: one vehicle, counted once.
+        for cam in ({"name": "c", "heading": "north"}, CAM):
+            d = Detector([cam], nosnap, {})
+            d.split_hijacks = True
+            for cls, y in (("car", 560.0), ("car", 560.0), ("truck", 160.0), ("car", 160.0)):
+                d._track("c", [(cls, 0.9, (600.0, y, 680.0, y + 80.0), 1)], big)
+            assert len(d.tracks["c"]) == 1 and sum(d.totals.values()) == 1, (d.totals, d.tracks)
         # A same-size jump (a fast mover) and a size-changing jump after a gap: one track.
         for gap, boxes in ((0.2, [BOX, FAR, FAR]), (HIJACK_GAP + 1, [BOX, (400.0, 400.0, 500.0, 500.0)])):
             d = fresh()
+            d.split_hijacks = True
             d.clock = d.wall = lambda: at[0]
             run(boxes, gap, d=d)
             assert len(d.tracks["c"]) == 1 and d.tracks["c"][1]["hits"] == len(boxes), (gap, d.tracks)
             assert d.totals["truck"] == 1, "no count line: counted once, not split and doubled"
         # A fast same-size mover with a disjoint jump across the count line, back-to-back frames: counted once.
         d = Detector([{"name": "c", "heading": "north"}], nosnap, {})
-        big = Image.new("RGB", (1280, 720))
+        d.split_hijacks = True
         for y in (560.0, 560.0, 160.0):
             d._track("c", [("truck", 0.9, (600.0, y, 680.0, y + 80.0), 1)], big)
         assert d.totals["truck"] == 1 and len(d.tracks["c"]) == 1, (d.totals, d.tracks)
