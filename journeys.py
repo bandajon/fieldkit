@@ -237,6 +237,13 @@ def _links(chains, cameras):
     return links
 
 
+def _member_attrs(ms, cls):
+    """Attrs of the member with the most hits, preferring ones of the journey's class."""
+    have = [t for t in ms if t.get("attrs")]
+    same = [t for t in have if t.get("class") == cls]
+    return max(same or have, key=lambda t: t["hits"], default={}).get("attrs") or {}
+
+
 def _doc(chains, link, cfg, tz, events):
     ms = sorted((t for c in chains for t in c["members"]), key=lambda t: (t["t0"], t["id"]))
     votes, conf = Counter(), {}
@@ -276,7 +283,7 @@ def _doc(chains, link, cfg, tz, events):
         "class": cls, "letter": letter_of(cls), "conf": conf.get(cls),
         "direction": direction,
         "bound": next((b for n in names if (b := bound_of(cfg.get(n, {}), direction))), None),
-        "attrs": max(evs, key=lambda e: e.get("hits", 0)).get("attrs") or {} if evs else {},
+        "attrs": (max(evs, key=lambda e: e.get("hits", 0)).get("attrs") if evs else None) or _member_attrs(ms, cls),
         "crops": crops, "plates": plates,
         "members": [{k: m[k] for k in ("id", "camera", "t0", "t1", "counted")} for m in ms],
         "link": link and {"from": link[0]["camera"], "to": link[1]["camera"],
@@ -384,6 +391,14 @@ def _selfcheck():
     [j] = build(h, _CAMS, events=ev)
     assert (j["class"], j["letter"], j["conf"]) == ("e-heavy", "E", 0.9) and j["link"], j
     assert j["crops"]["best"] == "cam4-1-top.jpg" and j["attrs"] == {"axles": 5}, j
+    # No events: the best same-class member's attrs; event attrs still win; ids unchanged.
+    h0 = [dict(m) for m in h]
+    h0[0]["attrs"], h0[1]["attrs"] = {"axles": 2}, {"axles": 5}
+    h0[0]["hits"], h0[1]["hits"] = 30, 20     # cam3 has more hits but is d-medium
+    [jn] = build(h0, _CAMS)
+    assert jn["attrs"] == {"axles": 5} and jn["id"] == j["id"], jn
+    [jn] = build(h0, _CAMS, events={"obs-cam3-1": {"class": "e-heavy", "hits": 1, "attrs": {"axles": 7}}})
+    assert jn["attrs"] == {"axles": 7}, jn
     # (i) ghost_of joins a tracklet to the one it continues, however long the gap.
     g1 = _t("cam3", 1, "c-small", [(100, _b(0.5, 0.2)), (102, _b(0.5, 0.3))], counted=True)
     g2 = _t("cam3", 2, "c-small", [(120, _b(0.5, 0.3)), (125, _b(0.5, 0.31))], ghost_of="obs-cam3-1")

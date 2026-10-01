@@ -60,6 +60,7 @@ TRACKLETS = "fieldkit-tracklets/"   # every track, counted or not: the journey b
 # One line per vehicle across a camera pair — beside EVENTS, not instead of it, until the
 # counts are compared.
 JOURNEYS = "fieldkit-journeys/"
+HEALTH = "fieldkit-health/"   # per-gate health JSON: backlog, per-camera lag, last-24h alerts
 ANNOTATED = "fieldkit-annotated/"   # DeepStream-style rendered clips, for the RDA dashboard's live view
 LIVE_HOURS = 6         # only this recent a segment is worth rendering — a backlog must
                        # never slow classification down waiting on video encodes
@@ -92,6 +93,15 @@ def now():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+ALERTS = []   # this pass's operational warnings; classify_pass folds them into state + R2
+
+
+def alert(kind, gate, detail):
+    """A warning that used to be a bare print only the office Mac's log showed."""
+    print(detail, flush=True)
+    ALERTS.append({"at": now(), "kind": kind, "gate": gate, "detail": detail})
+
+
 def load_state():
     try:
         return json.loads(STATE.read_text())
@@ -118,6 +128,69 @@ def cameras(keys):
             continue
         out.setdefault(parts[0] + "/" + parts[1], []).append(k)
     return {c: sorted(v) for c, v in out.items()}
+
+
+def camera_lag(keys, classified, since=""):
+    """{gate: {cam: (newest recorded start, newest classified start | None, oldest unclassified
+    start since `since` | None)}} as epochs — how far classify trails each camera's recorder.
+    The newest-vs-newest gap reads ~0 under the live lane with an old hole behind it; the
+    oldest unclassified start shows that hole. Unparseable keys are skipped."""
+    import ingest_video
+    done, out = set(classified), {}
+    for pc, segs in cameras(keys).items():
+        prefix, cam = pc.split("/")
+        slot = out.setdefault(gate_of(prefix), {}).setdefault(cam, [None, None, None])   # two prefixes, one gate
+        for k in segs:
+            try:
+                t = ingest_video.cam_and_start(Path(k))[1]
+            except Exception:
+                continue
+            slot[0] = max(slot[0] or t, t)
+            if k in done:
+                slot[1] = max(slot[1] or t, t)
+            elif Path(k).stem >= since:
+                slot[2] = min(slot[2] or t, t)
+    return {g: {c: tuple(v) for c, v in cams.items() if v[0] is not None} for g, cams in out.items()}
+
+
+def fold_alerts(s, fresh, cutoff=None):
+    """s["alerts"] += fresh, minus anything older than 24 h, identical kind+gate+detail
+    collapsed to the newest; newest first. Malformed entries (state is hand-editable) are dropped."""
+    from datetime import timedelta
+    cutoff = cutoff or (datetime.now(timezone.utc) - timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    newest = {}
+    for a in s.get("alerts", []) + fresh:
+        if not isinstance(a, dict) or not {"at", "kind", "gate", "detail"} <= a.keys():
+            continue
+        k = (a["kind"], a["gate"], a["detail"])
+        if a["at"] >= cutoff and a["at"] >= newest.get(k, a)["at"]:
+            newest[k] = a
+    s["alerts"] = sorted(newest.values(), key=lambda a: a["at"], reverse=True)
+
+
+def publish_health(s, cl, bucket, keys, since=""):
+    """One small JSON per gate for the RDA dashboard. Never fails the pass."""
+    import time
+    iso = lambda t: t and datetime.fromtimestamp(t, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        lag = camera_lag(keys, s.get("classified", []), since)
+    except Exception as e:
+        print(f"  ! health: {e}", flush=True)
+        return
+    for gate, cams in lag.items():
+        try:
+            doc = {"gate": gate, "updated": now(), "backlog": s.get("classify_backlog"),
+                   "backlog_scope": "loop",   # the whole classify window, not this gate's share
+                   "last_classify": s.get("last_classify"),
+                   "lag_s": {c: r - c_ if c_ is not None else None for c, (r, c_, _) in cams.items()},
+                   "oldest_unclassified_s": {c: round(time.time() - o) if o is not None else None
+                                             for c, (_, _, o) in cams.items()},
+                   "newest": {c: {"recorded": iso(r), "classified": iso(c_)} for c, (r, c_, _) in cams.items()},
+                   "alerts": [a for a in s.get("alerts", []) if a["gate"] == gate][:50]}
+            cl.put_object(Bucket=bucket, Key=f"{HEALTH}{gate}.json", Body=json.dumps(doc).encode(),
+                          ContentType="application/json")
+        except Exception as e:
+            print(f"  ! health {gate}: {e}", flush=True)
 
 
 def pick(keys, ingested, per_cam=PER_CAM):
@@ -458,7 +531,7 @@ def horizon(keys, classified, gate, day, since, cam_cfg, now=None):
         segs = by_cam.get(cam, [])
         dead = gate_newest - newest.get(cam, float("-inf")) >= DEAD_AFTER_S
         if dead:
-            print(f"  camera {cam} silent since way behind the gate: not blocking", flush=True)
+            alert("dead_camera", gate, f"  camera {cam} silent since way behind the gate: not blocking")
             out[cam] = float("inf")
             continue
         relevant = sorted((k for k in segs if starts[k] >= day_start - 600), key=starts.get)
@@ -492,8 +565,8 @@ def prune_open_days(candidates, still_open, today):
         if age <= 7:
             kept.add((gate, day))
         else:
-            print(f"{now()} journeys: dropping ({gate}, {day}) after {age}d with provisional "
-                  f"journeys still open — LOST COUNTS", flush=True)
+            alert("lost_counts", gate, f"{now()} journeys: dropping ({gate}, {day}) after {age}d with "
+                                       f"provisional journeys still open — LOST COUNTS")
     return kept
 
 
@@ -1048,8 +1121,8 @@ def journeys_pass(cl, bucket, touched, cameras, tz, keys=(), classified=(), sinc
                                                # construction, and would false-alarm on every day
                     if (gate_of(k.split("/")[0]) == gate and Path(k).stem[:8] == yyyymmdd
                             and _iv.cam_and_start(Path(k))[1] < frozen_ts - FINAL_MARGIN):
-                        print(f"  ! LATE FOOTAGE — possible duplicate journeys: {k} classified "
-                              f"behind {gate}/{yyyymmdd}'s latest frozen journey ts", flush=True)
+                        alert("late_footage", gate, f"  ! LATE FOOTAGE — possible duplicate journeys: {k} "
+                              f"classified behind {gate}/{yyyymmdd}'s latest frozen journey ts")
 
             checked_days.add((gate, day))
             h, abandoned = horizon(keys, classified, gate, yyyymmdd, since, cameras)
@@ -1285,15 +1358,28 @@ def classify_pass():
             # so a crash or an uncaught exception in the loop still gets a chance to freeze
             # what's already classified, instead of losing it until the next pass notices.
             run_journeys()
-        # A segment that keeps failing must not starve hunt/ingest/train for 48h: it stays
-        # in `left` for status, but not in the count classify_behind() acts on — it will
-        # be retried next pass regardless, since it is never added to s["classified"].
-        all_todo = pick_classify(keys, s.get("classified", []), since, per_pass=None)
-        stuck = len(failed & set(all_todo))
-        left = len(all_todo)
-        s["classify_backlog"] = {"at": now(), "left": left - stuck, "failed": stuck}
-        s["last_classify"] = {"at": now(), "segments": done, "events": events}
-        save_state(s)
+            # Recounted on EVERY exit: a raise above would otherwise leave the last round's
+            # count (up to CLASSIFY_PER_PASS too high) for ~2 h, and train/ingest yield to it.
+            # A segment that keeps failing must not starve hunt/ingest/train for 48h: it stays
+            # in `left` for status, but not in the count classify_behind() acts on — it will
+            # be retried next pass regardless, since it is never added to s["classified"].
+            # Guarded so a failure here can't mask the exception that got us here.
+            try:
+                all_todo = pick_classify(keys, s.get("classified", []), since, per_pass=None)
+                stuck = len(failed & set(all_todo))
+                left = len(all_todo)
+                s["classify_backlog"] = {"at": now(), "left": left - stuck, "failed": stuck}
+                s["last_classify"] = {"at": now(), "segments": done, "events": events}
+                save_state(s)       # the recount lands before anything optional can fail
+            except Exception as e:
+                print(f"  ! recount: {e}", flush=True)
+            try:
+                fold_alerts(s, ALERTS)
+                ALERTS.clear()
+                save_state(s)
+                publish_health(s, cl, bucket, keys, since)
+            except Exception as e:
+                print(f"  ! health: {e}", flush=True)
         for (gate, day), cams in coverage_manifests(keys, s.get("classified", []), since).items():
             cl.put_object(Bucket=bucket, Key=f"{COVERAGE}{gate}/{day}.json",
                           Body=json.dumps({"gate": gate, "day": day, "updated": now(),
@@ -1512,6 +1598,7 @@ def adopt_attrs(name):
 
 
 def status():
+    import time
     s = load_state()
     try:
         count = new_frames()
@@ -1529,20 +1616,42 @@ def status():
         print(f"new frames:    {count} outside the reference set, {s.get('trained_frames', 0)} at the last run"
               f" — {'ready to train' if gap <= 0 else f'{gap} more before the next run'}")
     print(f"lock:          {(LOCK.read_text().strip() if LOCK.exists() else '') or 'free'}")
+    keys, since = [], ""
     try:
         import ingest_video
         _, cl, bucket = r2()
         now_dt = datetime.now(ZoneInfo(TZ))
         since = classify_since(now_dt, ingest_video.config(), s.get("classify_floor", ""))
-        cov = coverage(list(recording_keys(cl, bucket)), s.get("classified", []), since)
+        keys = list(recording_keys(cl, bucket))
+        cov = coverage(keys, s.get("classified", []), since)
         default_since = classify_since(now_dt, {})
         label = (f"since {since}" if since != default_since else f"last {CLASSIFY_HOURS}h")
         print(f"coverage ({label}):")
         for hour in sorted(cov):
             parts = ", ".join(f"{cam} {c}/{r}" for cam, (c, r) in sorted(cov[hour].items()))
             print(f"  {hour}  {parts}")
-    except Exception as e:
+    except (Exception, SystemExit) as e:
         print(f"coverage:      unavailable ({e})")
+    print("health:")
+    print(f"  backlog:     {s.get('classify_backlog')}")
+    try:
+        for gate, cams in camera_lag(keys, s.get("classified", []), since).items():
+            print(f"  lag {gate}:  " + ", ".join(
+                f"{c} {'never classified' if k is None else f'{(r - k) / 60:.0f} min'}, oldest unclassified "
+                f"{'none' if o is None else f'{(time.time() - o) / 60:.0f} min'}"
+                for c, (r, k, o) in sorted(cams.items())))
+    except Exception as e:
+        print(f"  lag:         unavailable ({e})")
+    fold_alerts(s, [])
+    by_kind = {}
+    for a in s["alerts"]:
+        by_kind.setdefault(a["kind"], []).append(a)
+    for kind, items in sorted(by_kind.items()):
+        print(f"  {kind}: {len(items)} in 24h")
+        for a in items[:3]:
+            print(f"    {a['at']} {a['gate']} {a['detail'].strip()}")
+    if not by_kind:
+        print("  no alerts in the last 24h")
 
 
 def suggest_check():
@@ -2202,6 +2311,11 @@ def selfcheck():
     journeys_check()
     suggest_check()
     curation_check()
+    lag = camera_lag(["site1/cam/20260927-110000.mkv", "site1/cam/20260927-111000.mkv",
+                      "site1/cam/20260927-112000.mkv", "site1/other/20260927-110000.mkv"],
+                     ["site1/cam/20260927-110000.mkv", "site1/cam/20260927-111000.mkv"])["RDA-TG-KTB"]
+    assert lag["cam"][0] - lag["cam"][1] == 600 and lag["other"][1] is None
+    assert lag["cam"][2] == lag["cam"][0] and lag["other"][2] == lag["other"][0]   # oldest hole, not newest
     print("selfloop self-check ok: cameras found under any gate prefix, newest unsampled segments "
           "picked per camera, training triggers on the cumulative threshold, promotion needs a "
           "strictly better reference score (detector) or mean val accuracy (attributes) unless "
