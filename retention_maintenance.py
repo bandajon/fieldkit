@@ -62,6 +62,9 @@ def dataset_lock(root, filename="loop.lock"):
                 import fcntl
                 fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             except (ImportError, OSError): yield False; return
+        # Same text as selfloop's Lock, so a classify that finds this held prints who has it.
+        try: f.truncate(0); f.write(f"{os.getpid()} ['retention'] since {datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}"); f.flush()
+        except OSError: pass
         yield True
     finally:
         try:
@@ -417,16 +420,18 @@ def maintenance_once(root, cl, bucket, prefix=PREFIX):
     if not (root / policy.POLICY_NAME).exists() and authority: return {"disabled": True}
     if not _CYCLE_LOCK.acquire(blocking=False): return {"busy": True}
     try:
+        if not authority:
+            # Network-bound (~700k-object listing, crop pull): done before loop.lock so classify is not starved.
+            listing = dataset_sync.remote(cl, bucket, prefix)
+            if dataset_sync.load_policy(cl, bucket, prefix, root, listing) is None:
+                return {"disabled": True}
+            # Unlocked on purpose: a concurrent train could read crops mid-pull, but pull is idempotent and train is rare.
+            dataset_sync.pull(cl, bucket, prefix, root, names=("classifier-crops",))
         with dataset_lock(root) as locked:
             if not locked: return {"busy": True}
             if authority:
                 with policy.DATASET_LOCK:
                     activate(root, cl, bucket, prefix)
-            else:
-                listing = dataset_sync.remote(cl, bucket, prefix)
-                if dataset_sync.load_policy(cl, bucket, prefix, root, listing) is None:
-                    return {"disabled": True}
-                dataset_sync.pull(cl, bucket, prefix, root, names=("classifier-crops",))
             policy.DATASET_LOCK.acquire()
             try:
                 plan = run(root, cl=cl, bucket=bucket, prefix=prefix, mode="plan", internal_locked=True)

@@ -70,7 +70,31 @@ def main():
                                      {"Key": "curation/classifier-crops/a/manifest.json", "Size": 2}]}
             def get_object(self, **_): return {"Body": BytesIO(policy_raw)}
             def download_file(self, bucket, key, dest): Path(dest).write_bytes(b"{}")
-        result = rm.maintenance_once(root, Client(), "b")
+        order, held = [], []
+        real_lock, real_run = rm.dataset_lock, rm.run
+        @__import__("contextlib").contextmanager
+        def spy_lock(*a, **kw):
+            with real_lock(*a, **kw) as ok:
+                held.append(1); order.append("lock")
+                holder = (root / "loop.lock").read_text()
+                assert f"{__import__('os').getpid()} ['retention'] since " in holder, holder
+                yield ok
+            held.pop()
+        def spy_run(*a, **kw):
+            assert held, "plan/apply must run under loop.lock"
+            order.append("run:" + kw["mode"]); return real_run(*a, **kw)
+        def before_lock(name):
+            fn = getattr(real_dataset_sync, name)
+            def spy(*a, **kw):
+                assert not held, f"{name} ran under loop.lock"
+                order.append(name); return fn(*a, **kw)
+            return spy
+        with patch.object(rm, "dataset_lock", spy_lock), patch.object(rm, "run", spy_run), \
+             patch.object(real_dataset_sync, "remote", before_lock("remote")), \
+             patch.object(real_dataset_sync, "load_policy", before_lock("load_policy")), \
+             patch.object(real_dataset_sync, "pull", before_lock("pull")):
+            result = rm.maintenance_once(root, Client(), "b")
+        assert order[-3:] == ["lock", "run:plan", "run:apply"] and order[:3] == ["remote", "load_policy", "pull"], order  # pull re-lists internally
         assert result["disabled"] is False
         assert (root / "classifier-crops/a/manifest.json").read_bytes() == b"{}"
 

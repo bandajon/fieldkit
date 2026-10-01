@@ -10,7 +10,10 @@
     <string>/Users/admin/fieldkit/retention_maintenance.py</string>
     <string>once</string><string>--dataset</string><string>/Users/admin/fieldkit/dataset</string><string>--quiesced</string>
   </array>
-  <key>StartInterval</key><integer>3600</integer>
+  <!-- Daily, not hourly: apply holds loop.lock through a full ~700k-object cloud listing (5+ min
+       on the office link), which starves classify, and the retention window is 7 days. -->
+  <key>StartCalendarInterval</key>
+  <dict><key>Hour</key><integer>2</integer><key>Minute</key><integer>15</integer></dict>
   <key>WorkingDirectory</key><string>/Users/admin/fieldkit</string>
   <key>StandardOutPath</key><string>/dev/null</string>
   <key>StandardErrorPath</key><string>/Users/admin/fieldkit/output/retention.err</string>
