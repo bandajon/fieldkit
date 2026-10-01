@@ -10,7 +10,11 @@
     <string>/Users/admin/fieldkit/retention_maintenance.py</string>
     <string>once</string><string>--dataset</string><string>/Users/admin/fieldkit/dataset</string><string>--quiesced</string>
   </array>
-  <key>StartInterval</key><integer>3600</integer>
+  <!-- Daily 02:15, not hourly: the job holds loop.lock for plan+apply, which is two full ~700k-object
+       cloud listings (5+ min each on the office link) and would starve classify; the window is 7 days.
+       It waits up to 6 h for the loop lock (classify can hold it 3 h) and records busy if it never frees. -->
+  <key>StartCalendarInterval</key>
+  <dict><key>Hour</key><integer>2</integer><key>Minute</key><integer>15</integer></dict>
   <key>WorkingDirectory</key><string>/Users/admin/fieldkit</string>
   <key>StandardOutPath</key><string>/dev/null</string>
   <key>StandardErrorPath</key><string>/Users/admin/fieldkit/output/retention.err</string>

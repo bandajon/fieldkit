@@ -77,6 +77,15 @@ class ClassifyPassTest(unittest.TestCase):
         self.run_pass(keys, journeys)
         self.assertEqual(seen, [set(keys[:1]), set(keys[:2]), set(keys[1:]), set(keys[2:])])
 
+    def test_journeys_publish_health_each_run_after_save(self):
+        events = []
+        with patch.object(selfloop, "publish_health", side_effect=lambda *a: events.append("health")):
+            self.run_pass(["site1/cam/20260927-110000.mkv"], lambda *a: (0, set(), set()),
+                          save=lambda s: events.append("save"))
+        self.assertGreaterEqual(events.count("health"), 2)   # mid-pass journeys + the finally
+        first = events.index("health")
+        self.assertEqual(events[first - 1], "save")
+
     def test_real_journey_pass_reports_checked_day_around_failures(self):
         class FakeS3:
             def get_paginator(self, _):

@@ -1244,6 +1244,13 @@ def classify_pass():
                 touched.clear()
             except Exception as e:       # journeys ride beside events; they never cost a classify
                 print(f"  ! journeys: {e}", flush=True)
+            try:                         # health no older than a journeys cadence, not a whole pass
+                fold_alerts(s, ALERTS)
+                ALERTS.clear()
+                save_state(s)
+                publish_health(s, cl, bucket, keys, since)
+            except Exception as e:
+                print(f"  ! health: {e}", flush=True)
             last_journeys = time.monotonic()
 
         deadline = time.monotonic() + CLASSIFY_BUDGET
