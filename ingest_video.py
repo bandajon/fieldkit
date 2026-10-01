@@ -139,7 +139,7 @@ class Sink:
     """dataset/pending writer with the live capture's gates, measured in footage time:
     no detections, an unchanged scene, or a too-recent sample and nothing lands."""
 
-    def __init__(self, dataset, ids, gate="", wanted=(), only_wanted=False):
+    def __init__(self, dataset, ids, gate="", wanted=(), only_wanted=False, congested=0):
         self.images = Path(dataset) / "pending" / "images"
         self.labels = Path(dataset) / "pending" / "labels"
         for d in (self.images, self.labels):
@@ -147,8 +147,11 @@ class Sink:
         self.ids, self.gate = ids, gate
         self.wanted = set(wanted)   # classes worth a sample off-cadence (detect._capture)
         self.only_wanted = only_wanted   # a hunt: the cadence captures nothing at all
+        self.congested = congested   # boxes that make a frame a queue worth a sample; 0 = off
         self.at = {}          # cam -> footage timestamp of its last capture
         self.rare_at = {}     # cam -> footage timestamp of its last off-cadence capture
+        self.dense_at = {}    # cam -> footage timestamp of its last congested capture
+        self.dense = 0        # frames written because they were congested
         self.dets = {}        # cam -> its `shown`, for the scene comparison
         self.written = Counter()
         self.hits = Counter()   # wanted class -> frames written holding it: a hunt's quota
@@ -163,12 +166,14 @@ class Sink:
             return False
         rare = any(d[0] in self.wanted for d in shown) \
             and ts - self.rare_at.get(cam, float("-inf")) >= detect.RARE_EVERY
-        if not rare and (self.only_wanted
+        dense = bool(self.congested) and len(shown) >= self.congested \
+            and ts - self.dense_at.get(cam, float("-inf")) >= detect.CONGESTED_EVERY
+        if not (rare or dense) and (self.only_wanted
                          or ts - self.at.get(cam, float("-inf")) < detect.CAPTURE_EVERY):
             return False
         if detect.same_scene(shown, self.dets.get(cam, [])):
             return False
-        stem = detect.sample_stem(self.gate, cam, ts, detect.RARE_STEP if rare else None)
+        stem = detect.sample_stem(self.gate, cam, ts, detect.RARE_STEP if rare or dense else None)
         lines = [f"{self.ids[cls]} {(x1 + x2) / 2 / w:.6f} {(y1 + y2) / 2 / h:.6f} "
                  f"{(x2 - x1) / w:.6f} {(y2 - y1) / h:.6f}"
                  for cls, _conf, (x1, y1, x2, y2) in shown if cls in self.ids]
@@ -186,6 +191,9 @@ class Sink:
             self.at[cam], self.dets[cam] = ts, shown
             if rare:
                 self.rare_at[cam] = ts
+            if dense:
+                self.dense_at[cam] = ts
+                self.dense += 1
         self.written[cam] += 1
         self.hits.update({cls for cls, _c, _b in shown if cls in self.wanted})
         self.stems.append(stem)
@@ -235,7 +243,7 @@ def ingest_one(f, run, sink, cam=None):
 def ingest(files, cfg):
     run, ids = detector(cfg)
     sink = Sink(DATASET, ids, gate_id(cfg), cfg.get("capture_wanted") or (),
-                bool(cfg.get("capture_only_wanted")))
+                bool(cfg.get("capture_only_wanted")), int(cfg.get("capture_congested") or 0))
     sampled = sum(ingest_one(f, run, sink)[0] for f in files)
     print(f"\n{len(files)} file(s), {sampled} frames sampled at {INGEST_FPS} fps, "
           f"{sum(sink.written.values())} samples written to {sink.images.parent}")
@@ -436,6 +444,12 @@ def selfcheck():
     assert only.offer("c", base + 61, b"c", bus, 64, 64), "a hunt keeps the wanted ones"
     assert only.hits == {"bus": 1}, f"a hunt counts its frames per wanted class: {only.hits}"
     assert not only.offer("c", base + 62, b"d", bus2, 64, 64), "...spaced like any rare capture"
+    jam = Sink(tmp / "jam", dict(detect.CLASS_IDS), only_wanted=True, congested=3)
+    row = lambda x: [("car", 0.9, (x + 100.0 * i, 10.0, x + 100.0 * i + 50.0, 60.0)) for i in range(3)]
+    assert jam.offer("c", base, b"a", row(0.0), 64, 64), "a hunt keeps a queue"
+    assert not jam.offer("c", base + 1, b"b", row(0.0)[:2], 64, 64), "...but not two cars"
+    assert not jam.offer("c", base + 2, b"c", row(20.0), 64, 64), "one queue frame per CONGESTED_EVERY"
+    assert jam.offer("c", base + detect.CONGESTED_EVERY, b"d", row(20.0), 64, 64) and jam.dense == 2
 
     assert segments([str(tmp)]) == [odd, seg], segments([str(tmp)])
 
