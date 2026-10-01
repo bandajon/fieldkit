@@ -32,3 +32,12 @@ bytetrack-fieldkit.yaml
 # per-vehicle event records + evidence crops — site data
 events/
 fieldkit-server.log
+# runtime artefacts: logs, pids, generated review output — never repo content, and logs
+# can carry camera URLs with passwords (this repo is public)
+*.log
+*.err
+*.pid
+output/
+transition-editor-draft.png
+# client procurement documents — kept local, not in a public repo
+docs/methodology/

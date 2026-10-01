@@ -27,6 +27,7 @@ import yaml
 from fastapi import Body, FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
+from starlette.concurrency import run_in_threadpool
 
 import camera
 import detect
@@ -60,6 +61,7 @@ GOLD_RATE = float(os.environ.get("GOLD_RATE", 0.05))       # how often a check s
 # every one of them token-gated, and none of the camera/recorder/cloud machinery.
 CURATION = os.environ.get("FIELDKIT_MODE", "console") == "curation"
 if CURATION:
+    import paired_review
     import curation_cap
 REVIEWERS = [w.strip() for w in os.environ.get("REVIEWERS", "").split(",") if w.strip()]
 # Break-glass supervisor: PASSWORD in the environment beats the stored hash, so a
@@ -214,6 +216,51 @@ def record_dir():
     d.mkdir(parents=True, exist_ok=True)
     return d
 
+def _paired_failure(exc):
+    if isinstance(exc, PermissionError):
+        return HTTPException(403, "example deletion forbidden")
+    if isinstance(exc, ValueError):
+        return HTTPException(400, str(exc))
+    if isinstance(exc, paired_review.RecordingMissing):
+        return HTTPException(404, "recording not found")
+    return HTTPException(503, "paired recording service unavailable")
+
+def _paired_response(data):
+    return JSONResponse(data, headers={"Cache-Control": "no-store"})
+
+def _paired_resources():
+    try:
+        return r2()
+    except HTTPException:
+        raise HTTPException(503, "paired storage unavailable") from None
+
+def _save_paired_calibration(site, body):
+    _, client, bucket = _paired_resources()
+    return paired_review.save_calibration(client, bucket, site, body)
+
+def _save_paired_example(site, date, body, who):
+    _, client, bucket = _paired_resources()
+    return paired_review.save_example(client, bucket, DATASET / "paired-cache", site, date, body, who)
+
+async def _paired_body(request):
+    declared = request.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > paired_review.MAX_JSON:
+        raise HTTPException(400, "request body is too large")
+    chunks, total = [], 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > paired_review.MAX_JSON:
+            raise HTTPException(400, "request body is too large")
+        chunks.append(chunk)
+    raw = b"".join(chunks)
+    try:
+        value = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise HTTPException(400, "invalid JSON body") from None
+    if not isinstance(value, dict):
+        raise HTTPException(400, "JSON body must be an object")
+    return value
+
 
 if not CONFIG_PATH.exists():      # first boot (and cloud deploys, where it is untracked)
     shutil.copyfile(EXAMPLE_PATH, CONFIG_PATH)
@@ -313,8 +360,12 @@ if CURATION:
             # /login is the one path in without a token: it proves the caller itself.
             if path != "/api/dataset/login" and \
                     not any(hmac.compare_digest(t, token) for t in curators().values()):
-                return JSONResponse({"detail": "unknown curator or bad token"}, status_code=401)
-        return await call_next(request)
+                headers = {"Cache-Control": "no-store"} if path.startswith("/api/dataset/paired/") else {}
+                return JSONResponse({"detail": "unknown curator or bad token"}, status_code=401, headers=headers)
+        response = await call_next(request)
+        if path.startswith("/api/dataset/paired/"):
+            response.headers["Cache-Control"] = "no-store"
+        return response
 
 
 @app.get("/")
@@ -328,6 +379,91 @@ def healthz():
     through without a token, and shared with ops.py so one healthcheckPath serves
     every service built from this repo."""
     return {"ok": True, "app": "fieldkit"}
+
+
+if CURATION:
+    @app.get("/api/dataset/paired/recordings")
+    def paired_recordings(site: str = "", date: str = "", x_curator_token: str = Header("")):
+        token_who(x_curator_token)
+        try:
+            _, client, bucket = _paired_resources()
+            return _paired_response(paired_review.catalog(client, bucket, site or None, date or None))
+        except HTTPException: raise
+        except Exception as exc: raise _paired_failure(exc) from None
+
+    @app.get("/api/dataset/paired/frames")
+    def paired_frames(source_a: str, source_b: str, ts: float | None = None, delta_s: float = 0,
+                      mode: str = "overlap", x_curator_token: str = Header("")):
+        token_who(x_curator_token)
+        try:
+            _, client, bucket = _paired_resources()
+            return _paired_response(paired_review.frames(client, bucket, DATASET / "paired-cache", source_a, source_b, ts, delta_s, mode))
+        except HTTPException: raise
+        except Exception as exc: raise _paired_failure(exc) from None
+
+    @app.get("/api/dataset/paired/{site}/calibrations")
+    def paired_calibrations(site: str, x_curator_token: str = Header("")):
+        token_who(x_curator_token)
+        try:
+            _, client, bucket = _paired_resources()
+            return _paired_response(paired_review.list_calibrations(client, bucket, site))
+        except HTTPException: raise
+        except Exception as exc: raise _paired_failure(exc) from None
+
+    @app.post("/api/dataset/paired/{site}/calibrations")
+    async def paired_calibration_save(site: str, request: Request, x_curator_token: str = Header("")):
+        token_who(x_curator_token)
+        body = await _paired_body(request)
+        try:
+            return _paired_response(await run_in_threadpool(_save_paired_calibration, site, body))
+        except HTTPException: raise
+        except Exception as exc: raise _paired_failure(exc) from None
+
+    @app.get("/api/dataset/paired/{site}/{date}/examples")
+    def paired_examples(site: str, date: str, x_curator_token: str = Header("")):
+        who = token_who(x_curator_token)
+        try:
+            _, client, bucket = _paired_resources()
+            return _paired_response(paired_review.list_examples(client, bucket, site, date, who, REVIEWERS))
+        except HTTPException: raise
+        except Exception as exc: raise _paired_failure(exc) from None
+
+    @app.post("/api/dataset/paired/{site}/{date}/examples")
+    async def paired_example_save(site: str, date: str, request: Request, x_curator_token: str = Header("")):
+        who = token_who(x_curator_token)
+        body = await _paired_body(request)
+        try:
+            return _paired_response(await run_in_threadpool(_save_paired_example, site, date, body, who))
+        except HTTPException: raise
+        except Exception as exc: raise _paired_failure(exc) from None
+
+    @app.get("/api/dataset/paired/{site}/{date}/examples/{ident}")
+    def paired_example_get(site: str, date: str, ident: str, x_curator_token: str = Header("")):
+        who = token_who(x_curator_token)
+        try:
+            _, client, bucket = _paired_resources()
+            return _paired_response(paired_review.get_example(client, bucket, site, date, ident, who, REVIEWERS))
+        except HTTPException: raise
+        except Exception as exc: raise _paired_failure(exc) from None
+
+    @app.delete("/api/dataset/paired/{site}/{date}/examples/{ident}")
+    def paired_example_delete(site: str, date: str, ident: str, x_curator_token: str = Header("")):
+        who = token_who(x_curator_token)
+        try:
+            _, client, bucket = _paired_resources()
+            return _paired_response(paired_review.delete_example(client, bucket, site, date, ident, who, REVIEWERS))
+        except HTTPException: raise
+        except Exception as exc: raise _paired_failure(exc) from None
+
+    @app.get("/api/dataset/paired/{site}/{date}/examples/{ident}/frames/{side}")
+    def paired_example_frame(site: str, date: str, ident: str, side: str, x_curator_token: str = Header("")):
+        token_who(x_curator_token)
+        try:
+            _, client, bucket = _paired_resources()
+            raw = paired_review.get_example_frame(client, bucket, site, date, ident, side)
+            return Response(content=raw, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+        except HTTPException: raise
+        except Exception as exc: raise _paired_failure(exc) from None
 
 
 @app.get("/api/status")
@@ -1645,6 +1781,12 @@ def sync_loop():
             sync_both(*r2())
         except Exception as e:   # a failed pass is a retry in SYNC_EVERY, never a dead server
             print(f"dataset sync failed: {e}", flush=True)
+        if CURATION:
+            try:
+                _, client, bucket = r2()
+                paired_review.cleanup(client, bucket, DATASET / "paired-cache")
+            except Exception as e:
+                print(f"paired cleanup failed: {e}", flush=True)
         time.sleep(SYNC_EVERY)
 
 
