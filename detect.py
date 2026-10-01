@@ -1306,6 +1306,7 @@ class Detector:
                "counted": bool(t["counted_as"]) and not t.get("ghost"),
                "ghost_of": t.get("ghost_of"), "direction": self._direction(t, self._cam(name)),
                "path": path, "crops": {tag: rel[tag] for tag in shots},
+               "attrs": t["attrs"] or (self._classify(t, k) if shots and self.attrs else {}),
                "plate": plate and {"conf": round(plate[0], 3), "crop": rel["plate"]}}
         try:
             (self.events_dir / "tracklets" / "crops" / day).mkdir(parents=True, exist_ok=True)
@@ -2115,6 +2116,33 @@ if __name__ == "__main__":
         assert not list((tk / "tracklets" / "crops" / tday).glob(short["id"] + "-*")), "a blip keeps no jpeg"
         assert long["plate"]["conf"] == 0.3 and (tk / long["plate"]["crop"]).is_file(), long["plate"]
         assert len((tk / f"{tday}.jsonl").read_text().splitlines()) == 3, "events: one per counted id"
+
+        # Every tracklet with crops carries attrs: a counted track reuses what it got at
+        # count time, an uncounted one is classified when it retires (never a blip).
+        calls = []
+        tk2 = Path(tempfile.mkdtemp())
+        d = fresh(events_dir=tk2)
+        d.clock = d.wall = lambda: at[0]
+        d.attrs = lambda img, cls=None: calls.append(cls) or {"type": cls}
+        for i in range(TRACKLET_CROP_HITS):
+            d._track("c", [("truck", 0.9, VEH, 1)], pic)
+            at[0] += 0.4
+        seen = len(calls)
+        d.tracks["c"][1]["attrs"], d.tracks["c"][1]["counted_as"] = {}, None
+        d.flush("c")
+        doc = json.loads((tk2 / "tracklets" / f"{tday}.jsonl").read_text().splitlines()[-1])
+        assert doc["attrs"] == {"type": "truck"} and len(calls) == seen + 1, (doc, calls)
+        d = fresh(events_dir=tk2)
+        d.clock = d.wall = lambda: at[0]
+        d.attrs = lambda img, cls=None: calls.append(cls) or {"type": cls}
+        for i in range(TRACKLET_CROP_HITS):
+            d._track("c", [("truck", 0.9, VEH, 1)], pic)
+            at[0] += 0.4
+        seen = len(calls)
+        assert d.tracks["c"][1]["attrs"], "counted at least once"
+        d.flush("c")
+        doc = json.loads((tk2 / "tracklets" / f"{tday}.jsonl").read_text().splitlines()[-1])
+        assert doc["attrs"] == {"type": "truck"} and len(calls) == seen, (doc, calls)
 
         # Parked all day is one id: its path stops at PATH_MAX, and the exit still lands.
         d = fresh(events_dir=tk)
