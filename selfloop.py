@@ -323,9 +323,8 @@ def classify_since(now_dt, cfg, floor=""):
     return max(default, configured)
 
 
-def live_lane(keys, classified, since, now, failed=(), limit=CLASSIFY_PER_PASS // 2):
-    """Keep live clips available while oldest-first classification drains a backlog.
-    Round-robin each camera's newest eligible segments, leaving room for the backlog."""
+def live_lane(keys, classified, since, now, failed=(), limit=2):
+    """Keep up to two live clips available while oldest-first classification drains a backlog."""
     import ingest_video
     excluded = set(classified) | set(failed)
     per_camera = []
@@ -961,7 +960,8 @@ def journeys_pass(cl, bucket, touched, cameras, tz, keys=(), classified=(), sinc
     belongs to at most one final journey, ever, so re-linking it on a later pass (once its
     partner camera catches up) can never double-import it. Only cameras with `handoff`
     config pair up; without any there is nothing to link. -> (journeys written, still-open
-    (gate, day) pairs — those with provisional journeys left for classify_pass to revisit).
+    (gate, day) pairs — those with provisional journeys left for classify_pass to revisit;
+    checked (gate, YYYY-MM-DD) days whose frozen/LATE FOOTAGE diagnostic completed).
 
     A provisional journey freezes only once BOTH: (a) its latest member clears FINAL_MARGIN
     against every camera `gate` owns (horizon()), not just the cameras it happens to touch,
@@ -981,7 +981,7 @@ def journeys_pass(cl, bucket, touched, cameras, tz, keys=(), classified=(), sinc
     reads, cheap next to classify's own downloads. Crops are cited by bucket key, never
     copied."""
     if not any(c.get("handoff") for c in cameras):
-        return 0, set()
+        return 0, set(), set(touched)
     from datetime import timedelta
     import journeys
 
@@ -1004,7 +1004,7 @@ def journeys_pass(cl, bucket, touched, cameras, tz, keys=(), classified=(), sinc
         w = f"{gate}/{day8}/"       # can span several minutes either side of midnight)
         return list(docs(TRACKLETS + w)), w
 
-    total, still_open = 0, set()
+    total, still_open, checked_days = 0, set(), set()
     for gate, day in sorted(touched):
         try:
             yyyymmdd = day.replace("-", "")
@@ -1051,6 +1051,7 @@ def journeys_pass(cl, bucket, touched, cameras, tz, keys=(), classified=(), sinc
                         print(f"  ! LATE FOOTAGE — possible duplicate journeys: {k} classified "
                               f"behind {gate}/{yyyymmdd}'s latest frozen journey ts", flush=True)
 
+            checked_days.add((gate, day))
             h, abandoned = horizon(keys, classified, gate, yyyymmdd, since, cameras)
             # min(h.values()): a journey freezes only once EVERY camera the gate owns is past it
             # by FINAL_MARGIN — an uncaught-up partner could still hand a lone chain a new link.
@@ -1086,7 +1087,7 @@ def journeys_pass(cl, bucket, touched, cameras, tz, keys=(), classified=(), sinc
         except Exception as e:    # one bad key or JSON line must not stop every other day
             print(f"  ! journeys {gate} {day}: {e}", flush=True)
             still_open.add((gate, day))     # leave it in open_days: retry next pass
-    return total, still_open
+    return total, still_open, checked_days
 
 
 def classify_pass():
@@ -1156,8 +1157,14 @@ def classify_pass():
         def run_journeys():
             nonlocal open_days, touched, last_journeys
             try:
-                _, still_open = journeys_pass(cl, bucket, touched | open_days, base.get("cameras") or [], tz,
-                                              keys, s.get("classified", []), since, classified_now)
+                _, still_open, checked_days = journeys_pass(
+                    cl, bucket, touched | open_days, base.get("cameras") or [], tz,
+                    keys, s.get("classified", []), since, classified_now)
+                classified_now.difference_update({
+                    k for k in set(classified_now)
+                    if (gate_of(k.split("/")[0]),
+                        f"{Path(k).stem[:4]}-{Path(k).stem[4:6]}-{Path(k).stem[6:8]}") in checked_days
+                })
                 open_days = prune_open_days(open_days | touched, still_open, datetime.now(ZoneInfo(TZ)).date())
                 s["open_days"] = sorted(list(p) for p in open_days)
                 save_state(s)
@@ -1172,7 +1179,10 @@ def classify_pass():
             while not expired:
                 keys = list(recording_keys(cl, bucket))   # re-listed each round: picks up arrivals
                 all_todo = pick_classify(keys, s.get("classified", []), since, per_pass=None)
-                left = len(all_todo)          # honest backlog count, failed segments included
+                stuck = len(failed & set(all_todo))
+                left = len(all_todo)
+                s["classify_backlog"] = {"at": now(), "left": left - stuck, "failed": stuck}
+                save_state(s)
                 live = live_lane(keys, s.get("classified", []), since, time.time(), failed)
                 todo = list(dict.fromkeys(live + [k for k in all_todo if k not in failed]))[:CLASSIFY_PER_PASS]
                 if not todo:
@@ -1230,7 +1240,7 @@ def classify_pass():
                         # with the download.
                         day, _, render_ok = detect.classify_segment(video, cam, cfg, tz, out, source_key=key,
                                                                     render_to=clip, gate=gate)
-                        render_s = time.monotonic() - t0 if live else 0
+                        classify_s = time.monotonic() - t0 if live else 0
                         n = publish(cl, bucket, out, gate, key, day)
                         new_days = {(gate, js.stem) for js in (out / "tracklets").glob("*.jsonl")}
                         touched |= new_days
@@ -1256,7 +1266,7 @@ def classify_pass():
                             except Exception as e:
                                 print(f"  ! annotated upload {key}: {e}", flush=True)
                         print(f"    {n} event(s) -> {EVENTS}{gate}/{day.replace('-', '')}/"
-                              + (f" ({render_s:.0f}s to render)" if live else ""), flush=True)
+                              + (f" ({classify_s:.0f}s classify incl. render)" if live else ""), flush=True)
                     except Exception as e:       # one bad segment must not strand the rest
                         failed.add(key)
                         print(f"  ! {key}: {e}", flush=True)
@@ -1278,7 +1288,9 @@ def classify_pass():
         # A segment that keeps failing must not starve hunt/ingest/train for 48h: it stays
         # in `left` for status, but not in the count classify_behind() acts on — it will
         # be retried next pass regardless, since it is never added to s["classified"].
+        all_todo = pick_classify(keys, s.get("classified", []), since, per_pass=None)
         stuck = len(failed & set(all_todo))
+        left = len(all_todo)
         s["classify_backlog"] = {"at": now(), "left": left - stuck, "failed": stuck}
         s["last_classify"] = {"at": now(), "segments": done, "events": events}
         save_state(s)
@@ -1870,7 +1882,8 @@ def journeys_check():
             {"name": "cam4", "heading": "north", "handoff": {"camera": "cam3", "zone": [0.0, 0.55, 0.22, 0.30]}}]
     cl = FakeS3(objs)
     assert journeys_pass(cl, "buck", {("G", "2026-08-19")}, cams, timezone.utc) == \
-        (1, {("G", "2026-08-19")}), "unfrozen (no keys/classified given: horizon never clears): still open"
+        (1, {("G", "2026-08-19")}, {("G", "2026-08-19")}), \
+        "unfrozen (no keys/classified given: horizon never clears): still open and checked"
     assert set(cl.put) == {"fieldkit-journeys/G/20260819/journeys.jsonl"}, cl.put
     assert not any("/crops/" in k for k in cl.listed), cl.listed
     [j] = map(json.loads, cl.put["fieldkit-journeys/G/20260819/journeys.jsonl"].decode().splitlines())
@@ -1878,7 +1891,8 @@ def journeys_check():
     assert j["crops"] and all(v.startswith(day + "crops/") for v in j["crops"].values()), j["crops"]
     cl = FakeS3(objs)
     assert journeys_pass(cl, "buck", {("G", "2026-08-19")}, [{"name": "cam3"}, {"name": "cam4"}],
-                         timezone.utc) == (0, set()), "no handoff, nothing to link"
+                         timezone.utc) == (0, set(), {("G", "2026-08-19")}), \
+        "no handoff, nothing to diagnose"
 
     # Finalization: with both cameras' one segment of the day classified, horizon() reads a
     # real 2026 epoch well past the tracklets' — so the linked journey clears FINAL_MARGIN
@@ -1886,17 +1900,18 @@ def journeys_check():
     # tracklets and neither re-emit it nor write a second batch.
     day_keys = ["G/cam3/20260819-130000.mkv", "G/cam4/20260819-130000.mkv"]   # after BASE's ~12:01 CAT
     cl = FakeS3(dict(objs))
-    n1, open1 = journeys_pass(cl, "buck", {("G", "2026-08-19")}, cams, timezone.utc,
+    n1, open1, checked1 = journeys_pass(cl, "buck", {("G", "2026-08-19")}, cams, timezone.utc,
                               keys=day_keys, classified=day_keys, since="20260101-000000")
-    assert n1 == 1 and open1 == set(), (n1, open1)
+    assert n1 == 1 and open1 == set() and checked1 == {("G", "2026-08-19")}, (n1, open1, checked1)
     [final_key] = [k for k in cl.put if "/final/" in k]
     [frozen] = map(json.loads, cl.put[final_key].decode().splitlines())
     assert frozen["link"] and frozen["gate"] == "G", frozen
     cl.objs.update(cl.put)         # the bucket now holds pass 1's writes
     cl.put, cl.listed = {}, []
-    n2, open2 = journeys_pass(cl, "buck", {("G", "2026-08-19")}, cams, timezone.utc,
+    n2, open2, checked2 = journeys_pass(cl, "buck", {("G", "2026-08-19")}, cams, timezone.utc,
                               keys=day_keys, classified=day_keys, since="20260101-000000")
-    assert (n2, open2) == (0, set()), "the pair's tracklets are already frozen: nothing left to build"
+    assert (n2, open2, checked2) == (0, set(), {("G", "2026-08-19")}), \
+        "the pair's tracklets are already frozen: nothing left to build"
     assert not any("/final/" in k for k in cl.put), "already frozen: no second batch"
     [j2] = map(json.loads, cl.put["fieldkit-journeys/G/20260819/journeys.jsonl"].decode().splitlines())
     assert j2["id"] == frozen["id"], "journeys.jsonl still reports the frozen journey, informationally"
@@ -1919,12 +1934,12 @@ def journeys_check():
             tracklet("cam4", [(100.4 + k + shift4, 0.1 + 0.1 * k, 0.7 - 0.1 * k) for k in range(5)]).replace(
                 b'"obs-cam4"', b'"obs-cam4-mid"')}
     cl = FakeS3(mid_objs)
-    n_d, _ = journeys_pass(cl, "buck", {("G", "2026-08-19")}, cams, timezone.utc)
+    n_d, _, _ = journeys_pass(cl, "buck", {("G", "2026-08-19")}, cams, timezone.utc)
     [jd] = map(json.loads, cl.put["fieldkit-journeys/G/20260819/journeys.jsonl"].decode().splitlines())
     assert n_d == 1 and jd["link"], "day D's pass sees cam4's sliver across the boundary and links them"
     cl.objs.update(cl.put)
     cl.put = {}
-    n_d1, _ = journeys_pass(cl, "buck", {("G", "2026-08-20")}, cams, timezone.utc)
+    n_d1, _, _ = journeys_pass(cl, "buck", {("G", "2026-08-20")}, cams, timezone.utc)
     d1_lines = cl.put["fieldkit-journeys/G/20260820/journeys.jsonl"].decode().splitlines()
     assert n_d1 == 0 and not d1_lines, \
         "day D+1's own pass must not also build the boundary vehicle: it belongs to D's ts"
@@ -1934,15 +1949,17 @@ def journeys_check():
     # D's final/ batch, and D+1's own pass excludes them via that same batch.
     later_keys = ["G/cam3/20260819-130000.mkv", "G/cam3/20260820-130000.mkv", "G/cam4/20260820-130000.mkv"]
     cl2 = FakeS3(dict(mid_objs))
-    n_fd, open_fd = journeys_pass(cl2, "buck", {("G", "2026-08-19")}, cams, timezone.utc,
+    n_fd, open_fd, checked_fd = journeys_pass(cl2, "buck", {("G", "2026-08-19")}, cams, timezone.utc,
                                   keys=later_keys, classified=later_keys, since="20260101-000000")
-    assert n_fd == 1 and open_fd == set(), (n_fd, open_fd)
+    assert n_fd == 1 and open_fd == set() and checked_fd == {("G", "2026-08-19")}, \
+        (n_fd, open_fd, checked_fd)
     [ffinal] = [k for k in cl2.put if "/final/" in k]
     cl2.objs.update(cl2.put)
     cl2.put = {}
-    n_fd1, open_fd1 = journeys_pass(cl2, "buck", {("G", "2026-08-20")}, cams, timezone.utc,
+    n_fd1, open_fd1, checked_fd1 = journeys_pass(cl2, "buck", {("G", "2026-08-20")}, cams, timezone.utc,
                                     keys=later_keys, classified=later_keys, since="20260101-000000")
-    assert n_fd1 == 0 and open_fd1 == set() and not any("/final/" in k for k in cl2.put), \
+    assert n_fd1 == 0 and open_fd1 == set() and checked_fd1 == {("G", "2026-08-20")} \
+        and not any("/final/" in k for k in cl2.put), \
         "D+1's pass must not mint a second final batch for the vehicle D already froze"
 
 
@@ -2026,7 +2043,7 @@ def selfcheck():
     assert round_picks(old) == pick_classify(old, [], lane_since), "no live footage: same oldest-first drain"
     assert round_picks(fresh) == fresh, "live picks are not duplicated in the drain"
     earlier = "site1/cam3/20260927-105000.mkv"
-    assert live_lane(fresh + [earlier], [], lane_since, lane_now) == fresh + [earlier], \
+    assert live_lane(fresh + [earlier], [], lane_since, lane_now, limit=3) == fresh + [earlier], \
         "round-robin continues to each camera's next newest segment"
     assert live_lane(fresh + [earlier], fresh, lane_since, lane_now) == [earlier], \
         "pick the newest unclassified segment, even if a later one is already done"
@@ -2037,13 +2054,15 @@ def selfcheck():
         "exactly LIVE_HOURS old is outside the render window"
     many = [f"gate{i}/cam/20260927-110000.mkv" for i in range(CLASSIFY_PER_PASS + 1)]
     crowded = round_picks(old + many)
-    assert crowded == sorted(many, reverse=True)[:CLASSIFY_PER_PASS // 2] + old[:CLASSIFY_PER_PASS // 2], \
-        "live lane is capped at half the pass, then oldest backlog fills the rest"
+    assert crowded == sorted(many, reverse=True)[:2] + old[:CLASSIFY_PER_PASS - 2], \
+        "default live lane is capped at two, then oldest backlog fills the rest"
     lanes = ["site1/camA/20260927-115000.mkv", "site1/camA/20260927-114000.mkv",
              "site1/camA/20260927-113000.mkv", "site1/camB/20260927-112000.mkv",
              "site1/camB/20260927-111000.mkv", "site1/camB/20260927-110000.mkv"]
     expected_lanes = [lanes[0], lanes[3], lanes[1], lanes[4], lanes[2], lanes[5]]
-    assert live_lane(lanes, [], lane_since, lane_now) == expected_lanes, \
+    assert live_lane(lanes, [], lane_since, lane_now) == expected_lanes[:2], \
+        "default live lane caps at two round-robin picks"
+    assert live_lane(lanes, [], lane_since, lane_now, limit=6) == expected_lanes, \
         "cameras take turns through all three newest clips each"
     assert live_lane(lanes, [], lane_since, lane_now, limit=3) == expected_lanes[:3]
     assert live_lane(lanes, [], lane_since, lane_now, limit=0) == []
