@@ -83,6 +83,7 @@ PATH_MAX = 600           # ten minutes of samples; a longer track is parked, and
                          # its ends — path_last still keeps the exit box
 PLATE_SCALE = 3          # plates are ~20 px wide at 1080p: the plate model only finds them upscaled
 PLATE_CONF = 0.15        # ...and even then at 0.2-0.4, so it is asked leniently
+APP_MIXED = 0.5          # cosine under which a track's top and best crops are two vehicles: same vehicle ~0.93, a switched track ~0.25
 PLATE_ASPECT = 1.2       # w/h floor: a tyre is ~1:1, a plate ~4:1 (two-line ~1.5-2:1, more at an angle) — the lenient conf accepts wheels
 PLATE_PAD = 0.15         # a tight plate crop loses its edge characters
 RECEDE = 0.5             # a receding vehicle shows its rear once its box has shrunk to this share
@@ -1395,6 +1396,13 @@ class Detector:
                 doc["app"] = appearance_code(Image.open(io.BytesIO(t["best"][1])).convert("RGB"),
                                              self.attrs.embed, self.app)
                 doc["app_v"] = self.app[2]
+                if doc["app"] and shots.get("top") not in (None, t["best"][1]):
+                    import base64
+                    import numpy as np
+                    z = appearance_code(Image.open(io.BytesIO(shots["top"])).convert("RGB"), self.attrs.embed, self.app)
+                    if z and np.dot(*(np.frombuffer(base64.b64decode(c), np.float16).astype(np.float32)
+                                      for c in (doc["app"], z))) < APP_MIXED:
+                        doc["mixed"] = True
             except Exception:
                 pass                      # a bad crop costs the code, never the tracklet
         try:

@@ -45,6 +45,8 @@ APP_PEN = 2.5        # s-equivalent cost per unit of (1 - cosine) between appear
                      # pickups pair correctly and ~80% of changed links are visually right (~14% before)
 APP_TYPICAL = 0.7    # cosine of a typical true match (Katuba median ~0.79): an uncoded candidate pays
                      # the penalty of a typical match, so it never beats a coded one at equal timing
+APP_VETO = 0.2       # known cosine below this is never a link: true pairs' 1st percentile is far above, and
+                     # every linked pair under it audited on a real Katuba hour was two different vehicles
 MIN_EDGE_HITS = 5    # ~1 s at 5 fps: a zone crossing alone must last this long; night glare blips don't
 
 
@@ -250,6 +252,8 @@ def _links(chains, cameras):
                 r = chains[j]
                 if r["z"][1] >= d["z"][0] - LEAD:
                     sim = _similar(d["app"], r["app"])
+                    if sim is not None and sim < APP_VETO:
+                        continue
                     t = abs(r["arr"] - d["dep"] - MU) + CLASS_PEN * (d["class"] != r["class"])
                     cands.append((t, t + APP_PEN * (1 - (APP_TYPICAL if sim is None else sim)), i, j))
 
@@ -303,13 +307,15 @@ def _doc(chains, link, cfg, tz, events):
     direction = dirs[0][0] if dirs else None
     names = sorted({t["camera"] for t in ms})
     crops, plates = {}, {}
-    tops = [t for t in ms if (t.get("crops") or {}).get("top")]
+    pics = [t for t in ms if not t.get("mixed")]    # a switched track's crops show two vehicles
+    pics = pics if any((t.get("crops") or {}) for t in pics) else ms
+    tops = [t for t in pics if (t.get("crops") or {}).get("top")]
     if tops:
         crops["best"] = max(tops, key=lambda t: t["conf"].get(cls, 0.0))["crops"]["top"]
     if direction in OPPOSITE:
         # A camera sees the fronts of traffic coming at it and the rears of traffic it faces with.
         for side, way in (("front", OPPOSITE[direction]), ("rear", direction)):
-            seen = [t for t in ms if HEADINGS.get(heading_of(cfg.get(t["camera"], {}))) == way]
+            seen = [t for t in pics if HEADINGS.get(heading_of(cfg.get(t["camera"], {}))) == way]
             # The rear camera's largest box is the vehicle passing beside it, still side-on;
             # the true rear is the recede crop, taken once it has shrunk away after the peak.
             for tag in ("recede", "best") if side == "rear" else ("best",):
@@ -421,9 +427,17 @@ def _selfcheck():
     assert _app([{"hits": 1, "app": "!!", "app_v": "m1"}]) is None == _app([{"hits": 1, "app": "AAAA"}])
     # (b3) appearance may never strand a chain: d2 only reaches r2, and r1's rear view looks
     # nothing like d1, so looks alone would send d1 to r2 and leave d2 and r1 lone. Timing's two links stay.
-    pair = _north(1, 100.0, gap=0.5, k3={"app": code(1), "app_v": "m1"}, k4={"app": code(-1), "app_v": "m1"}) \
-        + _north(2, 105.0, gap=-1.0, k3={"app": code(0, 1), "app_v": "m1"}, k4={"app": code(1), "app_v": "m1"})
+    pair = _north(1, 100.0, gap=0.5, k3={"app": code(1), "app_v": "m1"}, k4={"app": code(.25, .968), "app_v": "m1"}) \
+        + _north(2, 105.0, gap=-1.0, k3={"app": code(.25, .968), "app_v": "m1"}, k4={"app": code(1), "app_v": "m1"})
     assert ids(build(pair, _CAMS)) == [["obs-cam3-1", "obs-cam4-1"], ["obs-cam3-2", "obs-cam4-2"]]
+    # (b4) codes that disagree (cosine < APP_VETO) never link, even when timing says they should.
+    pair = _north(1, 100.0, k3={"app": code(1), "app_v": "m1", "counted": True},
+                  k4={"app": code(-1), "app_v": "m1", "counted": True})
+    assert len(build(pair, _CAMS)) == 2
+    # (b5) a mixed member's crops lose to a clean member's.
+    shot = lambda c: {"top": c + "-top.jpg", "best": c + "-best.jpg"}
+    [j] = build(_north(1, 100.0, k3={"crops": shot("cam3-1"), "mixed": True}, k4={"crops": shot("cam4-1")}), _CAMS)
+    assert j["crops"]["best"] == "cam4-1-top.jpg" and "front" not in j["crops"] and j["crops"]["rear"] == "cam4-1-best.jpg", j
     # (c) a long truck southbound: its cam3 arrival starts 8 s before its cam4 departure ends.
     t4 = _t("cam4", 1, "e-heavy", [(100, _b(0.5, 0.4))] + [(t, _b(0.1, 0.7)) for t in range(101, 113)])
     t3 = _t("cam3", 1, "e-heavy", [(104, _b(0.9, 0.8)), (105, _b(0.9, 0.8)), (106, _b(0.88, 0.78)),
