@@ -14,8 +14,10 @@ chain entering the other's; each linked pair or lone chain is a journey — coun
 missed only if both cameras missed it, with its class fused from both views and the
 front and rear crops from whichever camera saw each.
 """
+import base64
 import hashlib
 import json
+import struct
 import sys
 import time
 from bisect import bisect_left, bisect_right
@@ -38,11 +40,32 @@ LEAD = 2.0           # s: an arrival may show up this long before its departure 
 LAG = 5.0            # ...or this long after it ends: at night cam3 locks on late (4.6 s measured)
 MU = 0.5             # s: typical departure -> arrival gap across the blind strip (0.2-2.2 measured)
 CLASS_PEN = 1.0      # s-equivalent cost of pairing two different classes
+APP_PEN = 2.5        # s-equivalent cost per unit of (1 - cosine) between appearance codes, so 0..5 s.
+                     # Measured at Katuba 2026-10-01 10:30-11:30: at 2.5 the crossed near-simultaneous
+                     # pickups pair correctly and ~80% of changed links are visually right (~14% before)
+APP_TYPICAL = 0.7    # cosine of a typical true match (Katuba median ~0.79): an uncoded candidate pays
+                     # the penalty of a typical match, so it never beats a coded one at equal timing
 MIN_EDGE_HITS = 5    # ~1 s at 5 fps: a zone crossing alone must last this long; night glare blips don't
 
 
 def _centre(b):
     return (b[0] + b[2]) / 2, (b[1] + b[3]) / 2
+
+
+def _app(ms):
+    """(unit vector, model version) of the member with the most hits that has a code, else None."""
+    t = max((t for t in ms if t.get("app")), key=lambda t: t["hits"], default=None)
+    try:
+        return t and (struct.unpack("<32e", base64.b64decode(t["app"])), t.get("app_v"))
+    except (TypeError, ValueError, struct.error):  # ValueError covers binascii.Error
+        return None
+
+
+def _similar(a, b):
+    """Cosine of two appearance codes; None unless both exist and come from the same model."""
+    if a is None or b is None or a[1] != b[1]:
+        return None
+    return sum(x * y for x, y in zip(a[0], b[0]))
 
 
 def _vel(p, q):
@@ -183,7 +206,7 @@ def _chains(tracklets, cameras):
             for c, v in t["conf"].items():
                 conf[c] = max(conf.get(c, 0.0), v)
         ch = {"camera": ms[0]["camera"], "members": ms, "votes": votes, "conf": conf,
-              "class": _top(votes, conf), "dep": None, "arr": None}
+              "class": _top(votes, conf), "dep": None, "arr": None, "app": _app(ms)}
         zone = zones.get(ch["camera"])
         zt = [p[0] for p in path if _in(p[1:], zone)] if zone else []
         if zt:
@@ -226,14 +249,38 @@ def _links(chains, cameras):
             for j in js[lo:bisect_right(js, d["z"][1] + LAG, key=z0)]:
                 r = chains[j]
                 if r["z"][1] >= d["z"][0] - LEAD:
-                    cands.append((abs(r["arr"] - d["dep"] - MU) + CLASS_PEN * (d["class"] != r["class"]),
-                                  i, j))
-    cands.sort()
-    used, links = set(), []
-    for _, i, j in cands:
-        if i not in used and j not in used:
-            used |= {i, j}
-            links.append((chains[i], chains[j]))
+                    sim = _similar(d["app"], r["app"])
+                    t = abs(r["arr"] - d["dep"] - MU) + CLASS_PEN * (d["class"] != r["class"])
+                    cands.append((t, t + APP_PEN * (1 - (APP_TYPICAL if sim is None else sim)), i, j))
+
+    def greedy(cs, k):
+        used, out = set(), []
+        for *_, i, j in sorted(cs, key=lambda c: (c[k], c[2], c[3])):
+            if i not in used and j not in used:
+                used |= {i, j}
+                out.append((chains[i], chains[j]))
+        return out
+
+    # Appearance only re-pairs within a connected set of candidates, and only if that costs no
+    # link: a re-pairing that strands a chain would turn one vehicle into two journeys.
+    root = list(range(len(chains)))
+
+    def find(x):
+        while root[x] != x:
+            root[x] = root[root[x]]
+            x = root[x]
+        return x
+
+    for *_, i, j in cands:
+        root[find(i)] = find(j)
+    comps = {}
+    for c in cands:
+        comps.setdefault(find(c[2]), []).append(c)
+    links = []
+    for cs in comps.values():
+        by_time = greedy(cs, 0)
+        by_look = greedy(cs, 1)
+        links += by_look if len(by_look) == len(by_time) else by_time
     return links
 
 
@@ -357,6 +404,26 @@ def _selfcheck():
     q = _north(1, 100.0) + _north(2, 103.0) + _north(3, 105.0)
     js = build(q, _CAMS)
     assert [sorted(m["id"][-1] for m in j["members"]) for j in js] == [["1", "1"], ["2", "2"], ["3", "3"]], js
+    # (b2) two same-class vehicles 1 s apart: timing alone crosses them (B leaves 1 s after A and
+    # A's arrival lands 0.5 s after B's departure); the look pairs A with its own arrival.
+    code = lambda *v: base64.b64encode(struct.pack("<32e", *v, *[0.0] * (32 - len(v)))).decode()
+    ids = lambda js: sorted(sorted(m["id"] for m in j["members"]) for j in js)
+    right = [["obs-cam3-1", "obs-cam4-1"], ["obs-cam3-2", "obs-cam4-2"]]
+    crossed = [["obs-cam3-1", "obs-cam4-2"], ["obs-cam3-2", "obs-cam4-1"]]
+    for v3, v4, want in (("m1", "m1", right),       # learned codes decide
+                         (None, None, crossed),     # no codes: timing as before
+                         ("m1", "m2", crossed)):    # different models: ignored
+        def k(c, v):
+            return {"app": code(*c), "app_v": v} if v else {}
+        pair = _north(1, 100.0, gap=1.5, k3=k([1], v3), k4=k([1], v4)) \
+            + _north(2, 101.0, gap=1.5, k3=k([0, 1], v3), k4=k([0, 1], v4))
+        assert ids(build(pair, _CAMS)) == want, (v3, v4, ids(build(pair, _CAMS)))
+    assert _app([{"hits": 1, "app": "!!", "app_v": "m1"}]) is None == _app([{"hits": 1, "app": "AAAA"}])
+    # (b3) appearance may never strand a chain: d2 only reaches r2, and r1's rear view looks
+    # nothing like d1, so looks alone would send d1 to r2 and leave d2 and r1 lone. Timing's two links stay.
+    pair = _north(1, 100.0, gap=0.5, k3={"app": code(1), "app_v": "m1"}, k4={"app": code(-1), "app_v": "m1"}) \
+        + _north(2, 105.0, gap=-1.0, k3={"app": code(0, 1), "app_v": "m1"}, k4={"app": code(1), "app_v": "m1"})
+    assert ids(build(pair, _CAMS)) == [["obs-cam3-1", "obs-cam4-1"], ["obs-cam3-2", "obs-cam4-2"]]
     # (c) a long truck southbound: its cam3 arrival starts 8 s before its cam4 departure ends.
     t4 = _t("cam4", 1, "e-heavy", [(100, _b(0.5, 0.4))] + [(t, _b(0.1, 0.7)) for t in range(101, 113)])
     t3 = _t("cam3", 1, "e-heavy", [(104, _b(0.9, 0.8)), (105, _b(0.9, 0.8)), (106, _b(0.88, 0.78)),
