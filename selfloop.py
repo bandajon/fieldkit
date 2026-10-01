@@ -130,14 +130,16 @@ def cameras(keys):
     return {c: sorted(v) for c, v in out.items()}
 
 
-def camera_lag(keys, classified):
-    """{gate: {cam: (newest recorded start epoch, newest classified start epoch | None)}} —
-    how far classify trails each camera's recorder. Keys whose start can't be parsed are skipped."""
+def camera_lag(keys, classified, since=""):
+    """{gate: {cam: (newest recorded start, newest classified start | None, oldest unclassified
+    start since `since` | None)}} as epochs — how far classify trails each camera's recorder.
+    The newest-vs-newest gap reads ~0 under the live lane with an old hole behind it; the
+    oldest unclassified start shows that hole. Unparseable keys are skipped."""
     import ingest_video
     done, out = set(classified), {}
     for pc, segs in cameras(keys).items():
         prefix, cam = pc.split("/")
-        slot = out.setdefault(gate_of(prefix), {}).setdefault(cam, [None, None])   # two prefixes, one gate
+        slot = out.setdefault(gate_of(prefix), {}).setdefault(cam, [None, None, None])   # two prefixes, one gate
         for k in segs:
             try:
                 t = ingest_video.cam_and_start(Path(k))[1]
@@ -146,39 +148,45 @@ def camera_lag(keys, classified):
             slot[0] = max(slot[0] or t, t)
             if k in done:
                 slot[1] = max(slot[1] or t, t)
+            elif Path(k).stem >= since:
+                slot[2] = min(slot[2] or t, t)
     return {g: {c: tuple(v) for c, v in cams.items() if v[0] is not None} for g, cams in out.items()}
 
 
 def fold_alerts(s, fresh, cutoff=None):
     """s["alerts"] += fresh, minus anything older than 24 h, identical kind+gate+detail
-    collapsed to the newest; newest first."""
+    collapsed to the newest; newest first. Malformed entries (state is hand-editable) are dropped."""
     from datetime import timedelta
     cutoff = cutoff or (datetime.now(timezone.utc) - timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%SZ")
     newest = {}
     for a in s.get("alerts", []) + fresh:
+        if not isinstance(a, dict) or not {"at", "kind", "gate", "detail"} <= a.keys():
+            continue
         k = (a["kind"], a["gate"], a["detail"])
         if a["at"] >= cutoff and a["at"] >= newest.get(k, a)["at"]:
             newest[k] = a
     s["alerts"] = sorted(newest.values(), key=lambda a: a["at"], reverse=True)
 
 
-def publish_health(s, cl, bucket, keys):
+def publish_health(s, cl, bucket, keys, since=""):
     """One small JSON per gate for the RDA dashboard. Never fails the pass."""
-    fold_alerts(s, ALERTS)
-    ALERTS.clear()
+    import time
     iso = lambda t: t and datetime.fromtimestamp(t, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     try:
-        lag = camera_lag(keys, s.get("classified", []))
+        lag = camera_lag(keys, s.get("classified", []), since)
     except Exception as e:
         print(f"  ! health: {e}", flush=True)
         return
     for gate, cams in lag.items():
         try:
             doc = {"gate": gate, "updated": now(), "backlog": s.get("classify_backlog"),
+                   "backlog_scope": "loop",   # the whole classify window, not this gate's share
                    "last_classify": s.get("last_classify"),
-                   "lag_s": {c: r - c_ if c_ is not None else None for c, (r, c_) in cams.items()},
-                   "newest": {c: {"recorded": iso(r), "classified": iso(c_)} for c, (r, c_) in cams.items()},
-                   "alerts": [a for a in s["alerts"] if a["gate"] == gate][:50]}
+                   "lag_s": {c: r - c_ if c_ is not None else None for c, (r, c_, _) in cams.items()},
+                   "oldest_unclassified_s": {c: round(time.time() - o) if o is not None else None
+                                             for c, (_, _, o) in cams.items()},
+                   "newest": {c: {"recorded": iso(r), "classified": iso(c_)} for c, (r, c_, _) in cams.items()},
+                   "alerts": [a for a in s.get("alerts", []) if a["gate"] == gate][:50]}
             cl.put_object(Bucket=bucket, Key=f"{HEALTH}{gate}.json", Body=json.dumps(doc).encode(),
                           ContentType="application/json")
         except Exception as e:
@@ -1362,10 +1370,16 @@ def classify_pass():
                 left = len(all_todo)
                 s["classify_backlog"] = {"at": now(), "left": left - stuck, "failed": stuck}
                 s["last_classify"] = {"at": now(), "segments": done, "events": events}
-                publish_health(s, cl, bucket, keys)
-                save_state(s)
+                save_state(s)       # the recount lands before anything optional can fail
             except Exception as e:
                 print(f"  ! recount: {e}", flush=True)
+            try:
+                fold_alerts(s, ALERTS)
+                ALERTS.clear()
+                save_state(s)
+                publish_health(s, cl, bucket, keys, since)
+            except Exception as e:
+                print(f"  ! health: {e}", flush=True)
         for (gate, day), cams in coverage_manifests(keys, s.get("classified", []), since).items():
             cl.put_object(Bucket=bucket, Key=f"{COVERAGE}{gate}/{day}.json",
                           Body=json.dumps({"gate": gate, "day": day, "updated": now(),
@@ -1584,6 +1598,7 @@ def adopt_attrs(name):
 
 
 def status():
+    import time
     s = load_state()
     try:
         count = new_frames()
@@ -1601,13 +1616,14 @@ def status():
         print(f"new frames:    {count} outside the reference set, {s.get('trained_frames', 0)} at the last run"
               f" — {'ready to train' if gap <= 0 else f'{gap} more before the next run'}")
     print(f"lock:          {(LOCK.read_text().strip() if LOCK.exists() else '') or 'free'}")
-    keys = []
+    keys, since = [], ""
     try:
         import ingest_video
         _, cl, bucket = r2()
         now_dt = datetime.now(ZoneInfo(TZ))
         since = classify_since(now_dt, ingest_video.config(), s.get("classify_floor", ""))
-        cov = coverage(list(recording_keys(cl, bucket)), s.get("classified", []), since)
+        keys = list(recording_keys(cl, bucket))
+        cov = coverage(keys, s.get("classified", []), since)
         default_since = classify_since(now_dt, {})
         label = (f"since {since}" if since != default_since else f"last {CLASSIFY_HOURS}h")
         print(f"coverage ({label}):")
@@ -1619,10 +1635,11 @@ def status():
     print("health:")
     print(f"  backlog:     {s.get('classify_backlog')}")
     try:
-        for gate, cams in camera_lag(keys, s.get("classified", [])).items():
+        for gate, cams in camera_lag(keys, s.get("classified", []), since).items():
             print(f"  lag {gate}:  " + ", ".join(
-                f"{c} {'never classified' if k is None else f'{(r - k) / 60:.0f} min'}"
-                for c, (r, k) in sorted(cams.items())))
+                f"{c} {'never classified' if k is None else f'{(r - k) / 60:.0f} min'}, oldest unclassified "
+                f"{'none' if o is None else f'{(time.time() - o) / 60:.0f} min'}"
+                for c, (r, k, o) in sorted(cams.items())))
     except Exception as e:
         print(f"  lag:         unavailable ({e})")
     fold_alerts(s, [])
@@ -2298,6 +2315,7 @@ def selfcheck():
                       "site1/cam/20260927-112000.mkv", "site1/other/20260927-110000.mkv"],
                      ["site1/cam/20260927-110000.mkv", "site1/cam/20260927-111000.mkv"])["RDA-TG-KTB"]
     assert lag["cam"][0] - lag["cam"][1] == 600 and lag["other"][1] is None
+    assert lag["cam"][2] == lag["cam"][0] and lag["other"][2] == lag["other"][0]   # oldest hole, not newest
     print("selfloop self-check ok: cameras found under any gate prefix, newest unsampled segments "
           "picked per camera, training triggers on the cumulative threshold, promotion needs a "
           "strictly better reference score (detector) or mean val accuracy (attributes) unless "

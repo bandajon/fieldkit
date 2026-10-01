@@ -139,6 +139,12 @@ class ClassifyPassTest(unittest.TestCase):
         self.assertEqual(state["classify_backlog"]["left"], 0)
         self.assertFalse(selfloop.classify_behind(state))
 
+    def test_malformed_alert_does_not_lose_the_recount(self):
+        state = {"classified": [], "open_days": [], "alerts": ["junk", {"kind": "x"}]}
+        self.run_pass(["site1/cam/20260927-110000.mkv"], lambda *a: (0, set(), set()), state=state)
+        self.assertEqual(state["classify_backlog"]["left"], 0)
+        self.assertEqual(state["alerts"], [])
+
     def test_alerts_fold_and_health_json(self):
         selfloop.ALERTS.clear()
         selfloop.alert("lost_counts", "RDA-TG-KTB", "dropped a")
@@ -150,7 +156,10 @@ class ClassifyPassTest(unittest.TestCase):
         self.assertEqual(sorted(a["kind"] for a in state["alerts"]), ["late_footage", "lost_counts"])
         self.assertEqual(selfloop.ALERTS, [])
         doc = json.loads(self.cl.puts["fieldkit-health/RDA-TG-KTB.json"])
-        self.assertEqual(set(doc), {"gate", "updated", "backlog", "last_classify", "lag_s", "newest", "alerts"})
+        self.assertEqual(set(doc), {"gate", "updated", "backlog", "backlog_scope", "last_classify", "lag_s",
+                                    "oldest_unclassified_s", "newest", "alerts"})
+        self.assertEqual(doc["backlog_scope"], "loop")
+        self.assertEqual(doc["oldest_unclassified_s"], {"cam": None})
         self.assertEqual([a["kind"] for a in doc["alerts"]], ["lost_counts"])
         self.assertEqual(doc["lag_s"], {"cam": 0})
         self.assertEqual(doc["newest"]["cam"]["recorded"], doc["newest"]["cam"]["classified"])
