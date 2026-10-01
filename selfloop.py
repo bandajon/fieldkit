@@ -76,6 +76,7 @@ CLASSIFY_PER_PASS = 12        # ~10 min of footage per camera per pass, at 600 s
 CLASSIFY_HOURS = 48           # what the gates keep mirrored: one backlog may span this;
                               # older gaps are a backfill job, not this pass's problem
 CLASSIFY_BUDGET = 3 * 3600    # seconds one classify pass drains for before checkpointing
+NIGHT_LEFT = 24               # segments; a backlog this small drains in one classify pass after a long train — a bigger one keeps the yield, so a night train can't age footage past CLASSIFY_HOURS
 NIGHT = range(0, 5)           # Lusaka hours the gates are near-empty: scheduled train may take the GPU despite a classify backlog
 JOURNEYS_EVERY_S = 1200       # journeys_pass also runs mid-pass at this cadence: the RDA
                               # dashboard should lag by tens of minutes, not by up to a
@@ -1404,7 +1405,8 @@ def prune_annotated(cl, bucket, gate, cam_name):
 
 def train_pass(force=False):
     import train as trainer
-    if not force and datetime.now(ZoneInfo(TZ)).hour not in NIGHT and classify_behind():
+    night = datetime.now(ZoneInfo(TZ)).hour in NIGHT and (load_state().get("classify_backlog") or {}).get("left", 0) <= NIGHT_LEFT
+    if not force and not night and classify_behind():
         print(f"{now()} train: yielding — classify has segment(s) to do", flush=True)
         return
     # A forced run must not exit "busy" while classify drains its budget (up to

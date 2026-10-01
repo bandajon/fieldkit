@@ -6,7 +6,7 @@ Runs on the always-on training machine (the office MacBook Pro, `100.83.203.125`
 gate boxes mirror recordings ─► bucket ─► selfloop ingest (every 4 h)
         sample newest segments, champion model pre-labels ─► pending ─► bucket ─► curation tool
 curators approve ─► bucket ─► selfloop train (checked hourly)
-        (waits while classify has a backlog, except 00:00–05:00 Lusaka when the gates are near-empty)
+        (waits while classify has a backlog, except 00:00–05:00 Lusaka when the gates are near-empty and the backlog is under NIGHT_LEFT segments)
         ≥ 1,000 new frames outside the reference set ─► train.py ─► score on the reference
         ─► better than the champion? ─► champion.pt (pre-labels the next ingest) + models/ in the bucket
         then train_attrs.py on the same set ─► better mean val accuracy across the heads?
