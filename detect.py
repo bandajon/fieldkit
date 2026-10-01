@@ -36,10 +36,11 @@ COUNT_AT_HITS = 2        # an id counts on its 2nd sighting: one-frame blips nev
 ID_EXPIRY = 10.0         # forget an id unseen this long (ByteTrack recycles ids; caps memory)
 HIJACK_IOU = 0.05        # ByteTrack can hand one id from a vehicle to the next one passing it:
 HIJACK_JUMP = 1.0        # a box that shares nothing with its last sighting and whose centre
-HIJACK_GAP = 1.0         # moved a whole vehicle-length is another vehicle (ponytail: at 5 fps
-                         # a very fast near-camera mover can false-split; raise HIJACK_JUMP).
-                         # Only sightings <= HIJACK_GAP apart are judged: a longer gap is an
-                         # occlusion, and expiry/ghost already handle that.
+HIJACK_GAP = 1.5 / FPS   # moved a whole vehicle-length is another vehicle, but only if it also
+HIJACK_SIZE = 1.5        # changed size by this factor or class (a fast same-size mover is not
+                         # a swap). Only consecutive frames are judged: a longer gap is an
+                         # occlusion, and expiry/ghost handle that. ponytail: assumes frames
+                         # arrive at FPS; a slow node simply never splits (a miss, not a loss).
 RECOUNT_GUARD = 45.0     # a counted vehicle's resting place is remembered this long: a new
                          # id of the same class in the same spot is the same vehicle, not
                          # a second count. ponytail: IoU-at-rest is the assumption — one
@@ -1118,11 +1119,12 @@ class Detector:
                 t = ids.get(tid)
                 if t and t.get("box") and now - t["last_seen"] <= HIJACK_GAP:
                     pb = t["box"]
-                    if (iou(pb, box) < HIJACK_IOU and
+                    ar = ((box[2] - box[0]) * (box[3] - box[1])) / max((pb[2] - pb[0]) * (pb[3] - pb[1]), 1e-9)
+                    if ((ar > HIJACK_SIZE or ar < 1 / HIJACK_SIZE or cls != t["label"]) and iou(pb, box) < HIJACK_IOU and
                             ((t["c"][0] - (box[0] + box[2]) / 2) ** 2 + (t["c"][1] - (box[1] + box[3]) / 2) ** 2) ** 0.5
                             >= HIJACK_JUMP * max(pb[2] - pb[0], pb[3] - pb[1])):
                         # The id jumped to another vehicle: close the first one's life.
-                        self._retire(name, ids.pop(tid), now)
+                        self._retire(name, ids.pop(tid), now, hijack=True)
                         t = None
                 if t is None:
                     self.event_ordinal += 1
@@ -1226,11 +1228,11 @@ class Detector:
             self.visible[name] = Counter(live)
         return shown
 
-    def _retire(self, name, t, now):
+    def _retire(self, name, t, now, hijack=False):
         """A track's last rites. Counted vehicles (ghosts included: a long stop chains
         through several track lives) leave their resting place behind for the recount
         guard, then the event is written. Caller holds the lock."""
-        if t["counted_as"] and t.get("box"):
+        if t["counted_as"] and t.get("box") and not hijack:   # a swapped id's box is no resting place
             self.recent.setdefault(name, []).append(   # a ghost of a ghost points at the root
                 (t["counted_as"], t["box"], now + RECOUNT_GUARD, t.get("ghost_of") or t["observation_id"]))
         if t.get("counted_as") and not t.get("ghost") and t.get("classified_best") != t["best"][1]:
@@ -1780,33 +1782,44 @@ if __name__ == "__main__":
     except ImportError:
         print("detect self-check: Pillow absent, drawing + capture checks skipped")
 
-    # Hijack: an id that teleports to a far, disjoint box is two vehicles (two tracklets,
-    # each with its own crops); a fast but overlapping mover is one; a gap > HIJACK_GAP
-    # is left to expiry.
+    # Hijack: on consecutive frames an id that jumps to a far, disjoint box of another size
+    # (or class) is two vehicles; a same-size same-class jump, however fast, or any jump
+    # after a gap, is one — splitting those loses or doubles counts.
     if jpeg:
-        from PIL import Image
         pic = Image.new("RGB", (640, 480))
         tk = Path(tempfile.mkdtemp())
         d = fresh(events_dir=tk)
         at = [time.time()]
         hday = datetime.fromtimestamp(at[0]).strftime("%Y-%m-%d")
         d.clock = d.wall = lambda: at[0]
-        def run(boxes, gap=0.2):
+
+        def run(boxes, gap=0.2, tid=1, d=None):
             for b in boxes:
-                d._track("c", [("truck", 0.9, b, 1)], pic)
+                d._track("c", [("truck", 0.9, b, tid)], pic)
                 at[0] += gap
         run([(10.0 + 5 * i, 10.0, 60.0 + 5 * i, 60.0) for i in range(TRACKLET_CROP_HITS)]
-            + [(400.0 + 5 * i, 400.0, 450.0 + 5 * i, 450.0) for i in range(TRACKLET_CROP_HITS)])
+            + [(400.0 + 5 * i, 400.0, 500.0 + 5 * i, 500.0) for i in range(TRACKLET_CROP_HITS)], d=d)
+        assert d.totals["truck"] == 2 and not d.recent.get("c"), (d.totals, d.recent)
+        run([BOX] * 2, tid=7, d=d)       # the swapped-out box is no resting place: no ghost
+        assert d.totals["truck"] == 3, "a hijack retire must not seed the recount guard"
         d.flush("c")
         docs = [json.loads(l) for l in (tk / "tracklets" / f"{hday}.jsonl").read_text().splitlines()]
-        assert len(docs) == 2 and docs[0]["id"] != docs[1]["id"], docs
-        assert all(doc["hits"] == TRACKLET_CROP_HITS and doc["crops"] for doc in docs), docs
-        for gap, boxes, n in ((0.2, [(10.0 + 30 * i, 10.0, 60.0 + 30 * i, 60.0) for i in range(6)], 1),
-                              (HIJACK_GAP + 1, [BOX, FAR], 1)):
-            d = fresh(events_dir=Path(tempfile.mkdtemp()))
+        swapped = [x for x in docs if x["hits"] == TRACKLET_CROP_HITS]
+        assert len(swapped) == 2 and swapped[0]["id"] != swapped[1]["id"], docs
+        assert all(x["crops"] for x in swapped), swapped
+        # A same-size jump (a fast mover) and a size-changing jump after a gap: one track.
+        for gap, boxes in ((0.2, [BOX, FAR, FAR]), (HIJACK_GAP + 1, [BOX, (400.0, 400.0, 500.0, 500.0)])):
+            d = fresh()
             d.clock = d.wall = lambda: at[0]
-            run(boxes, gap)
+            run(boxes, gap, d=d)
             assert len(d.tracks["c"]) == 1 and d.tracks["c"][1]["hits"] == len(boxes), (gap, d.tracks)
+            assert d.totals["truck"] == 1, "no count line: counted once, not split and doubled"
+        # A fast same-size mover with a disjoint jump across the count line, back-to-back frames: counted once.
+        d = Detector([{"name": "c", "heading": "north"}], nosnap, {})
+        big = Image.new("RGB", (1280, 720))
+        for y in (560.0, 560.0, 160.0):
+            d._track("c", [("truck", 0.9, (600.0, y, 680.0, y + 80.0), 1)], big)
+        assert d.totals["truck"] == 1 and len(d.tracks["c"]) == 1, (d.totals, d.tracks)
 
     # The whole loop against a fake reader: corrupt frame -> error, good frame -> annotated
     # frame + one dataset sample, one count for the id however many frames arrive.
@@ -2208,7 +2221,7 @@ if __name__ == "__main__":
         d = Detector([TRAVEL], nosnap, {}, events_dir=sp)
         pic = Image.new("RGB", (300, 200))            # lines land at y=110 and y=150
         for y in (100.0, 115.0, 160.0, 190.0):
-            d._track("c", [("truck", 0.9, (100.0, y - 30, 140.0, y + 30), 1)], pic)   # tall: steps overlap, not a hijack
+            d._track("c", [("truck", 0.9, (100.0, y - 10, 140.0, y + 10), 1)], pic)
         t = d.tracks["c"][1]
         assert {"a", "b"} <= set(t["cross"]), t["cross"]    # the count line "n" rides along
         assert d._speed({"cross": {"a": 1.0, "n": 1.0}}, TRAVEL) is None, "count line is not a speed line"
@@ -2302,11 +2315,9 @@ if __name__ == "__main__":
     for _ in range(4):
         d._track("n", [("truck", 0.9, lo, 1)], big)
     assert d.totals["truck"] == 0, "queued short of the line: not counted, however many hits"
-    for y in (500.0, 440.0, 380.0, 320.0, 260.0, 200.0, 160.0):   # overlapping steps: not a hijack
-        d._track("n", [("truck", 0.9, (600.0, y, 680.0, y + 80.0), 1)], big)
+    d._track("n", [("truck", 0.9, hi, 1)], big)
     assert d.totals["truck"] == 1, "counted once, on the crossing"
     d._track("n", [("truck", 0.9, hi, 1), ("truck", 0.9, lo, 2)], big)
-    d.tracks["n"][2]["last_seen"] -= HIJACK_GAP + 1      # unseen a while: a jump after a gap is no hijack
     d._track("n", [("truck", 0.9, hi, 1), ("truck", 0.9, hi, 2)], big)   # id 2 crosses onto id 1
     assert d.totals["truck"] == 1, "a twin id on a just-counted vehicle is not a second vehicle"
     assert d.tracks["n"][2]["ghost_of"] == d.tracks["n"][1]["observation_id"], "a twin names its original"
