@@ -55,7 +55,8 @@ frame — so `python selfloop.py hunt` (every 10 min, `HUNT_PER_PASS` segments a
 sweeps the last `HUNT_HOURS` (48) of footage newest first at the ingest rate and keeps
 *only* wanted-class frames: a two-day backlog clears in hours, and after that the newest
 bus or plant frame in the queue is never more than a pass or two old. Only a class that
-is under the floor gets hunted; once every class is past it the pass is a no-op.
+is under the floor gets hunted; once every class is past it the pass still sweeps for queues
+(12+ vehicles in view, at most 10 frames per gate per pass) so curators box occluded vehicles.
 
 - Change the cadence: edit `THRESHOLD` / `PER_CAM` / `CLASSIFY_PER_PASS` in `selfloop.py`, intervals in
   `install_loop.sh`, then `./install_loop.sh` again.

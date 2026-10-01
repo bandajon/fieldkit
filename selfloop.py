@@ -867,6 +867,7 @@ def hunt_pass():
     but wanted-class frames, so two days of footage are swept in hours and the queue's
     bus, plant and abnormal-load frames are days old at most, not a week.
     """
+    import detect
     import ingest_video
     from datetime import timedelta
     if classify_behind():
@@ -875,7 +876,7 @@ def hunt_pass():
     with Lock():
         s = load_state()
         wanted = hunting()
-        if not wanted:
+        if not wanted and not detect.CONGESTED_BOXES:
             return
         ds, cl, bucket = r2()
         cfg = ingest_video.config()
@@ -895,13 +896,14 @@ def hunt_pass():
         if CHAMPION.is_file():
             cfg["detect_weights"] = str(CHAMPION)
         cfg["capture_wanted"], cfg["capture_only_wanted"] = wanted, True
+        cfg["capture_congested"] = detect.CONGESTED_BOXES
         files = []
         for key in todo:
             dest = local_path(key)
             dest.parent.mkdir(parents=True, exist_ok=True)
             cl.download_file(bucket, key, str(dest))
             files.append(dest)
-        stems, written = [], 0
+        stems, written, dense = [], 0, 0
         try:
             by_gate = {}
             for f in files:
@@ -910,13 +912,15 @@ def hunt_pass():
                 sink = ingest_video.ingest(fs, {**cfg, "toll_gate_id": gate})
                 stems += sink.stems
                 written += sum(sink.written.values())
+                dense += sink.dense
         finally:
             for f in files:
                 f.unlink(missing_ok=True)
         if ATTRS_CHAMPION.is_file():
             suggest(stems)
         s["hunted"] = (s.get("hunted", []) + todo)[-REMEMBER:]
-        s["last_hunt"] = {"at": now(), "segments": len(todo), "samples": written, "wanted": wanted}
+        s["last_hunt"] = {"at": now(), "segments": len(todo), "samples": written, "congested": dense,
+                         "wanted": wanted}
         save_state(s)
         pruned, ok = prune_pending(cl, bucket, settings["cap"])
         if pruned:
@@ -924,7 +928,7 @@ def hunt_pass():
         if not ok:
             return
         sent, _ = ds.push(cl, bucket, names=PENDING)
-        print(f"{now()} hunt: {written} wanted-class samples written, {sent} files pushed", flush=True)
+        print(f"{now()} hunt: {written} samples written ({dense} congested), {sent} files pushed", flush=True)
 
 
 def published_manifests(cl, bucket, keys, since):

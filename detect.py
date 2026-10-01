@@ -94,6 +94,10 @@ CAPTURE_EVERY = 10.0     # dataset samples per camera; dedup already skips uncha
 RARE_STEP = 1            # a wanted class ignores the cadence, so its stems need finer buckets
 RARE_EVERY = 5.0         # ...but one frame of it per this many seconds: a vehicle rolling through
                          # at one frame a second is the same sample five times, and a curator's five minutes
+CONGESTED_BOXES = 12     # 12+ vehicles in view is a queue: the occlusion the detector handles worst
+CONGESTED_EVERY = 120.0  # a queue lasts hours: one frame per camera per two minutes of footage,
+                         # so curators get variety, not 700 near-duplicates
+CONGESTED_PER_PASS = 10  # ...and at most this many per gate per hunt pass: queues never crowd out rare classes
 DATASET_CAP = 10000      # rolling buffer of the freshest unlabeled frames; ~2-3 GB of JPEGs.
                          # Sized for the fleet goal: 9 toll gates, >=10k contributed each,
                          # 100k-image combined dataset.
