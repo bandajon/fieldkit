@@ -1549,7 +1549,7 @@ def crown(s, run, frames, ev, cl, bucket):
                      **{k: (ev or {}).get(k) for k in ("map50", "map50_95")}}
     for key in (f"{MODELS}{run.name}/best.pt", f"{MODELS}champion.pt"):
         cl.upload_file(str(best), bucket, key)
-    if ev:
+    if (run / "reference-eval.json").is_file():      # absent when no reference frames were held out
         cl.upload_file(str(run / "reference-eval.json"), bucket, f"{MODELS}{run.name}/reference-eval.json")
     cl.put_object(Bucket=bucket, Key=f"{MODELS}champion.json", Body=json.dumps(s["champion"]).encode())
     # Every approved frame outside the reference went into this run: record the list, so
