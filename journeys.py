@@ -20,7 +20,7 @@ import json
 import struct
 import sys
 import time
-from bisect import bisect_left, bisect_right, insort
+from bisect import bisect_left, bisect_right
 from collections import Counter
 from datetime import datetime, timezone
 
@@ -54,7 +54,7 @@ APP_VETO = 0.2       # known cosine below this is never a link: true pairs' 1st 
 HEAVY = ("d-medium", "e-heavy", "f-abnormal")
 TRUCK_LEAD = 8.0     # s: a slow long truck's arrival may precede its departure...
 TRUCK_LAG = 15.0     # ...or follow it this long
-TRUCK_COS = 0.6      # look agreement a wider window demands
+TRUCK_COS = 0.7      # look agreement a wider window demands
 MIN_EDGE_HITS = 5    # ~1 s at 5 fps: a zone crossing alone must last this long; night glare blips don't
 
 
@@ -337,34 +337,65 @@ def _links(chains, cameras):
 
 def _trucks(chains, links, pairs):
     """Slow trucks miss the ordinary window: a wider one, only for trucks that look alike, only for
-    chains still unlinked, and never crossing an accepted truck link (convoy order)."""
+    chains still unlinked, and never crossing an accepted truck link (convoy order). Within a set of
+    competing candidates the most links in order win, then the cheapest: a greedy would cross a convoy."""
     used = {id(c) for link in links for c in link}
     heavy = lambda c: c["class"] in HEAVY
     ta = lambda r: r["arr"] if r["arr"] is not None else r["late"]
-    deps = [d for d in chains if d["dep"] is not None and id(d) not in used and heavy(d)]
-    arrs = sorted((r for r in chains if id(r) not in used and heavy(r) and (r["arr"] is not None or (
-        r.get("late") is not None and sum(t["hits"] for t in r["members"]) >= MIN_EDGE_HITS))), key=ta)
+    solid = lambda c: sum(t["hits"] for t in c["members"]) >= MIN_EDGE_HITS
+    deps = [d for d in chains if d["dep"] is not None and id(d) not in used and heavy(d) and solid(d)]
+    arrs = sorted((r for r in chains if id(r) not in used and heavy(r) and (
+        r["arr"] is not None or (r.get("late") is not None and solid(r)))), key=ta)
     times = [ta(r) for r in arrs]
-    cands = []
+    accepted = {}  # (dep camera, arr camera) -> [(dep, arr)] of accepted truck links
+    for d, r in links:
+        if heavy(d) and heavy(r):
+            accepted.setdefault((d["camera"], r["camera"]), []).append((d["dep"], ta(r)))
+    cost, root, cands = {}, {}, []
+
+    def find(x):
+        while root.setdefault(x, x) != x:
+            root[x] = root[root[x]]
+            x = root[x]
+        return x
+
     for d in deps:
         for r in arrs[bisect_left(times, d["dep"] - TRUCK_LEAD):bisect_right(times, d["dep"] + TRUCK_LAG)]:
             if r["camera"] == d["camera"] or frozenset((d["camera"], r["camera"])) not in pairs:
                 continue
             sim = _similar(d["app"], r["app"])
-            if sim is not None and sim >= TRUCK_COS:
-                cands.append((abs(ta(r) - d["dep"] - MU) + APP_PEN * (1 - sim), d["dep"], ta(r), d, r))
-    order = sorted((d["dep"], ta(r), d["camera"]) for d, r in links if heavy(d) and heavy(r))
-    reach = TRUCK_LEAD + TRUCK_LAG + 60  # only nearby links can cross
+            if (sim is not None and sim >= TRUCK_COS and not any(
+                    (dd - d["dep"]) * (aa - ta(r)) < 0 for dd, aa in accepted.get((d["camera"], r["camera"]), ()))):
+                cost[id(d), id(r)] = abs(ta(r) - d["dep"] - MU) + APP_PEN * (1 - sim)
+                root[find(id(d))] = find(id(r))
+                cands.append((d, r))
+    comps = {}  # (component, dep camera, arr camera) -> (deps, arrs) by id
+    for d, r in cands:
+        ds, rs = comps.setdefault((find(id(d)), d["camera"], r["camera"]), ({}, {}))
+        ds[id(d)], rs[id(r)] = d, r
+    comps = [(list(ds.values()), list(rs.values())) for ds, rs in comps.values()]
     out = []
-    for _c, dep, arr, d, r in sorted(cands, key=lambda c: c[:3]):
-        if id(d) in used or id(r) in used:
-            continue
-        near = order[bisect_left(order, (dep - reach,)):bisect_right(order, (dep + reach, float("inf")))]
-        if any(cam == d["camera"] and (dd - dep) * (aa - arr) < 0 for dd, aa, cam in near):
-            continue
-        used |= {id(d), id(r)}
-        out.append((d, r))
-        insort(order, (dep, arr, d["camera"]))
+    for ds, rs in comps:
+        ds.sort(key=lambda d: d["dep"])
+        rs.sort(key=ta)
+        # Monotone alignment: best[i][j] = (links, -cost) over the first i departures and j arrivals.
+        best = [[(0, 0.0)] * (len(rs) + 1) for _ in range(len(ds) + 1)]
+        for i, d in enumerate(ds, 1):
+            for j, r in enumerate(rs, 1):
+                best[i][j] = max(best[i - 1][j], best[i][j - 1])
+                c = cost.get((id(d), id(r)))
+                if c is not None:
+                    n, k = best[i - 1][j - 1]
+                    best[i][j] = max(best[i][j], (n + 1, k - c))
+        i, j = len(ds), len(rs)
+        while i and j:
+            if best[i][j] == best[i - 1][j]:
+                i -= 1
+            elif best[i][j] == best[i][j - 1]:
+                j -= 1
+            else:
+                out.append((ds[i - 1], rs[j - 1]))
+                i, j = i - 1, j - 1
     return out
 
 
@@ -623,7 +654,7 @@ def _selfcheck():
     # a convoy never crosses (C2); cars are not widened (C3).
     k = lambda c: {"app": code(*c), "app_v": "m1"}
     dep4 = lambda i, t, cls, c: _t("cam4", i, cls, [(t, _b(.45, .35)), (t + 1, _b(.3, .5)), (t + 2, _b(.1, .7))],
-                                   counted=True, **k(c))
+                                   counted=True, hits=8, **k(c))
     arr3 = lambda i, t, cls, c: _t("cam3", i, cls, [(t, _b(.9, .8)), (t + 1, _b(.7, .6)), (t + 2, _b(.5, .4))],
                                    counted=True, hits=8, **k(c))
     for c, n in (((1,), 1), ((0, 1), 2), ((.5, .866), 2), ((.8, .6), 1)):
@@ -634,6 +665,11 @@ def _selfcheck():
     A, B = dep4(1, 100, "e-heavy", (1,)), dep4(2, 103, "e-heavy", (0, 1))
     Bp, Ap = arr3(2, 105.5, "e-heavy", (0, 1)), arr3(1, 112, "e-heavy", (1,))
     assert ids(build([A, B, Ap, Bp], _CAMS)) == [["obs-cam3-1"], ["obs-cam3-2", "obs-cam4-2"], ["obs-cam4-1"]]
+    # Slow convoy: A exits 102, B 106; A' enters 113, B' 115, all alike. Cheapest-first would pair B->A'
+    # and strand both; the order-preserving selection links A+A' and B+B'.
+    A, B, Ap, Bp = dep4(1, 100, "e-heavy", (1,)), dep4(2, 104, "e-heavy", (1,)), \
+        arr3(1, 113, "e-heavy", (1,)), arr3(2, 115, "e-heavy", (1,))
+    assert ids(build([A, B, Ap, Bp], _CAMS)) == [["obs-cam3-1", "obs-cam4-1"], ["obs-cam3-2", "obs-cam4-2"]]
     # (j) a rebuild, in any input order, yields the same ids.
     assert [j["id"] for j in build(q, _CAMS)] == [j["id"] for j in build(q[::-1], _CAMS)]
     # A whole day at a gate: 10k passes, 20k tracklets, in windowed time rather than all pairs.
