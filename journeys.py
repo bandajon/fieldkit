@@ -578,7 +578,7 @@ def _selfcheck():
     out = _t("cam4", 1, "c-small", [(100, _b(0.45, 0.35)), (101, _b(0.3, 0.5)), (102, _b(0.1, 0.7))],
              counted=True, **k(1))
     real = _t("cam3", 1, "c-small", [(103, _b(0.9, 0.8)), (104, _b(0.9, 0.8)), (105, _b(0.7, 0.6))], hits=8)
-    late = _t("cam3", 2, "c-small", [(103.5, _b(0.5, 0.4)), (104.5, _b(0.3, 0.3))], hits=2, **k(1))
+    late = _t("cam3", 2, "c-small", [(103.5, _b(0.5, 0.4)), (104.5, _b(0.3, 0.3))], hits=6, **k(1))
     [j] = build([out, real, late], _CAMS)
     assert ids([j]) == [["obs-cam3-1", "obs-cam4-1"]], j
     # (j) a rebuild, in any input order, yields the same ids.
