@@ -373,11 +373,13 @@ def _trucks(chains, links, pairs):
     for d, r in cands:
         ds, rs = comps.setdefault((find(id(d)), d["camera"], r["camera"]), ({}, {}))
         ds[id(d)], rs[id(r)] = d, r
-    comps = [(list(ds.values()), list(rs.values())) for ds, rs in comps.values()]
     out = []
-    for ds, rs in comps:
-        ds.sort(key=lambda d: d["dep"])
-        rs.sort(key=ta)
+    # One chain, one link across every DP: components go in a fixed order and skip what is taken.
+    for key, (ds, rs) in sorted(comps.items(), key=lambda kv: (min(d["dep"] for d in kv[1][0].values()), kv[0][1:])):
+        ds = sorted((d for d in ds.values() if id(d) not in used), key=lambda d: d["dep"])
+        rs = sorted((r for r in rs.values() if id(r) not in used), key=ta)
+        # ponytail: O(D*R) per component; one giant component of thousands of alike trucks ~10 s apart
+        # would take seconds. Band the DP to the time window if it ever does.
         # Monotone alignment: best[i][j] = (links, -cost) over the first i departures and j arrivals.
         best = [[(0, 0.0)] * (len(rs) + 1) for _ in range(len(ds) + 1)]
         for i, d in enumerate(ds, 1):
@@ -394,8 +396,13 @@ def _trucks(chains, links, pairs):
             elif best[i][j] == best[i][j - 1]:
                 j -= 1
             else:
-                out.append((ds[i - 1], rs[j - 1]))
+                d, r = ds[i - 1], rs[j - 1]
                 i, j = i - 1, j - 1
+                acc = accepted.setdefault(key[1:], [])
+                if not any((dd - d["dep"]) * (aa - ta(r)) < 0 for dd, aa in acc):  # crosses an earlier component's link
+                    acc.append((d["dep"], ta(r)))
+                    used |= {id(d), id(r)}
+                    out.append((d, r))
     return out
 
 
@@ -670,6 +677,12 @@ def _selfcheck():
     A, B, Ap, Bp = dep4(1, 100, "e-heavy", (1,)), dep4(2, 104, "e-heavy", (1,)), \
         arr3(1, 113, "e-heavy", (1,)), arr3(2, 115, "e-heavy", (1,))
     assert ids(build([A, B, Ap, Bp], _CAMS)) == [["obs-cam3-1", "obs-cam4-1"], ["obs-cam3-2", "obs-cam4-2"]]
+    # A chain that moves inside its zone (dep and arr) is in one journey, not one per direction.
+    k3 = dep4(1, 90, "e-heavy", (1,))
+    k3.update(camera="cam3", id="obs-cam3-1", path=[[90, *_b(.5, .4)], [91, *_b(.7, .6)], [92, *_b(.9, .8)]])
+    mid = _t("cam4", 9, "e-heavy", [(100, _b(.05, .6)), (101, _b(.1, .7)), (102, _b(.15, .8))], counted=True, hits=8, **k((1,)))
+    js = build([k3, mid, arr3(2, 110, "e-heavy", (1,))], _CAMS)
+    assert sum("obs-cam4-9" in (m["id"] for m in j["members"]) for j in js) == 1, ids(js)
     # (j) a rebuild, in any input order, yields the same ids.
     assert [j["id"] for j in build(q, _CAMS)] == [j["id"] for j in build(q[::-1], _CAMS)]
     # A whole day at a gate: 10k passes, 20k tracklets, in windowed time rather than all pairs.
