@@ -135,17 +135,17 @@ def _twin(a, b):
         s = min((p[2] - p[0]) * (p[3] - p[1]), (q[2] - q[0]) * (q[3] - q[1]))
         return w > 0 and h > 0 and s > 0 and w * h / s >= TWIN_COVER
 
-    def same(p, q):
+    def same(p, q, born):
         if iou(p, q) >= TWIN_IOU:
             return True
-        if not cover(p, q):
+        if born or not cover(p, q):
             return False
         if not alike:
             alike.append(a["class"] == b["class"] and (_similar(_app([a]), _app([b])) or 0) >= TWIN_COS)
         return alike[0]
 
-    return all(p and q and same(p, q) for p, q in (
-        (_at(a["path"], b["t0"]), b["path"][0][1:]), (_at(a["path"], end), _at(b["path"], end))))
+    return all(p and q and same(p, q, born) for born, p, q in (
+        (True, _at(a["path"], b["t0"]), b["path"][0][1:]), (False, _at(a["path"], end), _at(b["path"], end))))
 
 
 def _in(box, zone):
@@ -257,10 +257,6 @@ def _links(chains, cameras):
     chain takes part in one link at most. Overlap, not order, gates a candidate: a long
     truck fills both zones at once and can arrive seconds before it has finished leaving."""
     pairs = {frozenset((c["name"], c["handoff"]["camera"])) for c in cameras if c.get("handoff")}
-    arrivals = {}
-    for j, r in enumerate(chains):
-        if r["arr"] is not None or r.get("late") is not None:
-            arrivals.setdefault(r["camera"], []).append(j)
 
     def z0(j):
         return chains[j]["z"][0] if chains[j]["arr"] is not None else chains[j]["late"]
@@ -268,60 +264,70 @@ def _links(chains, cameras):
     def z1(j):
         return chains[j]["z"][1] if chains[j]["arr"] is not None else chains[j]["late"]
 
-    # Arrivals by zone entry; the longest zone stay bounds how far back an overlap can start.
-    index = {cam: (sorted(js, key=z0), max(z1(j) - z0(j) for j in js))
-             for cam, js in arrivals.items()}
-    cands = []
-    for i, d in enumerate(chains):
-        if d["dep"] is None:
-            continue
-        for cam, (js, span) in index.items():
-            if cam == d["camera"] or frozenset((d["camera"], cam)) not in pairs:
+    def match(late, used):
+        """Pass 1 (late False): ordinary arrivals. Pass 2: late chains for the departures left over."""
+        arrivals = {}
+        for j, r in enumerate(chains):
+            if (r["arr"] is None and r.get("late") is not None
+                    and sum(t["hits"] for t in r["members"]) >= MIN_EDGE_HITS) if late else r["arr"] is not None:
+                arrivals.setdefault(r["camera"], []).append(j)
+        # By zone entry; the longest zone stay bounds how far back an overlap can start.
+        index = {cam: (sorted(js, key=z0), max(z1(j) - z0(j) for j in js))
+                 for cam, js in arrivals.items()}
+        cands = []
+        for i, d in enumerate(chains):
+            if d["dep"] is None or id(d) in used:
                 continue
-            lo = bisect_left(js, d["z"][0] - LEAD - span, key=z0)
-            for j in js[lo:bisect_right(js, d["z"][1] + max(LAG, LAG_LATE), key=z0)]:
-                r = chains[j]
-                late = r["arr"] is None
-                if z0(j) > d["z"][1] + (LAG_LATE if late else LAG):
+            for cam, (js, span) in index.items():
+                if cam == d["camera"] or frozenset((d["camera"], cam)) not in pairs:
                     continue
-                if z1(j) >= d["z"][0] - LEAD:
-                    sim = _similar(d["app"], r["app"])
-                    if sim is not None and sim < APP_VETO:
-                        continue
-                    if late and (sim is None or sim < LATE_COS):
-                        continue
-                    t = abs(z0(j) - d["dep"] - MU) + CLASS_PEN * (d["class"] != r["class"])
-                    cands.append((t, t + APP_PEN * (1 - (APP_TYPICAL if sim is None else sim)), i, j))
+                lo = bisect_left(js, d["z"][0] - LEAD - span, key=z0)
+                for j in js[lo:bisect_right(js, d["z"][1] + (LAG_LATE if late else LAG), key=z0)]:
+                    r = chains[j]
+                    if z1(j) >= d["z"][0] - LEAD:
+                        sim = _similar(d["app"], r["app"])
+                        if sim is not None and sim < APP_VETO:
+                            continue
+                        if late and (sim is None or sim < LATE_COS):
+                            continue
+                        t = abs(z0(j) - d["dep"] - MU) + CLASS_PEN * (d["class"] != r["class"])
+                        cands.append((t, t + APP_PEN * (1 - (APP_TYPICAL if sim is None else sim)), i, j))
 
-    def greedy(cs, k):
-        used, out = set(), []
-        for *_, i, j in sorted(cs, key=lambda c: (c[k], c[2], c[3])):
-            if i not in used and j not in used:
-                used |= {i, j}
-                out.append((chains[i], chains[j]))
-        return out
+        def greedy(cs, k):
+            taken, out = set(), []
+            for *_, i, j in sorted(cs, key=lambda c: (c[k], c[2], c[3])):
+                if i not in taken and j not in taken:
+                    taken |= {i, j}
+                    out.append((chains[i], chains[j]))
+            return out
 
-    # Appearance only re-pairs within a connected set of candidates, and only if that costs no
-    # link: a re-pairing that strands a chain would turn one vehicle into two journeys.
-    root = list(range(len(chains)))
+        if late:
+            return greedy(cands, 1)
+        # Appearance only re-pairs within a connected set of candidates, and only if that costs no
+        # link: a re-pairing that strands a chain would turn one vehicle into two journeys.
+        root = list(range(len(chains)))
 
-    def find(x):
-        while root[x] != x:
-            root[x] = root[root[x]]
-            x = root[x]
-        return x
+        def find(x):
+            while root[x] != x:
+                root[x] = root[root[x]]
+                x = root[x]
+            return x
 
-    for *_, i, j in cands:
-        root[find(i)] = find(j)
-    comps = {}
-    for c in cands:
-        comps.setdefault(find(c[2]), []).append(c)
-    links = []
-    for cs in comps.values():
-        by_time = greedy(cs, 0)
-        by_look = greedy(cs, 1)
-        links += by_look if len(by_look) == len(by_time) else by_time
-    return links
+        for *_, i, j in cands:
+            root[find(i)] = find(j)
+        comps = {}
+        for c in cands:
+            comps.setdefault(find(c[2]), []).append(c)
+        links = []
+        for cs in comps.values():
+            by_time = greedy(cs, 0)
+            by_look = greedy(cs, 1)
+            links += by_look if len(by_look) == len(by_time) else by_time
+        return links
+
+    links = match(False, set())
+    # Late chains never compete with ordinary arrivals: only departures still unlinked may take one.
+    return links + match(True, {id(c) for link in links for c in link})
 
 
 def _member_attrs(ms, cls):
@@ -554,16 +560,27 @@ def _selfcheck():
         k = lambda c: {"app": c, "app_v": "m1"} if c else {}
         out = _t("cam4", 1, "c-small", [(100, _b(0.45, 0.35)), (101, _b(0.3, 0.5)), (102, _b(0.1, 0.7))],
                  counted=True, **k(c4))
-        late = _t("cam3", 1, "c-small", [(110, _b(0.5, 0.4)), (111, _b(0.3, 0.3))], counted=True, **k(c3))
+        late = _t("cam3", 1, "c-small", [(110, _b(0.5, 0.4)), (111, _b(0.3, 0.3))], counted=True, hits=6, **k(c3))
         js = build([out, late], _CAMS)
         assert len(js) == n and (n == 2 or js[0]["link"]["gap_s"] == 8.0), (n, js)
     # (T) one long truck as two concurrent boxes, the small one inside the big (IoU 0.25):
     # one chain on matching class and codes (T1); two on another class or unlike codes (T2).
     k = lambda c: {"app": code(c), "app_v": "m1"}
     big = [(t, _b(0.5, 0.4, 0.2)) for t in (100, 101, 102, 103)]
-    part = [(t, _b(0.5, 0.4)) for t in (101, 102, 103)]
+    part = [(101, _b(0.5, 0.4, 0.17)), (102, _b(0.5, 0.4, 0.1)), (103, _b(0.5, 0.4))]  # born on the truck, then shrinks
     for cls, c, n in (("c-small", 1, 1), ("d-medium", 1, 2), ("c-small", -1, 2)):
         assert len(_chains([_t("cam4", 1, "c-small", big, **k(1)), _t("cam4", 2, cls, part, **k(c))], _CAMS)) == n, (cls, c)
+    # (T3) a near vehicle and a far one nose to tail, alike, the far box inside the near: two.
+    near = _t("cam4", 1, "d-medium", [(t, [0.25, 0.25, 0.75, 0.75]) for t in (100, 101, 102, 103)], **k(1))
+    far = _t("cam4", 2, "d-medium", [(t, [0.35, 0.3, 0.55, 0.5]) for t in (101, 102, 103)], **k(1))
+    assert len(_chains([near, far], _CAMS)) == 2
+    # (L4) a late chain never takes a departure from its real, uncoded arrival.
+    out = _t("cam4", 1, "c-small", [(100, _b(0.45, 0.35)), (101, _b(0.3, 0.5)), (102, _b(0.1, 0.7))],
+             counted=True, **k(1))
+    real = _t("cam3", 1, "c-small", [(103, _b(0.9, 0.8)), (104, _b(0.9, 0.8)), (105, _b(0.7, 0.6))], hits=8)
+    late = _t("cam3", 2, "c-small", [(103.5, _b(0.5, 0.4)), (104.5, _b(0.3, 0.3))], hits=2, **k(1))
+    [j] = build([out, real, late], _CAMS)
+    assert ids([j]) == [["obs-cam3-1", "obs-cam4-1"]], j
     # (j) a rebuild, in any input order, yields the same ids.
     assert [j["id"] for j in build(q, _CAMS)] == [j["id"] for j in build(q[::-1], _CAMS)]
     # A whole day at a gate: 10k passes, 20k tracklets, in windowed time rather than all pairs.
