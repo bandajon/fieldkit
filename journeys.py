@@ -20,7 +20,7 @@ import json
 import struct
 import sys
 import time
-from bisect import bisect_left, bisect_right
+from bisect import bisect_left, bisect_right, insort
 from collections import Counter
 from datetime import datetime, timezone
 
@@ -51,6 +51,10 @@ APP_TYPICAL = 0.7    # cosine of a typical true match (Katuba median ~0.79): an 
                      # the penalty of a typical match, so it never beats a coded one at equal timing
 APP_VETO = 0.2       # known cosine below this is never a link: true pairs' 1st percentile is far above, and
                      # every linked pair under it audited on a real Katuba hour was two different vehicles
+HEAVY = ("d-medium", "e-heavy", "f-abnormal")
+TRUCK_LEAD = 8.0     # s: a slow long truck's arrival may precede its departure...
+TRUCK_LAG = 15.0     # ...or follow it this long
+TRUCK_COS = 0.6      # look agreement a wider window demands
 MIN_EDGE_HITS = 5    # ~1 s at 5 fps: a zone crossing alone must last this long; night glare blips don't
 
 
@@ -327,7 +331,41 @@ def _links(chains, cameras):
 
     links = match(False, set())
     # Late chains never compete with ordinary arrivals: only departures still unlinked may take one.
-    return links + match(True, {id(c) for link in links for c in link})
+    links += match(True, {id(c) for link in links for c in link})
+    return links + _trucks(chains, links, pairs)
+
+
+def _trucks(chains, links, pairs):
+    """Slow trucks miss the ordinary window: a wider one, only for trucks that look alike, only for
+    chains still unlinked, and never crossing an accepted truck link (convoy order)."""
+    used = {id(c) for link in links for c in link}
+    heavy = lambda c: c["class"] in HEAVY
+    ta = lambda r: r["arr"] if r["arr"] is not None else r["late"]
+    deps = [d for d in chains if d["dep"] is not None and id(d) not in used and heavy(d)]
+    arrs = sorted((r for r in chains if id(r) not in used and heavy(r) and (r["arr"] is not None or (
+        r.get("late") is not None and sum(t["hits"] for t in r["members"]) >= MIN_EDGE_HITS))), key=ta)
+    times = [ta(r) for r in arrs]
+    cands = []
+    for d in deps:
+        for r in arrs[bisect_left(times, d["dep"] - TRUCK_LEAD):bisect_right(times, d["dep"] + TRUCK_LAG)]:
+            if r["camera"] == d["camera"] or frozenset((d["camera"], r["camera"])) not in pairs:
+                continue
+            sim = _similar(d["app"], r["app"])
+            if sim is not None and sim >= TRUCK_COS:
+                cands.append((abs(ta(r) - d["dep"] - MU) + APP_PEN * (1 - sim), d["dep"], ta(r), d, r))
+    order = sorted((d["dep"], ta(r), d["camera"]) for d, r in links if heavy(d) and heavy(r))
+    reach = TRUCK_LEAD + TRUCK_LAG + 60  # only nearby links can cross
+    out = []
+    for _c, dep, arr, d, r in sorted(cands, key=lambda c: c[:3]):
+        if id(d) in used or id(r) in used:
+            continue
+        near = order[bisect_left(order, (dep - reach,)):bisect_right(order, (dep + reach, float("inf")))]
+        if any(cam == d["camera"] and (dd - dep) * (aa - arr) < 0 for dd, aa, cam in near):
+            continue
+        used |= {id(d), id(r)}
+        out.append((d, r))
+        insort(order, (dep, arr, d["camera"]))
+    return out
 
 
 def _member_attrs(ms, cls):
@@ -581,6 +619,21 @@ def _selfcheck():
     late = _t("cam3", 2, "c-small", [(103.5, _b(0.5, 0.4)), (104.5, _b(0.3, 0.3))], hits=6, **k(1))
     [j] = build([out, real, late], _CAMS)
     assert ids([j]) == [["obs-cam3-1", "obs-cam4-1"]], j
+    # (C) a slow truck's cam3 arrival 10 s after its cam4 departure (past LAG): linked only on like codes (C1);
+    # a convoy never crosses (C2); cars are not widened (C3).
+    k = lambda c: {"app": code(*c), "app_v": "m1"}
+    dep4 = lambda i, t, cls, c: _t("cam4", i, cls, [(t, _b(.45, .35)), (t + 1, _b(.3, .5)), (t + 2, _b(.1, .7))],
+                                   counted=True, **k(c))
+    arr3 = lambda i, t, cls, c: _t("cam3", i, cls, [(t, _b(.9, .8)), (t + 1, _b(.7, .6)), (t + 2, _b(.5, .4))],
+                                   counted=True, hits=8, **k(c))
+    for c, n in (((1,), 1), ((0, 1), 2), ((.5, .866), 2), ((.8, .6), 1)):
+        assert len(build([dep4(1, 100, "e-heavy", (1,)), arr3(1, 112, "e-heavy", c)], _CAMS)) == n, c
+    assert len(build([dep4(1, 100, "c-small", (1,)), arr3(1, 112, "c-small", (1,))], _CAMS)) == 2
+    # A leaves first, B 3 s later; B's own arrival B' (0.5 s after B leaves) is linked by pass 1; A's only
+    # arrival A' lands 10 s after A, after B' (0.5 s beyond B's 105 + 2 s exit): linking A->A' would invert.
+    A, B = dep4(1, 100, "e-heavy", (1,)), dep4(2, 103, "e-heavy", (0, 1))
+    Bp, Ap = arr3(2, 105.5, "e-heavy", (0, 1)), arr3(1, 112, "e-heavy", (1,))
+    assert ids(build([A, B, Ap, Bp], _CAMS)) == [["obs-cam3-1"], ["obs-cam3-2", "obs-cam4-2"], ["obs-cam4-1"]]
     # (j) a rebuild, in any input order, yields the same ids.
     assert [j["id"] for j in build(q, _CAMS)] == [j["id"] for j in build(q[::-1], _CAMS)]
     # A whole day at a gate: 10k passes, 20k tracklets, in windowed time rather than all pairs.
