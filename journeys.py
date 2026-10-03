@@ -81,13 +81,14 @@ def _hijacked(tracklets):
     for ts in by.values():
         ts.sort(key=lambda t: t["t0"])
         for a in ts:
-            anchor = a["path"][:1]
-            for s in a["path"][1:]:
+            path = a.get("path") or []      # a node without images writes no path
+            anchor = path[:1]
+            for s in path[1:]:
                 if iou(anchor[0][1:], s[1:]) >= PARK_IOU:
                     continue
                 if s[0] - anchor[0][0] >= PARK_S:
                     lo = bisect_left(ts, s[0] - 1, key=lambda t: t["t0"])
-                    if any(b is not a and b["path"] and iou(anchor[0][1:], b["path"][0][1:]) >= REPARK_IOU
+                    if any(b is not a and b.get("path") and iou(anchor[0][1:], b["path"][0][1:]) >= REPARK_IOU
                            for b in ts[lo:bisect_right(ts, s[0] + REPARK_S, key=lambda t: t["t0"])]):
                         out.add(a["id"])
                     break
@@ -615,6 +616,7 @@ def _selfcheck():
     # (H2) B born far from P: no. (H3) A never still for 2 s: no.
     assert not _hijacked([A, _t("cam3", 2, "e-heavy", [(109, _b(.1, .1)), (110, _b(.1, .1))])])
     assert not _hijacked([_t("cam3", 1, "e-heavy", [(100 + k, _b(.3 + .05 * k, .4)) for k in range(8)]), B])
+    assert not _hijacked([{k: v for k, v in A.items() if k != "path"}, B]), "a node without images writes no path"
     # (c) a long truck southbound: its cam3 arrival starts 8 s before its cam4 departure ends.
     t4 = _t("cam4", 1, "e-heavy", [(100, _b(0.5, 0.4))] + [(t, _b(0.1, 0.7)) for t in range(101, 113)])
     t3 = _t("cam3", 1, "e-heavy", [(104, _b(0.9, 0.8)), (105, _b(0.9, 0.8)), (106, _b(0.88, 0.78)),
