@@ -52,6 +52,11 @@ APP_TYPICAL = 0.7    # cosine of a typical true match (Katuba median ~0.79): an 
 APP_VETO = 0.2       # known cosine below this is never a link: true pairs' 1st percentile is far above, and
                      # every linked pair under it audited on a real Katuba hour was two different vehicles
 HEAVY = ("d-medium", "e-heavy", "f-abnormal")
+SMALL = ("a-small",)  # never links to HEAVY: 0 of 43 labelled true cross-camera pairs do, 16 of 89 wrong candidates
+PARK_S = 2.0         # s: a box held this long is a parked vehicle
+PARK_IOU = 0.6       # a sample overlapping the anchor box this much has not moved
+REPARK_S = 15.0      # s: a new track born on the parked box this soon after it pulled away took it over
+REPARK_IOU = 0.5     # overlap of that birth box with the parked box
 TRUCK_LEAD = 8.0     # s: a slow long truck's arrival may precede its departure...
 TRUCK_LAG = 15.0     # ...or follow it this long
 TRUCK_COS = 0.7      # look agreement a wider window demands
@@ -62,9 +67,40 @@ def _centre(b):
     return (b[0] + b[2]) / 2, (b[1] + b[3]) / 2
 
 
+def _clash(a, b):
+    return a in SMALL and b in HEAVY or b in SMALL and a in HEAVY
+
+
+def _hijacked(tracklets):
+    """Ids of tracklets that sat still, then pulled away as a new track was born on the parked box:
+    the track slid onto passing traffic, so its crops, attrs and look are the parked vehicle's."""
+    by = {}
+    for t in tracklets:
+        by.setdefault(t["camera"], []).append(t)
+    out = set()
+    for ts in by.values():
+        ts.sort(key=lambda t: t["t0"])
+        for a in ts:
+            path = a.get("path") or []      # a node without images writes no path
+            anchor = path[:1]
+            for s in path[1:]:
+                if iou(anchor[0][1:], s[1:]) >= PARK_IOU:
+                    continue
+                if s[0] - anchor[0][0] >= PARK_S:
+                    lo = bisect_left(ts, s[0] - 1, key=lambda t: t["t0"])
+                    if any(b is not a and b.get("path") and iou(anchor[0][1:], b["path"][0][1:]) >= REPARK_IOU
+                           for b in ts[lo:bisect_right(ts, s[0] + REPARK_S, key=lambda t: t["t0"])]):
+                        out.add(a["id"])
+                    break
+                anchor = [s]
+    return out
+
+
 def _app(ms):
     """(unit vector, model version) of the member with the most hits that has a code, else None.
-    A mixed member's code may be the other vehicle's: it never speaks for the chain."""
+    A mixed member's code may be the other vehicle's: it never speaks for the chain. (A hijacked
+    one keeps its code: the flag also fires on ordinary queue advances, and linking without
+    their codes measurably let more wrong pairs through - it only steers photos and attrs.)"""
     t = max((t for t in ms if t.get("app") and not t.get("mixed")), key=lambda t: t["hits"], default=None)
     try:
         return t and (struct.unpack("<32e", base64.b64decode(t["app"])), t.get("app_v"))
@@ -290,6 +326,8 @@ def _links(chains, cameras):
                     r = chains[j]
                     if z1(j) >= d["z"][0] - LEAD:
                         sim = _similar(d["app"], r["app"])
+                        if _clash(d["class"], r["class"]):
+                            continue
                         if sim is not None and sim < APP_VETO:
                             continue
                         if late and (sim is None or sim < LATE_COS):
@@ -409,6 +447,7 @@ def _trucks(chains, links, pairs):
 def _member_attrs(ms, cls):
     """Attrs of the member with the most hits, preferring ones of the journey's class."""
     have = [t for t in ms if t.get("attrs")]
+    have = [t for t in have if not (t.get("mixed") or t.get("hijacked"))] or have
     same = [t for t in have if t.get("class") == cls]
     return max(same or have, key=lambda t: t["hits"], default={}).get("attrs") or {}
 
@@ -425,7 +464,7 @@ def _doc(chains, link, cfg, tz, events):
     direction = dirs[0][0] if dirs else None
     names = sorted({t["camera"] for t in ms})
     crops, plates = {}, {}
-    pics = [t for t in ms if not t.get("mixed")]    # a switched track's crops show two vehicles
+    pics = [t for t in ms if not (t.get("mixed") or t.get("hijacked"))]    # a switched or hijacked track's crops show another vehicle
     pics = pics if any((t.get("crops") or {}) for t in pics) else ms
     tops = [t for t in pics if (t.get("crops") or {}).get("top")]
     if tops:
@@ -465,6 +504,8 @@ def _doc(chains, link, cfg, tz, events):
 
 
 def _build(tracklets, cameras, tz=None, events=None):
+    hj = _hijacked(tracklets)
+    tracklets = [dict(t, hijacked=True) if t["id"] in hj else t for t in tracklets]
     chains = _chains(tracklets, cameras)
     links = _links(chains, cameras)
     linked = {id(c) for pair in links for c in pair}
@@ -558,6 +599,24 @@ def _selfcheck():
     shot = lambda c: {"top": c + "-top.jpg", "best": c + "-best.jpg"}
     [j] = build(_north(1, 100.0, k3={"crops": shot("cam3-1"), "mixed": True}, k4={"crops": shot("cam4-1")}), _CAMS)
     assert j["crops"]["best"] == "cam4-1-top.jpg" and "front" not in j["crops"] and j["crops"]["rear"] == "cam4-1-best.jpg", j
+    # (V1) a small car never links to a truck, however well timing and codes agree; two trucks do.
+    k = lambda c: {"app": code(1), "app_v": "m1", "counted": True}
+    for c3, c4, n in (("e-heavy", "a-small", 2), ("e-heavy", "e-heavy", 1)):
+        [d] = [_t("cam4", 1, c4, [(100, _b(.45, .35)), (101, _b(.3, .5)), (102, _b(.1, .7))], hits=8, **k(0))]
+        r = _t("cam3", 1, c3, [(102.5, _b(.9, .8)), (103.5, _b(.7, .6)), (104.5, _b(.5, .4))], hits=8, **k(0))
+        assert len(build([d, r], _CAMS)) == n, (c3, c4)
+    # (H1) A sits at P for 5 s, moves off; B is born on P 3 s later: A is hijacked, and its crops lose.
+    P = _b(.5, .4)
+    A = _t("cam3", 1, "e-heavy", [(100 + k, P) for k in range(6)] + [(106, _b(.7, .6))])
+    B = _t("cam3", 2, "e-heavy", [(109, P), (110, P)])
+    assert _hijacked([A, B]) == {"obs-cam3-1"}
+    C = _t("cam3", 3, "e-heavy", [(106.5, _b(.7, .6)), (107.5, _b(.9, .8))])
+    [j] = [j for j in build([A, B, C], _CAMS) if len(j["members"]) == 3] or build([A, B, C], _CAMS)[:1]
+    assert j["crops"]["best"] in ("cam3-2-top.jpg", "cam3-3-top.jpg") and "hijacked" not in A, j
+    # (H2) B born far from P: no. (H3) A never still for 2 s: no.
+    assert not _hijacked([A, _t("cam3", 2, "e-heavy", [(109, _b(.1, .1)), (110, _b(.1, .1))])])
+    assert not _hijacked([_t("cam3", 1, "e-heavy", [(100 + k, _b(.3 + .05 * k, .4)) for k in range(8)]), B])
+    assert not _hijacked([{k: v for k, v in A.items() if k != "path"}, B]), "a node without images writes no path"
     # (c) a long truck southbound: its cam3 arrival starts 8 s before its cam4 departure ends.
     t4 = _t("cam4", 1, "e-heavy", [(100, _b(0.5, 0.4))] + [(t, _b(0.1, 0.7)) for t in range(101, 113)])
     t3 = _t("cam3", 1, "e-heavy", [(104, _b(0.9, 0.8)), (105, _b(0.9, 0.8)), (106, _b(0.88, 0.78)),
