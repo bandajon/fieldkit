@@ -668,15 +668,22 @@ def r2_jsonl(cl, bucket, prefix):
     except OSError:
         pass
 
+    def name(key, etag):
+        return etag and R2_CACHE / f"{hashlib.sha256(key.encode()).hexdigest()[:32]}-{etag.strip(chr(34))}.jsonl"
+
     def body(o):
-        f = o.get("ETag") and R2_CACHE / f"{hashlib.sha256(o['Key'].encode()).hexdigest()[:32]}-{o['ETag'].strip(chr(34))}.jsonl"
+        f = name(o["Key"], o.get("ETag"))
         try:
-            if f:
+            # A cut power can leave a short file under the final name: frozen batches read short
+            # would refreeze journeys, so the listed size must match or it is fetched again.
+            if f and o.get("Size", f.stat().st_size) == f.stat().st_size:
                 os.utime(f)
                 return f.read_bytes()
         except OSError:
             pass
-        b = cl.get_object(Bucket=bucket, Key=o["Key"])["Body"].read()
+        r = cl.get_object(Bucket=bucket, Key=o["Key"])
+        b = r["Body"].read()
+        f = name(o["Key"], r.get("ETag") or o.get("ETag"))   # what was fetched, if rewritten since the list
         try:
             if f:
                 tmp = f.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")
@@ -2095,7 +2102,7 @@ def journeys_check():
         def __init__(self): self.o, self.gets = {"p/a.jsonl": (b'{"n":1}\n', "e1"), "p/b.jsonl": (b'{"n":2}\n', "e2")}, 0
         def get_paginator(self, _): return self
         def paginate(self, Bucket, Prefix, Delimiter):
-            return [{"Contents": [{"Key": k, "ETag": f'"{e}"'} for k, (_, e) in self.o.items()]}]
+            return [{"Contents": [{"Key": k, "ETag": f'"{e}"', "Size": len(b)} for k, (b, e) in self.o.items()]}]
         def get_object(self, Bucket, Key):
             self.gets += 1
             return {"Body": io.BytesIO(self.o[Key][0])}
@@ -2108,6 +2115,9 @@ def journeys_check():
         assert r2_jsonl(ec, "buck", "p/") == d1 and ec.gets == 2, "second read must be all cache hits"
         ec.o["p/b.jsonl"] = (b'{"n":3}\n', "e3")
         assert r2_jsonl(ec, "buck", "p/") == [{"n": 1}, {"n": 3}] and ec.gets == 3, ec.gets
+        short = next(f for f in R2_CACHE.iterdir() if f.read_bytes() == b'{"n":3}\n')
+        short.write_bytes(b'{"n"')                     # a power cut left it short under its final name
+        assert r2_jsonl(ec, "buck", "p/") == [{"n": 1}, {"n": 3}] and ec.gets == 4, "a short cache file is refetched"
     finally:
         shutil.rmtree(R2_CACHE, ignore_errors=True)
         R2_CACHE = keep
