@@ -35,6 +35,8 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
+import time
 from datetime import datetime, timezone
 from itertools import islice
 from pathlib import Path
@@ -42,6 +44,8 @@ from zoneinfo import ZoneInfo
 
 ROOT = Path(__file__).resolve().parent
 DATASET = ROOT / "dataset"
+R2_CACHE = DATASET / "r2-cache"   # manifest bodies by key+ETag: a classify batch re-reads its day and
+                                  # neighbours (~10 min over the office uplink), but only new segments changed
 STATE = DATASET / "loop-state.json"
 LOCK = DATASET / "loop.lock"
 VIDEOS = DATASET / "loop-videos"      # a segment lives here only while it is being sampled
@@ -650,6 +654,41 @@ def bucket_keys(cl, bucket, prefix="", delimiter=None):
             yield obj["Key"]
 
 
+def r2_jsonl(cl, bucket, prefix):
+    """Parsed docs of every .jsonl one level under prefix, keys sorted; bodies cached on disk by (key, ETag)."""
+    import concurrent.futures
+    objs = sorted((o for p in cl.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix,
+                                                                           Delimiter="/")
+                   for o in p.get("Contents", []) if o["Key"].endswith(".jsonl")), key=lambda o: o["Key"])
+    try:
+        R2_CACHE.mkdir(parents=True, exist_ok=True)
+        for f in R2_CACHE.iterdir():
+            if f.stat().st_mtime < time.time() - 3 * 86400:
+                f.unlink()
+    except OSError:
+        pass
+
+    def body(o):
+        f = o.get("ETag") and R2_CACHE / f"{hashlib.sha256(o['Key'].encode()).hexdigest()[:32]}-{o['ETag'].strip(chr(34))}.jsonl"
+        try:
+            if f:
+                os.utime(f)
+                return f.read_bytes()
+        except OSError:
+            pass
+        b = cl.get_object(Bucket=bucket, Key=o["Key"])["Body"].read()
+        try:
+            if f:
+                tmp = f.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")
+                tmp.write_bytes(b)
+                os.replace(tmp, f)
+        except OSError:
+            pass
+        return b
+    with concurrent.futures.ThreadPoolExecutor(8) as pool:
+        return [json.loads(l) for b in pool.map(body, objs) for l in b.decode().splitlines() if l.strip()]
+
+
 def new_frames():
     """Approved frames outside the reference set — what the next run would train on."""
     import train
@@ -1069,11 +1108,7 @@ def journeys_pass(cl, bucket, touched, cameras, tz, keys=(), classified=(), sinc
 
     def docs(prefix):             # every manifest of the day; crops/ is never listed
         if prefix not in _cache:
-            _cache[prefix] = [json.loads(l)
-                               for key in sorted(k for k in bucket_keys(cl, bucket, prefix, "/")
-                                                  if k.endswith(".jsonl"))
-                               for l in cl.get_object(Bucket=bucket, Key=key)["Body"].read().decode()
-                                            .splitlines() if l.strip()]
+            _cache[prefix] = r2_jsonl(cl, bucket, prefix)
         return iter(_cache[prefix])
 
     def frozen_ids(where):
@@ -2053,6 +2088,29 @@ def journeys_check():
     assert journeys_pass(cl, "buck", {("G", "2026-08-19")}, [{"name": "cam3"}, {"name": "cam4"}],
                          timezone.utc) == (0, set(), {("G", "2026-08-19")}), \
         "no handoff, nothing to diagnose"
+
+    # r2_jsonl: bodies cached by (key, ETag): re-read costs 0 downloads, a changed ETag exactly 1.
+    import tempfile
+    class ETagS3:
+        def __init__(self): self.o, self.gets = {"p/a.jsonl": (b'{"n":1}\n', "e1"), "p/b.jsonl": (b'{"n":2}\n', "e2")}, 0
+        def get_paginator(self, _): return self
+        def paginate(self, Bucket, Prefix, Delimiter):
+            return [{"Contents": [{"Key": k, "ETag": f'"{e}"'} for k, (_, e) in self.o.items()]}]
+        def get_object(self, Bucket, Key):
+            self.gets += 1
+            return {"Body": io.BytesIO(self.o[Key][0])}
+    global R2_CACHE
+    keep, R2_CACHE = R2_CACHE, Path(tempfile.mkdtemp())
+    try:
+        ec = ETagS3()
+        d1 = r2_jsonl(ec, "buck", "p/")
+        assert d1 == [{"n": 1}, {"n": 2}] and ec.gets == 2, (d1, ec.gets)
+        assert r2_jsonl(ec, "buck", "p/") == d1 and ec.gets == 2, "second read must be all cache hits"
+        ec.o["p/b.jsonl"] = (b'{"n":3}\n', "e3")
+        assert r2_jsonl(ec, "buck", "p/") == [{"n": 1}, {"n": 3}] and ec.gets == 3, ec.gets
+    finally:
+        shutil.rmtree(R2_CACHE, ignore_errors=True)
+        R2_CACHE = keep
 
     # Finalization: with both cameras' one segment of the day classified, horizon() reads a
     # real 2026 epoch well past the tracklets' — so the linked journey clears FINAL_MARGIN
