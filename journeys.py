@@ -525,14 +525,17 @@ def _held(t, t_off):
 def _stays(t):
     """True if t holds its birth box for REPARK_STILL_S and ends on it: one that drives off is a vehicle."""
     p0 = t["path"][0]
-    # Ends where born: REPARK_IOU, not PARK_IOU - a parked box jitters (Maersk's parked truck: 0.58),
-    # while one that drives off ends near 0.
-    return iou(p0[1:], t["path"][-1][1:]) >= REPARK_IOU and max(p[0] for p in t["path"] if iou(p0[1:], p[1:]) >= PARK_IOU) - p0[0] >= REPARK_STILL_S
+    # Ends where born: REPARK_IOU, not PARK_IOU - a parked box jitters (Maersk's parked truck: 0.58) -
+    # and its centre within 2*MOVE: parked boxes measured drift 0.005-0.032, ones that left 0.05+,
+    # and a wide truck can slide 0.13 sideways while still overlapping its birth box by 0.5.
+    (x0, y0), (x1, y1) = _centre(p0[1:]), _centre(t["path"][-1][1:])
+    return iou(p0[1:], t["path"][-1][1:]) >= REPARK_IOU and abs(complex(x1 - x0, y1 - y0)) < 2 * MOVE and max(p[0] for p in t["path"] if iou(p0[1:], p[1:]) >= PARK_IOU) - p0[0] >= REPARK_STILL_S
 
 
 def _pulled(t, t_off):
-    """Copy of hijacked t from its pull-away on: that is the passing vehicle, so its zone timing starts there."""
-    p = [p for p in t["path"] if p[0] >= t_off]
+    """Copy of hijacked t from its last still sample on: that is the passing vehicle, so its zone timing
+    starts there - at the parked box, inside the zone (a wide truck's first moving box is already out)."""
+    p = [p for p in t["path"] if p[0] >= max([q[0] for q in t["path"] if q[0] < t_off] or [t_off])]
     # votes/class stay whole: tracklets carry no per-frame votes
     return dict(t, hijacked=True, **({"path": p, "t0": p[0][0], "hits": max(1, round(t["hits"] * len(p) / len(t["path"])))}
                                      if len(p) >= 2 else {}))
