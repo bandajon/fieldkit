@@ -149,8 +149,8 @@ def _near(a, b):
     """B picks up where A was heading, for a far box too small to overlap its last one. Same
     class or both heavy: every false merge by position on footage was a big vehicle occluding a small
     one, a small-heavy jump (heavy classes flicker on one truck). Never behind A: that is the next vehicle in the queue."""
-    if a["class"] != b["class"] and not (a["class"] in HEAVY and b["class"] in HEAVY):
-        return False
+    if a["class"] != b["class"] and not (a["class"] in HEAVY and b["class"] in HEAVY and abs(complex(*(_leaving(a["path"]) or (0, 0)))) >= MOVE / 2):
+        return False    # a stopped truck never swallows a different one queued behind it
     last, first = a["path"][-1][1:], b["path"][0][1:]
     vx, vy = _leaving(a["path"]) or (0.0, 0.0)
     (ax, ay), (bx, by) = _centre(last), _centre(first)
@@ -523,15 +523,19 @@ def _held(t, t_off):
 
 
 def _stays(t):
-    """True if t holds its birth box for REPARK_STILL_S."""
+    """True if t holds its birth box for REPARK_STILL_S and ends on it: one that drives off is a vehicle."""
     p0 = t["path"][0]
-    return max(p[0] for p in t["path"] if iou(p0[1:], p[1:]) >= PARK_IOU) - p0[0] >= REPARK_STILL_S
+    # Ends where born: REPARK_IOU, not PARK_IOU - a parked box jitters (Maersk's parked truck: 0.58),
+    # while one that drives off ends near 0.
+    return iou(p0[1:], t["path"][-1][1:]) >= REPARK_IOU and max(p[0] for p in t["path"] if iou(p0[1:], p[1:]) >= PARK_IOU) - p0[0] >= REPARK_STILL_S
 
 
 def _pulled(t, t_off):
     """Copy of hijacked t from its pull-away on: that is the passing vehicle, so its zone timing starts there."""
     p = [p for p in t["path"] if p[0] >= t_off]
-    return dict(t, hijacked=True, **({"path": p, "t0": p[0][0]} if len(p) >= 2 else {}))
+    # votes/class stay whole: tracklets carry no per-frame votes
+    return dict(t, hijacked=True, **({"path": p, "t0": p[0][0], "hits": max(1, round(t["hits"] * len(p) / len(t["path"])))}
+                                     if len(p) >= 2 else {}))
 
 
 def _build(tracklets, cameras, tz=None, events=None):
@@ -667,6 +671,22 @@ def _selfcheck():
     _, ch, _ = _build([A, B], _CAMS)
     assert [len(m["path"]) for c in ch for m in c["members"]] == [6, 5] and not any(m.get("parked") for c in ch for m in c["members"])
     assert any(c["arr"] == 106 for c in ch)
+    # (H6) the re-park track drives off later (north: counted; south: into cam3) or B is a queue at a gate
+    # (A stops 8 s and leaves, B first seen on the spot stops 8 s and leaves): photo flag only, as on main.
+    for cnt in (False, True):
+        R = _t("cam4", 2, "c-small", [(108 + k, _b(.1, .7)) for k in range(30)]
+               + [(138, _b(.2, .6)), (139, _b(.3, .5)), (140, _b(.45, .35))], counted=cnt)
+        assert len(build([M, P, R], _CAMS)) == 2, cnt
+        R = _t("cam4", 2, "c-small", [(108 + k, _b(.1, .7)) for k in range(30)] + [(138, _b(.08, .75)), (139, _b(.05, .78))], counted=cnt)
+        S = _t("cam3", 5, "c-small", [(139.5, _b(.9, .8)), (140.5, _b(.7, .6)), (141.5, _b(.5, .4))], counted=cnt)
+        assert len(build([M, P, R, S], _CAMS)) == 2, cnt
+    A = _t("cam4", 1, "c-small", [(100 + k, _b(.1, .7)) for k in range(9)] + [(109, _b(.2, .6)), (110, _b(.3, .5)), (111, _b(.45, .35))])
+    B = _t("cam4", 2, "c-small", [(112 + k, _b(.1, .7)) for k in range(9)] + [(121, _b(.2, .6)), (122, _b(.3, .5)), (123, _b(.45, .35))])
+    _, ch, _ = _build([A, B], _CAMS)
+    assert not any(m.get("parked") for c in ch for m in c["members"]) and sum(c["arr"] is not None for c in ch) == 2
+    # (m3) a stopped e-heavy truck never swallows the d-medium one queued 1.5 s behind it.
+    st = _t("cam3", 1, "e-heavy", [(100 + k, _b(.5, .4)) for k in range(5)])
+    assert len(_chains([st, _t("cam3", 2, "d-medium", [(105.5, _b(.5, .62)), (106.5, _b(.5, .62))])], _CAMS)) == 2
     # (c) a long truck southbound: its cam3 arrival starts 8 s before its cam4 departure ends.
     t4 = _t("cam4", 1, "e-heavy", [(100, _b(0.5, 0.4))] + [(t, _b(0.1, 0.7)) for t in range(101, 113)])
     t3 = _t("cam3", 1, "e-heavy", [(104, _b(0.9, 0.8)), (105, _b(0.9, 0.8)), (106, _b(0.88, 0.78)),
