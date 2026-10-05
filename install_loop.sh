@@ -35,3 +35,4 @@ agent com.fieldkit.loop-ingest 14400 ingest
 agent com.fieldkit.loop-train   3600 train
 agent com.fieldkit.loop-classify 600 classify
 agent com.fieldkit.loop-hunt 600 hunt
+agent com.fieldkit.loop-audit 86400 audit

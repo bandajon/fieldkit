@@ -116,6 +116,17 @@ Switching it is a prefix change there, once the counts are compared — but the 
 rebuilt every pass (ids are deterministic, so unchanged journeys keep theirs), and crops are
 cited by full bucket key rather than `crops/<name>`.
 
+### Duplicate audit
+
+`selfloop.py audit [YYYYMMDD]` (daily agent `loop-audit`, default yesterday in Lusaka) reads a
+day's frozen journeys and flags pairs that are probably one vehicle counted twice: a leftover
+track on the other camera with the same look, a no-look pair of the same class seconds apart,
+or a same-camera fragment that resumes where the other stopped (`dup_audit.py`, thresholds
+measured on 5 Oct). It writes `fieldkit-audit/<gate>/<day>/suspects.json`, a summary goes to
+the gate's health doc as `duplicate_audit`. It is a review queue, not a correction: precision
+measured 61%. A reviewer samples the list; flags x sample precision estimates the day's
+duplicate count.
+
 ## Comparing models like for like
 
 `python train.py baseline` trains on the reference set itself — the exact frames and hash
