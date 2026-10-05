@@ -9,6 +9,7 @@
   python selfloop.py train         pull the curated set; train once enough is new; promote if better
   python selfloop.py train --now   train now, threshold or not
   python selfloop.py status        where the loop stands
+  python selfloop.py audit [YYYYMMDD]   duplicate suspects among yesterday's (Lusaka) journeys -> bucket
   python selfloop.py adopt <run>   crown a run trained by hand (v2 was)
   python selfloop.py adopt-attrs <run>   the same, for an attribute run
   python selfloop.py               self-check
@@ -192,7 +193,8 @@ def publish_health(s, cl, bucket, keys, since=""):
                    "oldest_unclassified_s": {c: round(time.time() - o) if o is not None else None
                                              for c, (_, _, o) in cams.items()},
                    "newest": {c: {"recorded": iso(r), "classified": iso(c_)} for c, (r, c_, _) in cams.items()},
-                   "alerts": [a for a in s.get("alerts", []) if a["gate"] == gate][:50]}
+                   "alerts": [a for a in s.get("alerts", []) if a["gate"] == gate][:50],
+                   "duplicate_audit": (s.get("dup_audit") or {}).get(gate)}
             cl.put_object(Bucket=bucket, Key=f"{HEALTH}{gate}.json", Body=json.dumps(doc).encode(),
                           ContentType="application/json")
         except Exception as e:
@@ -694,6 +696,25 @@ def r2_jsonl(cl, bucket, prefix):
         return b
     with concurrent.futures.ThreadPoolExecutor(8) as pool:
         return [json.loads(l) for b in pool.map(body, objs) for l in b.decode().splitlines() if l.strip()]
+
+
+def audit_pass(day8=None):
+    """Daily: flag probable double counts among a day's frozen journeys (dup_audit.py)."""
+    import dup_audit
+    from datetime import timedelta
+    day8 = day8 or (datetime.now(ZoneInfo(TZ)) - timedelta(days=1)).strftime("%Y%m%d")
+    ds, cl, bucket = r2()
+    for gate in GATES.values():
+        try:
+            summary = dup_audit.run(cl, bucket, gate, day8)   # reads take minutes: no lock held
+        except Exception as e:
+            print(f"  ! audit {gate} {day8}: {e}", flush=True)
+            continue
+        with Lock():
+            s = load_state()
+            s.setdefault("dup_audit", {})[gate] = summary
+            save_state(s)
+        print(f"audit {gate} {day8}: {summary['suspects']} suspects in {summary['journeys']} journeys {summary['by_kind']}", flush=True)
 
 
 def new_frames():
@@ -2461,6 +2482,8 @@ if __name__ == "__main__":
     elif a[0] == "train":
         train_pass(force="--now" in a)
         refresh_appearance()
+    elif a[0] == "audit":
+        audit_pass(a[1] if len(a) > 1 else None)
     elif a[0] == "status":
         status()
     elif a[0] == "adopt" and len(a) == 2:
