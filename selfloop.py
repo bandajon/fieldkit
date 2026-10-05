@@ -726,9 +726,13 @@ def audit_pass(day8=None):
             summary["partial"] = [gate, f"{d8[:4]}-{d8[4:6]}-{d8[6:]}"] in load_state().get("open_days", []) \
                 or not summary["journeys"]
             try:   # its own file, not state.json: classify holds loop.lock for hours and rewrites state
-                done = json.loads(AUDIT_STATE.read_text()) if AUDIT_STATE.exists() else {}
+                try:
+                    done = json.loads(AUDIT_STATE.read_text())
+                    done = done if isinstance(done, dict) else {}
+                except (OSError, ValueError):
+                    done = {}                                       # missing or damaged: start over
                 done[gate] = summary                                # the last day audited: yesterday
-                tmp = AUDIT_STATE.with_suffix(".tmp")
+                tmp = AUDIT_STATE.with_suffix(f".{os.getpid()}.tmp")
                 tmp.write_text(json.dumps(done))
                 os.replace(tmp, AUDIT_STATE)
             except (OSError, ValueError) as e:
