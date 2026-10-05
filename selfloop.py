@@ -916,7 +916,7 @@ def hunt_pass():
     import detect
     import ingest_video
     from datetime import timedelta
-    if classify_behind():
+    if not night_slot() and classify_behind():
         print(f"{now()} hunt: yielding — classify has segment(s) to do", flush=True)
         return
     with Lock():
@@ -1460,10 +1460,16 @@ def prune_annotated(cl, bucket, gate, cam_name):
             cl.delete_object(Bucket=bucket, Key=key)
 
 
+def night_slot():
+    """Lusaka night with a backlog one classify pass drains: train and hunt may take the GPU.
+    By day any backlog wins; without this slot hunt never ran (classify always has a few left)."""
+    return datetime.now(ZoneInfo(TZ)).hour in NIGHT and \
+        (load_state().get("classify_backlog") or {}).get("left", 0) <= NIGHT_LEFT
+
+
 def train_pass(force=False):
     import train as trainer
-    night = datetime.now(ZoneInfo(TZ)).hour in NIGHT and (load_state().get("classify_backlog") or {}).get("left", 0) <= NIGHT_LEFT
-    if not force and not night and classify_behind():
+    if not force and not night_slot() and classify_behind():
         print(f"{now()} train: yielding — classify has segment(s) to do", flush=True)
         return
     # A forced run must not exit "busy" while classify drains its budget (up to
