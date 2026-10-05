@@ -699,22 +699,29 @@ def r2_jsonl(cl, bucket, prefix):
 
 
 def audit_pass(day8=None):
-    """Daily: flag probable double counts among a day's frozen journeys (dup_audit.py)."""
+    """Daily: flag probable double counts among a day's frozen journeys (dup_audit.py). By default
+    yesterday and the day before: a day still open (classify behind, journeys not all frozen) is
+    marked partial, and the next morning's run audits it again once it has closed."""
     import dup_audit
     from datetime import timedelta
-    day8 = day8 or (datetime.now(ZoneInfo(TZ)) - timedelta(days=1)).strftime("%Y%m%d")
+    today = datetime.now(ZoneInfo(TZ))
+    days = [day8] if day8 else [(today - timedelta(days=k)).strftime("%Y%m%d") for k in (2, 1)]
     ds, cl, bucket = r2()
     for gate in GATES.values():
-        try:
-            summary = dup_audit.run(cl, bucket, gate, day8)   # reads take minutes: no lock held
-        except Exception as e:
-            print(f"  ! audit {gate} {day8}: {e}", flush=True)
-            continue
-        with Lock():
-            s = load_state()
-            s.setdefault("dup_audit", {})[gate] = summary
-            save_state(s)
-        print(f"audit {gate} {day8}: {summary['suspects']} suspects in {summary['journeys']} journeys {summary['by_kind']}", flush=True)
+        for d8 in days:
+            try:
+                summary = dup_audit.run(cl, bucket, gate, d8)   # reads take minutes: no lock held
+            except Exception as e:
+                print(f"  ! audit {gate} {d8}: {e}", flush=True)
+                continue
+            with Lock():
+                s = load_state()
+                summary["partial"] = [gate, f"{d8[:4]}-{d8[4:6]}-{d8[6:]}"] in s.get("open_days", []) \
+                    or not summary["journeys"]
+                s.setdefault("dup_audit", {})[gate] = summary      # the last day audited: yesterday
+                save_state(s)
+            print(f"audit {gate} {d8}: {summary['suspects']} suspects in {summary['journeys']} journeys "
+                  f"{summary['by_kind']}{' (partial: day still open)' if summary['partial'] else ''}", flush=True)
 
 
 def new_frames():
