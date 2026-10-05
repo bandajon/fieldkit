@@ -66,6 +66,7 @@ TRACKLETS = "fieldkit-tracklets/"   # every track, counted or not: the journey b
 # counts are compared.
 JOURNEYS = "fieldkit-journeys/"
 HEALTH = "fieldkit-health/"   # per-gate health JSON: backlog, per-camera lag, last-24h alerts
+AUDIT_STATE = DATASET / "dup-audit.json"   # dup_audit summaries by gate: never state.json (see audit_pass)
 ANNOTATED = "fieldkit-annotated/"   # DeepStream-style rendered clips, for the RDA dashboard's live view
 LIVE_HOURS = 6         # only this recent a segment is worth rendering — a backlog must
                        # never slow classification down waiting on video encodes
@@ -175,6 +176,14 @@ def fold_alerts(s, fresh, cutoff=None):
     s["alerts"] = sorted(newest.values(), key=lambda a: a["at"], reverse=True)
 
 
+def audit_summary(gate):
+    """The latest dup_audit summary for gate (audit_pass writes AUDIT_STATE), or None."""
+    try:
+        return json.loads(AUDIT_STATE.read_text()).get(gate)
+    except (OSError, ValueError):
+        return None
+
+
 def publish_health(s, cl, bucket, keys, since=""):
     """One small JSON per gate for the RDA dashboard. Never fails the pass."""
     import time
@@ -194,7 +203,7 @@ def publish_health(s, cl, bucket, keys, since=""):
                                              for c, (_, _, o) in cams.items()},
                    "newest": {c: {"recorded": iso(r), "classified": iso(c_)} for c, (r, c_, _) in cams.items()},
                    "alerts": [a for a in s.get("alerts", []) if a["gate"] == gate][:50],
-                   "duplicate_audit": (s.get("dup_audit") or {}).get(gate)}
+                   "duplicate_audit": audit_summary(gate)}
             cl.put_object(Bucket=bucket, Key=f"{HEALTH}{gate}.json", Body=json.dumps(doc).encode(),
                           ContentType="application/json")
         except Exception as e:
@@ -714,12 +723,20 @@ def audit_pass(day8=None):
             except Exception as e:
                 print(f"  ! audit {gate} {d8}: {e}", flush=True)
                 continue
-            with Lock():
-                s = load_state()
-                summary["partial"] = [gate, f"{d8[:4]}-{d8[4:6]}-{d8[6:]}"] in s.get("open_days", []) \
-                    or not summary["journeys"]
-                s.setdefault("dup_audit", {})[gate] = summary      # the last day audited: yesterday
-                save_state(s)
+            summary["partial"] = [gate, f"{d8[:4]}-{d8[4:6]}-{d8[6:]}"] in load_state().get("open_days", []) \
+                or not summary["journeys"]
+            try:   # its own file, not state.json: classify holds loop.lock for hours and rewrites state
+                try:
+                    done = json.loads(AUDIT_STATE.read_text())
+                    done = done if isinstance(done, dict) else {}
+                except (OSError, ValueError):
+                    done = {}                                       # missing or damaged: start over
+                done[gate] = summary                                # the last day audited: yesterday
+                tmp = AUDIT_STATE.with_suffix(f".{os.getpid()}.tmp")
+                tmp.write_text(json.dumps(done))
+                os.replace(tmp, AUDIT_STATE)
+            except (OSError, ValueError) as e:
+                print(f"  ! audit summary: {e}", flush=True)
             print(f"audit {gate} {d8}: {summary['suspects']} suspects in {summary['journeys']} journeys "
                   f"{summary['by_kind']}{' (partial: day still open)' if summary['partial'] else ''}", flush=True)
 
