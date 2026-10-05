@@ -57,6 +57,8 @@ PARK_S = 2.0         # s: a box held this long is a parked vehicle
 PARK_IOU = 0.6       # a sample overlapping the anchor box this much has not moved
 REPARK_S = 15.0      # s: a new track born on the parked box this soon after it pulled away took it over
 REPARK_IOU = 0.5     # overlap of that birth box with the parked box
+HIJACK_STILL_S = 5.0  # s: the hijacked track sat this long before pulling away; a queue advance (next vehicle moves into the vacated spot) mimics a hijack, a true park does not
+REPARK_STILL_S = 5.0  # s: the re-park track stays still this long from birth; a true parked vehicle and its stolen track both sat for seconds (2 s parked->moving still flags photos)
 TRUCK_LEAD = 8.0     # s: a slow long truck's arrival may precede its departure...
 TRUCK_LAG = 15.0     # ...or follow it this long
 TRUCK_COS = 0.7      # look agreement a wider window demands
@@ -72,12 +74,13 @@ def _clash(a, b):
 
 
 def _hijacked(tracklets):
-    """Ids of tracklets that sat still, then pulled away as a new track was born on the parked box:
-    the track slid onto passing traffic, so its crops, attrs and look are the parked vehicle's."""
+    """{id: (pull-away time, re-park tracklet id)} of tracklets that sat still, then pulled away as a new
+    track was born on the parked box: the track slid onto passing traffic, so its crops, attrs and
+    look are the parked vehicle's, and the re-park track is the parked vehicle itself."""
     by = {}
     for t in tracklets:
         by.setdefault(t["camera"], []).append(t)
-    out = set()
+    out = {}
     for ts in by.values():
         ts.sort(key=lambda t: t["t0"])
         for a in ts:
@@ -88,9 +91,10 @@ def _hijacked(tracklets):
                     continue
                 if s[0] - anchor[0][0] >= PARK_S:
                     lo = bisect_left(ts, s[0] - 1, key=lambda t: t["t0"])
-                    if any(b is not a and b.get("path") and iou(anchor[0][1:], b["path"][0][1:]) >= REPARK_IOU
-                           for b in ts[lo:bisect_right(ts, s[0] + REPARK_S, key=lambda t: t["t0"])]):
-                        out.add(a["id"])
+                    b = next((b for b in ts[lo:bisect_right(ts, s[0] + REPARK_S, key=lambda t: t["t0"])]
+                              if b is not a and b.get("path") and iou(anchor[0][1:], b["path"][0][1:]) >= REPARK_IOU), None)
+                    if b:
+                        out[a["id"]] = s[0], b["id"]
                     break
                 anchor = [s]
     return out
@@ -143,10 +147,10 @@ def _opposed(a, b):
 
 def _near(a, b):
     """B picks up where A was heading, for a far box too small to overlap its last one. Same
-    class only: every false merge by position on footage was a big vehicle occluding a small
-    one, always a class jump. Never behind A: that is the next vehicle in the queue."""
-    if a["class"] != b["class"]:
-        return False
+    class or both heavy: every false merge by position on footage was a big vehicle occluding a small
+    one, a small-heavy jump (heavy classes flicker on one truck). Never behind A: that is the next vehicle in the queue."""
+    if a["class"] != b["class"] and not (a["class"] in HEAVY and b["class"] in HEAVY and abs(complex(*(_leaving(a["path"]) or (0, 0)))) >= MOVE / 2):
+        return False    # a stopped truck never swallows a different one queued behind it
     last, first = a["path"][-1][1:], b["path"][0][1:]
     vx, vy = _leaving(a["path"]) or (0.0, 0.0)
     (ax, ay), (bx, by) = _centre(last), _centre(first)
@@ -272,6 +276,8 @@ def _chains(tracklets, cameras):
         ch = {"camera": ms[0]["camera"], "members": ms, "votes": votes, "conf": conf,
               "class": _top(votes, conf), "dep": None, "arr": None, "app": _app(ms)}
         zone = zones.get(ch["camera"])
+        if all(t.get("parked") for t in ms):
+            zone = None     # a parked vehicle is neither an arrival nor a departure
         zt = [p[0] for p in path if _in(p[1:], zone)] if zone else []
         if zt:
             b0, b1 = path[0][1:], path[-1][1:]
@@ -503,9 +509,45 @@ def _doc(chains, link, cfg, tz, events):
         "dwell_s": round(max(m["t1"] for m in ms) - ms[0]["t0"], 1)}
 
 
+def _held(t, t_off):
+    """True if t sat still HIJACK_STILL_S up to (not including) its pull-away sample at t_off."""
+    anchor = t["path"][0]
+    last = anchor
+    for p in t["path"]:
+        if p[0] >= t_off:
+            break
+        if iou(anchor[1:], p[1:]) < PARK_IOU:
+            anchor = p
+        last = p
+    return last[0] - anchor[0] >= HIJACK_STILL_S
+
+
+def _stays(t):
+    """True if t holds its birth box for REPARK_STILL_S and ends on it: one that drives off is a vehicle."""
+    p0 = t["path"][0]
+    # Ends where born: REPARK_IOU, not PARK_IOU - a parked box jitters (Maersk's parked truck: 0.58) -
+    # and its centre within 2*MOVE: parked boxes measured drift 0.005-0.032, ones that left 0.05+,
+    # and a wide truck can slide 0.13 sideways while still overlapping its birth box by 0.5.
+    (x0, y0), (x1, y1) = _centre(p0[1:]), _centre(t["path"][-1][1:])
+    return iou(p0[1:], t["path"][-1][1:]) >= REPARK_IOU and abs(complex(x1 - x0, y1 - y0)) < 2 * MOVE and max(p[0] for p in t["path"] if iou(p0[1:], p[1:]) >= PARK_IOU) - p0[0] >= REPARK_STILL_S
+
+
+def _pulled(t, t_off):
+    """Copy of hijacked t from its last still sample on: that is the passing vehicle, so its zone timing
+    starts there - at the parked box, inside the zone (a wide truck's first moving box is already out)."""
+    p = [p for p in t["path"] if p[0] >= max([q[0] for q in t["path"] if q[0] < t_off] or [t_off])]
+    # votes/class stay whole: tracklets carry no per-frame votes
+    return dict(t, hijacked=True, **({"path": p, "t0": p[0][0], "hits": max(1, round(t["hits"] * len(p) / len(t["path"])))}
+                                     if len(p) >= 2 else {}))
+
+
 def _build(tracklets, cameras, tz=None, events=None):
     hj = _hijacked(tracklets)
-    tracklets = [dict(t, hijacked=True) if t["id"] in hj else t for t in tracklets]
+    by = {t["id"]: t for t in tracklets}
+    hit = {a: hj[a] for a in hj if _held(by[a], hj[a][0]) and _stays(by[hj[a][1]])}   # a parked vehicle's stolen track, not a queue advance
+    parked = {b for _, b in hit.values()}
+    tracklets = [_pulled(t, hj[t["id"]][0]) if t["id"] in hit else dict(t, hijacked=True) if t["id"] in hj
+                 else dict(t, parked=True) if t["id"] in parked else t for t in tracklets]
     chains = _chains(tracklets, cameras)
     links = _links(chains, cameras)
     linked = {id(c) for pair in links for c in pair}
@@ -609,7 +651,7 @@ def _selfcheck():
     P = _b(.5, .4)
     A = _t("cam3", 1, "e-heavy", [(100 + k, P) for k in range(6)] + [(106, _b(.7, .6))])
     B = _t("cam3", 2, "e-heavy", [(109, P), (110, P)])
-    assert _hijacked([A, B]) == {"obs-cam3-1"}
+    assert _hijacked([A, B]).keys() == {"obs-cam3-1"}
     C = _t("cam3", 3, "e-heavy", [(106.5, _b(.7, .6)), (107.5, _b(.9, .8))])
     [j] = [j for j in build([A, B, C], _CAMS) if len(j["members"]) == 3] or build([A, B, C], _CAMS)[:1]
     assert j["crops"]["best"] in ("cam3-2-top.jpg", "cam3-3-top.jpg") and "hijacked" not in A, j
@@ -617,6 +659,37 @@ def _selfcheck():
     assert not _hijacked([A, _t("cam3", 2, "e-heavy", [(109, _b(.1, .1)), (110, _b(.1, .1))])])
     assert not _hijacked([_t("cam3", 1, "e-heavy", [(100 + k, _b(.3 + .05 * k, .4)) for k in range(8)]), B])
     assert not _hijacked([{k: v for k, v in A.items() if k != "path"}, B]), "a node without images writes no path"
+    # (H4) Maersk: P sits in cam4's zone, then drives off (it is M, counted); R is born on the parked box
+    # and stays (a 0.04 drift): M is one journey with cam3's, R is no vehicle and takes no link.
+    M = _north(1, 104.0)[0]
+    P = _t("cam4", 1, "c-small", [(90 + k, _b(.1, .7)) for k in range(14)]
+           + [(104, _b(.2, .6)), (105, _b(.3, .5)), (106, _b(.45, .35))], counted=True)
+    R = _t("cam4", 2, "c-small", [(108 + k, _b(.1, .7)) for k in range(6)] + [(114, _b(.14, .7))])
+    js = build([M, P, R], _CAMS)
+    assert [sorted(m["id"] for m in j["members"]) for j in js] == [["obs-cam3-1", "obs-cam4-1"]], js
+    # (H5) queue advance: A sits 3 s and moves off, B born on its spot moves off 2 s later: no trim, B not parked.
+    A = _t("cam4", 1, "c-small", [(100 + k, _b(.1, .7)) for k in range(4)] + [(104, _b(.2, .6)), (105, _b(.3, .5))])
+    B = _t("cam4", 2, "c-small", [(106 + k, _b(.1, .7)) for k in range(3)] + [(109, _b(.2, .6)), (110, _b(.3, .5))])
+    assert _hijacked([A, B]).keys() == {"obs-cam4-1"}
+    _, ch, _ = _build([A, B], _CAMS)
+    assert [len(m["path"]) for c in ch for m in c["members"]] == [6, 5] and not any(m.get("parked") for c in ch for m in c["members"])
+    assert any(c["arr"] == 106 for c in ch)
+    # (H6) the re-park track drives off later (north: counted; south: into cam3) or B is a queue at a gate
+    # (A stops 8 s and leaves, B first seen on the spot stops 8 s and leaves): photo flag only, as on main.
+    for cnt in (False, True):
+        R = _t("cam4", 2, "c-small", [(108 + k, _b(.1, .7)) for k in range(30)]
+               + [(138, _b(.2, .6)), (139, _b(.3, .5)), (140, _b(.45, .35))], counted=cnt)
+        assert len(build([M, P, R], _CAMS)) == 2, cnt
+        R = _t("cam4", 2, "c-small", [(108 + k, _b(.1, .7)) for k in range(30)] + [(138, _b(.08, .75)), (139, _b(.05, .78))], counted=cnt)
+        S = _t("cam3", 5, "c-small", [(139.5, _b(.9, .8)), (140.5, _b(.7, .6)), (141.5, _b(.5, .4))], counted=cnt)
+        assert len(build([M, P, R, S], _CAMS)) == 2, cnt
+    A = _t("cam4", 1, "c-small", [(100 + k, _b(.1, .7)) for k in range(9)] + [(109, _b(.2, .6)), (110, _b(.3, .5)), (111, _b(.45, .35))])
+    B = _t("cam4", 2, "c-small", [(112 + k, _b(.1, .7)) for k in range(9)] + [(121, _b(.2, .6)), (122, _b(.3, .5)), (123, _b(.45, .35))])
+    _, ch, _ = _build([A, B], _CAMS)
+    assert not any(m.get("parked") for c in ch for m in c["members"]) and sum(c["arr"] is not None for c in ch) == 2
+    # (m3) a stopped e-heavy truck never swallows the d-medium one queued 1.5 s behind it.
+    st = _t("cam3", 1, "e-heavy", [(100 + k, _b(.5, .4)) for k in range(5)])
+    assert len(_chains([st, _t("cam3", 2, "d-medium", [(105.5, _b(.5, .62)), (106.5, _b(.5, .62))])], _CAMS)) == 2
     # (c) a long truck southbound: its cam3 arrival starts 8 s before its cam4 departure ends.
     t4 = _t("cam4", 1, "e-heavy", [(100, _b(0.5, 0.4))] + [(t, _b(0.1, 0.7)) for t in range(101, 113)])
     t3 = _t("cam3", 1, "e-heavy", [(104, _b(0.9, 0.8)), (105, _b(0.9, 0.8)), (106, _b(0.88, 0.78)),
@@ -675,6 +748,10 @@ def _selfcheck():
     on = [(101.4, _b(0.34, 0.64, 0.025)), (102.4, _b(0.42, 0.64, 0.025))]
     assert len(_chains([fast, _t("cam3", 2, "a-small", on)], _CAMS)) == 1
     assert len(_chains([fast, _t("cam3", 2, "d-medium", on)], _CAMS)) == 2
+    # (m2) ...except between two heavy classes: a truck's class flickering, not a size jump.
+    for c1, c2, n in (("e-heavy", "d-medium", 1), ("a-small", "e-heavy", 2)):
+        a = _t("cam3", 1, c1, [(100, _b(0.5, 0.4)), (101, _b(0.5, 0.5))])
+        assert len(_chains([a, _t("cam3", 2, c2, [(102.5, _b(0.5, 0.7)), (103.5, _b(0.5, 0.8))])], _CAMS)) == n, (c1, c2)
     back = [(101.4, _b(0.20, 0.64, 0.025)), (102.4, _b(0.28, 0.64, 0.025))]
     assert len(_chains([fast, _t("cam3", 2, "a-small", back)], _CAMS)) == 2
     # (o) ByteTrack twins: two ids on one crawling vehicle at once are one journey;
