@@ -731,8 +731,11 @@ def _selfcheck():
     ca = [[.84, .70, .99, .89], [.70, .69, .84, .87], [.54, .67, .66, .82]]
     cb = [[.66, .68, .95, .88], [.50, .65, .80, .86], [.37, .62, .64, .82]]
     for votes, n in (({"e-heavy": 4, "b-light": 8}, 1), ({"b-light": 12}, 2)):
-        cabs = _t("cam3", 1, "b-light", list(zip((48, 49, 50), ca)), votes=votes, **k(1))
-        assert len(_chains([cabs, _t("cam3", 2, "e-heavy", list(zip((49.2, 50.2, 51.2), cb)), **k(1))], _CAMS)) == n, votes
+        cabs = _t("cam3", 1, "b-light", list(zip((48, 49, 50), ca)), votes=votes, hits=12, **k(1))   # the real counts
+        assert len(_chains([cabs, _t("cam3", 2, "e-heavy", list(zip((49.2, 50.2, 51.2), cb)), hits=37, **k(1))], _CAMS)) == n, votes
+    # ...and a covered vehicle that built up more sightings than the truck is no fragment.
+    cabs = _t("cam3", 1, "b-light", list(zip((48, 49, 50), ca)), votes={"e-heavy": 4, "b-light": 8}, hits=40, **k(1))
+    assert len(_chains([cabs, _t("cam3", 2, "e-heavy", list(zip((49.2, 50.2, 51.2), cb)), hits=37, **k(1))], _CAMS)) == 2
     # (E) attrs come from clean members' events: the mixed member's bigger event is another vehicle's.
     ev = {"obs-cam3-1": {"class": "c-small", "hits": 9, "attrs": {"axles": 3}}, "obs-cam4-1": {"class": "c-small", "hits": 2, "attrs": {"axles": 6}}}
     [j] = build(_north(1, 100.0, k3={"mixed": True}), _CAMS, events=ev)
