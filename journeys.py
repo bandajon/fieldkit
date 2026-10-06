@@ -52,8 +52,7 @@ APP_TYPICAL = 0.7    # cosine of a typical true match (Katuba median ~0.79): an 
                      # the penalty of a typical match, so it never beats a coded one at equal timing
 APP_VETO = 0.2       # known cosine below this is never a link: true pairs' 1st percentile is far above, and
                      # every linked pair under it audited on a real Katuba hour was two different vehicles
-DAY_HOURS = (6, 18)  # Lusaka hours the appearance veto applies to any pair; outside them only across classes
-LUSAKA = ZoneInfo("Africa/Lusaka")
+DAY_HOURS = (6, 18)  # local hours (build's tz) the appearance veto applies to any pair; outside them only across classes
 HEAVY = ("d-medium", "e-heavy", "f-abnormal")
 SMALL = ("a-small",)  # never links to HEAVY: 0 of 43 labelled true cross-camera pairs do, 16 of 89 wrong candidates
 PARK_S = 2.0         # s: a box held this long is a parked vehicle
@@ -303,7 +302,7 @@ def _chains(tracklets, cameras):
     return sorted(chains, key=lambda c: (c["camera"], c["members"][0]["t0"], c["members"][0]["id"]))
 
 
-def _links(chains, cameras):
+def _links(chains, cameras, tz=None):
     """Departures from one camera's zone to arrivals in its partner's, cheapest first; a
     chain takes part in one link at most. Overlap, not order, gates a candidate: a long
     truck fills both zones at once and can arrive seconds before it has finished leaving."""
@@ -341,7 +340,7 @@ def _links(chains, cameras):
                             continue
                         # At night one camera sees a lit side and the other headlights: a same-class pair
                         # can look unalike and still be one vehicle (measured at dusk: 7 of 10 judged true).
-                        night = not DAY_HOURS[0] <= datetime.fromtimestamp(d["dep"], LUSAKA).hour < DAY_HOURS[1]
+                        night = not DAY_HOURS[0] <= datetime.fromtimestamp(d["dep"], tz or timezone.utc).hour < DAY_HOURS[1]
                         if sim is not None and sim < APP_VETO and not (night and d["class"] == r["class"]):
                             continue
                         if late and (sim is None or sim < LATE_COS):
@@ -557,7 +556,7 @@ def _build(tracklets, cameras, tz=None, events=None):
     tracklets = [_pulled(t, hj[t["id"]][0]) if t["id"] in hit else dict(t, hijacked=True) if t["id"] in hj
                  else dict(t, parked=True) if t["id"] in parked else t for t in tracklets]
     chains = _chains(tracklets, cameras)
-    links = _links(chains, cameras)
+    links = _links(chains, cameras, tz)
     linked = {id(c) for pair in links for c in pair}
     # A lone chain counts if its camera counted it, or it crossed a handoff zone the partner
     # missed and stayed in view long enough to be a vehicle rather than headlight glare.
@@ -640,14 +639,15 @@ def _selfcheck():
         + _north(2, 105.0, gap=-1.0, k3={"app": code(.25, .968), "app_v": "m1"}, k4={"app": code(1), "app_v": "m1"})
     assert ids(build(pair, _CAMS)) == [["obs-cam3-1", "obs-cam4-1"], ["obs-cam3-2", "obs-cam4-2"]]
     # (b4) codes that disagree (cosine < APP_VETO) never link by day, even when timing says they should.
-    dt = datetime(2026, 10, 6, 12, 0, tzinfo=LUSAKA).timestamp()
+    lusaka = ZoneInfo("Africa/Lusaka")
+    dt = datetime(2026, 10, 6, 12, 0, tzinfo=lusaka).timestamp()
     pair = _north(1, dt, k3={"app": code(1), "app_v": "m1", "counted": True},
                   k4={"app": code(-1), "app_v": "m1", "counted": True})
-    assert len(build(pair, _CAMS)) == 2
+    assert len(build(pair, _CAMS, lusaka)) == 2
     # (b4n) ...but at night (here 20:00 Lusaka) a same-class pair is not vetoed: lit side vs headlights.
-    nt = datetime(2026, 10, 6, 20, 0, tzinfo=LUSAKA).timestamp()
+    nt = datetime(2026, 10, 6, 20, 0, tzinfo=lusaka).timestamp()
     pairn = _north(1, nt, k3={"app": code(1), "app_v": "m1", "counted": True}, k4={"app": code(-1), "app_v": "m1", "counted": True})
-    assert len(build(pairn, _CAMS)) == 1
+    assert len(build(pairn, _CAMS, lusaka)) == 1
     pair[0]["mixed"] = pair[1]["mixed"] = True        # ...unless a code may belong to a switched track
     assert len(build(pair, _CAMS)) == 1
     # (b5) a mixed member's crops lose to a clean member's.
