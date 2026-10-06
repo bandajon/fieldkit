@@ -33,6 +33,7 @@ TWIN_IOU = 0.5       # detect.GUARD_IOU: one vehicle, two ids, the same box at t
 TWIN_COVER = 0.8     # a box this much inside another is the same vehicle seen in part (cab + whole truck)...
 TWIN_COS = 0.5       # ...when the class agrees and the appearance codes cosine is at least this
 TWIN_HEAVY_SHARE = 0.25  # a fragment of another class is the same truck if this share of its votes is heavy
+TWIN_FRAG_S = 2.0    # s: ...and it dies this soon after the whole truck's track is born (the real cab fragment: 1.0)
 TWIN_SNAP = 1.0      # s: a path sample stands for a moment this close to it (paths are ~1 sample/s)
 NEAR = 2.0           # a far, fast box outruns IoU between fragments; a continuation lands within
                      # this many box-sizes of where the last one was heading
@@ -190,11 +191,17 @@ def _twin(a, b):
     def same(p, q, born):
         if iou(p, q) >= TWIN_IOU:
             return True
-        # At birth only B growing over A (B's box holds A's) is the same vehicle; B born small inside A is a queue.
-        if not cover(p, q) or born and (p[2] - p[0]) * (p[3] - p[1]) >= (q[2] - q[0]) * (q[3] - q[1]):
+        if not cover(p, q):
             return False
+        if born:
+            # Only a part-view fragment of another class (a truck's cab read as light) that B grows over
+            # and that dies within TWIN_FRAG_S of B's birth: a same-class pair, B born small inside A
+            # (a queue), or an A that drives on beside B (the next lane) stays two vehicles.
+            if (a["class"] == b["class"] or _clash(a["class"], b["class"]) or a["t1"] - b["t0"] > TWIN_FRAG_S
+                    or (p[2] - p[0]) * (p[3] - p[1]) >= (q[2] - q[0]) * (q[3] - q[1])):
+                return False
         if not alike:
-            alike.append((a["class"] == b["class"] or heavy(a, b) or heavy(b, a))
+            alike.append((a["class"] == b["class"] or not _clash(a["class"], b["class"]) and (heavy(a, b) or heavy(b, a)))
                          and (_similar(_app([a]), _app([b])) or 0) >= TWIN_COS)
         return alike[0]
 
