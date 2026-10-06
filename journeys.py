@@ -198,6 +198,7 @@ def _twin(a, b):
             # and that dies within TWIN_FRAG_S of B's birth: a same-class pair, B born small inside A
             # (a queue), or an A that drives on beside B (the next lane) stays two vehicles.
             if (a["class"] == b["class"] or _clash(a["class"], b["class"]) or a["t1"] - b["t0"] > TWIN_FRAG_S
+                    or a["hits"] >= b["hits"]     # a fragment is the briefer view; a covered car built up its own
                     or (p[2] - p[0]) * (p[3] - p[1]) >= (q[2] - q[0]) * (q[3] - q[1])):
                 return False
         if not alike:
