@@ -135,6 +135,8 @@ def _leaving(path):
 def _opposed(a, b):
     """A leaves one way and B arrives the other: a car exiting at the left edge and another
     entering there is two vehicles, while the fragments of one arriving car move alike."""
+    if a.get("direction") and b.get("direction") and OPPOSITE.get(a["direction"]) == b["direction"]:
+        return True         # detect already read them as opposite ways, however slowly B started
     pb = b["path"]
     b1 = next((p for p in pb if p[0] - pb[0][0] >= SPAN), None)
     va = _leaving(a["path"])
@@ -690,6 +692,12 @@ def _selfcheck():
     # (m3) a stopped e-heavy truck never swallows the d-medium one queued 1.5 s behind it.
     st = _t("cam3", 1, "e-heavy", [(100 + k, _b(.5, .4)) for k in range(5)])
     assert len(_chains([st, _t("cam3", 2, "d-medium", [(105.5, _b(.5, .62)), (106.5, _b(.5, .62))])], _CAMS)) == 2
+    # (O) minibuses passing at cam3's right edge: northbound A ends at x .93, southbound B starts at .98
+    # 0.5 s later barely moving: two chains, whatever B's speed.
+    na = _t("cam3", 1, "c-small", [(98, _b(.6, .5)), (99, _b(.78, .65)), (100, _b(.93, .8))], direction="northbound")
+    sb = _t("cam3", 2, "c-small", [(100.5, _b(.98, .8)), (101.5, _b(.98, .8)), (103, _b(.7, .6))], direction="southbound")
+    assert len(_chains([na, sb], _CAMS)) == 2
+    assert len(_chains([na, dict(sb, direction=None)], _CAMS)) == 1
     # (c) a long truck southbound: its cam3 arrival starts 8 s before its cam4 departure ends.
     t4 = _t("cam4", 1, "e-heavy", [(100, _b(0.5, 0.4))] + [(t, _b(0.1, 0.7)) for t in range(101, 113)])
     t3 = _t("cam3", 1, "e-heavy", [(104, _b(0.9, 0.8)), (105, _b(0.9, 0.8)), (106, _b(0.88, 0.78)),
