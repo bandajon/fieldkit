@@ -135,7 +135,7 @@ def _leaving(path):
 def _opposed(a, b):
     """A leaves one way and B arrives the other: a car exiting at the left edge and another
     entering there is two vehicles, while the fragments of one arriving car move alike."""
-    if a.get("direction") and OPPOSITE.get(a["direction"]) == b.get("direction"):
+    if a.get("direction") and b.get("direction") and OPPOSITE.get(a["direction"]) == b["direction"]:
         return True         # detect already read them as opposite ways, however slowly B started
     pb = b["path"]
     b1 = next((p for p in pb if p[0] - pb[0][0] >= SPAN), None)
