@@ -23,6 +23,7 @@ import time
 from bisect import bisect_left, bisect_right
 from collections import Counter
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 from detect import HEADINGS, OPPOSITE, bound_of, heading_of, iou, letter_of
 
@@ -51,6 +52,8 @@ APP_TYPICAL = 0.7    # cosine of a typical true match (Katuba median ~0.79): an 
                      # the penalty of a typical match, so it never beats a coded one at equal timing
 APP_VETO = 0.2       # known cosine below this is never a link: true pairs' 1st percentile is far above, and
                      # every linked pair under it audited on a real Katuba hour was two different vehicles
+DAY_HOURS = (6, 18)  # Lusaka hours the appearance veto applies to any pair; outside them only across classes
+LUSAKA = ZoneInfo("Africa/Lusaka")
 HEAVY = ("d-medium", "e-heavy", "f-abnormal")
 SMALL = ("a-small",)  # never links to HEAVY: 0 of 43 labelled true cross-camera pairs do, 16 of 89 wrong candidates
 PARK_S = 2.0         # s: a box held this long is a parked vehicle
@@ -336,7 +339,10 @@ def _links(chains, cameras):
                         sim = _similar(d["app"], r["app"])
                         if _clash(d["class"], r["class"]):
                             continue
-                        if sim is not None and sim < APP_VETO:
+                        # At night one camera sees a lit side and the other headlights: a same-class pair
+                        # can look unalike and still be one vehicle (measured at dusk: 7 of 10 judged true).
+                        night = not DAY_HOURS[0] <= datetime.fromtimestamp(d["dep"], LUSAKA).hour < DAY_HOURS[1]
+                        if sim is not None and sim < APP_VETO and not (night and d["class"] == r["class"]):
                             continue
                         if late and (sim is None or sim < LATE_COS):
                             continue
@@ -633,10 +639,15 @@ def _selfcheck():
     pair = _north(1, 100.0, gap=0.5, k3={"app": code(1), "app_v": "m1"}, k4={"app": code(.25, .968), "app_v": "m1"}) \
         + _north(2, 105.0, gap=-1.0, k3={"app": code(.25, .968), "app_v": "m1"}, k4={"app": code(1), "app_v": "m1"})
     assert ids(build(pair, _CAMS)) == [["obs-cam3-1", "obs-cam4-1"], ["obs-cam3-2", "obs-cam4-2"]]
-    # (b4) codes that disagree (cosine < APP_VETO) never link, even when timing says they should.
-    pair = _north(1, 100.0, k3={"app": code(1), "app_v": "m1", "counted": True},
+    # (b4) codes that disagree (cosine < APP_VETO) never link by day, even when timing says they should.
+    dt = datetime(2026, 10, 6, 12, 0, tzinfo=LUSAKA).timestamp()
+    pair = _north(1, dt, k3={"app": code(1), "app_v": "m1", "counted": True},
                   k4={"app": code(-1), "app_v": "m1", "counted": True})
     assert len(build(pair, _CAMS)) == 2
+    # (b4n) ...but at night (here 20:00 Lusaka) a same-class pair is not vetoed: lit side vs headlights.
+    nt = datetime(2026, 10, 6, 20, 0, tzinfo=LUSAKA).timestamp()
+    pairn = _north(1, nt, k3={"app": code(1), "app_v": "m1", "counted": True}, k4={"app": code(-1), "app_v": "m1", "counted": True})
+    assert len(build(pairn, _CAMS)) == 1
     pair[0]["mixed"] = pair[1]["mixed"] = True        # ...unless a code may belong to a switched track
     assert len(build(pair, _CAMS)) == 1
     # (b5) a mixed member's crops lose to a clean member's.
