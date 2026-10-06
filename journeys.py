@@ -32,6 +32,7 @@ STITCH_IOU = 0.2     # the next fragment starts roughly where the last one ended
 TWIN_IOU = 0.5       # detect.GUARD_IOU: one vehicle, two ids, the same box at the same instant
 TWIN_COVER = 0.8     # a box this much inside another is the same vehicle seen in part (cab + whole truck)...
 TWIN_COS = 0.5       # ...when the class agrees and the appearance codes cosine is at least this
+TWIN_HEAVY_SHARE = 0.25  # a fragment of another class is the same truck if this share of its votes is heavy
 TWIN_SNAP = 1.0      # s: a path sample stands for a moment this close to it (paths are ~1 sample/s)
 NEAR = 2.0           # a far, fast box outruns IoU between fragments; a continuation lands within
                      # this many box-sizes of where the last one was heading
@@ -183,13 +184,18 @@ def _twin(a, b):
         s = min((p[2] - p[0]) * (p[3] - p[1]), (q[2] - q[0]) * (q[3] - q[1]))
         return w > 0 and h > 0 and s > 0 and w * h / s >= TWIN_COVER
 
+    def heavy(x, y):    # x is a heavy class and y's votes carry a heavy share: a truck's cab read as light
+        return x["class"] in HEAVY and sum(v for c, v in y["votes"].items() if c in HEAVY) >= TWIN_HEAVY_SHARE * sum(y["votes"].values())
+
     def same(p, q, born):
         if iou(p, q) >= TWIN_IOU:
             return True
-        if born or not cover(p, q):
+        # At birth only B growing over A (B's box holds A's) is the same vehicle; B born small inside A is a queue.
+        if not cover(p, q) or born and (p[2] - p[0]) * (p[3] - p[1]) >= (q[2] - q[0]) * (q[3] - q[1]):
             return False
         if not alike:
-            alike.append(a["class"] == b["class"] and (_similar(_app([a]), _app([b])) or 0) >= TWIN_COS)
+            alike.append((a["class"] == b["class"] or heavy(a, b) or heavy(b, a))
+                         and (_similar(_app([a]), _app([b])) or 0) >= TWIN_COS)
         return alike[0]
 
     return all(p and q and same(p, q, born) for born, p, q in (
@@ -497,7 +503,10 @@ def _doc(chains, link, cfg, tz, events):
             if plated:
                 p = max(plated, key=lambda t: t["plate"]["conf"])["plate"]
                 crops[side + "_plate"], plates[side] = p["crop"], p["conf"]
-    evs = [e for e in ((events or {}).get(t["id"]) for t in ms) if e and e.get("class") == cls]
+    evs = [(t, e) for t in ms if (e := (events or {}).get(t["id"])) and e.get("class") == cls]
+    # A switched track's event attrs are another vehicle's: only clean members' events speak; with none,
+    # _member_attrs below (which also prefers clean members) decides.
+    evs = [e for t, e in evs if not (t.get("mixed") or t.get("hijacked"))]
     t = link[0]["dep"] if link else ms[0]["t0"]
     return t, {
         "id": "jny-" + hashlib.sha256("\0".join(sorted(m["id"] for m in ms)).encode()).hexdigest()[:24],
@@ -709,6 +718,17 @@ def _selfcheck():
     sb = _t("cam3", 2, "c-small", [(100.5, _b(.98, .8)), (101.5, _b(.98, .8)), (103, _b(.7, .6))], direction="southbound")
     assert len(_chains([na, sb], _CAMS)) == 2
     assert len(_chains([na, dict(sb, direction=None)], _CAMS)) == 1
+    # (W) a tanker's headlit cab (A, read light but with heavy votes) is covered by the whole truck B born over it: one
+    # chain; with no heavy votes it is a car beside the truck: two.
+    ca = [[.84, .70, .99, .89], [.70, .69, .84, .87], [.54, .67, .66, .82]]
+    cb = [[.66, .68, .95, .88], [.50, .65, .80, .86], [.37, .62, .64, .82]]
+    for votes, n in (({"e-heavy": 4, "b-light": 8}, 1), ({"b-light": 12}, 2)):
+        cabs = _t("cam3", 1, "b-light", list(zip((48, 49, 50), ca)), votes=votes, **k(1))
+        assert len(_chains([cabs, _t("cam3", 2, "e-heavy", list(zip((49.2, 50.2, 51.2), cb)), **k(1))], _CAMS)) == n, votes
+    # (E) attrs come from clean members' events: the mixed member's bigger event is another vehicle's.
+    ev = {"obs-cam3-1": {"class": "c-small", "hits": 9, "attrs": {"axles": 3}}, "obs-cam4-1": {"class": "c-small", "hits": 2, "attrs": {"axles": 6}}}
+    [j] = build(_north(1, 100.0, k3={"mixed": True}), _CAMS, events=ev)
+    assert j["attrs"] == {"axles": 6}, j
     # (c) a long truck southbound: its cam3 arrival starts 8 s before its cam4 departure ends.
     t4 = _t("cam4", 1, "e-heavy", [(100, _b(0.5, 0.4))] + [(t, _b(0.1, 0.7)) for t in range(101, 113)])
     t3 = _t("cam3", 1, "e-heavy", [(104, _b(0.9, 0.8)), (105, _b(0.9, 0.8)), (106, _b(0.88, 0.78)),
