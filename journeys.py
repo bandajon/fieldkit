@@ -66,6 +66,9 @@ REPARK_STILL_S = 5.0  # s: the re-park track stays still this long from birth; a
 TRUCK_LEAD = 8.0     # s: a slow long truck's arrival may precede its departure...
 TRUCK_LAG = 15.0     # ...or follow it this long
 TRUCK_COS = 0.7      # look agreement a wider window demands
+BLIP_S = 3.0        # s: a photo-less glimpse this close in time to a full track's start...
+BLIP_DIST = 0.3     # ...and this close to where it starts (frame units) is that vehicle's first sighting
+BLIP_FULL = 8       # hits that make a track "full"
 MIN_EDGE_HITS = 5    # ~1 s at 5 fps: a zone crossing alone must last this long; night glare blips don't
 
 
@@ -565,6 +568,20 @@ def _pulled(t, t_off):
                                      if len(p) >= 2 else {}))
 
 
+def _blip(c, tracklets):
+    """A counted chain too brief for a photo (< MIN_EDGE_HITS, no direction) beside a full track of the
+    same camera starting within BLIP_S and BLIP_DIST of it: the first glimpse of that vehicle at the far
+    edge, counted again (6 Oct: 35 of 50 photo-less journeys). A lone glimpse with no such track stays."""
+    if sum(t["hits"] for t in c["members"]) >= MIN_EDGE_HITS or any(t.get("direction") for t in c["members"]):
+        return False
+    t0, last = c["members"][0]["t0"], c["members"][-1]["path"][-1]
+    ids = {t["id"] for t in c["members"]}
+    return any(t["camera"] == c["camera"] and t["id"] not in ids and t["hits"] >= BLIP_FULL
+               and -BLIP_S <= t["t0"] - t0 <= BLIP_S + 1 and t.get("path")
+               and abs(complex(*_centre(t["path"][0][1:])) - complex(*_centre(last[1:]))) <= BLIP_DIST
+               for t in tracklets)
+
+
 def _build(tracklets, cameras, tz=None, events=None):
     hj = _hijacked(tracklets)
     by = {t["id"]: t for t in tracklets}
@@ -577,7 +594,7 @@ def _build(tracklets, cameras, tz=None, events=None):
     linked = {id(c) for pair in links for c in pair}
     # A lone chain counts if its camera counted it, or it crossed a handoff zone the partner
     # missed and stayed in view long enough to be a vehicle rather than headlight glare.
-    lone = [c for c in chains if id(c) not in linked and (
+    lone = [c for c in chains if id(c) not in linked and not _blip(c, tracklets) and (
             any(t["counted"] for t in c["members"])
             or (c["dep"] is not None or c["arr"] is not None)
             and sum(t["hits"] for t in c["members"]) >= MIN_EDGE_HITS)]
@@ -736,6 +753,12 @@ def _selfcheck():
     # ...and a covered vehicle that built up more sightings than the truck is no fragment.
     cabs = _t("cam3", 1, "b-light", list(zip((48, 49, 50), ca)), votes={"e-heavy": 4, "b-light": 8}, hits=40, **k(1))
     assert len(_chains([cabs, _t("cam3", 2, "e-heavy", list(zip((49.2, 50.2, 51.2), cb)), hits=37, **k(1))], _CAMS)) == 2
+    # (B) a 3-hit counted glimpse at the far edge, then the full track of the same vehicle from just
+    # beside it: one vehicle. The same glimpse with no full track nearby still counts.
+    g = _t("cam3", 1, "c-bus", [(100, _b(.06, .55, .02)), (100.4, _b(.07, .55, .02))], hits=3, counted=True)
+    full = _t("cam3", 2, "c-bus", [(99.6, _b(.24, .58, .05)), (101, _b(.5, .7, .1)), (103, _b(.9, .8, .1))], hits=35, direction="northbound")
+    assert len(build([g, full], _CAMS)) == 0 or len([j for j in build([g, full], _CAMS) if "obs-cam3-1" in [m["id"] for m in j["members"]] and len(j["members"]) == 1]) == 0
+    assert len(build([g], _CAMS)) == 1
     # (E) attrs come from clean members' events: the mixed member's bigger event is another vehicle's.
     ev = {"obs-cam3-1": {"class": "c-small", "hits": 9, "attrs": {"axles": 3}}, "obs-cam4-1": {"class": "c-small", "hits": 2, "attrs": {"axles": 6}}}
     [j] = build(_north(1, 100.0, k3={"mixed": True}), _CAMS, events=ev)
