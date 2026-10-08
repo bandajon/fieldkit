@@ -955,16 +955,23 @@ def miss_moments(docs, cameras):
     have been seen: MISS_PAD before its first sighting and after its last. Heavy trucks are
     skipped: a lone one is mostly a queue-matching gap, not a detector miss."""
     import detect
-    from journeys import HEAVY
+    from journeys import HEADINGS, HEAVY, OPPOSITE
     partner = {c["name"]: c["handoff"]["camera"] for c in cameras if c.get("handoff")}
+    facing = {c["name"]: HEADINGS.get(detect.heading_of(c)) for c in cameras}
     out = {}
     for d in docs:
         p = partner.get(d["camera"])
         if "+" in d["camera"] or d.get("evidence") != "line" or not d.get("direction") or not p \
                 or d.get("class") in HEAVY:
             continue
-        out.setdefault(p, []).extend((min(m["t0"] for m in d["members"]) - detect.MISS_PAD,
-                                      max(m["t1"] for m in d["members"]) + detect.MISS_PAD))
+        # A vehicle reaches the partner once: receding from the lone camera (its direction is
+        # the camera's heading) it came from the partner first; approaching, it goes there next.
+        before, after = min(m["t0"] for m in d["members"]) - detect.MISS_PAD, \
+            max(m["t1"] for m in d["members"]) + detect.MISS_PAD
+        way = facing.get(d["camera"])
+        out.setdefault(p, []).extend([before] if way and d["direction"] == way
+                                     else [after] if way and d["direction"] == OPPOSITE.get(way)
+                                     else [before, after])
     return {c: sorted(v) for c, v in out.items()}
 
 
@@ -2283,12 +2290,15 @@ def journeys_check():
 
 def selfcheck():
     from datetime import timedelta
-    cams = [{"name": "cam3", "handoff": {"camera": "cam4", "zone": []}},
-            {"name": "cam4", "handoff": {"camera": "cam3", "zone": []}}, {"name": "cam5"}]
-    lone = lambda cam="cam4", ev="line", dr="north", cls="a-car": {
+    cams = [{"name": "cam3", "heading": "south", "handoff": {"camera": "cam4", "zone": []}},
+            {"name": "cam4", "heading": "north", "handoff": {"camera": "cam3", "zone": []}}, {"name": "cam5"}]
+    lone = lambda cam="cam4", ev="line", dr="northbound", cls="a-car": {
         "camera": cam, "evidence": ev, "direction": dr, "class": cls,
         "members": [{"t0": 100.0, "t1": 104.0}, {"t0": 101.0, "t1": 106.0}]}
-    assert miss_moments([lone()], cams) == {"cam3": [97.0, 109.0]}
+    assert miss_moments([lone()], cams) == {"cam3": [97.0]}, "northbound on cam4 came from cam3"
+    assert miss_moments([lone(dr="southbound")], cams) == {"cam3": [109.0]}, "southbound goes on to cam3"
+    nohead = [{"name": "cam4", "handoff": {"camera": "cam3", "zone": []}}]
+    assert miss_moments([lone()], nohead) == {"cam3": [97.0, 109.0]}, "no heading keeps both"
     assert miss_moments([lone("cam3+cam4"), lone(ev="handoff"), lone(ev="edge"), lone(dr=None),
                          lone("cam5"), lone(cls="e-heavy")], cams) == {}
     class NoKey(Exception):
@@ -2304,7 +2314,7 @@ def selfcheck():
             import io
             return {"Body": io.BytesIO((json.dumps(lone()) + "\n").encode())}
     got = gate_miss_moments(JourneysS3(), "b", "G", [Path("20261008-103635.mkv"), Path("20261009-000000.mkv")], cams)
-    assert got == {"cam3": [97.0, 109.0]}, got
+    assert got == {"cam3": [97.0]}, got
     assert gate_miss_moments(object(), "b", "G", [Path("20261008-103635.mkv")], cams) == {}
     classify_now = datetime(2026, 9, 27, 12)
     classify_default = "20260925-120000"
