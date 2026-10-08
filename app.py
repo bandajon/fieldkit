@@ -2365,6 +2365,9 @@ def dataset_label(body: dict = Body(default={}), x_curator_token: str = Header("
         suggest_path(sid).unlink(missing_ok=True)
         return finish(who, sid, action, {"ok": True})
     boxes = parse_boxes(body)
+    if sid.startswith("miss-") and not boxes:
+        raise HTTPException(400, "This frame was flagged because the detector likely missed a vehicle here. "
+                                 "Box every vehicle, or Discard if the road is truly empty.")
     attrs = valid_attrs(body.get("attrs"), len(boxes))
     # Unproven work goes to the holding pen, not the training set: everything that reads
     # approved/ — counts, examples, gold, payroll — then ignores it until a reviewer

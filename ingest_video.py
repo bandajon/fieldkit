@@ -166,24 +166,26 @@ class Sink:
         # changes right after a skipped duplicate should be caught, not waited out. A
         # class the curated set is short of skips the cadence entirely — dedup still
         # stops a parked one from becoming fifty samples.
-        if not shown:
-            return False
         ms = self.miss.get(cam) or []
         i = bisect.bisect_left(ms, ts - 0.5 / INGEST_FPS)
         missed = bool(ms) and self.missed < detect.MISS_PER_PASS \
             and ts - self.miss_at.get(cam, float("-inf")) >= detect.MISS_EVERY \
             and i < len(ms) and ms[i] <= ts + 0.5 / INGEST_FPS
+        if not shown and not missed:
+            return False
         rare = any(d[0] in self.wanted for d in shown) \
             and ts - self.rare_at.get(cam, float("-inf")) >= detect.RARE_EVERY
         dense = bool(self.congested) and len(shown) >= self.congested and self.dense < detect.CONGESTED_PER_PASS \
             and ts - self.dense_at.get(cam, float("-inf")) >= detect.CONGESTED_EVERY
         # A miss capture rides outside the cadence and the scene reference: it never shifts either.
-        normal = (rare or dense or not (self.only_wanted
+        normal = bool(shown) and (rare or dense or not (self.only_wanted
                   or ts - self.at.get(cam, float("-inf")) < detect.CAPTURE_EVERY)) \
             and not detect.same_scene(shown, self.dets.get(cam, []))
         if not (normal or missed):
             return False
         stem = detect.sample_stem(self.gate, cam, ts, detect.RARE_STEP if rare or missed else None)
+        if not normal:
+            stem = "miss-" + stem      # marks it for the curator: approving it with no box is refused
         lines = [f"{self.ids[cls]} {(x1 + x2) / 2 / w:.6f} {(y1 + y2) / 2 / h:.6f} "
                  f"{(x2 - x1) / w:.6f} {(y2 - y1) / h:.6f}"
                  for cls, _conf, (x1, y1, x2, y2) in shown if cls in self.ids]
@@ -470,15 +472,18 @@ def selfcheck():
 
     one = [("car", 0.9, (10.0, 10.0, 60.0, 60.0))]
     gap = Sink(tmp / "miss", dict(detect.CLASS_IDS), only_wanted=True, miss={"c": [base + 100.0, base + 110.0]})
-    assert not gap.offer("c", base + 100, b"a", [], 64, 64), "an empty frame at a miss time is never kept"
-    assert gap.offer("c", base + 100, b"a", one, 64, 64) and gap.missed == 1, "a boxed frame at a miss time is kept"
+    assert gap.offer("c", base + 100, b"a", [], 64, 64) and gap.missed == 1, "an empty frame at a miss time is kept"
+    assert gap.stems[0].startswith("miss-") and (gap.labels / f"{gap.stems[0]}.txt").read_text() == "\n", gap.stems
+    gap.miss_at.clear()
+    assert gap.offer("c", base + 110, b"a", one, 64, 64) and gap.stems[1].startswith("miss-"), "a boxed one is kept too"
+    assert not gap.offer("c", base + 95, b"b", [], 64, 64), "a non-miss empty frame is rejected"
     assert "c" not in gap.at and "c" not in gap.dets, "a miss leaves the cadence and scene reference alone"
     assert not gap.offer("c", base + 95, b"b", one, 64, 64), "5 s off a miss time is not"
     assert not gap.offer("c", base + 110, b"c", one, 64, 64), "one miss frame per MISS_EVERY"
     gap.miss_at.clear()
     gap.missed = detect.MISS_PER_PASS
     assert not gap.offer("c", base + 110, b"d", one, 64, 64), "a pass's miss quota holds"
-    assert not gap.offer("c", base + 300, b"e", one, 64, 64), "a non-miss frame is still rejected"
+    assert not gap.offer("c", base + 300, b"e", [], 64, 64), "a non-miss empty frame is still rejected"
     mix = Sink(tmp / "mix", dict(detect.CLASS_IDS), only_wanted=True, congested=3, miss={"c": [base + 6.0]})
     assert mix.offer("c", base, b"a", row(0.0), 64, 64) and mix.offer("c", base + 6, b"b", one, 64, 64)
     assert len(set(mix.stems)) == 2 and all((mix.images / f"{s}.jpg").is_file() for s in mix.stems), mix.stems
