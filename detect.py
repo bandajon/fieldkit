@@ -98,6 +98,9 @@ CONGESTED_BOXES = 12     # 12+ vehicles in view is a queue: the occlusion the de
 CONGESTED_EVERY = 120.0  # a queue lasts hours: one frame per camera per two minutes of footage,
                          # so curators get variety, not 700 near-duplicates
 CONGESTED_PER_PASS = 10  # ...and at most this many per gate per hunt pass: queues never crowd out rare classes
+MISS_PER_PASS = 10       # miss hunt: at most this many frames per gate per hunt pass, so misses never crowd out rare classes
+MISS_EVERY = 60.0        # footage seconds between two miss frames of one camera: neighbours of one vehicle are one sample
+MISS_PAD = 3.0           # seconds before a lone journey's first sighting, and after its last, at which the partner camera should hold the vehicle
 DATASET_CAP = 10000      # rolling buffer of the freshest unlabeled frames; ~2-3 GB of JPEGs.
                          # Sized for the fleet goal: 9 toll gates, >=10k contributed each,
                          # 100k-image combined dataset.
