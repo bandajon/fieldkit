@@ -1511,6 +1511,9 @@ def review_label(sid, who, body):
     if not lbl.is_file() or (tree == "holding" and not src_img.is_file()):
         raise HTTPException(404, f"{sid} is not in the {tree} set")
     boxes = parse_boxes(body)
+    if sid.startswith("miss-") and not boxes:
+        raise HTTPException(400, "This frame was flagged because the detector likely missed a vehicle here. "
+                                 "Box every vehicle, or Discard if the road is truly empty.")
     attrs = valid_attrs(body.get("attrs"), len(boxes))
     curator = sample_curators(tree).get(sid, "anon")
     was_boxes, was_attrs = read_boxes(lbl), read_attrs(attrs_path(sid, tree))

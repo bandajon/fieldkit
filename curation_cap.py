@@ -75,6 +75,7 @@ def gate_of(stem):
     still shows up somewhere to fix by hand."""
     if stem.startswith("external-"):
         return "external"
+    stem = stem.removeprefix("miss-")     # a miss-hunt flag, not part of the gate
     m = _STEM.match(stem)
     if not m:
         return "unknown"
@@ -198,6 +199,7 @@ def enforce(cl, bucket, root, prefix, keep=(), consumed=()):
 
 def selfcheck():
     assert gate_of("RDA-TG-KTB-cam3-20260926-071842") == "RDA-TG-KTB"
+    assert gate_of("miss-RDA-TG-KTB-cam3-20260926-071842") == "RDA-TG-KTB"
     assert gate_of("Ben-Bella-cam1-20260806-144054") == "Ben-Bella"
     assert gate_of("Kafue-Roundabout-cam2-20260101-000000") == "Kafue-Roundabout"
     assert gate_of("cam3-20260819-164645") == LEGACY_GATE
