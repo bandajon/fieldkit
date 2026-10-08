@@ -606,6 +606,11 @@ def _build(tracklets, cameras, tz=None, events=None):
         ts.sort(key=lambda t: t["t0"])
     lone = [c for c in lone if not _blip(c, by_cam)]
     cfg = {c["name"]: c for c in cameras}
+    # A lone chain with no direction is no passage, and a camera with lone_edge: false (cam3: the toll
+    # queue's tail sits in its zone) does not count lone edge-only chains. Measured 7 Oct: +6.5% -> -1.7%
+    # vs hand counts; under-counting is preferred.
+    lone = [c for c in lone if any(t.get("direction") for t in c["members"])
+            and (any(t["counted"] for t in c["members"]) or cfg.get(c["camera"], {}).get("lone_edge", True) is not False)]
     docs = [_doc(list(pair), pair, cfg, tz, events) for pair in links]
     docs += [_doc([c], None, cfg, tz, events) for c in lone]
     return [d for _, d in sorted(docs, key=lambda td: (td[0], td[1]["id"]))], chains, links
@@ -696,14 +701,14 @@ def _selfcheck():
     [j] = build(_north(1, 100.0, k3={"crops": shot("cam3-1"), "mixed": True}, k4={"crops": shot("cam4-1")}), _CAMS)
     assert j["crops"]["best"] == "cam4-1-top.jpg" and "front" not in j["crops"] and j["crops"]["rear"] == "cam4-1-best.jpg", j
     # (V1) a small car never links to a truck, however well timing and codes agree; two trucks do.
-    k = lambda c: {"app": code(1), "app_v": "m1", "counted": True}
+    k = lambda c: {"app": code(1), "app_v": "m1", "counted": True, "direction": "northbound"}
     for c3, c4, n in (("e-heavy", "a-small", 2), ("e-heavy", "e-heavy", 1)):
         [d] = [_t("cam4", 1, c4, [(100, _b(.45, .35)), (101, _b(.3, .5)), (102, _b(.1, .7))], hits=8, **k(0))]
         r = _t("cam3", 1, c3, [(102.5, _b(.9, .8)), (103.5, _b(.7, .6)), (104.5, _b(.5, .4))], hits=8, **k(0))
         assert len(build([d, r], _CAMS)) == n, (c3, c4)
     # (H1) A sits at P for 5 s, moves off; B is born on P 3 s later: A is hijacked, and its crops lose.
     P = _b(.5, .4)
-    A = _t("cam3", 1, "e-heavy", [(100 + k, P) for k in range(6)] + [(106, _b(.7, .6))])
+    A = _t("cam3", 1, "e-heavy", [(100 + k, P) for k in range(6)] + [(106, _b(.7, .6))], direction="northbound")
     B = _t("cam3", 2, "e-heavy", [(109, P), (110, P)])
     assert _hijacked([A, B]).keys() == {"obs-cam3-1"}
     C = _t("cam3", 3, "e-heavy", [(106.5, _b(.7, .6)), (107.5, _b(.9, .8))])
@@ -717,7 +722,7 @@ def _selfcheck():
     # and stays (a 0.04 drift): M is one journey with cam3's, R is no vehicle and takes no link.
     M = _north(1, 104.0)[0]
     P = _t("cam4", 1, "c-small", [(90 + k, _b(.1, .7)) for k in range(14)]
-           + [(104, _b(.2, .6)), (105, _b(.3, .5)), (106, _b(.45, .35))], counted=True)
+           + [(104, _b(.2, .6)), (105, _b(.3, .5)), (106, _b(.45, .35))], counted=True, direction="northbound")
     R = _t("cam4", 2, "c-small", [(108 + k, _b(.1, .7)) for k in range(6)] + [(114, _b(.14, .7))])
     js = build([M, P, R], _CAMS)
     assert [sorted(m["id"] for m in j["members"]) for j in js] == [["obs-cam3-1", "obs-cam4-1"]], js
@@ -732,9 +737,9 @@ def _selfcheck():
     # (A stops 8 s and leaves, B first seen on the spot stops 8 s and leaves): photo flag only, as on main.
     for cnt in (False, True):
         R = _t("cam4", 2, "c-small", [(108 + k, _b(.1, .7)) for k in range(30)]
-               + [(138, _b(.2, .6)), (139, _b(.3, .5)), (140, _b(.45, .35))], counted=cnt)
+               + [(138, _b(.2, .6)), (139, _b(.3, .5)), (140, _b(.45, .35))], counted=cnt, direction="northbound")
         assert len(build([M, P, R], _CAMS)) == 2, cnt
-        R = _t("cam4", 2, "c-small", [(108 + k, _b(.1, .7)) for k in range(30)] + [(138, _b(.08, .75)), (139, _b(.05, .78))], counted=cnt)
+        R = _t("cam4", 2, "c-small", [(108 + k, _b(.1, .7)) for k in range(30)] + [(138, _b(.08, .75)), (139, _b(.05, .78))], counted=cnt, direction="southbound")
         S = _t("cam3", 5, "c-small", [(139.5, _b(.9, .8)), (140.5, _b(.7, .6)), (141.5, _b(.5, .4))], counted=cnt)
         assert len(build([M, P, R, S], _CAMS)) == 2, cnt
     A = _t("cam4", 1, "c-small", [(100 + k, _b(.1, .7)) for k in range(9)] + [(109, _b(.2, .6)), (110, _b(.3, .5)), (111, _b(.45, .35))])
@@ -766,8 +771,9 @@ def _selfcheck():
     full = _t("cam3", 2, "c-bus", [(99.6, _b(.24, .58, .05)), (101, _b(.5, .7, .1)), (103, _b(.9, .8, .1))], hits=35,
               direction="northbound", counted=True)
     assert ids(build([g, full], _CAMS)) == [["obs-cam3-2"]], ids(build([g, full], _CAMS))
-    assert ids(build([g, dict(full, counted=False, direction=None, path=[(99.6, *_b(.2, .45, .05)), (103, *_b(.2, .45, .05))])], _CAMS)) == [["obs-cam3-1"]]
-    assert ids(build([g], _CAMS)) == [["obs-cam3-1"]]
+    gd = dict(g, direction="northbound")    # a lone chain needs a direction to count
+    assert ids(build([gd, dict(full, counted=False, direction=None, path=[(99.6, *_b(.2, .45, .05)), (103, *_b(.2, .45, .05))])], _CAMS)) == [["obs-cam3-1"]]
+    assert ids(build([gd], _CAMS)) == [["obs-cam3-1"]]
     # (E) attrs come from clean members' events: the mixed member's bigger event is another vehicle's.
     ev = {"obs-cam3-1": {"class": "c-small", "hits": 9, "attrs": {"axles": 3}}, "obs-cam4-1": {"class": "c-small", "hits": 2, "attrs": {"axles": 6}}}
     [j] = build(_north(1, 100.0, k3={"mixed": True}), _CAMS, events=ev)
@@ -779,16 +785,16 @@ def _selfcheck():
     [j] = build([t4, t3], _CAMS)
     assert j["link"] == {"from": "cam4", "to": "cam3", "gap_s": -8.0}, j
     # (d) a car leaves cam4 at the left edge, another enters there 1.5 s later: opposed, not stitched.
-    out = _t("cam4", 1, "c-small", [(100, _b(0.4, 0.4)), (101, _b(0.25, 0.55)), (102, _b(0.1, 0.7))], hits=15)
+    out = _t("cam4", 1, "c-small", [(100, _b(0.4, 0.4)), (101, _b(0.25, 0.55)), (102, _b(0.1, 0.7))], hits=15, direction="southbound")
     inn = _t("cam4", 2, "c-small", [(103.5, _b(0.1, 0.7)), (104.5, _b(0.25, 0.55)), (105.5, _b(0.4, 0.4))],
-             hits=15)
+             hits=15, direction="northbound")
     assert len(build([out, inn], _CAMS)) == 2
     # ...but a parked car's final box 0.2 s after the one before is jitter, not a heading.
     parked = _t("cam4", 3, "c-small", [(100, _b(0.1, 0.7)), (101, _b(0.1, 0.7)), (101.2, _b(0.105, 0.7))])
     assert _opposed(out, inn) and not _opposed(parked, _t("cam4", 4, "c-small", [
         (101.5, _b(0.1, 0.7)), (102.5, _b(0.05, 0.7))]))
     # (e) two fragments of one arriving car 0.4 s apart are one chain.
-    f1 = _t("cam4", 1, "c-small", [(100, _b(0.1, 0.7)), (101, _b(0.2, 0.6))], hits=5)
+    f1 = _t("cam4", 1, "c-small", [(100, _b(0.1, 0.7)), (101, _b(0.2, 0.6))], hits=5, direction="northbound")
     f2 = _t("cam4", 2, "c-small", [(101.4, _b(0.22, 0.58)), (102.4, _b(0.35, 0.45))], hits=5)
     [j] = build([f1, f2], _CAMS)
     assert len(j["members"]) == 2 and j["evidence"] == "edge", j
@@ -796,7 +802,7 @@ def _selfcheck():
     park = _t("cam3", 1, "c-small", [(100 + k, _b(0.9 + k % 2 * 0.005, 0.8)) for k in range(6)])
     assert build([park], _CAMS) == []
     # (g) one camera, counted on its line, never near a zone: a journey on the line's word.
-    [j] = build([_t("cam3", 1, "c-small", [(100, _b(0.5, 0.2)), (101, _b(0.5, 0.4))], counted=True)], _CAMS)
+    [j] = build([_t("cam3", 1, "c-small", [(100, _b(0.5, 0.2)), (101, _b(0.5, 0.4))], counted=True, direction="northbound")], _CAMS)
     assert j["evidence"] == "line" and j["link"] is None and j["cameras"] == ["cam3"], j
     # (h) class fusion: cam4's 20 e-heavy votes outweigh cam3's 3 d-medium; best crop is cam4's.
     h = _north(1, 100.0, k3={"votes": {"d-medium": 3}, "conf": {"d-medium": 0.7}, "class": "d-medium"},
@@ -815,14 +821,14 @@ def _selfcheck():
     [jn] = build(h0, _CAMS, events={"obs-cam3-1": {"class": "e-heavy", "hits": 1, "attrs": {"axles": 7}}})
     assert jn["attrs"] == {"axles": 7}, jn
     # (i) ghost_of joins a tracklet to the one it continues, however long the gap.
-    g1 = _t("cam3", 1, "c-small", [(100, _b(0.5, 0.2)), (102, _b(0.5, 0.3))], counted=True)
+    g1 = _t("cam3", 1, "c-small", [(100, _b(0.5, 0.2)), (102, _b(0.5, 0.3))], counted=True, direction="northbound")
     g2 = _t("cam3", 2, "c-small", [(120, _b(0.5, 0.3)), (125, _b(0.5, 0.31))], ghost_of="obs-cam3-1")
     [j] = build([g1, g2], _CAMS)
     assert [m["id"] for m in j["members"]] == ["obs-cam3-1", "obs-cam3-2"] and j["dwell_s"] == 25.0, j
     # (k) an edge crossing alone needs MIN_EDGE_HITS: a 2-frame glare blip is not a vehicle.
     blip = [(100, _b(0.1, 0.7)), (101, _b(0.3, 0.5))]
     assert build([_t("cam4", 1, "c-small", blip, hits=2)], _CAMS) == []
-    assert len(build([_t("cam4", 1, "c-small", blip, hits=6)], _CAMS)) == 1
+    assert len(build([_t("cam4", 1, "c-small", blip, hits=6, direction="northbound")], _CAMS)) == 1
     assert build([_t("cam3", 1, "c-small", [(100, _b(0.5, 0.2))], path=[], counted=True)], _CAMS) == []
     # (l) a far, fast car: 0.05 boxes 0.08 apart 0.4 s later overlap nothing, yet are one chain;
     # (m) not across a class jump; (n) not when B starts behind where A left off.
@@ -839,22 +845,22 @@ def _selfcheck():
     # (o) ByteTrack twins: two ids on one crawling vehicle at once are one journey;
     # (p) but two that touch where the second starts and have parted by the end are two.
     crawl = [(t, _b(0.1 + 0.02 * (t - 100), 0.7 - 0.02 * (t - 100))) for t in range(100, 111)]
-    first = _t("cam4", 1, "c-small", crawl, counted=True)
+    first = _t("cam4", 1, "c-small", crawl, counted=True, direction="northbound")
     assert len(build([first, _t("cam4", 2, "d-medium", crawl[3:], hits=8)], _CAMS)) == 1
     apart = [(t, _b(0.16 + 0.05 * (t - 103), 0.64)) for t in range(103, 111)]
-    assert len(build([first, _t("cam4", 2, "c-small", apart, hits=8)], _CAMS)) == 2
+    assert len(build([first, _t("cam4", 2, "c-small", apart, hits=8, direction="northbound")], _CAMS)) == 2
     # (q) a twin that dies mid-frame is no stitch anchor: the next vehicle starting on its
     # last box, same class and way, stays its own journey.
     after = [(105.5 + k, _b(0.2 + 0.05 * k, 0.6 - 0.05 * k)) for k in range(4)]
     assert len(build([first, _t("cam4", 2, "c-small", crawl[3:6]),
-                      _t("cam4", 3, "c-small", after, counted=True)], _CAMS)) == 2
+                      _t("cam4", 3, "c-small", after, counted=True, direction="northbound")], _CAMS)) == 2
     # (L) cam3 first sees a southbound vehicle 8 s after it left cam4, mid-frame and moving away
     # from its zone: it links on matching codes (L1) only; unlike codes (L2) or none (L3) leave two.
     for c3, c4, n in ((code(1), code(1), 1), (code(1), code(-1), 2), (None, None, 2)):
         k = lambda c: {"app": c, "app_v": "m1"} if c else {}
         out = _t("cam4", 1, "c-small", [(100, _b(0.45, 0.35)), (101, _b(0.3, 0.5)), (102, _b(0.1, 0.7))],
-                 counted=True, **k(c4))
-        late = _t("cam3", 1, "c-small", [(110, _b(0.5, 0.4)), (111, _b(0.3, 0.3))], counted=True, hits=6, **k(c3))
+                 counted=True, direction="southbound", **k(c4))
+        late = _t("cam3", 1, "c-small", [(110, _b(0.5, 0.4)), (111, _b(0.3, 0.3))], counted=True, hits=6, direction="southbound", **k(c3))
         js = build([out, late], _CAMS)
         assert len(js) == n and (n == 2 or js[0]["link"]["gap_s"] == 8.0), (n, js)
     # (T) one long truck as two concurrent boxes, the small one inside the big (IoU 0.25):
@@ -879,9 +885,9 @@ def _selfcheck():
     # a convoy never crosses (C2); cars are not widened (C3).
     k = lambda c: {"app": code(*c), "app_v": "m1"}
     dep4 = lambda i, t, cls, c: _t("cam4", i, cls, [(t, _b(.45, .35)), (t + 1, _b(.3, .5)), (t + 2, _b(.1, .7))],
-                                   counted=True, hits=8, **k(c))
+                                   counted=True, hits=8, direction="southbound", **k(c))
     arr3 = lambda i, t, cls, c: _t("cam3", i, cls, [(t, _b(.9, .8)), (t + 1, _b(.7, .6)), (t + 2, _b(.5, .4))],
-                                   counted=True, hits=8, **k(c))
+                                   counted=True, hits=8, direction="southbound", **k(c))
     for c, n in (((1,), 1), ((0, 1), 2), ((.5, .866), 2), ((.8, .6), 1)):
         assert len(build([dep4(1, 100, "e-heavy", (1,)), arr3(1, 112, "e-heavy", c)], _CAMS)) == n, c
     assert len(build([dep4(1, 100, "c-small", (1,)), arr3(1, 112, "c-small", (1,))], _CAMS)) == 2
@@ -898,18 +904,28 @@ def _selfcheck():
     # A chain that moves inside its zone (dep and arr) is in one journey, not one per direction.
     k3 = dep4(1, 90, "e-heavy", (1,))
     k3.update(camera="cam3", id="obs-cam3-1", path=[[90, *_b(.5, .4)], [91, *_b(.7, .6)], [92, *_b(.9, .8)]])
-    mid = _t("cam4", 9, "e-heavy", [(100, _b(.05, .6)), (101, _b(.1, .7)), (102, _b(.15, .8))], counted=True, hits=8, **k((1,)))
+    mid = _t("cam4", 9, "e-heavy", [(100, _b(.05, .6)), (101, _b(.1, .7)), (102, _b(.15, .8))], counted=True, hits=8, direction="southbound", **k((1,)))
     js = build([k3, mid, arr3(2, 110, "e-heavy", (1,))], _CAMS)
     assert sum("obs-cam4-9" in (m["id"] for m in j["members"]) for j in js) == 1, ids(js)
     # (j) a rebuild, in any input order, yields the same ids.
     assert [j["id"] for j in build(q, _CAMS)] == [j["id"] for j in build(q[::-1], _CAMS)]
+    # (D) lone chains: no direction is no passage; lone_edge: false drops an uncounted edge-only one (not a
+    # counted one); a linked pair needs no direction on both members.
+    nd = _t("cam3", 1, "c-small", [(100, _b(0.5, 0.2)), (101, _b(0.5, 0.4))], counted=True)
+    assert build([nd], _CAMS) == [] and len(build([dict(nd, direction="northbound")], _CAMS)) == 1
+    edge = _t("cam3", 1, "c-small", [(100, _b(0.5, 0.4)), (101, _b(0.7, 0.6)), (102, _b(0.9, 0.8))], hits=8, direction="northbound")
+    nolone = [dict(c, lone_edge=False) if c["name"] == "cam3" else c for c in _CAMS]
+    assert len(build([edge], _CAMS)) == 1 and build([edge], nolone) == []
+    assert len(build([dict(edge, counted=True)], nolone)) == 1
+    pr = _north(1, 100.0)
+    assert len(build([dict(pr[0], direction=None), pr[1]], _CAMS)) == 1
     # A whole day at a gate: 10k passes, 20k tracklets, in windowed time rather than all pairs.
     start = time.perf_counter()
     assert len(build([t for i in range(10_000) for t in _north(i, 100.0 + 5 * i)], _CAMS)) == 10_000
     took = time.perf_counter() - start
     print("journeys self-check ok: handoff links front to rear, queues pair in order, long trucks "
           "link across the overlap, opposed fragments stay apart, parked vehicles never count, "
-          "classes fuse by votes, ghosts join, glare blips drop, far fast fragments join, twins merge and anchor nothing, ids are stable; "
+          "classes fuse by votes, ghosts join, glare blips drop, far fast fragments join, twins merge and anchor nothing, ids are stable, lone chains need a direction and honour lone_edge; "
           f"10k passes (20k tracklets) in {took:.1f} s")
 
 
