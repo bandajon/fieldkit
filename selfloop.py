@@ -950,6 +950,40 @@ def ingest_pass():
         print(f"{now()} ingest: {s['last_ingest']['samples']} samples written, {sent} files pushed", flush=True)
 
 
+def miss_moments(docs, cameras):
+    """{partner camera: sorted epochs} where a lone counted journey's vehicle should also
+    have been seen: MISS_PAD before its first sighting and after its last. Heavy trucks are
+    skipped: a lone one is mostly a queue-matching gap, not a detector miss."""
+    import detect
+    from journeys import HEAVY
+    partner = {c["name"]: c["handoff"]["camera"] for c in cameras if c.get("handoff")}
+    out = {}
+    for d in docs:
+        p = partner.get(d["camera"])
+        if "+" in d["camera"] or d.get("evidence") != "line" or not d.get("direction") or not p \
+                or d.get("class") in HEAVY:
+            continue
+        out.setdefault(p, []).extend((min(m["t0"] for m in d["members"]) - detect.MISS_PAD,
+                                      max(m["t1"] for m in d["members"]) + detect.MISS_PAD))
+    return {c: sorted(v) for c, v in out.items()}
+
+
+def gate_miss_moments(cl, bucket, gate, files, cameras):
+    """miss_moments over the journeys of every day `files` start in; {} (and a note) on any failure."""
+    try:
+        docs = []
+        for day in sorted({f.stem[:8] for f in files}):
+            try:
+                body = cl.get_object(Bucket=bucket, Key=f"{JOURNEYS}{gate}/{day}/journeys.jsonl")["Body"].read()
+            except cl.exceptions.NoSuchKey:
+                continue
+            docs += [json.loads(ln) for ln in body.decode().splitlines() if ln.strip()]
+        return miss_moments(docs, cameras)
+    except Exception as e:
+        print(f"  ! miss hunt: {e}", flush=True)
+        return {}
+
+
 def hunt_pass():
     """Frames of the classes the curated set is short of, from the last HUNT_HOURS.
 
@@ -994,23 +1028,25 @@ def hunt_pass():
             dest.parent.mkdir(parents=True, exist_ok=True)
             cl.download_file(bucket, key, str(dest))
             files.append(dest)
-        stems, written, dense = [], 0, 0
+        stems, written, dense, missed = [], 0, 0, 0
         try:
             by_gate = {}
             for f in files:
                 by_gate.setdefault(gate_of(f.relative_to(VIDEOS).parts[0]), []).append(f)
             for gate, fs in by_gate.items():
-                sink = ingest_video.ingest(fs, {**cfg, "toll_gate_id": gate})
+                moments = gate_miss_moments(cl, bucket, gate, fs, cfg.get("cameras") or [])
+                sink = ingest_video.ingest(fs, {**cfg, "toll_gate_id": gate, "capture_miss": moments})
                 stems += sink.stems
                 written += sum(sink.written.values())
                 dense += sink.dense
+                missed += sink.missed
         finally:
             for f in files:
                 f.unlink(missing_ok=True)
         if ATTRS_CHAMPION.is_file():
             suggest(stems)
         s["hunted"] = (s.get("hunted", []) + todo)[-REMEMBER:]
-        s["last_hunt"] = {"at": now(), "segments": len(todo), "samples": written, "congested": dense,
+        s["last_hunt"] = {"at": now(), "segments": len(todo), "samples": written, "congested": dense, "missed": missed,
                          "wanted": wanted}
         save_state(s)
         pruned, ok = prune_pending(cl, bucket, settings["cap"])
@@ -1019,7 +1055,7 @@ def hunt_pass():
         if not ok:
             return
         sent, _ = ds.push(cl, bucket, names=PENDING)
-        print(f"{now()} hunt: {written} samples written ({dense} congested), {sent} files pushed", flush=True)
+        print(f"{now()} hunt: {written} samples written ({dense} congested, {missed} missed), {sent} files pushed", flush=True)
 
 
 def published_manifests(cl, bucket, keys, since):
@@ -2247,6 +2283,29 @@ def journeys_check():
 
 def selfcheck():
     from datetime import timedelta
+    cams = [{"name": "cam3", "handoff": {"camera": "cam4", "zone": []}},
+            {"name": "cam4", "handoff": {"camera": "cam3", "zone": []}}, {"name": "cam5"}]
+    lone = lambda cam="cam4", ev="line", dr="north", cls="a-car": {
+        "camera": cam, "evidence": ev, "direction": dr, "class": cls,
+        "members": [{"t0": 100.0, "t1": 104.0}, {"t0": 101.0, "t1": 106.0}]}
+    assert miss_moments([lone()], cams) == {"cam3": [97.0, 109.0]}
+    assert miss_moments([lone("cam3+cam4"), lone(ev="handoff"), lone(ev="edge"), lone(dr=None),
+                         lone("cam5"), lone(cls="e-heavy")], cams) == {}
+    class NoKey(Exception):
+        pass
+
+    class JourneysS3:
+        class exceptions:
+            NoSuchKey = NoKey
+
+        def get_object(self, Bucket, Key):
+            if Key != f"{JOURNEYS}G/20261008/journeys.jsonl":
+                raise NoKey(Key)
+            import io
+            return {"Body": io.BytesIO((json.dumps(lone()) + "\n").encode())}
+    got = gate_miss_moments(JourneysS3(), "b", "G", [Path("20261008-103635.mkv"), Path("20261009-000000.mkv")], cams)
+    assert got == {"cam3": [97.0, 109.0]}, got
+    assert gate_miss_moments(object(), "b", "G", [Path("20261008-103635.mkv")], cams) == {}
     classify_now = datetime(2026, 9, 27, 12)
     classify_default = "20260925-120000"
     assert classify_since(classify_now, {}) == classify_default

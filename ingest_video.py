@@ -18,6 +18,7 @@ Same detector, same dedup, same dataset/pending layout as detect.py, so a sample
 footage and a sample from the wire are indistinguishable on the Label tab.
 """
 
+import bisect
 import io
 import os
 import re
@@ -139,7 +140,7 @@ class Sink:
     """dataset/pending writer with the live capture's gates, measured in footage time:
     no detections, an unchanged scene, or a too-recent sample and nothing lands."""
 
-    def __init__(self, dataset, ids, gate="", wanted=(), only_wanted=False, congested=0):
+    def __init__(self, dataset, ids, gate="", wanted=(), only_wanted=False, congested=0, miss=None):
         self.images = Path(dataset) / "pending" / "images"
         self.labels = Path(dataset) / "pending" / "labels"
         for d in (self.images, self.labels):
@@ -152,6 +153,9 @@ class Sink:
         self.rare_at = {}     # cam -> footage timestamp of its last off-cadence capture
         self.dense_at = {}    # cam -> footage timestamp of its last congested capture
         self.dense = 0        # frames written because they were congested
+        self.miss = miss or {}   # cam -> sorted footage times a lone journey says it held a vehicle
+        self.miss_at = {}     # cam -> footage timestamp of its last miss capture
+        self.missed = 0       # frames written as probable detector misses
         self.dets = {}        # cam -> its `shown`, for the scene comparison
         self.written = Counter()
         self.hits = Counter()   # wanted class -> frames written holding it: a hunt's quota
@@ -162,16 +166,21 @@ class Sink:
         # changes right after a skipped duplicate should be caught, not waited out. A
         # class the curated set is short of skips the cadence entirely — dedup still
         # stops a parked one from becoming fifty samples.
-        if not shown:
+        ms = self.miss.get(cam) or []
+        i = bisect.bisect_left(ms, ts - 0.5 / INGEST_FPS)
+        missed = bool(ms) and self.missed < detect.MISS_PER_PASS \
+            and ts - self.miss_at.get(cam, float("-inf")) >= detect.MISS_EVERY \
+            and i < len(ms) and ms[i] <= ts + 0.5 / INGEST_FPS
+        if not shown and not missed:
             return False
         rare = any(d[0] in self.wanted for d in shown) \
             and ts - self.rare_at.get(cam, float("-inf")) >= detect.RARE_EVERY
         dense = bool(self.congested) and len(shown) >= self.congested and self.dense < detect.CONGESTED_PER_PASS \
             and ts - self.dense_at.get(cam, float("-inf")) >= detect.CONGESTED_EVERY
-        if not (rare or dense) and (self.only_wanted
+        if not (rare or dense or missed) and (self.only_wanted
                          or ts - self.at.get(cam, float("-inf")) < detect.CAPTURE_EVERY):
             return False
-        if detect.same_scene(shown, self.dets.get(cam, [])):
+        if not missed and detect.same_scene(shown, self.dets.get(cam, [])):
             return False
         stem = detect.sample_stem(self.gate, cam, ts, detect.RARE_STEP if rare else None)
         lines = [f"{self.ids[cls]} {(x1 + x2) / 2 / w:.6f} {(y1 + y2) / 2 / h:.6f} "
@@ -194,6 +203,9 @@ class Sink:
             if dense:
                 self.dense_at[cam] = ts
                 self.dense += 1
+            if missed:
+                self.miss_at[cam] = ts
+                self.missed += 1
         self.written[cam] += 1
         self.hits.update({cls for cls, _c, _b in shown if cls in self.wanted})
         self.stems.append(stem)
@@ -243,7 +255,8 @@ def ingest_one(f, run, sink, cam=None):
 def ingest(files, cfg):
     run, ids = detector(cfg)
     sink = Sink(DATASET, ids, gate_id(cfg), cfg.get("capture_wanted") or (),
-                bool(cfg.get("capture_only_wanted")), int(cfg.get("capture_congested") or 0))
+                bool(cfg.get("capture_only_wanted")), int(cfg.get("capture_congested") or 0),
+                miss=cfg.get("capture_miss") or {})
     sampled = sum(ingest_one(f, run, sink)[0] for f in files)
     print(f"\n{len(files)} file(s), {sampled} frames sampled at {INGEST_FPS} fps, "
           f"{sum(sink.written.values())} samples written to {sink.images.parent}")
@@ -452,6 +465,15 @@ def selfcheck():
     assert jam.offer("c", base + detect.CONGESTED_EVERY, b"d", row(20.0), 64, 64) and jam.dense == 2
     jam.dense = detect.CONGESTED_PER_PASS
     assert not jam.offer("c", base + 3 * detect.CONGESTED_EVERY, b"e", row(0.0), 64, 64), "a pass's queue quota holds"
+
+    gap = Sink(tmp / "miss", dict(detect.CLASS_IDS), only_wanted=True, miss={"c": [base + 100.0, base + 110.0]})
+    assert gap.offer("c", base + 100, b"a", [], 64, 64) and gap.missed == 1, "an empty frame at a miss time is kept"
+    assert not gap.offer("c", base + 95, b"b", [], 64, 64), "5 s off a miss time is not"
+    assert not gap.offer("c", base + 110, b"c", [], 64, 64), "one miss frame per MISS_EVERY"
+    gap.miss_at.clear()
+    gap.missed = detect.MISS_PER_PASS
+    assert not gap.offer("c", base + 110, b"d", [], 64, 64), "a pass's miss quota holds"
+    assert not gap.offer("c", base + 300, b"e", [], 64, 64), "a non-miss empty frame is still rejected"
 
     assert segments([str(tmp)]) == [odd, seg], segments([str(tmp)])
 
