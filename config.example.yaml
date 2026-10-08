@@ -21,6 +21,9 @@ cameras:                 # cameras recorded directly over RTSP
     #                  # that crawls, stops and re-appears is never counted twice. null = count
     #                  # on sight, as a camera without a heading does.
     # travel: {axis: y, neg: northbound, pos: southbound}   # only if heading cannot say it
+    # Single-camera ("lone") journeys need a direction, so a camera needs heading/travel for them to count.
+    # lone_edge: false  # with a handoff zone: don't count lone journeys that only crossed the zone and
+    #                  # were never counted by the line (a queue's tail crawling in it). Default: true.
     # speed_lines: {a: 0.55, b: 0.75, metres: 25}   # two reference lines on the travel
     #                                               # axis (normalized) + real distance
 

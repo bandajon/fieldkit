@@ -66,9 +66,6 @@ REPARK_STILL_S = 5.0  # s: the re-park track stays still this long from birth; a
 TRUCK_LEAD = 8.0     # s: a slow long truck's arrival may precede its departure...
 TRUCK_LAG = 15.0     # ...or follow it this long
 TRUCK_COS = 0.7      # look agreement a wider window demands
-BLIP_S = 3.0        # s: a photo-less glimpse this close in time to a full track's start...
-BLIP_DIST = 0.3     # ...and this close to where it starts (frame units) is that vehicle's first sighting
-BLIP_FULL = 8       # hits that make a track "full"
 MIN_EDGE_HITS = 5    # ~1 s at 5 fps: a zone crossing alone must last this long; night glare blips don't
 
 
@@ -568,21 +565,7 @@ def _pulled(t, t_off):
                                      if len(p) >= 2 else {}))
 
 
-def _blip(c, counted_by_cam):
-    """A counted chain too brief for a photo (< MIN_EDGE_HITS, no direction) beside a COUNTED full track of
-    the same camera starting within BLIP_S and BLIP_DIST of it: the first glimpse of that vehicle at the far
-    edge, counted again (6 Oct: 35 of 50 photo-less journeys). A glimpse with no such counted track stays."""
-    if sum(t["hits"] for t in c["members"]) >= MIN_EDGE_HITS or any(t.get("direction") for t in c["members"]):
-        return False
-    t0, last = c["members"][0]["t0"], c["members"][-1]["path"][-1]
-    ts = counted_by_cam.get(c["camera"], [])
-    lo, hi = bisect_left(ts, t0 - BLIP_S, key=lambda t: t["t0"]), bisect_right(ts, t0 + BLIP_S + 1, key=lambda t: t["t0"])
-    return any(t["hits"] >= BLIP_FULL and t.get("path")
-               and abs(complex(*_centre(t["path"][0][1:])) - complex(*_centre(last[1:]))) <= BLIP_DIST
-               for t in ts[lo:hi] if t not in c["members"])
-
-
-def _build(tracklets, cameras, tz=None, events=None):
+def _build(tracklets, cameras, tz=None, events=None, with_dropped=False):
     hj = _hijacked(tracklets)
     by = {t["id"]: t for t in tracklets}
     hit = {a: hj[a] for a in hj if _held(by[a], hj[a][0]) and _stays(by[hj[a][1]])}   # a parked vehicle's stolen track, not a queue advance
@@ -598,27 +581,25 @@ def _build(tracklets, cameras, tz=None, events=None):
             any(t["counted"] for t in c["members"])
             or (c["dep"] is not None or c["arr"] is not None)
             and sum(t["hits"] for t in c["members"]) >= MIN_EDGE_HITS)]
-    by_cam = {}
-    for c in [c for pair in links for c in pair] + lone:
-        for t in c["members"]:
-            by_cam.setdefault(t["camera"], []).append(t)
-    for ts in by_cam.values():
-        ts.sort(key=lambda t: t["t0"])
-    lone = [c for c in lone if not _blip(c, by_cam)]
     cfg = {c["name"]: c for c in cameras}
     # A lone chain with no direction is no passage, and a camera with lone_edge: false (cam3: the toll
     # queue's tail sits in its zone) does not count lone edge-only chains. Measured 7 Oct: +6.5% -> -1.7%
     # vs hand counts; under-counting is preferred.
-    lone = [c for c in lone if any(t.get("direction") for t in c["members"])
-            and (any(t["counted"] for t in c["members"]) or cfg.get(c["camera"], {}).get("lone_edge", True) is not False)]
+    keep = lambda c: any(t.get("direction") for t in c["members"]) and (
+        any(t["counted"] for t in c["members"]) or cfg.get(c["camera"], {}).get("lone_edge", True) is not False)
+    dropped = [c for c in lone if not keep(c)]
+    lone = [c for c in lone if keep(c)]
     docs = [_doc(list(pair), pair, cfg, tz, events) for pair in links]
     docs += [_doc([c], None, cfg, tz, events) for c in lone]
+    if with_dropped:    # lone chains the filter removed: not journeys, but a still-open one can yet link
+        docs += [(ts, dict(d, dropped=True)) for ts, d in (_doc([c], None, cfg, tz, events) for c in dropped)]
     return [d for _, d in sorted(docs, key=lambda td: (td[0], td[1]["id"]))], chains, links
 
 
-def build(tracklets, cameras, tz=None, events=None):
-    """Tracklets (detect.py) of paired cameras -> counted journeys, sorted by ts then id."""
-    return _build(tracklets, cameras, tz, events)[0]
+def build(tracklets, cameras, tz=None, events=None, with_dropped=False):
+    """Tracklets (detect.py) of paired cameras -> counted journeys, sorted by ts then id. with_dropped
+    also returns the lone chains the direction/lone_edge filter removed, flagged "dropped": True."""
+    return _build(tracklets, cameras, tz, events, with_dropped)[0]
 
 
 _CAMS = [{"name": "cam3", "heading": "south", "handoff": {"camera": "cam4", "zone": [0.80, 0.62, 0.20, 0.38]}},
@@ -723,7 +704,7 @@ def _selfcheck():
     M = _north(1, 104.0)[0]
     P = _t("cam4", 1, "c-small", [(90 + k, _b(.1, .7)) for k in range(14)]
            + [(104, _b(.2, .6)), (105, _b(.3, .5)), (106, _b(.45, .35))], counted=True, direction="northbound")
-    R = _t("cam4", 2, "c-small", [(108 + k, _b(.1, .7)) for k in range(6)] + [(114, _b(.14, .7))])
+    R = _t("cam4", 2, "c-small", [(108 + k, _b(.1, .7)) for k in range(6)] + [(114, _b(.14, .7))], direction="southbound")
     js = build([M, P, R], _CAMS)
     assert [sorted(m["id"] for m in j["members"]) for j in js] == [["obs-cam3-1", "obs-cam4-1"]], js
     # (H5) queue advance: A sits 3 s and moves off, B born on its spot moves off 2 s later: no trim, B not parked.
@@ -765,15 +746,6 @@ def _selfcheck():
     # ...and a covered vehicle that built up more sightings than the truck is no fragment.
     cabs = _t("cam3", 1, "b-light", list(zip((48, 49, 50), ca)), votes={"e-heavy": 4, "b-light": 8}, hits=40, **k(1))
     assert len(_chains([cabs, _t("cam3", 2, "e-heavy", list(zip((49.2, 50.2, 51.2), cb)), hits=37, **k(1))], _CAMS)) == 2
-    # (B) a 3-hit counted glimpse at the far edge, then the counted full track of the same vehicle from just
-    # beside it: one vehicle. With the full track uncounted (a parked vehicle), or none at all, the glimpse stays.
-    g = _t("cam3", 1, "c-bus", [(100, _b(.06, .55, .02)), (100.4, _b(.07, .55, .02))], hits=3, counted=True)
-    full = _t("cam3", 2, "c-bus", [(99.6, _b(.24, .58, .05)), (101, _b(.5, .7, .1)), (103, _b(.9, .8, .1))], hits=35,
-              direction="northbound", counted=True)
-    assert ids(build([g, full], _CAMS)) == [["obs-cam3-2"]], ids(build([g, full], _CAMS))
-    gd = dict(g, direction="northbound")    # a lone chain needs a direction to count
-    assert ids(build([gd, dict(full, counted=False, direction=None, path=[(99.6, *_b(.2, .45, .05)), (103, *_b(.2, .45, .05))])], _CAMS)) == [["obs-cam3-1"]]
-    assert ids(build([gd], _CAMS)) == [["obs-cam3-1"]]
     # (E) attrs come from clean members' events: the mixed member's bigger event is another vehicle's.
     ev = {"obs-cam3-1": {"class": "c-small", "hits": 9, "attrs": {"axles": 3}}, "obs-cam4-1": {"class": "c-small", "hits": 2, "attrs": {"axles": 6}}}
     [j] = build(_north(1, 100.0, k3={"mixed": True}), _CAMS, events=ev)
@@ -799,7 +771,7 @@ def _selfcheck():
     [j] = build([f1, f2], _CAMS)
     assert len(j["members"]) == 2 and j["evidence"] == "edge", j
     # (f) parked in the zone, jittering, never counted: nothing.
-    park = _t("cam3", 1, "c-small", [(100 + k, _b(0.9 + k % 2 * 0.005, 0.8)) for k in range(6)])
+    park = _t("cam3", 1, "c-small", [(100 + k, _b(0.9 + k % 2 * 0.005, 0.8)) for k in range(6)], direction="southbound")
     assert build([park], _CAMS) == []
     # (g) one camera, counted on its line, never near a zone: a journey on the line's word.
     [j] = build([_t("cam3", 1, "c-small", [(100, _b(0.5, 0.2)), (101, _b(0.5, 0.4))], counted=True, direction="northbound")], _CAMS)
@@ -827,7 +799,7 @@ def _selfcheck():
     assert [m["id"] for m in j["members"]] == ["obs-cam3-1", "obs-cam3-2"] and j["dwell_s"] == 25.0, j
     # (k) an edge crossing alone needs MIN_EDGE_HITS: a 2-frame glare blip is not a vehicle.
     blip = [(100, _b(0.1, 0.7)), (101, _b(0.3, 0.5))]
-    assert build([_t("cam4", 1, "c-small", blip, hits=2)], _CAMS) == []
+    assert build([_t("cam4", 1, "c-small", blip, hits=2, direction="northbound")], _CAMS) == []
     assert len(build([_t("cam4", 1, "c-small", blip, hits=6, direction="northbound")], _CAMS)) == 1
     assert build([_t("cam3", 1, "c-small", [(100, _b(0.5, 0.2))], path=[], counted=True)], _CAMS) == []
     # (l) a far, fast car: 0.05 boxes 0.08 apart 0.4 s later overlap nothing, yet are one chain;
@@ -917,6 +889,7 @@ def _selfcheck():
     nolone = [dict(c, lone_edge=False) if c["name"] == "cam3" else c for c in _CAMS]
     assert len(build([edge], _CAMS)) == 1 and build([edge], nolone) == []
     assert len(build([dict(edge, counted=True)], nolone)) == 1
+    assert [d.get("dropped") for d in build([nd], _CAMS, with_dropped=True)] == [True] and build([nd], _CAMS) == []
     pr = _north(1, 100.0)
     assert len(build([dict(pr[0], direction=None), pr[1]], _CAMS)) == 1
     # A whole day at a gate: 10k passes, 20k tracklets, in windowed time rather than all pairs.

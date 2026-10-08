@@ -1192,7 +1192,10 @@ def journeys_pass(cl, bucket, touched, cameras, tz, keys=(), classified=(), sinc
             events = {e["id"]: e for e in docs(EVENTS + where)}
             events.update({e["id"]: e for e in docs(EVENTS + prev_w)})
             events.update({e["id"]: e for e in docs(EVENTS + next_w)})
-            built = journeys.build(tracklets, cameras, tz, events)
+            # with_dropped: lone chains the direction/lone_edge filter removed are not journeys, but
+            # as open chains they still hold the freeze watermark back (they can yet link to a partner).
+            everything = journeys.build(tracklets, cameras, tz, events, with_dropped=True)
+            built = [j for j in everything if not j.get("dropped")]
             # A boundary tracklet can pull in a journey that really belongs to the neighbouring
             # day (it's rebuilt there too, from its own side of the same boundary) — keep only
             # the ones whose own ts (Lusaka) lands on THIS day, or a vehicle crossing midnight
@@ -1229,7 +1232,7 @@ def journeys_pass(cl, bucket, touched, cameras, tz, keys=(), classified=(), sinc
             # (built from the same boundary tracklets) still has to hold back a same-day `c`,
             # or `c` freezes while `d` is still free to grow and steal `c`'s rightful partner.
             # Only journeys actually owned by this day are ever candidates to freeze, though.
-            newly_final = cleared(built, provisional, cutoff)
+            newly_final = cleared(everything, provisional, cutoff)
             if newly_final:
                 existing = set(bucket_keys(cl, bucket, f"{JOURNEYS}{where}final/"))
                 ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
