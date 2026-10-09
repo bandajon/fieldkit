@@ -1229,6 +1229,10 @@ def journeys_pass(cl, bucket, touched, cameras, tz, keys=(), classified=(), sinc
             # day — so the exclusion set is the union of all three days' frozen ids, applied to
             # all three days' tracklets alike, never each day's own final/ against only its own.
             fids = frozen_ids(where) | frozen_ids(prev_w) | frozen_ids(next_w)
+            # Works mode reads plant presence off the RAW lists: a plant tracklet frozen into a final
+            # journey leaves `tracklets` below, but still marks the works for chains yet open.
+            plant = [(t["t0"], t["t1"], t["hits"]) for raw in (own_raw, prev_raw, next_raw)
+                     for t in raw if t.get("class") == "e-plant"]
             tracklets = [for_upload(t, gate, f"{TRACKLETS}{w}crops/")
                          for raw, w in ((own_raw, where), (prev_raw, prev_w), (next_raw, next_w))
                          for t in raw if t["id"] not in fids]
@@ -1237,7 +1241,7 @@ def journeys_pass(cl, bucket, touched, cameras, tz, keys=(), classified=(), sinc
             events.update({e["id"]: e for e in docs(EVENTS + next_w)})
             # with_dropped: lone chains the direction/lone_edge filter removed are not journeys, but
             # as open chains they still hold the freeze watermark back (they can yet link to a partner).
-            everything = journeys.build(tracklets, cameras, tz, events, with_dropped=True)
+            everything = journeys.build(tracklets, cameras, tz, events, with_dropped=True, plant=plant)
             built = [j for j in everything if not j.get("dropped")]
             # A boundary tracklet can pull in a journey that really belongs to the neighbouring
             # day (it's rebuilt there too, from its own side of the same boundary) — keep only
@@ -2192,6 +2196,26 @@ def journeys_check():
     assert journeys_pass(cl, "buck", {("G", "2026-08-19")}, [{"name": "cam3"}, {"name": "cam4"}],
                          timezone.utc) == (0, set(), {("G", "2026-08-19")}), \
         "no handoff, nothing to diagnose"
+
+    # Works mode survives freezing: three e-plant tracklets frozen into a final batch are dropped from the
+    # build, yet still mark the works, so a later open no-direction chain is kept (and dropped without them).
+    def plant_t(i):
+        return json.dumps({"id": f"obs-plant-{i}", "camera": "cam3", "t0": BASE + i, "t1": BASE + i + 1, "hits": 25,
+                           "class": "e-plant", "counted": False, "path": [], "votes": {}, "conf": {}}).encode() + b"\n"
+    lone = tracklet("cam3", [(300 + k, 0.5, 0.2 + 0.05 * k) for k in range(5)]).replace(
+        b'"direction": "northbound"', b'"direction": null').replace(b"obs-cam3", b"obs-lone")
+    wobjs = {day + "w.jsonl": lone + b"".join(plant_t(i) for i in range(3))}
+    frozen_plant = json.dumps({"id": "jny-plant", "ts": datetime.fromtimestamp(BASE, timezone.utc).isoformat(),
+                               "members": [{"id": f"obs-plant-{i}"} for i in range(3)]}).encode() + b"\n"
+
+    def lone_built(o):
+        cl = FakeS3(o)
+        journeys_pass(cl, "buck", {("G", "2026-08-19")}, cams, timezone.utc)
+        return [j for j in map(json.loads, cl.put["fieldkit-journeys/G/20260819/journeys.jsonl"].decode().splitlines())
+                if any(m["id"] == "obs-lone" for m in j["members"])]
+    assert len(lone_built(wobjs)) == 1
+    assert len(lone_built({**wobjs, "fieldkit-journeys/G/20260819/final/f.jsonl": frozen_plant})) == 1, "frozen plant still marks works"
+    assert lone_built({day + "w.jsonl": lone}) == [], "no plant, no works"
 
     # r2_jsonl: bodies cached by (key, ETag): re-read costs 0 downloads, a changed ETag exactly 1.
     import tempfile
