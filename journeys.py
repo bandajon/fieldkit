@@ -66,6 +66,8 @@ REPARK_STILL_S = 5.0  # s: the re-park track stays still this long from birth; a
 TRUCK_LEAD = 8.0     # s: a slow long truck's arrival may precede its departure...
 TRUCK_LAG = 15.0     # ...or follow it this long
 TRUCK_COS = 0.7      # look agreement a wider window demands
+WORKS_PLANT_HITS = 20  # a plant (e-plant) track this solid means works are on the road, not a passing roller glimpse
+WORKS_WINDOW = 900.0   # s either side of a chain: plant this close in time puts the chain inside the works
 MIN_EDGE_HITS = 5    # ~1 s at 5 fps: a zone crossing alone must last this long; night glare blips don't
 
 
@@ -587,8 +589,15 @@ def _build(tracklets, cameras, tz=None, events=None, with_dropped=False):
     # vs hand counts; under-counting is preferred.
     keep = lambda c: any(t.get("direction") for t in c["members"]) and (
         any(t["counted"] for t in c["members"]) or cfg.get(c["camera"], {}).get("lone_edge", True) is not False)
-    dropped = [c for c in lone if not keep(c)]
-    lone = [c for c in lone if keep(c)]
+    # Works mode: roadworks (rollers, graders, lanes closed) mean stop-start crawl and diversions, so lone
+    # chains the filter drops are real vehicles, not queue-tail duplicates. Measured 9 Oct noon: 184 -> 262
+    # vs hand count 272; 7 Oct morning unchanged (no plant track there has 20+ hits).
+    plant = sorted(t["t0"] for t in tracklets if t.get("class") == "e-plant" and t["hits"] >= WORKS_PLANT_HITS)
+    def works(c):
+        t = min(m["t0"] for m in c["members"])
+        return bisect_right(plant, t + WORKS_WINDOW) > bisect_left(plant, t - WORKS_WINDOW)
+    dropped = [c for c in lone if not keep(c) and not works(c)]
+    lone = [c for c in lone if keep(c) or works(c)]
     docs = [_doc(list(pair), pair, cfg, tz, events) for pair in links]
     docs += [_doc([c], None, cfg, tz, events) for c in lone]
     if with_dropped:    # lone chains the filter removed: not journeys, but a still-open one can yet link
@@ -890,6 +899,12 @@ def _selfcheck():
     assert len(build([edge], _CAMS)) == 1 and build([edge], nolone) == []
     assert len(build([dict(edge, counted=True)], nolone)) == 1
     assert [d.get("dropped") for d in build([nd], _CAMS, with_dropped=True)] == [True] and build([nd], _CAMS) == []
+    # (W) works mode: an e-plant track of 20+ hits within 900 s keeps the lone chains the filter drops.
+    plant = lambda t0, hits: _t("cam3", 9, "e-plant", [(t0, _b(.5, .5)), (t0 + 1, _b(.5, .6))], hits=hits)
+    assert build([nd], _CAMS) == []
+    assert len(build([nd, plant(-200.0, 25)], _CAMS)) == 1
+    assert build([nd, plant(-200.0, 10)], _CAMS) == [] and build([nd, plant(-1900.0, 25)], _CAMS) == []
+    assert build([edge], nolone) == [] and len(build([edge, plant(-200.0, 25)], nolone)) == 1
     pr = _north(1, 100.0)
     assert len(build([dict(pr[0], direction=None), pr[1]], _CAMS)) == 1
     # A whole day at a gate: 10k passes, 20k tracklets, in windowed time rather than all pairs.
@@ -898,7 +913,7 @@ def _selfcheck():
     took = time.perf_counter() - start
     print("journeys self-check ok: handoff links front to rear, queues pair in order, long trucks "
           "link across the overlap, opposed fragments stay apart, parked vehicles never count, "
-          "classes fuse by votes, ghosts join, glare blips drop, far fast fragments join, twins merge and anchor nothing, ids are stable, lone chains need a direction and honour lone_edge; "
+          "classes fuse by votes, ghosts join, glare blips drop, far fast fragments join, twins merge and anchor nothing, ids are stable, lone chains need a direction and honour lone_edge unless plant marks roadworks; "
           f"10k passes (20k tracklets) in {took:.1f} s")
 
 
