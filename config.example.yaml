@@ -24,8 +24,8 @@ cameras:                 # cameras recorded directly over RTSP
     # Single-camera ("lone") journeys need a direction, so a camera needs heading/travel for them to count.
     # lone_edge: false  # with a handoff zone: don't count lone journeys that only crossed the zone and
     #                  # were never counted by the line (a queue's tail crawling in it). Default: true.
-    # speed_lines: {a: 0.55, b: 0.75, metres: 25}   # two reference lines on the travel
-    #                                               # axis (normalized) + real distance
+    # ground: {image: [[0.10,0.80],[0.90,0.80],[0.70,0.55],[0.30,0.55]], metres: [[0,0],[14,0],[14,40],[0,40]]}
+    # Four points on the road surface: image as frame fractions, metres as real ground positions; enables speed_kph.
 
 site: site1              # this node's site name; recordings land in <record_dir>/<site>/<cam>/
 # The RDA toll gate this node sits at. Local disk stays keyed by `site` above — this is the

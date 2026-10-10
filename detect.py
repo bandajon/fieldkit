@@ -18,6 +18,8 @@ import threading
 import time
 import uuid
 from collections import Counter
+from functools import lru_cache
+from math import hypot, isfinite
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from statistics import median
@@ -453,6 +455,80 @@ def count_line(cam):
     if not travel_of(cam) or "count_line" in cam and cam["count_line"] is None:
         return None
     return float(cam.get("count_line", COUNT_LINE))
+
+
+def ground_of(cam, with_key=False):
+    """Reuse a road calibration; malformed config leaves speed unconfigured."""
+    ground = cam.get("ground")
+    try:
+        image, metres = (tuple(tuple(float(v) for v in p) for p in ground[k])
+                         for k in ("image", "metres"))
+        if len(image) != 4 or len(metres) != 4 or any(
+                len(p) != 2 or not all(isfinite(v) for v in p) for p in image + metres):
+            return None
+        if any(not 0 <= v <= 1 for p in image for v in p):
+            return None
+        project = _ground_map(image, metres)
+        return ((image, metres), project) if with_key else project
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return None
+
+
+@lru_cache(maxsize=32)
+def _ground_map(image, metres):
+    """Solve once so live and recorded frames share the same metre plane.
+
+    shortcut: assumes a flat road within the calibrated quad;
+    use surveyed local planes if road slope changes within the view.
+    """
+    edges = [(image[i], image[(i + 1) % 4]) for i in range(4)]
+    turns = [(b[0] - a[0]) * (c[1] - b[1]) - (b[1] - a[1]) * (c[0] - b[0])
+             for a, b, c in ((image[i], image[(i + 1) % 4], image[(i + 2) % 4])
+                              for i in range(4))]
+    if not (all(v > 1e-12 for v in turns) or all(v < -1e-12 for v in turns)):
+        return None                         # require a convex, non-self-intersecting quad
+    sign = 1 if turns[0] > 0 else -1
+    try:
+        import numpy as np
+    except ImportError:
+        return None
+    rows = []
+    origin = metres[0]
+    for (x, y), (u, v) in zip(image, metres):
+        u, v = u - origin[0], v - origin[1]
+        rows += [[x, y, 1, 0, 0, 0, -u*x, -u*y, -u],
+                 [0, 0, 0, x, y, 1, -v*x, -v*y, -v]]
+    try:
+        _, singular, vectors = np.linalg.svd(rows)
+    except np.linalg.LinAlgError:
+        return None
+    if singular[-1] <= 1e-12 * singular[0]:
+        return None                         # repeated or collinear calibration points
+    h = [float(v) for v in vectors[-1]]
+    determinant = (h[0]*(h[4]*h[8] - h[5]*h[7]) - h[1]*(h[3]*h[8] - h[5]*h[6])
+                   + h[2]*(h[3]*h[7] - h[4]*h[6]))
+    if not all(isfinite(v) for v in h) or not determinant:
+        return None
+    # A homography's sign is arbitrary; the calibrated road must have positive w.
+    w = h[6]*image[0][0] + h[7]*image[0][1] + h[8]
+    scale = max(abs(v) for v in h[6:]) * (1 if w > 0 else -1)
+    h = [v / scale for v in h]
+    if any(h[6]*x + h[7]*y + h[8] <= 1e-12 for x, y in image):
+        return None
+
+    def project(point):
+        x, y = point
+        if any(sign * ((b[0] - a[0]) * (y - a[1]) - (b[1] - a[1]) * (x - a[0])) < -1e-12
+               for a, b in edges):
+            return None                     # boundaries count; extrapolated road does not
+        w = h[6]*x + h[7]*y + h[8]
+        if w <= 1e-12:                      # also reject roundoff at the horizon
+            return None
+        p = ((h[0]*x + h[1]*y + h[2]) / w + origin[0],
+             (h[3]*x + h[4]*y + h[5]) / w + origin[1])
+        return p if all(isfinite(v) for v in p) else None
+
+    return project
 
 
 def bound_of(cam, direction):
@@ -967,30 +1043,19 @@ class Detector:
         return any(c["name"] == name for c in self.cams)
 
     def _cam(self, name):
-        """The camera's config entry — travel and speed_lines ride along on it.
+        """The camera's config entry — travel and ground calibration ride along on it.
         Caller holds the lock."""
         return next((c for c in self.cams if c["name"] == name), {})
 
     def _cross(self, t, cam, prev, now):
-        """Stamp the time the centre passes each reference line, in whichever order it
-        meets them. Caller holds the lock.
-
-        ponytail: the stamp is the frame's time, so each line carries up to one frame
-        interval of error — ~±0.25 s at 4 fps, ~10% on a 25 m gap at 60 km/h. Upgrade
-        path: interpolate the crossing between the two frames that straddle it.
-        """
-        lines = dict(cam.get("speed_lines") or {})
-        if count_line(cam) is not None:
-            lines["n"] = count_line(cam)          # the count line rides with the speed lines
-        if prev is None or not lines:
+        """Stamp the count-line crossing of the box centre. Caller holds the lock."""
+        line = count_line(cam)
+        if prev is None or line is None or "n" in t["cross"]:
             return
         i = 0 if (travel_of(cam) or {}).get("axis") == "x" else 1
-        for tag in ("a", "b", "n"):
-            if tag in t["cross"] or lines.get(tag) is None:
-                continue
-            edge = float(lines[tag]) * t["dim"][i]
-            if (prev[i] - edge) * (t["c"][i] - edge) <= 0:
-                t["cross"][tag] = now
+        edge = float(line) * t["dim"][i]
+        if (prev[i] - edge) * (t["c"][i] - edge) <= 0:
+            t["cross"]["n"] = now
 
     def _direction(self, t, cam):
         """Which way it travelled, from end-to-end displacement along the camera's axis."""
@@ -1008,13 +1073,15 @@ class Detector:
         return bound_of(cam, self._direction(t, cam))
 
     def _speed(self, t, cam):
-        """km/h between the two reference lines, or None when the run is not credible."""
-        lines = cam.get("speed_lines") or {}
-        if "a" not in t["cross"] or "b" not in t["cross"] or not lines.get("metres"):
+        """Mean km/h between first and last usable calibrated sightings, including queue time inside the zone."""
+        first, last = t.get("first_ground"), t.get("last_ground")
+        if ground_of(cam) is None or first is None or last is None:
             return None
-        gap = abs(t["cross"]["b"] - t["cross"]["a"])
-        kph = round(float(lines["metres"]) / gap * 3.6, 1) if gap else 0.0
-        # Outside these is a tracking artifact — an id swap, or both lines in one frame.
+        gap = last[0] - first[0]
+        if gap < 1.0:
+            return None                         # fewer than ~5 frames is a blip
+        kph = round(hypot(last[1][0] - first[1][0], last[1][1] - first[1][1]) / gap * 3.6, 1)
+        # Outside these is a tracking artifact — an id swap, or implausible displacement.
         return kph if SPEED_MIN <= kph <= SPEED_MAX else None
 
     def _url(self, cam):
@@ -1182,6 +1249,7 @@ class Detector:
                 return shown
             ids = self.tracks.setdefault(name, {})
             cam = self._cam(name)
+            ground_key, ground = ground_of(cam, with_key=True) or (None, None)
             live = []
             shown += [(self.display.get(c, c), cf, b) for c, cf, b, _t in wheels]
             for i, (cls, conf, box, tid) in enumerate(dets):
@@ -1208,7 +1276,8 @@ class Detector:
                                     "axles": 0, "best": (0.0, None), "attrs": {},
                                     "front": None, "rear": None,
                                     "first_c": None, "c": None, "cross": {}, "dim": (0, 0),
-                                    "first_wall": wall, "path": [], "top": {}}
+                                    "first_wall": wall, "path": [], "top": {},
+                                    "first_ground": None, "last_ground": None}
                 t["votes"][cls] += 1
                 t["hits"] += 1
                 t["conf"] = conf              # this frame's score, for the live overlay chip
@@ -1216,9 +1285,18 @@ class Detector:
                 t["box"] = box                    # resting place, for the recount guard
                 prev, t["c"] = t["c"], ((box[0] + box[2]) / 2, (box[1] + box[3]) / 2)
                 t["first_c"] = t["first_c"] or t["c"]
+                if t.get("ground_key") != ground_key:
+                    t["ground_key"] = ground_key
+                    t["first_ground"] = t["last_ground"] = None
                 if img is not None:
                     t["dim"] = (img.width, img.height)
                     self._cross(t, cam, prev, now)
+                    if ground is not None and (box[0] > 2 and box[1] > 2
+                                               and box[2] < img.width - 2 and box[3] < img.height - 2):
+                        point = ground(((box[0] + box[2]) / (2 * img.width), box[3] / img.height))
+                        if point is not None:
+                            t["last_ground"] = (now, point)
+                            t["first_ground"] = t["first_ground"] or t["last_ground"]
                     # The tracklet's path: a sample per PATH_EVERY, and the latest always
                     # kept aside so the exit box survives to retire.
                     s = t["path_last"] = [round(wall, 2)] + [
@@ -2315,21 +2393,111 @@ if __name__ == "__main__":
         assert len(doc["path"]) == PATH_MAX + 1 and doc["path"][-1] == [
             doc["t1"], 0.7, 0.05, 0.9333, 0.5], doc["path"][-1]
 
-    # Direction and speed from the camera's own reference lines.
+    # Direction still uses the centre; speed uses calibrated ground contact and footage time.
     if jpeg:
+        GROUND = {"image": [[0.10, 0.80], [0.90, 0.80], [0.70, 0.55], [0.30, 0.55]],
+                  "metres": [[0, 0], [14, 0], [14, 40], [0, 40]]}
         TRAVEL = {"name": "c", "ip": "10.0.0.1", "user": "u", "password": "",
                   "travel": {"axis": "y", "neg": "northbound", "pos": "southbound"},
-                  "speed_lines": {"a": 0.55, "b": 0.75, "metres": 25}}
+                  "ground": GROUND}
+        assert callable(globals().get("ground_of")), "ground calibration helper is missing"
+        ground = ground_of(TRAVEL)
+        assert ground is ground_of(TRAVEL), "reuse the calibration every frame"
+        for point, metres in zip(GROUND["image"], GROUND["metres"]):
+            mapped = ground(point)
+            assert mapped is not None and all(abs(a - b) < 1e-6 for a, b in zip(mapped, metres)), (point, mapped)
+        translated = {**TRAVEL, "ground": {**GROUND, "metres": [[x + 500000, y + 9000000] for x, y in GROUND["metres"]]}}
+        translated_ground = ground_of(translated)
+        assert translated_ground is not None, "large metre origin must remain valid"
+        for point, metres in zip(GROUND["image"], translated["ground"]["metres"]):
+            mapped = translated_ground(point)
+            assert mapped is not None and all(abs(a - b) < 1e-6 for a, b in zip(mapped, metres)), (point, mapped)
+        assert ground((0.5, 0.30)) is None, "the horizon is outside calibrated road"
+        horizon_image = [[0.2, 0.4], [0.8, 0.4], [0.8, 0.8], [0.2, 0.8]]
+        horizon_metres = [[x / (y - 0.6), 1 / (y - 0.6)] for x, y in horizon_image]
+        assert ground_of({"ground": {"image": horizon_image, "metres": horizon_metres}}) is None, "quad spans horizon"
+        zero_h33 = ground_of({"ground": {**GROUND, "metres": [[x / y, 1 / y] for x, y in GROUND["image"]]}})
+        assert zero_h33 is not None and all(abs(a - b) < 1e-6 for a, b in zip(zero_h33((0.5, 0.7)), (0.5 / 0.7, 1 / 0.7)))
+        with patch.dict("sys.modules", {"numpy": None}):
+            assert _ground_map.__wrapped__(tuple(map(tuple, GROUND["image"])),
+                                           tuple(map(tuple, GROUND["metres"]))) is None, "missing numpy disables speed"
+        for bad in (None, [], {"image": []}, {**GROUND, "metres": [[0, 0]]},
+                    {**GROUND, "image": [[0, 0]] * 4},
+                    {**GROUND, "metres": [[0, 0]] * 4},
+                    {**GROUND, "image": [[float("nan"), 0]] * 4},
+                    {**GROUND, "image": [[0, 0, 0]] * 4}):
+            assert ground_of({"ground": bad}) is None, bad
+
+        outside = Detector([TRAVEL], nosnap, {})
+        outside._track("c", [("truck", 0.9, (130, 150, 170, 180), 1)],
+                       Image.new("RGB", (300, 200)))
+        assert outside.tracks["c"][1]["first_ground"] is None, "box bottom outside quad is not an endpoint"
+        assert ground((0.5, 0.9)) is None, "below the quad is not calibrated road"
+        assert ground((0.15, 0.6)) is None, "beside the quad is not calibrated road"
+        assert ground((0.5, 0.8)) is not None, "quad boundary is calibrated road"
+        reverse = ground_of({"ground": {k: list(reversed(v)) for k, v in GROUND.items()}})
+        assert reverse is not None and all(abs(a - b) < 1e-6 for a, b in zip(reverse((0.5, 0.7)), ground((0.5, 0.7))))
+        for image in ([[0.1, 0.8], [0.9, 0.8], [0.5, 0.7], [0.3, 0.55]],
+                      [GROUND["image"][i] for i in (0, 2, 1, 3)]):
+            assert ground_of({"ground": {**GROUND, "image": image}}) is None, "quad must be convex and simple"
+
+        # A config save must not mix endpoints from different metre origins.
+        parked = Detector([TRAVEL], nosnap, {})
+        at = [1000.0]
+        parked.clock = lambda: at[0]
+        road = Image.new("RGB", (300, 200))
+        box = (130, 120, 170, 140)
+        parked._track("c", [("truck", 0.9, box, 1)], road)
+        shifted = {**TRAVEL, "ground": {**GROUND, "metres": [[x + 10, y] for x, y in GROUND["metres"]]}}
+        parked.set_cameras([shifted])
+        at[0] += 1.5
+        parked._track("c", [("truck", 0.9, box, 1)], road)
+        speed = parked._speed(parked.tracks["c"][1], shifted)
+        assert speed is None, f"stationary box across calibration change: {speed} km/h"
+        at[0] += 1.5
+        parked._track("c", [("truck", 0.9, box, 1)], road)
+        assert parked._speed(parked.tracks["c"][1], shifted) is None, "stationary in the new calibration"
+        endpoints = parked.tracks["c"][1]["first_ground"], parked.tracks["c"][1]["last_ground"]
+        parked.set_cameras([dict(shifted)])
+        parked._track("c", [("truck", 0.9, box, 1)], road)
+        assert (parked.tracks["c"][1]["first_ground"], parked.tracks["c"][1]["last_ground"]) == endpoints, "unchanged config preserves endpoints"
+        _ground_map.cache_clear()
+        parked._track("c", [("truck", 0.9, box, 1)], road)
+        assert (parked.tracks["c"][1]["first_ground"], parked.tracks["c"][1]["last_ground"]) == endpoints, "unchanged calibration after cache clear preserves endpoints"
+
         sp = Path(tempfile.mkdtemp())
         d = Detector([TRAVEL], nosnap, {}, events_dir=sp)
-        pic = Image.new("RGB", (300, 200))            # lines land at y=110 and y=150
-        for y in (100.0, 115.0, 160.0, 190.0):
-            d._track("c", [("truck", 0.9, (100.0, y - 10, 140.0, y + 10), 1)], pic)
+        clk = [1000.0]
+        d.clock = lambda: clk[0]
+        pic = Image.new("RGB", (300, 200))
+        # On this trapezoid, x=0.5 maps to 7 m and y=(32+0.3*Y)/(40+Y).
+        for at, metres in ((0, 40), (0.5, 32), (1.0, 24), (1.5, 15)):
+            clk[0] = 1000.0 + at
+            bottom = 200 * (32 + 0.3 * metres) / (40 + metres)
+            d._track("c", [("truck", 0.9, (130.0, bottom - 20, 170.0, bottom), 1)], pic)
         t = d.tracks["c"][1]
-        assert {"a", "b"} <= set(t["cross"]), t["cross"]    # the count line "n" rides along
-        assert d._speed({"cross": {"a": 1.0, "n": 1.0}}, TRAVEL) is None, "count line is not a speed line"
-        t["cross"] = {"a": 10.0, "b": 11.5}           # 25 m in 1.5 s = 60 km/h
-        t["last_seen"] -= 20
+        assert set(t["cross"]) == {"n"}, t["cross"]
+        assert d._speed(t, TRAVEL) == 60.0, t
+        translated_track = {**t, **{k: (t[k][0], translated_ground((0.5, (32 + 0.3 * y) / (40 + y))))
+                                  for k, y in (("first_ground", 40), ("last_ground", 15))}}
+        assert d._speed(translated_track, translated) == d._speed(t, TRAVEL), "metre origin must not change speed"
+        first, last = t["first_ground"], t["last_ground"]
+        # Clipped or outside-quad sightings must preserve both usable endpoints.
+        for box in ((2, 100, 170, 140), (130, 2, 170, 140),
+                    (130, 100, 298, 140), (130, 100, 170, 198), (130, 150, 170, 180)):
+            clk[0] += 0.1
+            d._track("c", [("truck", 0.9, box, 1)], pic)
+            assert (t["first_ground"], t["last_ground"]) == (first, last), box
+        d._track("c", [("truck", 0.9, (2, 100, 170, 140), 2)], pic)
+        assert d.tracks["c"][2]["first_ground"] is None, "clipped first sighting is not an endpoint"
+        d._track("c", [("truck", 0.9, (130, 10, 170, 40), 3)], pic)
+        assert d.tracks["c"][3]["first_ground"] is None, "above-horizon box is not an endpoint"
+        # Resolution changes preserve the same normalised road position.
+        large = Image.new("RGB", (600, 400))
+        bottom = 400 * (32 + 0.3 * 15) / (40 + 15)
+        d._track("c", [("truck", 0.9, (260, bottom - 40, 340, bottom), 4)], large)
+        assert all(abs(a - b) < 1e-6 for a, b in zip(d.tracks["c"][4]["first_ground"][1], last[1]))
+        clk[0] += ID_EXPIRY + 1
         d._track("c", [])
         e = json.loads((sp / f"{date.today().isoformat()}.jsonl").read_text().splitlines()[0])
         assert e["speed_kph"] == 60.0 and e["direction"] == "southbound", e
@@ -2338,8 +2506,12 @@ if __name__ == "__main__":
         assert d._direction(moved, TRAVEL) == "northbound", "sign picks the label"
         assert d._direction({**moved, "c": (0.0, 157.0)}, TRAVEL) is None, "jitter is not travel"
         assert d._direction(moved, {}) is None and d._speed(t, {}) is None   # unconfigured
-        assert d._speed({"cross": {"a": 1.0}}, TRAVEL) is None, "one line proves nothing"
-        assert d._speed({"cross": {"a": 1.0, "b": 1.05}}, TRAVEL) is None, "1800 kph: artifact"
+        assert d._speed({"first_ground": first, "last_ground": None}, TRAVEL) is None, "one point proves nothing"
+        assert d._speed({"first_ground": first, "last_ground": (first[0] + 0.9, last[1])}, TRAVEL) is None, "short blip"
+        assert d._speed({"first_ground": first, "last_ground": (first[0] + 1.0, (7, 140))}, TRAVEL) is None, "360 kph: artifact"
+        assert d._speed({"first_ground": first, "last_ground": (first[0] + 2, first[1])}, TRAVEL) is None, "stationary"
+        assert d._speed(t, {"ground": {"image": []}}) is None, "malformed calibration"
+        assert d._speed({"first_ground": first, "last_ground": (first[0] + 90, last[1])}, TRAVEL) == 1.0, "queue time lowers mean speed"
 
     # The offline pass runs on footage time: a segment filmed last week must produce that
     # week's ids and timestamps, and the vehicles still in frame when the footage runs out
