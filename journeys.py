@@ -23,6 +23,7 @@ import time
 from bisect import bisect_left, bisect_right
 from collections import Counter
 from datetime import datetime, timezone
+from statistics import median
 from zoneinfo import ZoneInfo
 
 from detect import HEADINGS, OPPOSITE, bound_of, heading_of, iou, letter_of
@@ -497,6 +498,7 @@ def _doc(chains, link, cfg, tz, events):
     names = sorted({t["camera"] for t in ms})
     crops, plates = {}, {}
     pics = [t for t in ms if not (t.get("mixed") or t.get("hijacked"))]    # a switched or hijacked track's crops show another vehicle
+    speeds = [t["speed_kph"] for t in pics if t.get("speed_kph") is not None]
     pics = pics if any((t.get("crops") or {}) for t in pics) else ms
     tops = [t for t in pics if (t.get("crops") or {}).get("top")]
     if tops:
@@ -527,6 +529,7 @@ def _doc(chains, link, cfg, tz, events):
         "cameras": names, "camera": "+".join(names),
         "class": cls, "letter": letter_of(cls), "conf": conf.get(cls),
         "direction": direction,
+        "speed_kph": round(median(speeds), 1) if speeds else None,
         "bound": next((b for n in names if (b := bound_of(cfg.get(n, {}), direction))), None),
         "attrs": (max(evs, key=lambda e: e.get("hits", 0)).get("attrs") if evs else None) or _member_attrs(ms, cls),
         "crops": crops, "plates": plates,
@@ -659,6 +662,19 @@ def _selfcheck():
     assert j["crops"]["front_plate"] == "cam3-1-plate.jpg" and j["plates"] == {"front": 0.31}, j
     assert "rear_plate" not in j["crops"] and j["camera"] == "cam3+cam4" and j["hits"] == 6, j
     assert j["ts"] == "1970-01-01T00:01:40+00:00" and j["bound"] == "toward_gate", j
+    # Speed uses only clean members; old files and null speeds contribute nothing.
+    legacy_id = "jny-c6f23aeb221245706e98c7e6"
+    assert j["id"] == legacy_id, j
+    assert j["speed_kph"] is None, "old tracklets have no speed key"
+    [j] = build(_north(1, 100.0, k3={"speed_kph": 40.2}, k4={"speed_kph": 60.4}), _CAMS)
+    assert j["speed_kph"] == 50.3 and j["id"] == legacy_id, j
+    for flag in ("mixed", "hijacked"):
+        [j] = build(_north(1, 100.0, k3={"speed_kph": 150.0, flag: True}, k4={"speed_kph": 60.4}), _CAMS)
+        assert j["speed_kph"] == 60.4 and j["id"] == legacy_id, (flag, j)
+        [j] = build(_north(1, 100.0, k3={"speed_kph": 150.0, flag: True}, k4={"speed_kph": None}), _CAMS)
+        assert j["speed_kph"] is None, (flag, j)
+    [j] = build(_north(1, 100.0, k3={"speed_kph": None}, k4={"speed_kph": 60.4}), _CAMS)
+    assert j["speed_kph"] == 60.4, j
     # ...and once cam4 saw it recede, the rear is that crop, not the side-on largest box.
     shot = {"top": "cam4-1-top.jpg", "best": "cam4-1-best.jpg", "recede": "cam4-1-recede.jpg"}
     [j] = build(_north(1, 100.0, k4={"crops": shot}), _CAMS)
