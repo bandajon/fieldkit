@@ -1480,6 +1480,7 @@ class Detector:
                "conf": {c: round(v[0], 3) for c, v in t["top"].items()},
                "counted": bool(t["counted_as"]) and not t.get("ghost"),
                "ghost_of": t.get("ghost_of"), "direction": self._direction(t, self._cam(name)),
+               "speed_kph": self._speed(t, self._cam(name)),
                "path": path, "crops": {tag: rel[tag] for tag in shots},
                "attrs": t["attrs"] or (self._classify(t, k) if shots and self.attrs else {}),
                "plate": plate and {"conf": round(plate[0], 3), "crop": rel["plate"]}}
@@ -2357,6 +2358,7 @@ if __name__ == "__main__":
         assert "recede" not in long["crops"], "only ever approached: no rear view"
         assert (tk / docs["bus"]["crops"]["recede"]).read_bytes().startswith(SOI), docs["bus"]
         for doc in docs.values():
+            assert doc["speed_kph"] is None, "uncalibrated tracklets carry null speed"
             assert all(0 <= v <= 1 for s in doc["path"] for v in s[1:]), doc["path"]
             assert (doc["path"][0][0], doc["path"][-1][0]) == (doc["t0"], doc["t1"]), doc
         assert [round(s[0] - long["t0"], 1) for s in long["path"]] == [0.0, 1.2, 1.6], long["path"]
@@ -2538,6 +2540,10 @@ if __name__ == "__main__":
         d._track("c", [])
         e = json.loads((sp / f"{date.today().isoformat()}.jsonl").read_text().splitlines()[0])
         assert e["speed_kph"] == 60.0 and e["direction"] == "southbound", e
+        rows = [json.loads(line) for line in
+                (sp / "tracklets" / f"{date.today().isoformat()}.jsonl").read_text().splitlines()]
+        row = next(row for row in rows if row["id"] == t["observation_id"])
+        assert row["speed_kph"] == 60.0, row
 
         moved = {"first_c": (0.0, 160.0), "c": (0.0, 100.0), "dim": (300, 200)}
         assert d._direction(moved, TRAVEL) == "northbound", "sign picks the label"
