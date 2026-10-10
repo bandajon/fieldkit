@@ -3,6 +3,7 @@
 
     python train_attrs.py          # build crops, train, report
     python train_attrs.py check    # build crops and count them only
+    python train_attrs.py noexternal  # train without external make datasets
     python train_attrs.py all      # baseline: include the reference frames (first model only)
 
 One mobilenet backbone with a linear head per attribute (spec:
@@ -26,6 +27,8 @@ DATASET = (ROOT / "dataset").resolve()
 APPROVED = DATASET / "approved"
 RUNS = DATASET / "attr_runs"
 BASELINE = "all" in sys.argv[1:]      # see build()
+NOEXTERNAL = "noexternal" in sys.argv[1:]
+SOURCES = {}
 
 INPUT = 224               # mobilenet's native size
 PAD = 0.10                # crop context: a truck's neighbours help read its type
@@ -56,9 +59,49 @@ def crop_box(img, box):
     return img.crop((x1, y1, x2, y2)).resize((INPUT, INPUT))
 
 
+def is_validation(stem):
+    return not stem.startswith("external-") and is_val(stem)
+
+
+def validation_mask(stems):
+    return [is_validation(s) for s in stems]
+
+
+def ai_labels():
+    """Last entry per box in filename/line order across immutable AI run files."""
+    labels = {}
+    for path in sorted((DATASET / "ai-attrs").glob("*.jsonl")):
+        for line in path.read_text().splitlines():
+            try:
+                row = json.loads(line)
+                if (isinstance(row, dict) and isinstance(row.get("sid"), str)
+                        and type(row.get("box")) is int and row["box"] >= 0):
+                    labels.setdefault(row["sid"], {})[row["box"]] = row
+            except ValueError:
+                continue                  # ignore malformed records
+    return labels
+
+
+def merged_attrs(human, row, bbox):
+    """Human keys win, including values not in this run's vocabulary."""
+    ai = {}
+    if row and isinstance(row.get("attrs"), dict):
+        try:
+            values = row["bbox"]
+            if isinstance(values, list) and len(values) == len(bbox) == 4 and all(
+                    abs(float(a) - float(b)) <= 1e-4 for a, b in zip(values, bbox)):
+                ai = {k: v for k, v in row["attrs"].items() if k not in human}
+        except (KeyError, TypeError, ValueError):
+            pass
+    return {**ai, **human}, ai
+
+
 def build(heads):
-    """-> ([crop], [targets], [stem]); targets are value ids per head, -1 = not labelled."""
+    """-> (crops, targets, stems, classes); -1 = unlabelled. SOURCES counts contributors."""
     names = list(heads)
+    SOURCES.clear()
+    SOURCES.update(human=0, ai=0, archive=0, external={})
+    ai = ai_labels()
     crops, targets, stems, classes, skipped = [], [], [], [], 0
     archive_root = DATASET / "classifier-crops"
     archive_manifests = []
@@ -80,26 +123,32 @@ def build(heads):
     # model of its kind, which has no benchmark to protect: `train_attrs.py all` trains on
     # everything once, the way the detector's v2 did before the set was frozen.
     ref = set() if BASELINE else archive_refs | ({ln.strip() for ln in (DATASET / "reference.txt").read_text().splitlines() if ln.strip()} if (DATASET / "reference.txt").is_file() else set())
-    for js in sorted((APPROVED / "attrs").glob("*.json")):
-        if js.stem in ref:
+    human_sids = {p.stem for p in (APPROVED / "attrs").glob("*.json")}
+    for sid in sorted(human_sids | (set(ai) & current_sids)):
+        if sid in ref:
             continue
-        img_p = APPROVED / "images" / f"{js.stem}.jpg"
-        lbl_p = APPROVED / "labels" / f"{js.stem}.txt"
+        js = APPROVED / "attrs" / f"{sid}.json"
+        img_p = APPROVED / "images" / f"{sid}.jpg"
+        lbl_p = APPROVED / "labels" / f"{sid}.txt"
         if not (img_p.is_file() and lbl_p.is_file()):
             skipped += 1
             continue
         try:
-            attrs = json.loads(js.read_text())
+            attrs = json.loads(js.read_text()) if js.is_file() else {}
+            if not isinstance(attrs, dict):
+                raise ValueError("attrs is not an object")
             boxes = [line.split() for line in lbl_p.read_text().splitlines() if line.split()]
             img = Image.open(img_p).convert("RGB")
         except (OSError, ValueError):
             skipped += 1
             continue
-        for k, a in attrs.items():
+        for k in sorted(set(attrs) | {str(i) for i in ai.get(sid, {})}, key=str):
+            human = attrs.get(k, {})
             i = int(k) if str(k).lstrip("-").isdigit() else -1
-            if not 0 <= i < len(boxes) or not isinstance(a, dict):
+            if not 0 <= i < len(boxes) or not isinstance(human, dict):
                 skipped += 1          # sidecar written against a different label file
                 continue
+            a, filled = merged_attrs(human, ai.get(sid, {}).get(i), boxes[i][1:5])
             t = [heads[n].index(a[n]) if a.get(n) in heads[n] else -1 for n in names]
             crop = crop_box(img, boxes[i][1:5])
             if crop is None or all(v < 0 for v in t):
@@ -107,7 +156,9 @@ def build(heads):
                 continue
             crops.append(crop)
             targets.append(t)
-            stems.append(js.stem)
+            stems.append(sid)
+            SOURCES["human"] += any(human.get(n) in heads[n] for n in names)
+            SOURCES["ai"] += any(filled.get(n) in heads[n] for n in names)
             classes.append(int(boxes[i][0]) if boxes[i][0].isdigit() else -1)
     # The archive lets retention remove approved full frames after export.  A corrupt
     # manifest is fatal: silently shrinking the corpus makes a training run incomparable.
@@ -118,15 +169,49 @@ def build(heads):
                     continue
                 if s["source_sid"] in current_sids:
                     continue
-                t = [heads[n].index(s["attrs"][n]) if s["attrs"].get(n) in heads[n] else -1 for n in names]
+                a, filled = merged_attrs(s["attrs"], ai.get(s["source_sid"], {}).get(s["box_index"]), s["bbox"])
+                t = [heads[n].index(a[n]) if a.get(n) in heads[n] else -1 for n in names]
                 if all(v < 0 for v in t):
                     continue
                 crop = Image.open(d / s["crop"]).convert("RGB")
                 crops.append(crop)
                 targets.append(t)
                 stems.append(s["source_sid"])
+                SOURCES["archive"] += 1
+                SOURCES["human"] += any(s["attrs"].get(n) in heads[n] for n in names)
+                SOURCES["ai"] += any(filled.get(n) in heads[n] for n in names)
                 cnames = class_names()
                 classes.append(cnames.index(s["class_name"]) if s["class_name"] in cnames else -1)
+    if not NOEXTERNAL:
+        for manifest in sorted((DATASET / "external" / "make").glob("*/manifest.jsonl")):
+            source = manifest.parent
+            SOURCES["external"][source.name] = 0
+            unknown = 0
+            for i, line in enumerate(manifest.read_text().splitlines()):
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                if row.get("make") not in heads.get("make", []):
+                    unknown += 1
+                    continue
+                relative = Path(row["image"])
+                image = (source / relative).resolve()
+                if relative.is_absolute() or not image.is_relative_to(source.resolve()):
+                    raise ValueError(f"external image escapes source: {manifest}:{i}")
+                with Image.open(image) as opened:
+                    crop = opened.convert("RGB").resize((INPUT, INPUT))
+                t = [heads[n].index(row["make"]) if n == "make" else -1 for n in names]
+                cnames = class_names()
+                if "a-small" not in cnames:
+                    raise ValueError("external make samples require a-small in classes.txt")
+                crops.append(crop)
+                targets.append(t)
+                stems.append(f"external-make-{source.name}-{i}")
+                classes.append(cnames.index("a-small"))
+                SOURCES["external"][source.name] += 1
+            if unknown:
+                print(f"{source.name}: {unknown} external make line(s) skipped — make outside vocabulary")
+    print(f"sources: {json.dumps(SOURCES, sort_keys=True)}")
     if skipped:
         print(f"{skipped} enriched box(es) skipped — no image/label pair, or a stale sidecar")
     return crops, targets, stems, classes
@@ -134,7 +219,7 @@ def build(heads):
 
 def report_counts(heads, targets, stems):
     names = list(heads)
-    val = [i for i, s in enumerate(stems) if is_val(s)]
+    val = [i for i, flag in enumerate(validation_mask(stems)) if flag]
     print(f"{len(targets)} enriched crops from {len(set(stems))} samples: "
           f"{len(targets) - len(val)} train / {len(val)} val")
     for j, n in enumerate(names):
@@ -153,7 +238,11 @@ def check(heads, crops, targets, stems):
     assert all(-1 <= v < len(heads[names[j]]) for t in targets for j, v in enumerate(t)), \
         "a target id is outside its head's vocabulary"
     assert all(any(v >= 0 for v in t) for t in targets), "a crop with no labelled head got in"
-    frac = len(val) / len(targets)
+    local = sum(not s.startswith("external-") for s in stems)
+    frac = len(val) / local if local else 0
+    if not local:
+        print(f"ok — {len(heads)} heads, external-only train split")
+        return
     assert 0.03 <= frac <= 0.25, f"val fraction {frac:.0%} is off — check is_val()"
     print(f"ok — {len(heads)} heads, val split {frac:.0%}")
 
@@ -164,6 +253,14 @@ def class_names():
         return (DATASET / "classes.txt").read_text().split()
     except OSError:
         return []
+
+
+def report_dict(run_name, accs, val_crops, labelled, confusion):
+    ok = [a for a in accs.values() if a is not None]
+    return {"run": run_name, "per_head_acc": accs,
+            "mean_acc": sum(ok) / len(ok) if ok else None,
+            "val_crops": val_crops, "labelled": labelled, "axles_confusion": confusion,
+            "baseline": BASELINE, "sources": SOURCES}
 
 
 def train(heads, crops, targets, stems, classes):
@@ -192,7 +289,7 @@ def train(heads, crops, targets, stems, classes):
     for r, c in enumerate(classes):
         if 0 <= c < len(cnames):
             Z[r, c] = 1.0
-    val = torch.tensor([is_val(s) for s in stems])
+    val = torch.tensor(validation_mask(stems))
     xt, yt, zt, xv, yv, zv = X[~val], Y[~val], Z[~val], X[val], Y[val], Z[val]
 
     model = mobilenet_v3_small(weights=MobileNet_V3_Small_Weights.DEFAULT)
@@ -263,11 +360,8 @@ def train(heads, crops, targets, stems, classes):
     # The printed report is for a human reading the log; this one is for selfloop.py,
     # which promotes on mean_acc and quotes the confusion in its summary. A head nobody
     # has labelled in the val split scores null rather than 0 — it was not tested.
-    ok = [a for a in accs.values() if a is not None]
     (run / "report.json").write_text(json.dumps(
-        {"run": run.name, "per_head_acc": accs, "mean_acc": sum(ok) / len(ok) if ok else None,
-         "val_crops": len(xv), "labelled": labelled, "axles_confusion": confusion,
-         "baseline": BASELINE}, indent=1))
+        report_dict(run.name, accs, len(xv), labelled, confusion), indent=1))
     print(f"\nattrs: {out}")
     print(f"to deploy: set attr_weights: {out} in config.yaml and restart FieldKit")
 

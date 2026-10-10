@@ -35,14 +35,14 @@ PROGRESS = 200
 # What a curation instance needs to start work...
 PUSH = ("pending/images", "pending/labels", "pending/attrs", "pending/suggest", "gold",
         "classes.txt", "attributes.yaml", "curators.yaml", "assignments.yaml", "trusted.yaml",
-        "reference.txt", "external.json")
+        "reference.txt", "external.json", "ai-attrs")
 # ...the small part of that a node must have IN HAND before it can serve anything...
 CONFIG = ("curators.yaml", "classes.txt", "attributes.yaml", "assignments.yaml",
           "trusted.yaml", "gold", "reference.txt", "external.json", "trained.txt",
           "curation.yaml")
 # ...and what it produces: the daily harvest.
 LEDGERS = ("approved/images", "approved/labels", "approved/attrs",
-           "audit.jsonl", "scores.jsonl", "gold-served.jsonl")
+           "audit.jsonl", "scores.jsonl", "gold-served.jsonl", "ai-attrs")
 
 
 def creds():
@@ -434,6 +434,7 @@ def pull(cl, bucket, prefix=PREFIX, root=DATASET, names=None):
 
 
 def selfcheck():
+    from unittest.mock import patch
     import tempfile
 
     class FakeS3:
@@ -627,6 +628,28 @@ def selfcheck():
     # and a curator mid-label would watch the picture change under their boxes.
     assert push(two, "buck", "curation/", at_desk) == (0, 1), "second node overwrote the first"
     assert two.objects[f"curation/pending/images/{box_id}.jpg"] == b"live off the sub-stream"
+
+    # Immutable AI run files publish once and arrive unchanged in the daily harvest.
+    with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as dest_td:
+        ai_root, ai_dest = Path(td), Path(dest_td)
+        runs = ai_root / "ai-attrs"
+        runs.mkdir()
+        run = runs / "20261010T153000Z.jsonl"
+        content = b'{"sid":"a","box":0}\n'
+        run.write_bytes(content)
+        ai_cloud = FakeS3()
+        key = "curation/ai-attrs/" + run.name
+        assert push(ai_cloud, "buck", "curation/", ai_root) == (1, 0)
+        assert ai_cloud.objects[key] == content
+        with patch.object(ai_cloud, "upload_file", side_effect=AssertionError("run re-sent")):
+            assert push(ai_cloud, "buck", "curation/", ai_root) == (0, 1)
+        assert pull(ai_cloud, "buck", "curation/", ai_dest, LEDGERS) == (1, 0)
+        downloaded = ai_dest / "ai-attrs" / run.name
+        assert downloaded.read_bytes() == content
+        before = downloaded.stat().st_mtime_ns
+        with patch.object(ai_cloud, "download_file", side_effect=AssertionError("run re-fetched")):
+            assert pull(ai_cloud, "buck", "curation/", ai_dest, LEDGERS) == (0, 1)
+        assert downloaded.read_bytes() == content and downloaded.stat().st_mtime_ns == before
 
     print("dataset_sync self-check ok: push skips unchanged, pull harvests, --ledgers and "
           "--config filter, ledgers merge instead of overwriting, neither side deletes, env "
