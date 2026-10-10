@@ -31,7 +31,7 @@ def dataset():
         (root / 'attributes.yaml').write_text(yaml.safe_dump(
             {'type': ['van'], 'colour': ['white', 'blue'], 'make': ['Toyota', 'Ford']}, sort_keys=False))
         with patch.object(ta, 'DATASET', root), patch.object(ta, 'APPROVED', root / 'approved'), \
-             patch.object(ta, 'BASELINE', False), patch.object(ta, 'NOEXTERNAL', False, create=True):
+             patch.object(ta, 'BASELINE', False), patch.object(ta, 'EXTERNAL', False):
             yield root, ta.vocab()
 
 
@@ -103,7 +103,7 @@ def archive_and_reference():
 
 
 def external():
-    with dataset() as (root, heads):
+    with dataset() as (root, heads), patch.object(ta, "EXTERNAL", True):
         src = root / 'external/make/cars'; src.mkdir(parents=True)
         image = Image.new('RGB', (9, 5)); image.putdata([(x * 20, y * 40, 30) for y in range(5) for x in range(9)])
         image.save(src / 'crop.png')
@@ -124,10 +124,10 @@ def external():
                      ['road-val'] + ['road-train'] * 9 + stems * 100)
         for sid in ['road', 'katuba-20261010-120000', 'retained']:
             assert ta.is_validation(sid) == ta.is_val(sid), 'non-external split unchanged'
-        with patch.object(ta, 'NOEXTERNAL', True):
-            assert not ta.build(heads)[0], 'noexternal drops external sources'
-        with patch.object(sys, 'argv', ['train_attrs.py', 'noexternal']):
-            assert runpy.run_path(str(Path(ta.__file__)))['NOEXTERNAL'], 'CLI enables noexternal'
+        with patch.object(ta, 'EXTERNAL', False):
+            assert not ta.build(heads)[0], 'default drops external sources'
+        with patch.object(sys, 'argv', ['train_attrs.py', 'external']):
+            assert runpy.run_path(str(Path(ta.__file__)))['EXTERNAL'], 'CLI opts in to external'
 
 
 def counts_and_sync():
@@ -144,7 +144,7 @@ def counts_and_sync():
 
 
 def run_file_order():
-    with dataset() as (root, heads):
+    with dataset() as (root, heads), patch.object(ta, 'is_val', return_value=False):
         frame(root, 'ordered')
         directory = root / 'ai-attrs'; directory.mkdir()
         def row(make, at):
@@ -190,9 +190,68 @@ def training_mask_and_report():
             assert json.loads((run / 'report.json').read_text()) == report, \
                 'actual report.json must carry sources and all report fields'
 
+def review_validation():
+    with dataset() as (root, heads):
+        for sid in ('road-val', 'road-train'):
+            frame(root, sid, {'0': {'colour': 'white'}}, rows=2)
+            ai(root, sid, {'make': 'Ford'})
+            ai(root, sid, {'make': 'Toyota'}, box=1)
+        with patch.object(ta, 'is_val', side_effect=lambda sid: sid == 'road-val'):
+            _, targets, stems, _ = ta.build(heads)
+        assert [t for t, sid in zip(targets, stems) if sid == 'road-val'] == [[-1, 0, -1]], 'validation is human-only, AI-only box excluded'
+        assert [t for t, sid in zip(targets, stems) if sid == 'road-train'] == [[-1, 0, 1], [-1, -1, 0]]
+
+
+def review_external_default():
+    with dataset() as (root, heads):
+        src = root / 'external/make/cars'; src.mkdir(parents=True)
+        Image.new('RGB', (10, 10)).save(src / 'crop.png')
+        (src / 'manifest.jsonl').write_text('{"image":"crop.png","make":"Toyota"}\n')
+        assert not ta.build(heads)[0], 'external data must require opt-in'
+
+
+def review_archive_validation():
+    with dataset() as (root, heads):
+        for sid in ('archive-val', 'archive-train'):
+            frame(root, sid, {'0': {'colour': 'white'}}, rows=2)
+            classifier_crops.export_sample(root, sid)
+            for kind, suffix in (('images', '.jpg'), ('labels', '.txt'), ('attrs', '.json')):
+                (root / 'approved' / kind / (sid + suffix)).unlink()
+            ai(root, sid, {'make': 'Ford'})
+            ai(root, sid, {'make': 'Toyota'}, box=1)
+        with patch.object(ta, 'is_val', side_effect=lambda sid: sid == 'archive-val'):
+            _, targets, stems, _ = ta.build(heads)
+        assert [t for t, sid in zip(targets, stems) if sid == 'archive-val'] == [[-1, 0, -1]], 'archive validation uses only human labels'
+        assert [t for t, sid in zip(targets, stems) if sid == 'archive-train'] == [[-1, 0, 1], [-1, -1, 0]], 'archive training uses AI fill and AI-only boxes'
+
+
+def review_cli_gate():
+    tree = ast.parse(Path(ta.__file__).read_text())
+    body = tree.body[-1].body
+    heads = {'make': ['Toyota']}
+    calls = []
+    for args in (['external', 'check'], ['check', 'external']):
+        with patch.object(sys, 'argv', ['train_attrs.py', *args]):
+            parsed = runpy.run_path(str(Path(ta.__file__)))
+        assert parsed['ARGS'] == set(args) and parsed['EXTERNAL']
+        namespace = {**vars(ta), 'ARGS': parsed['ARGS'], 'vocab': lambda: heads,
+                     'build': lambda h: ([None] * 300, [[0]] * 300, ['road'] * 200 + ['external-cars'] * 100, [0] * 300),
+                     'check': lambda *a: calls.append('check'), 'train': lambda *a: calls.append('train')}
+        exec(compile(ast.Module(body=body, type_ignores=[]), '<main>', 'exec'), namespace)
+    assert calls == ['check', 'check'], 'check mode accepts any argument order'
+    namespace['build'] = lambda h: ([None] * 300, [[0]] * 300, ['road'] * 199 + ['external-cars'] * 101, [0] * 300)
+    namespace['report_counts'] = lambda *a: None
+    try:
+        exec(compile(ast.Module(body=body, type_ignores=[]), '<main>', 'exec'), namespace)
+    except SystemExit as exc:
+        assert '199 local enriched boxes' in str(exc), 'external crops cannot meet MIN_BOXES'
+    else:
+        assert False, '199 road crops must reject training/check'
+
+
 def main():
     failures = []
-    for test in [human_wins, stale_bbox, ai_only_and_last_line, archive_and_reference, external, counts_and_sync, run_file_order, training_mask_and_report]:
+    for test in [review_archive_validation, review_cli_gate, review_validation, review_external_default, human_wins, stale_bbox, ai_only_and_last_line, archive_and_reference, external, counts_and_sync, run_file_order, training_mask_and_report]:
         try:
             test()
             print(f'PASS {test.__name__}')

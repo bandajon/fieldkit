@@ -29,12 +29,13 @@ def fixture(root, mode="approved", count=1, box="0.512345 0.5 0.4 0.3", cls=0):
 
 
 def fake_runner(haiku, sonnet, calls):
-    def run(model, prompt):
+    def run(model, prompt, cwd):
         crops = json.loads(prompt.split("Crops:\n", 1)[1])
         assert 1 <= len(crops) <= 10
         for crop in crops:
             assert Path(crop["path"]).is_absolute()
             assert Path(crop["path"]).is_file()
+            assert Path(crop["path"]).parent == Path(cwd).resolve()
             assert set(crop["values"]) <= {"colour", "make"}
         calls.append((model, len(crops)))
         answer = haiku if model == "haiku" else sonnet
@@ -61,7 +62,7 @@ def run_case(haiku=None, sonnet=None, count=1,
             ledger = root / "ai-attrs"
             files = sorted(ledger.glob("*.jsonl"))
             rows = [json.loads(line) for file in files for line in file.read_text().splitlines()]
-            assert len(files) == bool(rows), "one run must produce exactly one file if it labelled anything"
+            assert len(files) == (len(rows) + 9) // 10, "one immutable file per completed batch"
             assert not (root / "ai-attrs.jsonl").exists()
             path = root / "approved" / "suggest/sample.json"
             suggestions = json.loads(path.read_text()) if path.exists() else {}
@@ -97,8 +98,8 @@ def boundary_checks():
             fake = fake_runner({"colour": "white", "make": "Volvo"},
                                {"colour": "white", "make": "Volvo"}, calls)
 
-            def runner(model, prompt):
-                answer = fake(model, prompt)
+            def runner(model, prompt, cwd):
+                answer = fake(model, prompt, cwd)
                 if model == "sonnet":
                     if change == "expired":
                         blocked.set()
@@ -266,10 +267,10 @@ def final_retention_checks():
             fake = fake_runner({"colour": "white", "make": "Volvo"},
                                {"colour": "white", "make": "Volvo"}, calls)
 
-            def runner(model, prompt):
-                answer = fake(model, prompt)
+            def runner(model, prompt, cwd):
+                answer = fake(model, prompt, cwd)
                 if model == "sonnet" and len(json.loads(prompt.split("Crops:\n", 1)[1])) == 1:
-                    expired.set()  # Batch one's rows are already buffered.
+                    expired.set()  # Batch one's rows are already published.
                 return answer
 
             with patch.object(labeller, "DATASET", root), \
@@ -280,17 +281,14 @@ def final_retention_checks():
                     redirect_stdout(io.StringIO()):
                 labeller.run_claude(runner=runner)
             assert sorted(calls) == [("haiku", 1), ("haiku", 10), ("sonnet", 1), ("sonnet", 10)]
-            files = list((root / "ai-attrs").glob("*"))
-            if all_expired:
-                assert files == [], "all expired buffered rows must produce no run file"
-            else:
-                assert len(files) == 1 and files[0].suffix == ".jsonl"
-                rows = [json.loads(line) for line in files[0].read_text().splitlines()]
-                assert [row["sid"] for row in rows] == ["z-live"], "batch-one expired sample must not be published"
+            files = sorted((root / "ai-attrs").glob("*.jsonl"))
+            rows = [json.loads(line) for file in files for line in file.read_text().splitlines()]
+            assert len(files) == (1 if all_expired else 2)
+            assert [row["sid"] for row in rows] == ["sample"] * 10 + ([] if all_expired else ["z-live"]), "completed batches remain immutable; final batch rechecks retention"
 
 
 def claude_cli_checks():
-    with patch.object(labeller, "run_claude") as run:
+    with patch.object(labeller.shutil, "which", return_value="/mock/claude"), patch.object(labeller, "run_claude") as run:
         for arguments, limit in (([], None), (["--limit", "12"], 12)):
             with patch.object(labeller.sys, "argv", ["suggest_attrs.py", "claude", *arguments]):
                 labeller.main()
@@ -308,7 +306,165 @@ def claude_cli_checks():
             run.assert_not_called()
 
 
+def review_parser():
+    items = [{"id": "0", "values": {"colour": ["white"]}}]
+    assert labeller.claude_answers('["prose"] [{"id":0,"colour":"white"},{"id":"invented","colour":"white"}]', items, {}) == {"0": {"colour": "white"}}
+
+
+def review_malformed():
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td); (root / "ai-attrs").mkdir()
+        (root / "ai-attrs/run.jsonl").write_text('bad\n{}\n[]\n{"sid":"ok","box":0}\n')
+        with patch.object(labeller, "DATASET", root):
+            assert labeller.ai_entries() == {("ok", 0): {"sid": "ok", "box": 0}}
+
+
+def review_interrupt():
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td); fixture(root, count=11)
+        calls = []
+        fake = fake_runner({"colour": "white"}, {"colour": "white"}, calls)
+        def runner(model, prompt, cwd):
+            if len(json.loads(prompt.split("Crops:\n", 1)[1])) == 1:
+                raise KeyboardInterrupt()
+            return fake(model, prompt, cwd)
+        with patch.object(labeller, "DATASET", root), redirect_stdout(io.StringIO()):
+            try:
+                labeller.run_claude(runner=runner)
+            except KeyboardInterrupt:
+                pass
+        rows = [json.loads(line) for file in (root / "ai-attrs").glob("*.jsonl") for line in file.read_text().splitlines()]
+        assert len(rows) == 10, "completed first batch survives interruption"
+
+
+def review_cli_isolation():
+    prompt = 'Prompt without crop metadata'
+    cwd = Path('/tmp/mock-batch')
+    with patch.object(labeller.subprocess, 'run') as run:
+        run.return_value.stdout = '[]'
+        for model in ('haiku', 'sonnet'):
+            labeller.claude_runner(model, prompt, cwd)
+            args, kwargs = run.call_args
+            assert args[0] == ['claude', '-p', '--model', model, '--allowedTools', 'Read', '--setting-sources', 'project', '--strict-mcp-config']
+            assert kwargs['cwd'] == cwd and kwargs['input'] == prompt
+            if os.name == 'nt':
+                assert kwargs['creationflags'] == labeller.subprocess.CREATE_NEW_PROCESS_GROUP
+            else:
+                assert kwargs['start_new_session'] is True
+    with patch.object(labeller.shutil, 'which', return_value=None), patch.object(labeller, 'run_claude') as run, patch.object(labeller.sys, 'argv', ['suggest_attrs.py', 'claude']), patch.object(labeller.sys, 'stderr', io.StringIO()) as error:
+        try:
+            labeller.main()
+        except SystemExit as exc:
+            assert exc.code == 1 and 'not found on PATH' in error.getvalue()
+        else:
+            assert False, 'missing binary must fail startup'
+        run.assert_not_called()
+    rows, _, _ = run_case(haiku={}, sonnet={})
+    assert not rows
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td); fixture(root)
+        with patch.object(labeller, 'DATASET', root), redirect_stdout(io.StringIO()) as out:
+            labeller.run_claude(runner=lambda *a: 'prose ["no answer"]')
+        assert len([line for line in out.getvalue().splitlines() if 'warning' in line]) == 1
+
+
+def review_current_batch_interrupt():
+    from concurrent.futures import Future
+    original = Future.result
+    interrupted = []
+    def result(future, *args, **kwargs):
+        if not interrupted:
+            interrupted.append(True)
+            raise KeyboardInterrupt()
+        return original(future, *args, **kwargs)
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td); fixture(root, count=11)
+        calls = []
+        with patch.object(labeller, 'DATASET', root), patch.object(Future, 'result', result), redirect_stdout(io.StringIO()):
+            labeller.run_claude(runner=fake_runner({'colour': 'white'}, {'colour': 'white'}, calls))
+        rows = [json.loads(line) for file in (root / 'ai-attrs').glob('*.jsonl') for line in file.read_text().splitlines()]
+        assert len(rows) == 10 and len(calls) == 2, 'interrupt waits for current batch publication, then stops'
+
+
+def review_empty_values_warning():
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td); fixture(root)
+        fake = fake_runner({'colour': 'unknown'}, {'colour': 'unknown'}, [])
+        with patch.object(labeller, 'DATASET', root), redirect_stdout(io.StringIO()) as out:
+            labeller.run_claude(runner=fake)
+        assert len([line for line in out.getvalue().splitlines() if 'warning' in line]) == 1, 'empty cleaned answers need one warning'
+
+
+def review_signal_seams():
+    import signal
+    for seam in ('parser', 'publish'):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td); fixture(root, count=11)
+            calls, raised = [], []
+            original = labeller.claude_answers if seam == 'parser' else os.replace
+            def interrupt(*args, **kwargs):
+                if not raised:
+                    raised.append(True)
+                    signal.raise_signal(signal.SIGINT)
+                return original(*args, **kwargs)
+            previous = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}
+            target = patch.object(labeller, 'claude_answers', side_effect=interrupt) if seam == 'parser' else patch.object(os, 'replace', side_effect=interrupt)
+            with patch.object(labeller, 'DATASET', root), target, redirect_stdout(io.StringIO()):
+                try:
+                    labeller.run_claude(runner=fake_runner({'colour': 'white'}, {'colour': 'white'}, calls))
+                except KeyboardInterrupt:
+                    pass
+            assert {sig: signal.getsignal(sig) for sig in previous} == previous, 'restore original signal handlers'
+            rows = [json.loads(line) for file in (root / 'ai-attrs').glob('*.jsonl') for line in file.read_text().splitlines()]
+            assert len(rows) == 10 and len(calls) == 2, f'{seam} interrupt must publish current batch then stop'
+
+
+def review_terminal_process_group():
+    import signal
+    import subprocess
+    import sys
+    import time
+    if os.name == 'nt':
+        return  # POSIX terminal signal reproduction; Windows flag is asserted below.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        ready = root / 'ready'
+        child = "import signal,time; from pathlib import Path; signal.signal(signal.SIGINT, signal.SIG_DFL); Path(" + repr(str(ready)) + ").touch(); time.sleep(.4); print('survived')"
+        parent = "\n".join([
+            'import signal,subprocess',
+            'import suggest_attrs as s',
+            'signal.signal(signal.SIGINT, lambda *_: None)',
+            'real_run = subprocess.run',
+            'def stub(command, **kwargs):',
+            '    return real_run([' + repr(sys.executable) + ', "-c", ' + repr(child) + '], **kwargs)',
+            's.subprocess.run = stub',
+            'print(s.claude_runner("haiku", ' + repr('Crops:\n' + json.dumps([{'path': str(root / 'crop.jpg')}])) + ', ' + repr(str(root)) + '))',
+        ])
+        proc = subprocess.Popen([sys.executable, '-c', parent], cwd=Path(labeller.__file__).parent,
+                                start_new_session=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            deadline = time.monotonic() + 5
+            while not ready.exists() and proc.poll() is None and time.monotonic() < deadline:
+                time.sleep(.01)
+            assert ready.exists(), 'stub child did not start'
+            os.killpg(proc.pid, signal.SIGINT)
+            stdout, stderr = proc.communicate(timeout=5)
+            assert proc.returncode == 0 and 'survived' in stdout, 'terminal Ctrl-C must leave paid model process running: ' + stderr
+        finally:
+            if proc.poll() is None:
+                os.killpg(proc.pid, signal.SIGKILL)
+                proc.communicate(timeout=5)
+
+
 def main():
+    review_terminal_process_group()
+    review_empty_values_warning()
+    review_signal_seams()
+    review_cli_isolation()
+    review_current_batch_interrupt()
+    review_interrupt()
+    review_parser()
+    review_malformed()
     atomic_publication_checks()
     ollama_main_checks()
     claude_cli_checks()

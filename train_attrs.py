@@ -3,7 +3,7 @@
 
     python train_attrs.py          # build crops, train, report
     python train_attrs.py check    # build crops and count them only
-    python train_attrs.py noexternal  # train without external make datasets
+    python train_attrs.py external  # opt in to external make datasets
     python train_attrs.py all      # baseline: include the reference frames (first model only)
 
 One mobilenet backbone with a linear head per attribute (spec:
@@ -26,8 +26,9 @@ ROOT = Path(__file__).resolve().parent
 DATASET = (ROOT / "dataset").resolve()
 APPROVED = DATASET / "approved"
 RUNS = DATASET / "attr_runs"
-BASELINE = "all" in sys.argv[1:]      # see build()
-NOEXTERNAL = "noexternal" in sys.argv[1:]
+ARGS = set(sys.argv[1:])
+BASELINE = "all" in ARGS      # see build()
+EXTERNAL = "external" in ARGS
 SOURCES = {}
 
 INPUT = 224               # mobilenet's native size
@@ -99,6 +100,7 @@ def merged_attrs(human, row, bbox):
 def build(heads):
     """-> (crops, targets, stems, classes); -1 = unlabelled. SOURCES counts contributors."""
     names = list(heads)
+    cnames = class_names()
     SOURCES.clear()
     SOURCES.update(human=0, ai=0, archive=0, external={})
     ai = ai_labels()
@@ -148,7 +150,7 @@ def build(heads):
             if not 0 <= i < len(boxes) or not isinstance(human, dict):
                 skipped += 1          # sidecar written against a different label file
                 continue
-            a, filled = merged_attrs(human, ai.get(sid, {}).get(i), boxes[i][1:5])
+            a, filled = merged_attrs(human, None if is_validation(sid) else ai.get(sid, {}).get(i), boxes[i][1:5])
             t = [heads[n].index(a[n]) if a.get(n) in heads[n] else -1 for n in names]
             crop = crop_box(img, boxes[i][1:5])
             if crop is None or all(v < 0 for v in t):
@@ -169,7 +171,7 @@ def build(heads):
                     continue
                 if s["source_sid"] in current_sids:
                     continue
-                a, filled = merged_attrs(s["attrs"], ai.get(s["source_sid"], {}).get(s["box_index"]), s["bbox"])
+                a, filled = merged_attrs(s["attrs"], None if is_validation(s["source_sid"]) else ai.get(s["source_sid"], {}).get(s["box_index"]), s["bbox"])
                 t = [heads[n].index(a[n]) if a.get(n) in heads[n] else -1 for n in names]
                 if all(v < 0 for v in t):
                     continue
@@ -180,9 +182,8 @@ def build(heads):
                 SOURCES["archive"] += 1
                 SOURCES["human"] += any(s["attrs"].get(n) in heads[n] for n in names)
                 SOURCES["ai"] += any(filled.get(n) in heads[n] for n in names)
-                cnames = class_names()
                 classes.append(cnames.index(s["class_name"]) if s["class_name"] in cnames else -1)
-    if not NOEXTERNAL:
+    if EXTERNAL:
         for manifest in sorted((DATASET / "external" / "make").glob("*/manifest.jsonl")):
             source = manifest.parent
             SOURCES["external"][source.name] = 0
@@ -201,7 +202,6 @@ def build(heads):
                 with Image.open(image) as opened:
                     crop = opened.convert("RGB").resize((INPUT, INPUT))
                 t = [heads[n].index(row["make"]) if n == "make" else -1 for n in names]
-                cnames = class_names()
                 if "a-small" not in cnames:
                     raise ValueError("external make samples require a-small in classes.txt")
                 crops.append(crop)
@@ -369,11 +369,12 @@ def train(heads, crops, targets, stems, classes):
 if __name__ == "__main__":
     heads = vocab()
     crops, targets, stems, classes = build(heads)
-    if len(targets) < MIN_BOXES:
+    local_boxes = sum(not s.startswith("external-") for s in stems)
+    if local_boxes < MIN_BOXES:
         report_counts(heads, targets, stems) if targets else None
-        sys.exit(f"only {len(targets)} enriched boxes — attribute training needs at least "
+        sys.exit(f"only {local_boxes} local enriched boxes — attribute training needs at least "
                  f"{MIN_BOXES}. Tap boxes on the Label tab and set type/axles/cargo.")
-    if len(sys.argv) > 1 and sys.argv[1] == "check":
+    if "check" in ARGS:
         check(heads, crops, targets, stems)
     else:
         train(heads, crops, targets, stems, classes)

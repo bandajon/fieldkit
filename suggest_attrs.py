@@ -16,6 +16,7 @@ import json
 import math
 import os
 import signal
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -160,11 +161,15 @@ def todo(classes):
     return work
 
 
-def claude_runner(model, prompt):
+def claude_runner(model, prompt, cwd):
     return subprocess.run(
-        ["claude", "-p", "--model", model, "--allowedTools", "Read"],
+        ["claude", "-p", "--model", model, "--allowedTools", "Read",
+         "--setting-sources", "project", "--strict-mcp-config"],
         input=prompt, text=True, capture_output=True, check=True,
         timeout=TIMEOUT_S,
+        cwd=cwd,
+        **({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt"
+           else {"start_new_session": True}),
     ).stdout
 
 
@@ -178,15 +183,15 @@ def claude_answers(stdout, items, implies):
             rows, _ = decoder.raw_decode(stdout[start:])
         except ValueError:
             continue
-        if not isinstance(rows, list):
+        if not isinstance(rows, list) or not any(isinstance(row, dict) and "id" in row for row in rows):
             continue
         opts = {item["id"]: item["values"] for item in items}
         answers, seen = {}, set()
         for row in rows:
             if not isinstance(row, dict):
                 continue
-            key = row.get("id")
-            if not isinstance(key, str) or key not in opts:
+            key = str(row.get("id"))
+            if key not in opts:
                 continue
             if key in seen:
                 answers.pop(key, None)
@@ -201,8 +206,13 @@ def ai_entries():
     entries = {}
     for path in sorted((DATASET / "ai-attrs").glob("*.jsonl")):
         for line in path.read_text().splitlines():
-            row = json.loads(line)
-            entries[(row["sid"], row["box"])] = row
+            try:
+                row = json.loads(line)
+                if (isinstance(row, dict) and isinstance(row.get("sid"), str)
+                        and type(row.get("box")) is int and row["box"] >= 0):
+                    entries[(row["sid"], row["box"])] = row
+            except ValueError:
+                continue
     return entries
 
 
@@ -266,96 +276,112 @@ def run_claude(limit=None, runner=claude_runner):
     classes = [c.strip() for c in (DATASET / "classes.txt").read_text().splitlines() if c.strip()]
     work = claude_work(classes, heads, constraints, limit)
     began, done, skipped = time.monotonic(), 0, 0
-    rows = []
+    stopping = False
     print("Claude approved: colour + make, batches of 10" + (f", limit {limit}" if limit is not None else ""))
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        while batch := list(islice(work, 10)):
-            with tempfile.TemporaryDirectory(prefix="fieldkit-claude-") as tmp:
-                items, metadata = [], {}
-                with dataset_retention.DATASET_LOCK:
-                    policy = dataset_retention.cached_policy(DATASET)
-                    for n, (item, jpeg) in enumerate(batch):
-                        if policy and dataset_retention.expired(item["sid"], policy):
-                            skipped += 1
-                            continue
-                        key = str(n)
-                        path = Path(tmp) / f"{n}.jpg"
-                        path.write_bytes(jpeg)
-                        items.append({"id": key, "path": str(path.resolve()),
-                                      "class": item["class"], "values": item["values"]})
-                        metadata[key] = item
-                if not items:
-                    continue
-                prompt = (
-                    "Label the largest central vehicle in each crop from a Zambian toll-gate camera. "
-                    "Use only the supplied vocabulary for each head. Colour is the CAB colour for "
-                    "trucks/tractors, main body colour otherwise. For buses, make is the visible "
-                    "body builder (Marcopolo, Higer, Yutong, Irizar, Zhongtong), else the chassis make. "
-                    "Use unknown when it genuinely cannot be read; do not guess. "
-                    "Return a JSON list of objects with id, colour and make. Use the exact supplied id.\n"
-                    "Crops:\n" + json.dumps(items)
-                )
-                futures = {m: pool.submit(runner, m, prompt) for m in ("haiku", "sonnet")}
-                answers = {}
-                for model, future in futures.items():
-                    try:
-                        answers[model] = claude_answers(future.result(), items, implies)
-                    except Exception as exc:
-                        print(f"  {model} failed: {exc}", flush=True)
-                        answers[model] = {}
-                with dataset_retention.DATASET_LOCK:
-                    policy = dataset_retention.cached_policy(DATASET)
-                    entries = ai_entries()
-                    for key, item in metadata.items():
-                        stem, index = item["sid"], item["box"]
-                        tree = DATASET / "approved"
-                        if policy and dataset_retention.expired(stem, policy):
-                            skipped += 1
-                            continue
-                        label = tree / "labels" / f"{stem}.txt"
-                        if not label.exists() or label.read_text().splitlines()[index:index + 1] != [item["line"]]:
-                            skipped += 1
-                            continue
-                        attrs = answers["sonnet"].get(key, {})
-                        attrs = {h: v for h, v in attrs.items()
-                                 if answers["haiku"].get(key, {}).get(h) == v}
-                        human = load_json(tree / "attrs" / f"{stem}.json").get(str(index), {})
-                        attrs = {h: v for h, v in attrs.items() if h not in human}
-                        if not attrs or entries.get((stem, index), {}).get("bbox") == item["bbox"]:
-                            skipped += 1
-                            continue
-                        row = {"sid": stem, "box": index, "bbox": item["bbox"], "attrs": attrs,
-                               "models": ["haiku", "sonnet"], "at": datetime.now(timezone.utc).isoformat()}
-                        rows.append(row)
-                        done += 1
-            rate = (done + skipped) / max(time.monotonic() - began, 1e-6)
-            print(f"  {done} done, {skipped} skipped, {rate * 60:.1f}/min", flush=True)
-    if rows:
-        with dataset_retention.DATASET_LOCK:
-            policy = dataset_retention.cached_policy(DATASET)
-            retained = [row for row in rows if not policy or not dataset_retention.expired(row["sid"], policy)]
-            skipped += len(rows) - len(retained)
-            done -= len(rows) - len(retained)
-            rows = retained
-            if rows:
-                directory = DATASET / "ai-attrs"
-                directory.mkdir(parents=True, exist_ok=True)
-                run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-                with tempfile.NamedTemporaryFile(mode="w", dir=DATASET, prefix=f".{run_id}-",
-                                                 suffix=".tmp", delete=False) as ledger:
-                    tmp = Path(ledger.name)
-                    try:
-                        ledger.writelines(json.dumps(row) + "\n" for row in rows)
-                    except BaseException:
-                        tmp.unlink(missing_ok=True)
-                        raise
-                try:
-                    dest = directory / (tmp.stem[1:] + ".jsonl")
-                    if dest.exists():
-                        raise FileExistsError(dest)
-                    os.replace(tmp, dest)
-                finally:
-                    tmp.unlink(missing_ok=True)
+    def stop_after_batch(*_):
+        nonlocal stopping
+        stopping = True
+
+    previous = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}
+    try:
+        for sig in previous:
+            signal.signal(sig, stop_after_batch)
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            while not stopping and (batch := list(islice(work, 10))):
+                rows = []
+                with tempfile.TemporaryDirectory(prefix="fieldkit-claude-") as tmp:
+                    items, metadata = [], {}
+                    with dataset_retention.DATASET_LOCK:
+                        policy = dataset_retention.cached_policy(DATASET)
+                        for n, (item, jpeg) in enumerate(batch):
+                            if policy and dataset_retention.expired(item["sid"], policy):
+                                skipped += 1
+                                continue
+                            key = str(n)
+                            path = Path(tmp) / f"{n}.jpg"
+                            path.write_bytes(jpeg)
+                            items.append({"id": key, "path": str(path.resolve()),
+                                          "class": item["class"], "values": item["values"]})
+                            metadata[key] = item
+                    if not items:
+                        continue
+                    prompt = (
+                        "Label the largest central vehicle in each crop from a Zambian toll-gate camera. "
+                        "Use only the supplied vocabulary for each head. Colour is the CAB colour for "
+                        "trucks/tractors, main body colour otherwise. For buses, make is the visible "
+                        "body builder (Marcopolo, Higer, Yutong, Irizar, Zhongtong), else the chassis make. "
+                        "Use unknown when it genuinely cannot be read; do not guess. "
+                        "Return a JSON list of objects with id, colour and make. Use the exact supplied id.\n"
+                        "Crops:\n" + json.dumps(items)
+                    )
+                    futures = {m: pool.submit(runner, m, prompt, tmp) for m in ("haiku", "sonnet")}
+                    answers, failures = {}, []
+                    for model, future in futures.items():
+                        try:
+                            while True:
+                                try:
+                                    output = future.result()
+                                    break
+                                except KeyboardInterrupt:
+                                    stopping = True
+                                    if future.done() and isinstance(future.exception(), KeyboardInterrupt):
+                                        output = ""
+                                        break
+                            answers[model] = claude_answers(output, items, implies)
+                        except Exception as exc:
+                            failures.append(f"{model}: {exc}")
+                            answers[model] = {}
+                    if failures or not any(attrs for answer in answers.values() for attrs in answer.values()):
+                        print("  Claude warning: " + ("; ".join(failures) or "no usable answer"), flush=True)
+                    with dataset_retention.DATASET_LOCK:
+                        policy = dataset_retention.cached_policy(DATASET)
+                        entries = ai_entries()
+                        for key, item in metadata.items():
+                            stem, index = item["sid"], item["box"]
+                            tree = DATASET / "approved"
+                            if policy and dataset_retention.expired(stem, policy):
+                                skipped += 1
+                                continue
+                            label = tree / "labels" / f"{stem}.txt"
+                            if not label.exists() or label.read_text().splitlines()[index:index + 1] != [item["line"]]:
+                                skipped += 1
+                                continue
+                            attrs = answers["sonnet"].get(key, {})
+                            attrs = {h: v for h, v in attrs.items()
+                                     if answers["haiku"].get(key, {}).get(h) == v}
+                            human = load_json(tree / "attrs" / f"{stem}.json").get(str(index), {})
+                            attrs = {h: v for h, v in attrs.items() if h not in human}
+                            if not attrs or entries.get((stem, index), {}).get("bbox") == item["bbox"]:
+                                skipped += 1
+                                continue
+                            row = {"sid": stem, "box": index, "bbox": item["bbox"], "attrs": attrs,
+                                   "models": ["haiku", "sonnet"], "at": datetime.now(timezone.utc).isoformat()}
+                            rows.append(row)
+                            done += 1
+                        if rows:
+                            directory = DATASET / "ai-attrs"
+                            directory.mkdir(parents=True, exist_ok=True)
+                            run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+                            with tempfile.NamedTemporaryFile(mode="w", dir=DATASET, prefix=f".{run_id}-",
+                                                             suffix=".tmp", delete=False) as ledger:
+                                tmp = Path(ledger.name)
+                                try:
+                                    ledger.writelines(json.dumps(row) + "\n" for row in rows)
+                                except BaseException:
+                                    tmp.unlink(missing_ok=True)
+                                    raise
+                            try:
+                                dest = directory / (tmp.stem[1:] + ".jsonl")
+                                if dest.exists():
+                                    raise FileExistsError(dest)
+                                os.replace(tmp, dest)
+                            finally:
+                                tmp.unlink(missing_ok=True)
+                rate = (done + skipped) / max(time.monotonic() - began, 1e-6)
+                print(f"  {done} done, {skipped} skipped, {rate * 60:.1f}/min", flush=True)
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
     print(f"{done} suggested, {skipped} skipped in {(time.monotonic() - began) / 60:.1f} min")
 
 
@@ -366,6 +392,8 @@ def main():
         args = parser.parse_args(sys.argv[2:])
         if args.limit is not None and args.limit < 0:
             parser.error("--limit must be nonnegative")
+        if shutil.which("claude") is None:
+            parser.exit(1, "Claude executable not found on PATH; install it before running Claude labelling.\n")
         run_claude(args.limit)
         return
     heads, constraints, implies = vocab()
