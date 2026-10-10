@@ -70,6 +70,7 @@ WORKS_PLANT_HITS = 20  # a plant (e-plant) track this solid means works are on t
 WORKS_WINDOW = 900.0   # s: a plant track covers [t0 - this, t1 + this], its whole stay and this much either side
 WORKS_PLANT_TRACKS = 3  # works need this many solid plant tracks in the window (a lone one can be a passing roller)...
 WORKS_PLANT_LONG = 150  # ...or one this long (a roller that sat in view): 7 Oct morning max 11 hits, 9 Oct noon 62 tracks of 20+
+WORKS_RESCUE_HITS = 20  # a chain works mode rescues needs this many hits: 9 Oct hand counts, 5 hits over-counted 14:00 (+5.9%), 20 gives 12:00 -5.7%, 14:00 +2.3%, combined -1.5% (under preferred)
 MIN_EDGE_HITS = 5    # ~1 s at 5 fps: a zone crossing alone must last this long; night glare blips don't
 
 
@@ -598,10 +599,10 @@ def _build(tracklets, cameras, tz=None, events=None, with_dropped=False, plant=N
         plant = [(t["t0"], t["t1"], t["hits"]) for t in tracklets if t.get("class") == "e-plant"]
     plant = [p for p in plant if p[2] >= WORKS_PLANT_HITS]
 
-    def works(c):    # plant never rescues itself, and a rescued chain needs substance (not a blip)
+    def works(c):    # plant never rescues itself, and a rescued chain needs substance (WORKS_RESCUE_HITS)
         ms = c["members"]
         if 2 * sum(t["hits"] for t in ms if t.get("class") == "e-plant") > sum(t["hits"] for t in ms) \
-                or sum(t["hits"] for t in ms) < MIN_EDGE_HITS:
+                or sum(t["hits"] for t in ms) < WORKS_RESCUE_HITS:
             return False
         t = min(m["t0"] for m in ms)
         near = [p for p in plant if p[0] - WORKS_WINDOW <= t <= p[1] + WORKS_WINDOW]
@@ -915,16 +916,17 @@ def _selfcheck():
     # chains the filter drops; plant never rescues itself, a blip is no rescue, a long stay covers its length.
     pln = lambda i, t0, hits, t1=None, cls="e-plant": _t("cam3", 90 + i, cls, [(t0, _b(.5, .5)), (t1 or t0 + 1, _b(.5, .6))], hits=hits)
     three = lambda t0, hits=25: [pln(i, t0 - i, hits) for i in range(3)]
-    nd = dict(nd, hits=5)
+    nd = dict(nd, hits=25)
     kept = lambda ts, cams=_CAMS: any(nd["id"] in [m["id"] for m in j["members"]] for j in build([nd] + ts, cams))
     assert not kept([]) and kept(three(-200.0))
     assert not kept(three(-200.0, 10)) and not kept(three(-1900.0))
     assert not kept([pln(0, -200.0, 25)]) and not kept(three(-200.0)[:2]), "one or two plant tracks are a passing roller"
     assert kept([pln(0, -200.0, 150)]) and not kept([pln(0, -200.0, 149)])
     assert not kept([pln(0, -1900.0, 200)]) and kept([pln(0, -1900.0, 200, t1=-100.0)]), "stay covers t1 + W"
+    edge = dict(edge, hits=25)
     assert build([edge], nolone) == [] and len(build([edge] + three(-200.0), nolone)) == 1
-    blip = dict(nd, hits=3)
-    assert build([blip] + three(-200.0), _CAMS) == [], "a 3-hit blip is not rescued"
+    thin = dict(nd, hits=15)
+    assert build([thin] + three(-200.0), _CAMS) == [], "a 15-hit chain is not rescued"
     pc = _t("cam3", 1, "e-plant", [(100, _b(0.5, 0.2)), (101, _b(0.5, 0.4))], counted=True, hits=30)
     assert build([pc] + three(-200.0), _CAMS) == [], "an e-plant chain is not rescued by its own presence"
     assert len(build([nd], _CAMS, plant=[(-200.0, -199.0, 150)])) == 1, "plant passed in (frozen tracklets) counts"
