@@ -1,23 +1,31 @@
 #!/usr/bin/env python3
-"""Pre-fill attribute suggestions for pending samples with a LOCAL vision model.
+"""Pre-fill pending suggestions locally, or opt in to Claude colour/make labelling.
 
     python suggest_attrs.py          # ask gemma about every un-suggested heavy box
     python suggest_attrs.py check    # count what would be asked, no requests
+    python suggest_attrs.py claude [--limit N]
 
-Writes dataset/pending/suggest/<id>.json in the attrs-sidecar shape. Suggestions
-are never a record: the Label tab shows them, the operator's tap is what gets
-saved. Re-runnable — anything already suggested or already labelled is skipped.
+Pending frames get colour/make from curators in the Label tab (heads come from attributes.yaml).
+Claude writes immutable dataset/ai-attrs/<UTC run id>.jsonl records.
 """
 
 import base64
+import argparse
 import io
 import json
+import math
+import os
 import signal
+import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+from itertools import islice
 
 # Background launches (nohup/&) have SIGINT ignored at the OS level, so Ctrl-C-grace
 # must also answer SIGTERM: plain `kill` finishes the current sample and stops.
@@ -152,7 +160,214 @@ def todo(classes):
     return work
 
 
+def claude_runner(model, prompt):
+    return subprocess.run(
+        ["claude", "-p", "--model", model, "--allowedTools", "Read"],
+        input=prompt, text=True, capture_output=True, check=True,
+        timeout=TIMEOUT_S,
+    ).stdout
+
+
+def claude_answers(stdout, items, implies):
+    """Extract the JSON list from CLI prose; bind answers only to supplied IDs."""
+    decoder = json.JSONDecoder()
+    for start, char in enumerate(stdout):
+        if char != "[":
+            continue
+        try:
+            rows, _ = decoder.raw_decode(stdout[start:])
+        except ValueError:
+            continue
+        if not isinstance(rows, list):
+            continue
+        opts = {item["id"]: item["values"] for item in items}
+        answers, seen = {}, set()
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            key = row.get("id")
+            if not isinstance(key, str) or key not in opts:
+                continue
+            if key in seen:
+                answers.pop(key, None)
+                continue
+            seen.add(key)
+            answers[key] = clean(row, opts[key], implies)
+        return answers
+    raise ValueError("Claude returned no JSON list")
+
+
+def ai_entries():
+    entries = {}
+    for path in sorted((DATASET / "ai-attrs").glob("*.jsonl")):
+        for line in path.read_text().splitlines():
+            row = json.loads(line)
+            entries[(row["sid"], row["box"])] = row
+    return entries
+
+
+def claude_work(classes, heads, constraints, limit):
+    import dataset_retention
+    tree = DATASET / "approved"
+    with dataset_retention.DATASET_LOCK:
+        entries = ai_entries()
+    count = 0
+    for label in sorted((tree / "labels").glob("*.txt")):
+        if limit is not None and count >= limit:
+            return
+        stem = label.stem
+        with dataset_retention.DATASET_LOCK:
+            policy = dataset_retention.cached_policy(DATASET)
+            if policy and dataset_retention.expired(stem, policy):
+                continue
+            human = load_json(tree / "attrs" / f"{stem}.json")
+            try:
+                lines = label.read_text().splitlines()
+                with Image.open(tree / "images" / f"{stem}.jpg") as source:
+                    img = source.convert("RGB")
+            except OSError:
+                continue
+        for i, line in enumerate(lines):
+            if limit is not None and count >= limit:
+                return
+            fields = line.split()
+            if len(fields) != 5 or not fields[0].isdigit() or int(fields[0]) >= len(classes):
+                continue
+            cls = classes[int(fields[0])]
+            if cls in ("a-motorcycle", "e-plant"):
+                continue
+            try:
+                box = [float(v) for v in fields[1:]]
+            except ValueError:
+                continue
+            if not all(math.isfinite(v) for v in box) or box[2] * img.width < 90 or box[3] * img.height < 60:
+                continue
+            key = str(i)
+            labelled = human.get(key, {})
+            if all(h in labelled for h in ("colour", "make")):
+                continue
+            if entries.get((stem, i), {}).get("bbox") == box:
+                continue
+            opts = {h: v for h, v in allowed(cls, heads, constraints).items()
+                    if h in ("colour", "make") and h not in labelled}
+            if not opts:
+                continue
+            jpeg = crop_jpeg(img, box)
+            if jpeg is not None:
+                count += 1
+                yield {"sid": stem, "box": i, "bbox": box, "line": line,
+                       "class": cls, "values": opts}, jpeg
+
+
+def run_claude(limit=None, runner=claude_runner):
+    # Opt-in: Claude crops leave the machine; the Ollama mode stays local-only.
+    import dataset_retention
+    heads, constraints, implies = vocab()
+    classes = [c.strip() for c in (DATASET / "classes.txt").read_text().splitlines() if c.strip()]
+    work = claude_work(classes, heads, constraints, limit)
+    began, done, skipped = time.monotonic(), 0, 0
+    rows = []
+    print("Claude approved: colour + make, batches of 10" + (f", limit {limit}" if limit is not None else ""))
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        while batch := list(islice(work, 10)):
+            with tempfile.TemporaryDirectory(prefix="fieldkit-claude-") as tmp:
+                items, metadata = [], {}
+                with dataset_retention.DATASET_LOCK:
+                    policy = dataset_retention.cached_policy(DATASET)
+                    for n, (item, jpeg) in enumerate(batch):
+                        if policy and dataset_retention.expired(item["sid"], policy):
+                            skipped += 1
+                            continue
+                        key = str(n)
+                        path = Path(tmp) / f"{n}.jpg"
+                        path.write_bytes(jpeg)
+                        items.append({"id": key, "path": str(path.resolve()),
+                                      "class": item["class"], "values": item["values"]})
+                        metadata[key] = item
+                if not items:
+                    continue
+                prompt = (
+                    "Label the largest central vehicle in each crop from a Zambian toll-gate camera. "
+                    "Use only the supplied vocabulary for each head. Colour is the CAB colour for "
+                    "trucks/tractors, main body colour otherwise. For buses, make is the visible "
+                    "body builder (Marcopolo, Higer, Yutong, Irizar, Zhongtong), else the chassis make. "
+                    "Use unknown when it genuinely cannot be read; do not guess. "
+                    "Return a JSON list of objects with id, colour and make. Use the exact supplied id.\n"
+                    "Crops:\n" + json.dumps(items)
+                )
+                futures = {m: pool.submit(runner, m, prompt) for m in ("haiku", "sonnet")}
+                answers = {}
+                for model, future in futures.items():
+                    try:
+                        answers[model] = claude_answers(future.result(), items, implies)
+                    except Exception as exc:
+                        print(f"  {model} failed: {exc}", flush=True)
+                        answers[model] = {}
+                with dataset_retention.DATASET_LOCK:
+                    policy = dataset_retention.cached_policy(DATASET)
+                    entries = ai_entries()
+                    for key, item in metadata.items():
+                        stem, index = item["sid"], item["box"]
+                        tree = DATASET / "approved"
+                        if policy and dataset_retention.expired(stem, policy):
+                            skipped += 1
+                            continue
+                        label = tree / "labels" / f"{stem}.txt"
+                        if not label.exists() or label.read_text().splitlines()[index:index + 1] != [item["line"]]:
+                            skipped += 1
+                            continue
+                        attrs = answers["sonnet"].get(key, {})
+                        attrs = {h: v for h, v in attrs.items()
+                                 if answers["haiku"].get(key, {}).get(h) == v}
+                        human = load_json(tree / "attrs" / f"{stem}.json").get(str(index), {})
+                        attrs = {h: v for h, v in attrs.items() if h not in human}
+                        if not attrs or entries.get((stem, index), {}).get("bbox") == item["bbox"]:
+                            skipped += 1
+                            continue
+                        row = {"sid": stem, "box": index, "bbox": item["bbox"], "attrs": attrs,
+                               "models": ["haiku", "sonnet"], "at": datetime.now(timezone.utc).isoformat()}
+                        rows.append(row)
+                        done += 1
+            rate = (done + skipped) / max(time.monotonic() - began, 1e-6)
+            print(f"  {done} done, {skipped} skipped, {rate * 60:.1f}/min", flush=True)
+    if rows:
+        with dataset_retention.DATASET_LOCK:
+            policy = dataset_retention.cached_policy(DATASET)
+            retained = [row for row in rows if not policy or not dataset_retention.expired(row["sid"], policy)]
+            skipped += len(rows) - len(retained)
+            done -= len(rows) - len(retained)
+            rows = retained
+            if rows:
+                directory = DATASET / "ai-attrs"
+                directory.mkdir(parents=True, exist_ok=True)
+                run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+                with tempfile.NamedTemporaryFile(mode="w", dir=DATASET, prefix=f".{run_id}-",
+                                                 suffix=".tmp", delete=False) as ledger:
+                    tmp = Path(ledger.name)
+                    try:
+                        ledger.writelines(json.dumps(row) + "\n" for row in rows)
+                    except BaseException:
+                        tmp.unlink(missing_ok=True)
+                        raise
+                try:
+                    dest = directory / (tmp.stem[1:] + ".jsonl")
+                    if dest.exists():
+                        raise FileExistsError(dest)
+                    os.replace(tmp, dest)
+                finally:
+                    tmp.unlink(missing_ok=True)
+    print(f"{done} suggested, {skipped} skipped in {(time.monotonic() - began) / 60:.1f} min")
+
+
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "claude":
+        parser = argparse.ArgumentParser(description="Opt-in Claude colour/make labeller")
+        parser.add_argument("--limit", type=int)
+        args = parser.parse_args(sys.argv[2:])
+        if args.limit is not None and args.limit < 0:
+            parser.error("--limit must be nonnegative")
+        run_claude(args.limit)
+        return
     heads, constraints, implies = vocab()
     classes = [c.strip() for c in (DATASET / "classes.txt").read_text().splitlines() if c.strip()]
     work = todo(classes)
