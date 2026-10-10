@@ -925,8 +925,8 @@ def _selfcheck():
     assert not kept([pln(0, -1900.0, 200)]) and kept([pln(0, -1900.0, 200, t1=-100.0)]), "stay covers t1 + W"
     edge = dict(edge, hits=25)
     assert build([edge], nolone) == [] and len(build([edge] + three(-200.0), nolone)) == 1
-    thin = dict(nd, hits=15)
-    assert build([thin] + three(-200.0), _CAMS) == [], "a 15-hit chain is not rescued"
+    thin = dict(nd, hits=19)
+    assert build([thin] + three(-200.0), _CAMS) == [], "a 19-hit chain is not rescued"
     pc = _t("cam3", 1, "e-plant", [(100, _b(0.5, 0.2)), (101, _b(0.5, 0.4))], counted=True, hits=30)
     assert build([pc] + three(-200.0), _CAMS) == [], "an e-plant chain is not rescued by its own presence"
     assert len(build([nd], _CAMS, plant=[(-200.0, -199.0, 150)])) == 1, "plant passed in (frozen tracklets) counts"

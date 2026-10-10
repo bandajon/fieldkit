@@ -2202,7 +2202,7 @@ def journeys_check():
     def plant_t(i):
         return json.dumps({"id": f"obs-plant-{i}", "camera": "cam3", "t0": BASE + i, "t1": BASE + i + 1, "hits": 25,
                            "class": "e-plant", "counted": False, "path": [], "votes": {}, "conf": {}}).encode() + b"\n"
-    lone = tracklet("cam3", [(300 + k, 0.5, 0.2 + 0.05 * k) for k in range(5)]).replace(
+    lone = tracklet("cam3", [(300 + k, 0.5, 0.2 + 0.03 * k) for k in range(20)]).replace(
         b'"direction": "northbound"', b'"direction": null').replace(b"obs-cam3", b"obs-lone")
     wobjs = {day + "w.jsonl": lone + b"".join(plant_t(i) for i in range(3))}
     frozen_plant = json.dumps({"id": "jny-plant", "ts": datetime.fromtimestamp(BASE, timezone.utc).isoformat(),
