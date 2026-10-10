@@ -289,6 +289,7 @@ def attr_classifier(path, dev="cpu"):
 
 
 _APP_WARNED = False
+_GROUND_WARNED = set()
 
 
 def _app_off(why):
@@ -822,6 +823,7 @@ class Reader:
     def __init__(self, url):
         self.url = url
         self.frame = None
+        self.frame_time = None
         self.seq = 0
         self.proc = None
         self.lock = threading.Lock()
@@ -831,7 +833,7 @@ class Reader:
 
     def latest(self):
         with self.lock:
-            return self.frame, self.seq
+            return self.frame, self.seq, self.frame_time
 
     def stop(self):
         self.stopping.set()
@@ -872,6 +874,9 @@ class Reader:
             if start >= 0:
                 with self.lock:
                     self.frame = buf[start:end + 2]
+                    # shortcut: pipe/decimation jitter is ~one interval (0.2 s at 5 fps);
+                    # use ffmpeg frame timestamps if known-speed passes exceed this error.
+                    self.frame_time = time.monotonic()
                     self.seq += 1
             buf = buf[end + 2:] if end > 0 else buf[-MAX_BUF:]
 
@@ -1183,7 +1188,7 @@ class Detector:
             for name, reader in list(self.readers.items()):
                 if self.stopping.is_set():
                     break
-                jpeg, seq = reader.latest()
+                jpeg, seq, frame_time = reader.latest()
                 if not jpeg or seq == seen_seq.get(name):
                     continue              # nothing new since the last pass
                 seen_seq[name] = seq
@@ -1191,7 +1196,7 @@ class Detector:
                 try:
                     img = Image.open(io.BytesIO(jpeg)).convert("RGB")
                     dets = track(name, img)
-                    shown = self._track(name, dets, img)  # voted labels, ready to draw
+                    shown = self._track(name, dets, img, frame_time=frame_time)  # voted labels, ready to draw
                     shot = annotate(img, shown)
                 except Exception as e:    # a truncated frame must not kill the thread
                     self._set("running", str(e))
@@ -1225,7 +1230,7 @@ class Detector:
         self._save(closing)      # the closing day's final word, before anyone counts again
         self._prune_events()
 
-    def _track(self, name, dets, img=None):
+    def _track(self, name, dets, img=None, frame_time=None):
         """Count by ByteTrack id, one count per id, into its majority class.
         Returns [(voted label, conf, box)] for drawing — the raw per-frame class is
         exactly what flickers when a car passes a truck.
@@ -1239,7 +1244,7 @@ class Detector:
         cross unseen. Upgrade path: per-camera fps tuning, or the Hailo backend so
         inference stops competing with the recorder for CPU.
         """
-        now, wall = self.clock(), self.wall()
+        now, wall = self.clock() if frame_time is None else frame_time, self.wall()
         shown = []
         wheels = [d for d in dets if not is_vehicle(d[0])]
         dets = [d for d in dets if is_vehicle(d[0])]
@@ -1250,6 +1255,9 @@ class Detector:
             ids = self.tracks.setdefault(name, {})
             cam = self._cam(name)
             ground_key, ground = ground_of(cam, with_key=True) or (None, None)
+            if "ground" in cam and ground is None and name not in _GROUND_WARNED:
+                _GROUND_WARNED.add(name)
+                print(f"  ! {name}: invalid ground calibration — speed off")
             live = []
             shown += [(self.display.get(c, c), cf, b) for c, cf, b, _t in wheels]
             for i, (cls, conf, box, tid) in enumerate(dets):
@@ -1795,8 +1803,12 @@ if __name__ == "__main__":
     # Frame splitting: two frames in one read keep only the newest, no partial frame.
     r = object.__new__(Reader)
     r.frame, r.seq, r.lock, r.stopping = None, 0, threading.Lock(), threading.Event()
+    before = time.monotonic()
     r._pump(io.BytesIO(SOI + b"one" + EOI + SOI + b"two" + EOI + SOI + b"half"))
-    assert r.latest() == (SOI + b"two" + EOI, 1), r.latest()
+    after = time.monotonic()
+    frame, seq, frame_time = r.latest()
+    assert (frame, seq) == (SOI + b"two" + EOI, 1), r.latest()
+    assert before <= frame_time <= after, frame_time
 
     # Sub-stream URL only, with creds_fn overriding the camera dict and quoting applied.
     u = Detector([], nosnap, {}, creds_fn=lambda ip: ("ad@min", "p@ss"))._url(CAM)
@@ -2010,10 +2022,12 @@ if __name__ == "__main__":
         class FakeReader:
             def __init__(self):
                 self.n = 0
+                self.timestamps = []
 
             def latest(self):
                 self.n += 1
-                return stream[0], self.n
+                self.timestamps.append(time.monotonic() - 10)
+                return stream[0], self.n, self.timestamps[-1]
 
             def stop(self):
                 pass
@@ -2055,6 +2069,8 @@ if __name__ == "__main__":
             time.sleep(0.5)               # frames keep coming; CAPTURE_EVERY gates the rest
             assert len(list((tmp / "pending" / "images").glob("*.jpg"))) == 1
 
+            with d.lock:
+                assert d.tracks["c"][1]["last_seen"] in d.readers["c"].timestamps, "live loop must use Reader time"
             d.set_cameras([])             # removal must stick against the in-flight pass
             time.sleep(0.5)
             assert d.frames == {} and d.counts()["visible"] == {}, d.frames
@@ -2440,6 +2456,27 @@ if __name__ == "__main__":
         for image in ([[0.1, 0.8], [0.9, 0.8], [0.5, 0.7], [0.3, 0.55]],
                       [GROUND["image"][i] for i in (0, 2, 1, 3)]):
             assert ground_of({"ground": {**GROUND, "image": image}}) is None, "quad must be convex and simple"
+
+        concave = [[0.1, 0.8], [0.9, 0.8], [0.5, 0.7], [0.3, 0.55]]
+        assert ground_of({"ground": {"image": concave,
+                                     "metres": [[x * 100, y * 100] for x, y in concave]}}) is None, "independent convexity guard"
+        assert ground_of({"ground": {**GROUND, "metres": [[0, 0], [14, 0], [28, 0], [42, 0]]}}) is None, "independent SVD rank guard"
+        with patch("builtins.print") as warning:
+            for _ in range(2):
+                invalid = Detector([{**TRAVEL, "name": "bad-ground-check", "ground": {}}], nosnap, {})
+                for _ in range(2):
+                    invalid._track("bad-ground-check", [])
+            assert warning.call_count == 1, "warn once per camera across offline segments"
+            assert "bad-ground-check" in warning.call_args.args[0] and "speed off" in warning.call_args.args[0]
+
+        # Reader times must drive speed even when inference's clock is frozen.
+        timed = Detector([TRAVEL], nosnap, {})
+        timed.clock = lambda: 9999.0
+        for frame_time, metres in ((1000.0, 40), (1001.5, 15)):
+            bottom = 200 * (32 + 0.3 * metres) / (40 + metres)
+            timed._track("c", [("truck", 0.9, (130.0, bottom - 20, 170.0, bottom), 1)],
+                         Image.new("RGB", (300, 200)), frame_time=frame_time)
+        assert timed._speed(timed.tracks["c"][1], TRAVEL) == 60.0, "1.5 seconds of frame time gives 60 km/h"
 
         # A config save must not mix endpoints from different metre origins.
         parked = Detector([TRAVEL], nosnap, {})

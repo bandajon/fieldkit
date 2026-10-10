@@ -25,7 +25,9 @@ cameras:                 # cameras recorded directly over RTSP
     # lone_edge: false  # with a handoff zone: don't count lone journeys that only crossed the zone and
     #                  # were never counted by the line (a queue's tail crawling in it). Default: true.
     # ground: {image: [[0.10,0.80],[0.90,0.80],[0.70,0.55],[0.30,0.55]], metres: [[0,0],[14,0],[14,40],[0,40]]}
-    # Four points on the road surface: image as frame fractions, metres as real ground positions; enables speed_kph.
+    # Four road points in perimeter order (not a Z), with the same order in both lists.
+    # image: normalized frame fractions, y down from the top; metres: real ground positions.
+    # Enables speed_kph; rejected calibration prints one warning per camera and leaves speed off.
 
 site: site1              # this node's site name; recordings land in <record_dir>/<site>/<cam>/
 # The RDA toll gate this node sits at. Local disk stays keyed by `site` above — this is the
