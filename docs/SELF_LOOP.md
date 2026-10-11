@@ -48,10 +48,10 @@ prints the list it is hunting. Scene dedup and the pending cap still apply to wa
 classes, a wanted class is captured at most once per `RARE_EVERY` (5 s) per camera so a
 rolling bus is a few samples rather than one a second, and rare frames use a 1 s id
 bucket instead of the 10 s one so they cannot overwrite each other. The classify pass
-carries the widest net — it decodes every mirrored segment, so it sees all 48 h of
-footage rather than the slice a sampling pass lands on — and pushes what it captures,
-attribute suggestions included, to the queue. It is slow, though — it tracks every
-frame — so `python selfloop.py hunt` (every 10 min, `HUNT_PER_PASS` segments a pass)
+decodes mirrored segments across the last 48 h and publishes vehicle events and
+tracklets; it does not capture dataset frames or push them to the curation queue.
+`CLASSIFY_WORKERS` in `selfloop.py` sets concurrent spawned classifiers (default 2).
+Classify tracks every frame, so `python selfloop.py hunt` (every 10 min, `HUNT_PER_PASS` segments a pass)
 sweeps the last `HUNT_HOURS` (48) of footage newest first at the ingest rate and keeps
 *only* wanted-class frames: a two-day backlog clears in hours, and after that the newest
 bus or plant frame in the queue is never more than a pass or two old. Only a class that

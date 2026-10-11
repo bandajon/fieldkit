@@ -34,6 +34,8 @@ import hashlib
 import json
 import os
 import shutil
+import signal
+import contextlib
 import subprocess
 import sys
 import threading
@@ -78,6 +80,9 @@ TZ = "Africa/Lusaka"          # the gates and this machine; segment names are lo
 WANT_BOXES = 300      # per-class floor for the next run; under it, a class is hunted
 HUNT_TOP = 6          # ...but only the thinnest few at once: with most classes under the
                       # floor a hunt kept every frame with a vehicle in it (400 per segment)
+CLASSIFY_SHUTDOWN_GRACE_S = 120
+CLASSIFY_POOL_RECREATIONS = 2
+CLASSIFY_WORKERS = 2          # spawned processes: torch/MPS must never inherit a fork
 CLASSIFY_PER_PASS = 12        # ~10 min of footage per camera per pass, at 600 s segments
 CLASSIFY_HOURS = 48           # what the gates keep mirrored: one backlog may span this;
                               # older gaps are a backfill job, not this pass's problem
@@ -640,10 +645,10 @@ class Lock:
         os.close(self.fd)            # ...and this releases the flock
 
 
-def r2():
+def r2(download_timeout=None):
     import dataset_sync
     o = dataset_sync.creds()
-    return dataset_sync, dataset_sync.client(o), o["bucket"]
+    return dataset_sync, dataset_sync.client(o, download_timeout=download_timeout), o["bucket"]
 
 
 def recording_keys(cl, bucket):
@@ -1307,6 +1312,97 @@ def journeys_pass(cl, bucket, touched, cameras, tz, keys=(), classified=(), sinc
     return total, still_open, checked_days
 
 
+def _classify_worker_init():
+    # ffmpeg inherits this group, so even an abruptly dead worker leaves killable children.
+    os.setsid()
+
+
+def _classify_job(*args, **kwargs):
+    import detect
+    out = Path(args[4])
+    (out / "worker.pid").write_text(str(os.getpid()))
+    return detect.classify_segment(*args, **kwargs)
+
+
+def _stop_classify_pool(pool):
+    # Python 3.10 has no public terminate_workers; retain handles before shutdown clears them.
+    processes = list((getattr(pool, "_processes", None) or {}).values())
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        for process in processes:
+            try:
+                os.killpg(process.pid, sig)
+            except PermissionError:
+                # A macOS group may contain helpers we do not own; kill its owned members.
+                rows = subprocess.run(["ps", "-axo", "pid=,pgid=,uid=,stat="],
+                                      capture_output=True, text=True, timeout=2).stdout.splitlines()
+                for row in rows:
+                    pid, group, uid, status = row.split()
+                    if group == str(process.pid) and uid == str(os.getuid()) and not status.startswith("Z"):
+                        try:
+                            os.kill(int(pid), sig)
+                        except ProcessLookupError:
+                            pass
+            except ProcessLookupError:
+                if process.is_alive():
+                    process.kill() if sig == signal.SIGKILL else process.terminate()
+        for process in processes:
+            process.join(timeout=0.1 if sig == signal.SIGTERM else 5)
+    pool.shutdown(wait=False, cancel_futures=True)
+
+
+@contextlib.contextmanager
+def _classify_resources():
+    import concurrent.futures
+    import multiprocessing
+    from multiprocessing.connection import wait as wait_processes
+    stop = threading.Event()
+    # ponytail: parent publish/journeys have no total deadline (as on main); launchd
+    # ExitTimeOut SIGKILLs the job's process group, bounding a launchd stop.
+    previous = signal.signal(signal.SIGTERM, lambda *args: stop.set())
+    def fetch(fn, *args):
+        future = concurrent.futures.Future()
+        def run():
+            if future.set_running_or_notify_cancel():
+                try:
+                    result = fn(*args)
+                except BaseException as e:
+                    future.set_exception(e)
+                else:
+                    future.set_result(result)
+        # ponytail: a late transfer can outlive the pass by at most its own remaining transfer
+        # (each request read-timeout bounded); use process-isolated downloads if that ever matters.
+        threading.Thread(target=run, name="classify-download", daemon=True).start()
+        return future
+    pools = []
+    def new_pool():
+        pool = concurrent.futures.ProcessPoolExecutor(max_workers=CLASSIFY_WORKERS,
+            mp_context=multiprocessing.get_context("spawn"), initializer=_classify_worker_init)
+        pools.append(pool)
+        if hasattr(pool, "_start_executor_manager_thread"):
+            # Capture the culprit before ProcessPoolExecutor terminates healthy peers.
+            pool._classify_dead_pids = set()
+            pool._launch_processes()
+            pool._start_executor_manager_thread()
+            manager = pool._executor_manager_thread
+            method = "_terminate_broken" if hasattr(manager, "_terminate_broken") else "terminate_broken"
+            terminate_broken = getattr(manager, method)
+            def remember_dead(cause):
+                processes = list(manager.processes.values())
+                ready = wait_processes([p.sentinel for p in processes], timeout=1)
+                pool._classify_dead_pids.update(p.pid for p in processes if p.sentinel in ready)
+                terminate_broken(cause)
+            setattr(manager, method, remember_dead)
+        return pool
+    try:
+        yield fetch, new_pool, stop
+    finally:
+        try:
+            for pool in pools:
+                _stop_classify_pool(pool)
+        finally:
+            signal.signal(signal.SIGTERM, previous)
+
+
 def classify_pass():
     """Vehicle events from the footage the gates mirror to the bucket.
 
@@ -1325,13 +1421,16 @@ def classify_pass():
     if not CHAMPION.is_file():
         print(f"{now()} classify: no detector at {CHAMPION} — nothing to classify", flush=True)
         return
-    with Lock(), concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+    from concurrent.futures.process import BrokenProcessPool
+    with Lock(), _classify_resources() as (fetch, new_pool, stop):
+        pool = new_pool()
+        recreations = 0
         s = load_state()
         why = appearance_stale()
         if why:
             alert("appearance_off", next(iter(GATES.values())),
                   f"  ! appearance off: {why} — refits after the next train pass")
-        ds, cl, bucket = r2()
+        ds, cl, bucket = r2(download_timeout=min(30, CLASSIFY_SHUTDOWN_GRACE_S))
         base, tz = ingest_video.config(), ZoneInfo(TZ)
         # hunt is the curation sweep; classify only counts — no capture_wanted/dataset_dir,
         # so detect.Detector's _dataset_init skips capture and this pass never captures
@@ -1340,6 +1439,9 @@ def classify_pass():
         s["classify_floor"] = since
         save_state(s)
         VIDEOS.mkdir(parents=True, exist_ok=True)
+        # Create it before spawn so two first-time workers cannot read a partial write.
+        if not detect.TRACKER_CFG.exists():
+            detect.TRACKER_CFG.write_text(detect.TRACKER_YAML)
         # cam_and_start parses a segment's stem in the HOST's own local tz, not Lusaka's —
         # every horizon computed from a segment start is wrong if this machine isn't set to
         # Africa/Lusaka (+02:00, no DST). Loud, not fatal: the office Mac IS that host today.
@@ -1349,7 +1451,7 @@ def classify_pass():
                   f"will be computed in the wrong clock", flush=True)
 
         def download(key):
-            dest = local_path(key)
+            dest = download_root / key
             dest.parent.mkdir(parents=True, exist_ok=True)
             cl.download_file(bucket, key, str(dest))
             return dest
@@ -1403,8 +1505,10 @@ def classify_pass():
 
         deadline = time.monotonic() + CLASSIFY_BUDGET
         expired = False
+        download_root = Path(tempfile.mkdtemp(prefix="classify-", dir=VIDEOS))
+        downloads, running = {}, {}
         try:
-            while not expired:
+            while not expired and not stop.is_set():
                 keys = list(recording_keys(cl, bucket))   # re-listed each round: picks up arrivals
                 all_todo = pick_classify(keys, s.get("classified", []), since, per_pass=None)
                 stuck = len(failed & set(all_todo))
@@ -1416,99 +1520,174 @@ def classify_pass():
                 if not todo:
                     break
                 print(f"{now()} classify: {len(todo)} segment(s), {left} left in the window", flush=True)
-                # Downloads run ~85-90s of a ~210s segment over the office link: the next
-                # segment's download overlaps this one's detection instead of stalling after it.
-                pending = pool.submit(download, todo[0])
-                for i, key in enumerate(todo):
-                    if time.monotonic() > deadline:
-                        # Checked per segment, not per round: a round is ~12 segments, and the
-                        # budget must not run 45 min over its own limit. The in-flight prefetch
-                        # is awaited and discarded rather than left downloaded on disk.
-                        try:
-                            pending.result().unlink(missing_ok=True)
-                        except Exception:
-                            pass
+                downloads, running = {}, {}
+                remaining = iter(todo)
+
+                def prefetch():
+                    while len(downloads) < CLASSIFY_WORKERS:
+                        key = next(remaining, None)
+                        if key is None:
+                            break
+                        downloads[fetch(download, key)] = key
+
+                def cleanup(video, out=None):
+                    video.unlink(missing_ok=True)
+                    if out is not None:
+                        shutil.rmtree(out, ignore_errors=True)
+
+                prefetch()
+                while downloads or running:
+                    if time.monotonic() > deadline or stop.is_set():
                         expired = True
                         break
-                    prefix, cam_name, seg = key.split("/")
-                    gate = gate_of(prefix)
-                    cfg = {**base, "detect_weights": str(CHAMPION), "toll_gate_id": gate}
-                    if ATTRS_CHAMPION.is_file():
-                        cfg["attr_weights"] = str(ATTRS_CHAMPION)
-                    if PLATE.is_file():
-                        cfg["plate_weights"] = str(PLATE)
-                    # Heading rides on the camera's config entry; without one there is no
-                    # direction on these events, which is right — it is never guessed.
-                    cam = next((c for c in (base.get("cameras") or []) if c.get("name") == cam_name),
-                               {"name": cam_name})
-                    print(f"  v {key}", flush=True)
-                    try:
-                        video = pending.result()
-                    except Exception as e:       # a download failure is this segment's error
-                        failed.add(key)
-                        print(f"  ! {key}: {e}", flush=True)
-                        video = None
-                    # Submitted regardless of this segment's outcome: the next download must
-                    # not wait on this one's detection, or the overlap is lost to a failure.
-                    if i + 1 < len(todo):
-                        pending = pool.submit(download, todo[i + 1])
-                    if video is None:
-                        continue
-                    out = clip = None
-                    try:
-                        out = Path(tempfile.mkdtemp())
-                        # Only footage recent enough to still matter as a "live view" is worth
-                        # the encode time — a backlog must classify at full speed regardless.
-                        seg_start = ingest_video.cam_and_start(video)[1]
-                        live = seg_start > time.time() - LIVE_HOURS * 3600
-                        clip = out / "annotated.mp4" if live else None
-                        t0 = time.monotonic()
-                        # The recorder's own filename is the footage clock: keep it, or
-                        # cam_and_start falls back to mtime and every event is stamped
-                        # with the download.
-                        day, _, render_ok = detect.classify_segment(video, cam, cfg, tz, out, source_key=key,
-                                                                    render_to=clip, gate=gate)
-                        classify_s = time.monotonic() - t0 if live else 0
-                        n = publish(cl, bucket, out, gate, key, day)
-                        new_days = {(gate, js.stem) for js in (out / "tracklets").glob("*.jsonl")}
-                        touched |= new_days
-                        open_days |= new_days
-                        classified_now.add(key)
-                        # Recorded only once published: a segment that died mid-pass is retried
-                        # next tick rather than lost, and re-running it rewrites the same keys.
-                        # open_days saved in the SAME call, not only after journeys_pass succeeds
-                        # later: a crash between here and there must not lose track of a day that
-                        # now has provisional journeys to revisit.
-                        s["classified"] = (s.get("classified", []) + [key])[-REMEMBER_CLASSIFIED:]
-                        s["open_days"] = sorted(list(p) for p in open_days)
-                        save_state(s)
-                        done, events = done + 1, events + n
-                        # The clip is a bonus, uploaded only once the segment itself is safely
-                        # classified: a failed upload must never fail (or retry) the segment.
-                        if render_ok:
-                            try:
-                                cl.upload_file(str(clip), bucket,
-                                               f"{ANNOTATED}{gate}/{cam_name}/{Path(key).stem}.mp4",
-                                               ExtraArgs={"ContentType": "video/mp4"})
-                                rendered.add((gate, cam_name))
-                            except Exception as e:
-                                print(f"  ! annotated upload {key}: {e}", flush=True)
-                        print(f"    {n} event(s) -> {EVENTS}{gate}/{day.replace('-', '')}/"
-                              + (f" ({classify_s:.0f}s classify incl. render)" if live else ""), flush=True)
-                    except Exception as e:       # one bad segment must not strand the rest
-                        failed.add(key)
-                        print(f"  ! {key}: {e}", flush=True)
-                    finally:
-                        video.unlink(missing_ok=True)   # never leave a prefetched file behind
-                        if out is not None:
-                            shutil.rmtree(out, ignore_errors=True)
-                # Not every round — journeys_pass re-reads whole days, so calling it on
-                # every ~12-segment round multiplied that cost for no benefit. But not only
-                # in `finally` either: with CLASSIFY_BUDGET at 3h, that alone could leave the
-                # RDA dashboard up to 3h stale when it should lag by tens of minutes.
-                if time.monotonic() - last_journeys >= JOURNEYS_EVERY_S:
-                    run_journeys()
+                    # Publish completed segments in the parent; failed workers never
+                    # own state, and every other completed segment still gets its turn.
+                    completed, _ = concurrent.futures.wait(
+                        list(running) + ([next(iter(downloads))] if downloads and len(running) < CLASSIFY_WORKERS else []),
+                        timeout=0.25, return_when=concurrent.futures.FIRST_COMPLETED)
+                    broken = False
+                    for future in completed & running.keys():
+                        if time.monotonic() > deadline or stop.is_set():
+                            expired = True
+                            break
+                        key, video, out, clip, live, t0 = running[future]
+                        try:
+                            result = future.result()
+                        except BrokenProcessPool:
+                            broken = True
+                            break
+                        except Exception as e:
+                            failed.add(key)
+                            print(f"  ! {key}: {e}", flush=True)
+                            running.pop(future)
+                            cleanup(video, out)
+                            continue
+                        running.pop(future)
+                        (out / "worker.pid").unlink(missing_ok=True)
+                        prefix, cam_name, seg = key.split("/")
+                        gate = gate_of(prefix)
+                        try:
+                            day, _, render_ok = result
+                            classify_s = time.monotonic() - t0 if live else 0
+                            n = publish(cl, bucket, out, gate, key, day)
+                            new_days = {(gate, js.stem) for js in (out / "tracklets").glob("*.jsonl")}
+                            touched |= new_days
+                            open_days |= new_days
+                            classified_now.add(key)
+                            # Only published segments are checkpointed, together with
+                            # the days whose journeys now need revisiting.
+                            s["classified"] = (s.get("classified", []) + [key])[-REMEMBER_CLASSIFIED:]
+                            s["open_days"] = sorted(list(p) for p in open_days)
+                            save_state(s)
+                            done, events = done + 1, events + n
+                            if render_ok:
+                                try:
+                                    cl.upload_file(str(clip), bucket,
+                                                   f"{ANNOTATED}{gate}/{cam_name}/{Path(key).stem}.mp4",
+                                                   ExtraArgs={"ContentType": "video/mp4"})
+                                    rendered.add((gate, cam_name))
+                                except Exception as e:
+                                    print(f"  ! annotated upload {key}: {e}", flush=True)
+                            print(f"    {n} event(s) -> {EVENTS}{gate}/{day.replace('-', '')}/"
+                                  + (f" ({classify_s:.0f}s classify incl. render)" if live else ""), flush=True)
+                        except Exception as e:
+                            failed.add(key)
+                            print(f"  ! {key}: {e}", flush=True)
+                        finally:
+                            cleanup(video, out)
+                    if expired:
+                        break
+                    if broken:
+                        # Broken futures are signalled before the manager reaps workers.
+                        manager = getattr(pool, "_executor_manager_thread", None)
+                        if manager is not None:
+                            manager.join(timeout=1)
+                        dead = pool._classify_dead_pids
+                        retry = {}
+                        for key, video, out, *_ in running.values():
+                            marker = out / "worker.pid"
+                            if marker.exists() and int(marker.read_text()) in dead:
+                                failed.add(key)
+                                print(f"  ! {key}: worker died", flush=True)
+                            else:
+                                future = concurrent.futures.Future()
+                                future.set_result(video)
+                                retry[future] = key
+                        _stop_classify_pool(pool)
+                        for key, video, out, *_ in running.values():
+                            if key not in failed:
+                                shutil.rmtree(out, ignore_errors=True)
+                            else:
+                                cleanup(video, out)
+                        running.clear()
+                        downloads = {**retry, **downloads}  # interrupted live jobs keep priority
+                        if recreations >= CLASSIFY_POOL_RECREATIONS:
+                            print("  ! classify pool recovery exhausted", flush=True)
+                            expired = True
+                            break
+                        recreations += 1
+                        try:
+                            pool = new_pool()
+                        except Exception as e:
+                            print(f"  ! classify pool recovery: {e}", flush=True)
+                            expired = True
+                            break
+                    for future in list(downloads):
+                        if len(running) >= CLASSIFY_WORKERS or time.monotonic() > deadline or stop.is_set():
+                            break
+                        if not future.done():
+                            break   # preserve live-lane priority despite download completion order
+                        key = downloads.pop(future)
+                        video, out = download_root / key, None
+                        try:
+                            video = future.result()
+                            prefix, cam_name, seg = key.split("/")
+                            gate = gate_of(prefix)
+                            cfg = {**base, "detect_weights": str(CHAMPION), "toll_gate_id": gate}
+                            if ATTRS_CHAMPION.is_file():
+                                cfg["attr_weights"] = str(ATTRS_CHAMPION)
+                            if PLATE.is_file():
+                                cfg["plate_weights"] = str(PLATE)
+                            cam = next((c for c in (base.get("cameras") or []) if c.get("name") == cam_name),
+                                       {"name": cam_name})
+                            out = Path(tempfile.mkdtemp())
+                            seg_start = ingest_video.cam_and_start(video)[1]
+                            live = seg_start > time.time() - LIVE_HOURS * 3600
+                            clip = out / "annotated.mp4" if live else None
+                            print(f"  v {key}", flush=True)
+                            t0 = time.monotonic()
+                            job = pool.submit(_classify_job, video, cam, cfg, tz, out,
+                                              source_key=key, render_to=clip, gate=gate)
+                            running[job] = key, video, out, clip, live, t0
+                        except BrokenProcessPool:
+                            # Keep the undispatched segment queued; recovery runs next iteration.
+                            job = concurrent.futures.Future()
+                            job.set_exception(BrokenProcessPool())
+                            running[job] = key, video, out, clip, live, t0
+                            break
+                        except Exception as e:
+                            failed.add(key)
+                            print(f"  ! {key}: {e}", flush=True)
+                            cleanup(video, out)
+                    # Keep journeys/health current even while both classifiers run.
+                    if time.monotonic() - last_journeys >= JOURNEYS_EVERY_S:
+                        run_journeys()
+                    if time.monotonic() <= deadline and not stop.is_set():
+                        prefetch()
         finally:
+            # One shared grace, never one unbounded result()/executor exit per job.
+            pending = list(downloads) + list(running)
+            pending = [future for future in pending if not future.cancel()]
+            if pending:
+                concurrent.futures.wait(pending, timeout=CLASSIFY_SHUTDOWN_GRACE_S)
+            _stop_classify_pool(pool)
+            for future, key in downloads.items():
+                cleanup(download_root / key)
+                # Late files can reappear temporarily; completion removes them again.
+                future.add_done_callback(lambda f: shutil.rmtree(download_root, ignore_errors=True))
+            for _, video, out, *_ in running.values():
+                cleanup(video, out)
+            shutil.rmtree(download_root, ignore_errors=True)
             # Always once more here: touched/open_days accumulate round by round precisely
             # so a crash or an uncaught exception in the loop still gets a chance to freeze
             # what's already classified, instead of losing it until the next pass notices.
@@ -2332,6 +2511,313 @@ def journeys_check():
         ("both midnight siblings freeze once", finals)
 
 
+def classify_parallel_check():
+    """Exercise the pass without models, storage, or production state."""
+    import concurrent.futures
+    import contextlib
+    import tempfile
+    from unittest.mock import patch
+    import detect
+    import ingest_video
+
+    me = sys.modules[__name__]
+    import boto3
+    import dataset_sync
+    credentials = dict(account_id="mock", access_key_id="mock", secret_access_key="mock", bucket="b")
+    with patch.object(dataset_sync, "creds", return_value=credentials), \
+         patch.object(boto3, "client") as make_client:
+        assert r2(download_timeout=30)[1] is make_client.return_value
+        config = make_client.call_args.kwargs["config"]
+        assert config.connect_timeout == config.read_timeout == 30
+        assert config.request_checksum_calculation == config.response_checksum_validation == "when_required"
+        make_client.assert_called_once()
+    real_threads = concurrent.futures.ThreadPoolExecutor
+    for scenario in ("failure", "publish_failure", "deadline", "deadline_running", "download_failure", "priority"):
+        with tempfile.TemporaryDirectory() as td, contextlib.ExitStack() as stack:
+            root = Path(td)
+            model = root / "champion.pt"
+            model.touch()
+            keys = [f"site1/cam3/20261011-11000{i}.mkv" for i in range(3)]
+            state, published, saves, active = {}, [], [], [0, 0]
+            entered = threading.Event()
+            journeys_observed = threading.Event()
+            first_started = threading.Event()
+            guard = threading.Lock()
+            outputs, started, dispatched, journeys_during = [], [], [], []
+
+            class Storage:
+                def download_file(self, bucket, key, dest, **kw):
+                    Path(dest).write_bytes(b"video")
+                    if scenario == "download_failure" and key == keys[0]:
+                        raise OSError("partial download")
+                    if scenario == "deadline" or (scenario == "priority" and key == keys[0]):
+                        time.sleep(0.08)
+                def upload_file(self, *a, **kw):
+                    raise OSError("bonus clip upload")
+
+            def classify(video, cam, cfg, tz, out, **kw):
+                assert "capture_wanted" not in cfg and "dataset_dir" not in cfg
+                assert kw["render_to"] == out / "annotated.mp4"
+                outputs.append(out)
+                if scenario == "priority" and kw["source_key"] != keys[0]:
+                    assert first_started.wait(2), "first dispatched classifier did not enter"
+                with guard:
+                    started.append(kw["source_key"])
+                    first_started.set()
+                    active[0] += 1
+                    active[1] = max(active)
+                    if active[0] == 2:
+                        entered.set()
+                try:
+                    assert entered.wait(2), "two segments must classify concurrently"
+                    if scenario == "deadline_running":
+                        time.sleep(0.08)
+                    else:
+                        assert journeys_observed.wait(2), "journeys did not observe an active classifier"
+                    if scenario == "failure" and kw["source_key"] == keys[0]:
+                        raise ValueError("bad segment")
+                    (out / "tracklets").mkdir()
+                    (out / "tracklets" / "2026-10-11.jsonl").write_text("{}\n")
+                    return "2026-10-11", 0, True
+                finally:
+                    with guard:
+                        active[0] -= 1
+
+            def journeys(*args):
+                with guard:
+                    journeys_during.append(active[0])
+                    if active[0]:
+                        journeys_observed.set()
+                return 0, set(), set()
+
+            def publish(cl, bucket, out, gate, key, day):
+                if scenario == "publish_failure" and key == keys[0]:
+                    raise OSError("publish failed")
+                published.append(key)
+                return 1
+
+            def save(s):
+                assert set(s.get("classified", [])) <= set(published), "state preceded publication"
+                saves.append(json.loads(json.dumps(s)))
+
+            def workers(max_workers, mp_context, initializer):
+                assert mp_context.get_start_method() == "spawn", "MPS workers must use spawn"
+                executor = real_threads(max_workers=max_workers)
+                submit = executor.submit
+                def dispatch(fn, *args, **kw):
+                    dispatched.append(kw["source_key"])
+                    return submit(fn, *args, **kw)
+                executor.submit = dispatch
+                return executor
+
+            replacements = {
+                "Lock": contextlib.nullcontext, "CHAMPION": model,
+                "ATTRS_CHAMPION": root / "absent", "PLATE": root / "absent",
+                "VIDEOS": root / "videos", "load_state": lambda: state,
+                "save_state": save,
+                "appearance_stale": lambda: None, "r2": lambda **kw: (None, Storage(), "b"),
+                "recording_keys": lambda *a: keys, "published_manifests": lambda *a: set(),
+                "classify_since": lambda *a: "20261011-000000",
+                "publish": publish, "publish_health": lambda *a: None,
+                "coverage_manifests": lambda *a: {}, "prune_annotated": lambda *a: None,
+                "live_lane": lambda keys, classified, since, at, failed: [
+                    k for k in keys if k not in classified and k not in failed],
+                "journeys_pass": journeys,
+                "CLASSIFY_BUDGET": 0.02 if scenario == "deadline" else (0.04 if scenario == "deadline_running" else 10),
+                "JOURNEYS_EVERY_S": 0, "ALERTS": [],
+            }
+            for name, value in replacements.items():
+                stack.enter_context(patch.object(me, name, value))
+            stack.enter_context(patch.object(concurrent.futures, "ProcessPoolExecutor", side_effect=workers))
+            stack.enter_context(patch.object(detect, "classify_segment", classify))
+            stack.enter_context(patch.object(detect, "TRACKER_CFG", root / "tracker.yaml"))
+            stack.enter_context(patch.object(ingest_video, "config", return_value={"cameras": [{"name": "cam3"}]}))
+            stack.enter_context(patch.object(ingest_video, "cam_and_start", return_value=("cam3", time.time())))
+            classify_pass()
+            expected = [] if scenario.startswith("deadline") else (keys if scenario == "priority" else keys[1:])
+            assert set(published) == set(expected), (scenario, published)
+            assert set(state.get("classified", [])) == set(published), state
+            backlog = state["classify_backlog"]
+            assert backlog["failed"] == (0 if scenario.startswith("deadline") or scenario == "priority" else 1)
+            assert backlog["left"] == (3 if scenario.startswith("deadline") else 0)
+            assert not list((root / "videos").rglob("*.mkv")), "downloaded files leaked"
+            assert all(not out.exists() for out in outputs), "worker outputs leaked"
+            if scenario != "deadline":
+                assert active[1] == 2, active
+            if not scenario.startswith("deadline"):
+                assert any(s.get("open_days") for s in saves), "published day must be checkpointed"
+                assert any(journeys_during), "journeys cadence must run during active classification"
+            if scenario == "priority":
+                assert dispatched == keys, "live dispatch priority must survive out-of-order downloads"
+                assert started == keys, "live priority must survive out-of-order downloads"
+    # EPERM fallback must still kill owned children, while leaving foreign helpers alone.
+    from types import SimpleNamespace
+    uid = os.getuid()
+    rows = f"111 111 {uid} S\n112 111 {uid} S\n113 111 {uid + 1} S\n114 111 {uid} Z\n"
+    process = SimpleNamespace(pid=111, join=lambda **kw: None)
+    pool = SimpleNamespace(_processes={111: process}, shutdown=lambda **kw: None)
+    with patch.object(os, "killpg", side_effect=PermissionError), \
+         patch.object(subprocess, "run", return_value=SimpleNamespace(stdout=rows)), \
+         patch.object(os, "kill") as kill:
+        _stop_classify_pool(pool)
+        assert [(call.args) for call in kill.call_args_list] == [
+            (111, signal.SIGTERM), (112, signal.SIGTERM),
+            (111, signal.SIGKILL), (112, signal.SIGKILL)]
+    print("classify parallel self-check ok: concurrency, isolated failures, publish-only state, deadline cleanup, owned process-group fallback")
+
+
+def _spawn_check_job(video, cam, cfg, tz, out, **kw):
+    """Real process regression fixture; no models or storage."""
+    root = Path(cfg["check_root"])
+    (out / "worker.pid").write_text(str(os.getpid()))
+    key = kw["source_key"]
+    (root / (Path(key).stem + f".{os.getpid()}.started")).write_text(str(out))
+    (root / f"{os.getpid()}.worker-pid").touch()
+    if cfg["check_scenario"] == "signal_death" and key.endswith("110000.mkv"):
+        time.sleep(0.3)
+        os.kill(os.getpid(), signal.SIGTERM)
+    if cfg["check_scenario"] == "exhausted" or (cfg["check_scenario"] == "death" and key.endswith("110000.mkv")):
+        time.sleep(0.3)
+        os._exit(17)
+    if cfg["check_scenario"] in ("stuck", "term"):
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        (root / "child.pid").write_text(str(child.pid))
+        if cfg["check_scenario"] == "term":
+            os.kill(os.getppid(), signal.SIGTERM)
+        time.sleep(60)
+    time.sleep(0.5)
+    (out / "tracklets").mkdir()
+    (out / "tracklets" / "2026-10-11.jsonl").write_text("{}\n")
+    return "2026-10-11", 0, False
+
+
+def classify_spawn_check(scenario="death"):
+    """Exercise actual spawn, abrupt worker death and a stuck worker's child."""
+    import contextlib
+    import tempfile
+    from unittest.mock import patch
+    import detect
+    import ingest_video
+    with tempfile.TemporaryDirectory() as td, contextlib.ExitStack() as stack:
+        root = Path(td)
+        model = root / "champion.pt"
+        model.touch()
+        keys = [f"site1/cam3/20261011-11000{i}.mkv" for i in range(4)]
+        state, published = {}, []
+        downloads_started, finish_download = threading.Event(), threading.Event()
+        download_threads = []
+        journeys_called = []
+        def journeys(*args):
+            assert not list((root / "videos").rglob("*.mkv")), "journeys preceded file cleanup"
+            assert all(not Path(p.read_text()).exists() for p in root.glob("*.started"))
+            import fcntl
+            fd = os.open(root / "loop.lock", os.O_RDWR)
+            try:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    pass
+                else:
+                    raise AssertionError("lock released before final journeys")
+            finally:
+                os.close(fd)
+            journeys_called.append(True)
+            return 0, set(), set()
+        class Storage:
+            def download_file(self, bucket, key, dest, **kw):
+                Path(dest).write_bytes(b"video")
+                if scenario == "download":
+                    assert "Config" not in kw, "default multipart concurrency must be preserved"
+                    download_threads.append(threading.current_thread())
+                    downloads_started.set()
+                    assert finish_download.wait(5), "download fixture was not released"
+                    # Like a transfer's late rename/write, this can recreate a removed path.
+                    Path(dest).parent.mkdir(parents=True, exist_ok=True)
+                    Path(dest).write_bytes(b"late video")
+        replacements = {
+            "LOCK": root / "loop.lock", "CHAMPION": model,
+            "ATTRS_CHAMPION": root / "absent", "PLATE": root / "absent",
+            "VIDEOS": root / "videos", "load_state": lambda: state,
+            "save_state": lambda s: None, "appearance_stale": lambda: None,
+            "r2": lambda **kw: (None, Storage(), "b"), "recording_keys": lambda *a: keys,
+            "published_manifests": lambda *a: set(), "classify_since": lambda *a: "20261011-000000",
+            "publish": lambda cl, bucket, out, gate, key, day: published.append(key) or 1,
+            "publish_health": lambda *a: None, "coverage_manifests": lambda *a: {},
+            "live_lane": lambda *a: [], "journeys_pass": journeys,
+            "CLASSIFY_BUDGET": 10 if scenario in ("death", "signal_death", "exhausted") else (0.05 if scenario == "download" else 2),
+            "CLASSIFY_WORKERS": 2 if scenario in ("death", "signal_death") else 1, "ALERTS": [],
+        }
+        # Small real-process bounds; production uses a longer inference grace.
+        if hasattr(sys.modules[__name__], "CLASSIFY_SHUTDOWN_GRACE_S"):
+            replacements["CLASSIFY_SHUTDOWN_GRACE_S"] = 0.3
+        for name, value in replacements.items():
+            stack.enter_context(patch.object(sys.modules[__name__], name, value))
+        stack.enter_context(patch.object(detect, "classify_segment", _spawn_check_job))
+        stack.enter_context(patch.object(sys.modules[__name__], "_classify_job", _spawn_check_job))
+        stack.enter_context(patch.object(detect, "TRACKER_CFG", root / "tracker.yaml"))
+        stack.enter_context(patch.object(ingest_video, "config", return_value={
+            "check_root": str(root), "check_scenario": scenario}))
+        stack.enter_context(patch.object(ingest_video, "cam_and_start", return_value=("cam3", 0)))
+        previous_handler = signal.getsignal(signal.SIGTERM)
+        before = time.monotonic()
+        if scenario == "download":
+            try:
+                classify_pass()
+                elapsed = time.monotonic() - before
+                assert downloads_started.is_set(), "download never started"
+                assert elapsed < 1.5, ("download shutdown exceeded grace + slack", elapsed)
+                assert not any(t.is_alive() and not t.daemon for t in download_threads), "live non-daemon download thread"
+                assert not list((root / "videos").rglob("*.*")), "partial download leaked"
+                assert not (root / "loop.lock").read_text(), "lock holder leaked"
+                assert signal.getsignal(signal.SIGTERM) == previous_handler, "SIGTERM handler leaked"
+                assert journeys_called, "final journeys skipped"
+                assert not published and state["classify_backlog"]["failed"] == 0, state
+            finally:
+                finish_download.set()
+                for thread in download_threads:
+                    thread.join(timeout=2)
+            assert all(not t.is_alive() for t in download_threads), "released download did not finish"
+            assert not list((root / "videos").rglob("*.*")), "late download resurrected files"
+            print(f"classify spawn self-check ok: download, {elapsed:.2f}s; daemon fallback, late cleanup")
+            return
+        classify_pass()
+        assert signal.getsignal(signal.SIGTERM) == previous_handler, "SIGTERM handler leaked"
+        assert journeys_called, "final journeys skipped"
+        elapsed = time.monotonic() - before
+        if scenario in ("death", "signal_death"):
+            assert set(published) == set(keys[1:]), ("pool must recover", published)
+            assert state["classify_backlog"]["failed"] == 1, state
+        elif scenario == "exhausted":
+            assert not published, published
+            assert state["classify_backlog"]["failed"] == 3, state
+            assert state["classify_backlog"]["left"] == 1, "untouched work must remain retryable"
+        else:
+            assert elapsed < 5, ("shutdown exceeded grace + slack", elapsed)
+            assert not published and state["classify_backlog"]["failed"] == 0, state
+            child = int((root / "child.pid").read_text())
+            # Allow the OS reaper a short scheduling interval; no orphan, even a zombie.
+            reap_by = time.monotonic() + 1
+            while True:
+                status = subprocess.run(["ps", "-o", "stat=", "-p", str(child)],
+                                        capture_output=True, text=True).stdout.strip()
+                if not status or time.monotonic() >= reap_by:
+                    break
+                time.sleep(0.01)
+            assert not status, ("orphan child", child, status)
+        for pid_file in root.glob("*.worker-pid"):
+            pid = int(pid_file.stem)
+            status = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)],
+                                    capture_output=True, text=True).stdout.strip()
+            assert not status, ("worker was not reaped", pid, status)
+        assert state.get("classified", []) == published, state
+        assert not list((root / "videos").rglob("*.mkv")), "videos leaked"
+        assert all(not Path(p.read_text()).exists() for p in root.glob("*.started")), "outputs leaked"
+        assert not (root / "loop.lock").read_text(), "lock holder leaked"
+        with Lock(wait=0):
+            pass  # the flock must be available only after worker/file cleanup
+    print(f"classify spawn self-check ok: {scenario}, {elapsed:.2f}s")
+
+
 def selfcheck():
     from datetime import timedelta
     cams = [{"name": "cam3", "heading": "south", "handoff": {"camera": "cam4", "zone": []}},
@@ -2591,6 +3077,9 @@ def selfcheck():
     fresh = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y%m%d-%H%M%S")
     stale = (datetime.now(timezone.utc) - timedelta(days=ANNOTATED_KEEP_DAYS + 1)).strftime("%Y%m%d-%H%M%S")
     assert fresh >= cutoff and stale < cutoff, "the stems the prune keeps vs. drops"
+    classify_parallel_check()
+    for scenario in ("death", "signal_death", "stuck", "term", "exhausted", "download"):
+        classify_spawn_check(scenario)
     lock_check()
     publish_check()
     listing_check()
