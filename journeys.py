@@ -342,8 +342,7 @@ def _links(chains, cameras, tz=None):
     def z1(j):
         return chains[j]["z"][1] if chains[j]["arr"] is not None else chains[j]["late"]
 
-    def match(late, used, early=False):
-        """Ordinary, then late arrivals, then early departures; guesses never compete with zone links."""
+    def candidates(late, used, early=False):
         arrivals = {}
         for j, r in enumerate(chains):
             if id(r) in used or early and sum(t["hits"] for t in r["members"]) < MIN_EDGE_HITS:
@@ -379,6 +378,11 @@ def _links(chains, cameras, tz=None):
                             continue
                         t = abs(z0(j) - dep - MU) + CLASS_PEN * (d["class"] != r["class"])
                         cands.append((t, t + APP_PEN * (1 - (APP_TYPICAL if sim is None else sim)), i, j))
+        return cands
+
+    def match(late, used, early=False):
+        """Match unused chains per component, preferring appearance when it preserves the link count."""
+        cands = candidates(late, used, early)
 
         def greedy(cs, k):
             taken, out = set(), []
@@ -411,12 +415,39 @@ def _links(chains, cameras, tz=None):
         return links
 
     links = match(False, set())
+    ordinary_count = len(links)
     # Late chains never compete with ordinary arrivals: only departures still unlinked may take one.
     links += match(True, {id(c) for link in links for c in link})
     # 11 Oct pickup: lost 1.8 s before arrival; use the ordinary -LEAD..LAG start window.
     # Early pass deliberately skips the lone-chain evidence filter: requiring it costs abs +3 / over +2 on the hand-count gate.
     links += match(False, {id(c) for link in links for c in link}, early=True)
-    return links + _trucks(chains, links, pairs)
+    links += _trucks(chains, links, pairs)
+    used = {id(c) for link in links for c in link}
+    ta = lambda r: r["arr"] if r["arr"] is not None else r["late"]
+    # Swap ordinary links only into late arrivals unused by all passes; no matching follows.
+    for k in range(ordinary_count):
+        d, r = links[k]
+        sim = _similar(d["app"], r["app"])
+        if (d["class"] == r["class"] or sim is None or sim >= LATE_COS
+                or any(t.get("counted") or t.get("direction") for t in r["members"])):
+            continue
+        replacements = []
+        for c in candidates(True, used - {id(d)}):
+            L = chains[c[3]]
+            if chains[c[2]] is not d or L["class"] != d["class"]:
+                continue
+            if d["class"] in HEAVY and any(
+                    ((dd["dep"] if dd["dep"] is not None else dd["early"]) - d["dep"]) * (ta(aa) - ta(L)) < 0
+                    for dd, aa in links if dd["class"] in HEAVY and aa["class"] in HEAVY
+                    and (dd["camera"], aa["camera"]) == (d["camera"], L["camera"])):
+                continue
+            replacements.append(c)
+        if replacements:
+            *_, i, j = min(replacements, key=lambda c: (c[1], c[2], c[3]))
+            links[k] = (d, chains[j])
+            used.remove(id(r))
+            used.add(id(chains[j]))
+    return links
 
 
 def _trucks(chains, links, pairs):
@@ -892,7 +923,126 @@ def _selfcheck_review(case):
         assert j["attrs"] == {"axles": 7}, "photo-owning derived leg reads the raw event"
 
 
+def _selfcheck_late_priority(case):
+    # 11 Oct 11:40: a truck cab overlaps a minibus departure before its own late track locks.
+    def chain(cam, name, cls, look, hits, dep=None, arr=None, late=None):
+        return {"camera": cam, "class": cls, "app": (look, "m1"), "dep": dep, "arr": arr,
+                "late": late, "z": (dep - 1, dep) if dep is not None else (arr, arr),
+                "members": [{"id": name, "hits": hits}]}
+
+    if case == "truck_swap_crossing":
+        chains = [chain("cam3", "A", "e-heavy", (1, 0, 0), 88, dep=36100),
+                  chain("cam3", "B", "e-heavy", (0, 1, 0), 88, dep=36106),
+                  chain("cam4", "r", "b-light", (.3, 0, .91 ** .5), 88, arr=36100.5),
+                  chain("cam4", "R2", "e-heavy", (0, 1, 0), 88, arr=36101),
+                  chain("cam4", "U", "e-heavy", (1, 0, 0), 88, late=36108)]
+        links = {(d["members"][0]["id"], r["members"][0]["id"]) for d, r in _links(chains, _CAMS)}
+        assert links == {("A", "r"), ("B", "R2")}, ("truck swap crossing", links)
+        return
+
+    if case == "truck_swap_protection":
+        chains = [chain("cam3", "A", "e-heavy", (1, 0, 0), 88, dep=36100),
+                  chain("cam3", "B", "e-heavy", (.8, .6, 0), 88, dep=36095),
+                  chain("cam4", "r", "b-light", (.3, -.4, .75 ** .5), 88, arr=36100.5),
+                  chain("cam4", "U", "e-heavy", (1, 0, 0), 88, late=36108)]
+        links = {(d["members"][0]["id"], r["members"][0]["id"]) for d, r in _links(chains, _CAMS)}
+        assert links == {("A", "r"), ("B", "U")}, ("truck swap protection", links)
+        return
+
+    if case == "early_swap_protection":
+        chains = [chain("cam3", "A", "b-minibuses", (1, 0, 0), 88, dep=36100),
+                  dict(chain("cam3", "E", "b-light", (.3, .91 ** .5, 0), 88), early=36100),
+                  chain("cam4", "r", "b-light", (.3, .91 ** .5, 0), 88, arr=36100.5),
+                  chain("cam4", "b", "b-light", (0, .6 / .91 ** .5, (1 - .36 / .91) ** .5), 88, arr=36101),
+                  chain("cam4", "U", "b-minibuses", (1, 0, 0), 88, late=36108)]
+        links = {(d["members"][0]["id"], r["members"][0]["id"]) for d, r in _links(chains, _CAMS)}
+        # E keeps its baseline link; only A swaps its weak cross-class link to unused U, releasing r.
+        assert links == {("A", "U"), ("E", "b")}, ("early swap protection", links)
+        return
+
+    if case == "shared_late":
+        chains = [chain("cam3", "A", "b-minibuses", (1, 0, 0, 0), 88, dep=100),
+                  chain("cam3", "B", "b-minibuses", (0, 1, 0, 0), 88, dep=101),
+                  chain("cam4", "a", "b-light", (.3, 0, .91 ** .5, 0), 21, arr=100.4),
+                  chain("cam4", "b", "b-light", (0, .3, 0, .91 ** .5), 21, arr=101.4),
+                  chain("cam4", "late", "b-minibuses", (.6, .8, 0, 0), 176, late=104)]
+        links = {(d["members"][0]["id"], r["members"][0]["id"]) for d, r in _links(chains, _CAMS)}
+        # A is first in ordinary assignment order and takes late; B keeps its ordinary link.
+        assert links == {("A", "late"), ("B", "b")}, ("shared late arrival", links)
+        return
+
+    if case == "uncontested_replacement":
+        chains = [chain("cam3", "A", "b-minibuses", (1, 0, 0), 88, dep=36100),
+                  chain("cam3", "B", "b-minibuses", (0, 1, 0), 88, dep=36101),
+                  chain("cam4", "a", "b-light", (.3, 0, .91 ** .5), 88, arr=36100.5),
+                  chain("cam4", "U", "b-minibuses", (.6, 0, .8), 88, late=36110),
+                  chain("cam4", "S", "b-minibuses", (.8, .6, 0), 88, late=36101)]
+        links = {(d["members"][0]["id"], r["members"][0]["id"]) for d, r in _links(chains, _CAMS)}
+        # B keeps S from the late pass; A swaps its ordinary arrival for unused U.
+        assert links == {("A", "U"), ("B", "S")}, ("uncontested replacement before shared late", links)
+        return
+
+    if case == "shared_late_three":
+        chains = [chain("cam3", "A", "b-minibuses", (1, 0, 0, 0), 88, dep=36100),
+                  chain("cam3", "B", "b-minibuses", (0, 1, 0, 0), 88, dep=36101),
+                  chain("cam3", "C", "b-light", (0, 0, 1, 0), 88, dep=36101),
+                  chain("cam4", "a", "b-light", (.3, 0, .25, .8475 ** .5), 88, arr=36100.5),
+                  chain("cam4", "b", "b-light", (0, .3, 0, .91 ** .5), 88, arr=36101.5),
+                  chain("cam4", "L", "b-minibuses", (.5, .6, .6, .03 ** .5), 88, late=36104)]
+        links = {(d["members"][0]["id"], r["members"][0]["id"]) for d, r in _links(chains, _CAMS)}
+        # C already uses L after the late pass, so both ordinary links stay intact.
+        assert links == {("A", "a"), ("B", "b"), ("C", "L")}, ("three departures share late arrival", links)
+        return
+
+    if case == "ordinary_count_protection":
+        chains = [chain("cam3", "A", "b-light", (1, 0, 0), 88, dep=36100),
+                  chain("cam3", "B", "b-light", (0, 1, 0), 88, dep=36101),
+                  chain("cam4", "a", "b-light", (.3, .65, .4875 ** .5), 88, arr=36100.5),
+                  chain("cam4", "b", "b-minibuses", (0, .3, .91 ** .5), 88, arr=36102),
+                  chain("cam4", "U", "b-light", (0, .6, .8), 88, late=36100)]
+        links = {(d["members"][0]["id"], r["members"][0]["id"]) for d, r in _links(chains, _CAMS)}
+        # Preserve count-protected A→a; only B swaps its weak cross-class link for U.
+        assert links == {("A", "a"), ("B", "U")}, ("ordinary count protection", links)
+        return
+
+    if case == "truck_wider_window":
+        chains = [chain("cam3", "A", "e-heavy", (1, 0, 0), 88, dep=36100),
+                  chain("cam3", "B", "e-heavy", (.4, .84 ** .5, 0), 88, dep=36095),
+                  chain("cam3", "C", "e-heavy", (.6, -.6, .28 ** .5), 88, dep=36111),
+                  chain("cam4", "c", "e-heavy", (.6, -.6, .28 ** .5), 88, arr=36112),
+                  chain("cam4", "U", "e-heavy", (.71, .4959 ** .5, 0), 88, late=36108),
+                  chain("cam4", "S", "e-heavy", (1, 0, 0), 88, late=36110)]
+        links = {(d["members"][0]["id"], r["members"][0]["id"]) for d, r in _links(chains, _CAMS)}
+        # No weak cross-class ordinary link exists; A keeps S and the truck pass gives B U.
+        assert links == {("C", "c"), ("A", "S"), ("B", "U")}, ("truck wider window", links)
+        return
+
+    ordinary_cos = .61 if case == "strong_ordinary" else .368
+    late_cos = .3 if case == "weak_late" else .61
+    cab_class = "b-minibuses" if case == "same_class" else "b-light"
+    chains = [chain("cam3", "4c", "b-minibuses", (1, 0, 0, 0), 88, dep=2414.8),
+              chain("cam3", "45", "b-light", (0, 1, 0, 0), 104, dep=2416.6),
+              chain("cam4", "5b", cab_class,
+                    (ordinary_cos, .264, (1 - ordinary_cos ** 2 - .264 ** 2) ** .5, 0), 21, arr=2412.4),
+              chain("cam4", "5d", "b-light", (0, .448, 0, (1 - .448 ** 2) ** .5), 19, arr=2415.4),
+              chain("cam4", "61", "b-minibuses", (late_cos, 0, (1 - late_cos ** 2) ** .5, 0),
+                    176, late=2420)]
+    if case in ("released_counted", "released_direction"):
+        # Evidence on any member of the released cab must preserve its ordinary link.
+        chains[2]["members"].append({"id": "5b-fragment", "hits": 1,
+                                    "counted": case == "released_counted",
+                                    "direction": "northbound" if case == "released_direction" else None})
+    links = {(d["members"][0]["id"], r["members"][0]["id"]) for d, r in _links(chains, _CAMS)}
+    expected = {("4c", "61" if case == "yield" else "5b"), ("45", "5d")}
+    assert links == expected, ("late priority", case, links, expected)
+
+
 def _selfcheck():
+    for case in ("yield", "same_class", "weak_late", "strong_ordinary", "shared_late", "shared_late_three",
+                 "uncontested_replacement", "ordinary_count_protection", "truck_wider_window",
+                 "truck_swap_protection", "early_swap_protection", "truck_swap_crossing",
+                 "released_counted", "released_direction"):
+        _selfcheck_late_priority(case)
     for case in ("frozen_unsplit", "speed", "events"):
         _selfcheck_review(case)
     for case in ("photos", "plant", "fragment", "fragment_works"):
