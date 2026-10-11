@@ -246,7 +246,9 @@ def _chains(tracklets, cameras):
         return i
 
     for t in by.values():
-        if t.get("ghost_of") in by:
+        if t.get("ghost_of") in by and not (t["hits"] >= MIN_EDGE_HITS and by[t["ghost_of"]]["hits"] >= MIN_EDGE_HITS
+                                             and t.get("direction") and by[t["ghost_of"]].get("direction")
+                                             and t["direction"] != by[t["ghost_of"]]["direction"]):
             up[find(t["id"])] = find(t["ghost_of"])
     per = {}
     for t in by.values():
@@ -311,13 +313,18 @@ def _chains(tracklets, cameras):
             ch["z"] = zt[0], zt[-1]
             ch["dep"] = zt[-1] if in1 and (not in0 or moved) else None
             ch["arr"] = zt[0] if in0 and (not in1 or moved) else None
-        elif zone and len(ms[0]["path"]) > 1:
+        elif zone:
             # Never in the zone yet moving away from it: cam3 at night locks on only mid-frame.
             zc = (zone[0] + zone[2] / 2, zone[1] + zone[3] / 2)
             first = ms[0]["path"]
             (x0, y0), (x1, y1) = _centre(first[0][1:]), _centre(first[-1][1:])
             if abs(complex(x1 - zc[0], y1 - zc[1])) - abs(complex(x0 - zc[0], y0 - zc[1])) >= MOVE:
                 ch["late"] = first[0][0]
+            # Lost before the zone: use the last fragment's approach, not the whole chain's motion.
+            last = max(ms, key=lambda t: t["t1"])["path"]
+            (x0, y0), (x1, y1) = _centre(last[0][1:]), _centre(last[-1][1:])
+            if abs(complex(x0 - zc[0], y0 - zc[1])) - abs(complex(x1 - zc[0], y1 - zc[1])) >= MOVE:
+                ch["early"] = last[-1][0]
         chains.append(ch)
     return sorted(chains, key=lambda c: (c["camera"], c["members"][0]["t0"], c["members"][0]["id"]))
 
@@ -334,10 +341,12 @@ def _links(chains, cameras, tz=None):
     def z1(j):
         return chains[j]["z"][1] if chains[j]["arr"] is not None else chains[j]["late"]
 
-    def match(late, used):
-        """Pass 1 (late False): ordinary arrivals. Pass 2: late chains for the departures left over."""
+    def match(late, used, early=False):
+        """Ordinary, then late arrivals, then early departures; guesses never compete with zone links."""
         arrivals = {}
         for j, r in enumerate(chains):
+            if id(r) in used or early and sum(t["hits"] for t in r["members"]) < MIN_EDGE_HITS:
+                continue
             if (r["arr"] is None and r.get("late") is not None
                     and sum(t["hits"] for t in r["members"]) >= MIN_EDGE_HITS) if late else r["arr"] is not None:
                 arrivals.setdefault(r["camera"], []).append(j)
@@ -346,26 +355,28 @@ def _links(chains, cameras, tz=None):
                  for cam, js in arrivals.items()}
         cands = []
         for i, d in enumerate(chains):
-            if d["dep"] is None or id(d) in used:
+            dep = d.get("early") if early else d["dep"]
+            if dep is None or id(d) in used or early and sum(t["hits"] for t in d["members"]) < MIN_EDGE_HITS:
                 continue
+            start, end = (dep, dep) if early else d["z"]
             for cam, (js, span) in index.items():
                 if cam == d["camera"] or frozenset((d["camera"], cam)) not in pairs:
                     continue
-                lo = bisect_left(js, d["z"][0] - LEAD - span, key=z0)
-                for j in js[lo:bisect_right(js, d["z"][1] + (LAG_LATE if late else LAG), key=z0)]:
+                lo = bisect_left(js, start - LEAD - (0 if early else span), key=z0)
+                for j in js[lo:bisect_right(js, end + (LAG_LATE if late else LAG), key=z0)]:
                     r = chains[j]
-                    if z1(j) >= d["z"][0] - LEAD:
+                    if z1(j) >= start - LEAD:
                         sim = _similar(d["app"], r["app"])
                         if _clash(d["class"], r["class"]):
                             continue
                         # At night one camera sees a lit side and the other headlights: a same-class pair
                         # can look unalike and still be one vehicle (measured at dusk: 7 of 10 judged true).
-                        night = not DAY_HOURS[0] <= datetime.fromtimestamp(d["dep"], tz or timezone.utc).hour < DAY_HOURS[1]
+                        night = not DAY_HOURS[0] <= datetime.fromtimestamp(dep, tz or timezone.utc).hour < DAY_HOURS[1]
                         if sim is not None and sim < APP_VETO and not (night and d["class"] == r["class"]):
                             continue
-                        if late and (sim is None or sim < LATE_COS):
+                        if (late or early) and (sim is None or sim < LATE_COS):
                             continue
-                        t = abs(z0(j) - d["dep"] - MU) + CLASS_PEN * (d["class"] != r["class"])
+                        t = abs(z0(j) - dep - MU) + CLASS_PEN * (d["class"] != r["class"])
                         cands.append((t, t + APP_PEN * (1 - (APP_TYPICAL if sim is None else sim)), i, j))
 
         def greedy(cs, k):
@@ -401,6 +412,9 @@ def _links(chains, cameras, tz=None):
     links = match(False, set())
     # Late chains never compete with ordinary arrivals: only departures still unlinked may take one.
     links += match(True, {id(c) for link in links for c in link})
+    # 11 Oct pickup: lost 1.8 s before arrival; use the ordinary -LEAD..LAG start window.
+    # Early pass deliberately skips the lone-chain evidence filter: requiring it costs abs +3 / over +2 on the hand-count gate.
+    links += match(False, {id(c) for link in links for c in link}, early=True)
     return links + _trucks(chains, links, pairs)
 
 
@@ -419,7 +433,7 @@ def _trucks(chains, links, pairs):
     accepted = {}  # (dep camera, arr camera) -> [(dep, arr)] of accepted truck links
     for d, r in links:
         if heavy(d) and heavy(r):
-            accepted.setdefault((d["camera"], r["camera"]), []).append((d["dep"], ta(r)))
+            accepted.setdefault((d["camera"], r["camera"]), []).append((d["dep"] if d["dep"] is not None else d["early"], ta(r)))
     cost, root, cands = {}, {}, []
 
     def find(x):
@@ -520,7 +534,7 @@ def _doc(chains, link, cfg, tz, events):
     # A switched track's event attrs are another vehicle's: only clean members' events speak; with none,
     # _member_attrs below (which also prefers clean members) decides.
     evs = [e for t, e in evs if not (t.get("mixed") or t.get("hijacked"))]
-    t = link[0]["dep"] if link else ms[0]["t0"]
+    t = (link[0]["dep"] if link[0]["dep"] is not None else link[0]["early"]) if link else ms[0]["t0"]
     return t, {
         "id": "jny-" + hashlib.sha256("\0".join(sorted(m["id"] for m in ms)).encode()).hexdigest()[:24],
         "ts": datetime.fromtimestamp(t, timezone.utc).astimezone(tz).isoformat(timespec="seconds"),
@@ -533,7 +547,7 @@ def _doc(chains, link, cfg, tz, events):
         "crops": crops, "plates": plates,
         "members": [{k: m[k] for k in ("id", "camera", "t0", "t1", "counted")} for m in ms],
         "link": link and {"from": link[0]["camera"], "to": link[1]["camera"],
-                          "gap_s": round((link[1]["arr"] if link[1]["arr"] is not None else link[1]["late"]) - link[0]["dep"], 2)},
+                          "gap_s": round((link[1]["arr"] if link[1]["arr"] is not None else link[1]["late"]) - t, 2)},
         "evidence": "handoff" if link else "line" if any(m["counted"] for m in ms) else "edge",
         "hits": sum(m["hits"] for m in ms),
         "dwell_s": round(max(m["t1"] for m in ms) - ms[0]["t0"], 1)}
@@ -651,7 +665,78 @@ def _north(i, t, gap=0.4, cls="c-small", k3={}, k4={}):
                                 (t + gap + 2, _b(0.45, 0.35))], direction="northbound", **k4)]
 
 
+def _selfcheck_ghost():
+    a = _t("cam3", 1, "e-heavy", [(100, _b(.5, .4)), (102, _b(.6, .5))], hits=8, direction="northbound")
+    b = _t("cam3", 2, "e-heavy", [(140, _b(.6, .5)), (142, _b(.5, .4))], hits=8, ghost_of=a["id"])
+    for direction, n in (("southbound", 2), ("northbound", 1), (None, 1)):
+        assert len(_chains([a, dict(b, direction=direction)], _CAMS)) == n, ("ghost direction", direction)
+    assert len(_chains([dict(a, direction=None), dict(b, direction="southbound")], _CAMS)) == 1
+
+    for short in ("original", "ghost"):
+        aa = dict(a, hits=3) if short == "original" else a
+        bb = dict(b, hits=3, direction="southbound") if short == "ghost" else dict(b, direction="southbound")
+        assert len(_chains([aa, bb], _CAMS)) == 1, ("short ghost direction", short)
+
+
+def _selfcheck_early(case):
+    code = lambda x, y: base64.b64encode(struct.pack("<32e", x, y, *[0.0] * 30)).decode()
+    a = _t("cam3", 1, "a-small", [(100, _b(.1, .54)), (101, _b(.4, .65)), (102, _b(.7, .78))],
+           counted=True, hits=32, direction="northbound", app=code(1, 0), app_v="m1")
+    b = _north(2, 103.4, cls="a-small", k4={"app": code(.9, .43589), "app_v": "m1", "counted": True, "hits": 8})[1]
+    [ch] = _chains([a], _CAMS)
+    assert ch.get("early") == 102 and ch["dep"] is None and ch["arr"] is None, (case, "early fixture", ch)
+    if case == "look":
+        b.update(app=code(.3, .95394))
+        assert len(build([a, b], _CAMS)) == 2, "early low cosine"
+    elif case == "away":
+        away = dict(a, path=[[100 + i, *p[1:]] for i, p in enumerate(reversed(a["path"]))])
+        [ch] = _chains([away], _CAMS)
+        assert ch.get("early") is None and ch.get("late") == 100, "moving away is not early"
+    elif case == "priority":
+        ordinary = _north(2, 103.4, cls="a-small")[0]
+        js, _, ll = _build([a, ordinary, b], _CAMS)
+        assert len(js) == 2 and len(ll) == 1 and ll[0][0]["members"][0]["id"] == ordinary["id"], "ordinary departure wins"
+    elif case == "late":
+        late = dict(b, path=[[103.8, *_b(.4, .4)], [104.8, *_b(.6, .3)]], t0=103.8, t1=104.8)
+        assert len(build([a, late], _CAMS)) == 2, "two guessed edges never link"
+    elif case in ("dep_hits", "arr_hits"):
+        (a if case == "dep_hits" else b)["hits"] = MIN_EDGE_HITS - 1
+        assert not _build([a, b], _CAMS)[2], ("early hit floor", case)
+    elif case == "last_end":
+        long = dict(a, t1=106, path=[a["path"][0], [106, *a["path"][-1][1:]]])
+        short = _t("cam3", 3, "a-small", [(101, _b(.5, .65)), (102, _b(.4, .55))],
+                   hits=8, direction="northbound", ghost_of=a["id"])
+        [ch] = _chains([long, short], _CAMS)
+        assert ch.get("early") == 106, "early uses latest end, not latest start"
+        arrival = dict(b, t0=b["t0"] + 4, t1=b["t1"] + 4, path=[[p[0] + 4, *p[1:]] for p in b["path"]])
+        [j] = build([long, short, arrival], _CAMS)
+        assert j["link"]["gap_s"] == 1.8, "early time uses latest end"
+        away = dict(long, path=[[100, *long["path"][-1][1:]], [106, *long["path"][0][1:]]])
+        toward = dict(short, path=[[101, *short["path"][-1][1:]], [102, *short["path"][0][1:]]])
+        [ch] = _chains([away, toward], _CAMS)
+        assert ch.get("early") is None, "latest-ending member must approach"
+    elif case == "truck_convoy":
+        a = dict(a, **{"class": "e-heavy", "votes": {"e-heavy": 32}})
+        b = dict(b, **{"class": "e-heavy", "votes": {"e-heavy": 8}})
+        dep, arr = _north(4, 108, gap=10, cls="e-heavy",
+                          k3={"counted": True, "hits": 8, "app": code(1, 0), "app_v": "m1"},
+                          k4={"counted": True, "hits": 8, "app": code(1, 0), "app_v": "m1"})
+        js, _, ll = _build([a, b, dep, arr], _CAMS)
+        assert len(js) == 2 and len(ll) == 2, "truck convoy reads accepted early time"
+    elif case == "heavy":
+        js = build([dict(a, **{"class": "e-heavy", "votes": {"e-heavy": 32}}),
+                    dict(b, **{"class": "e-heavy", "votes": {"e-heavy": 8}})], _CAMS)
+        assert len(js) == 1 and js[0]["link"]["gap_s"] == 1.8, "early truck document"
+    else:
+        [j] = build([a, b], _CAMS, timezone.utc)
+        assert j["link"] == {"from": "cam3", "to": "cam4", "gap_s": 1.8}, j
+        assert j["ts"] == "1970-01-01T00:01:42+00:00", j
+
+
 def _selfcheck():
+    _selfcheck_ghost()
+    for case in ("link", "look", "away", "priority", "late", "heavy", "dep_hits", "arr_hits", "last_end", "truck_convoy"):
+        _selfcheck_early(case)
     # (a) one northbound vehicle across the handoff: one journey, front from cam3, rear from cam4.
     a = _north(1, 100.0, k3={"plate": {"conf": 0.31, "crop": "cam3-1-plate.jpg"}})
     [j] = build(a, _CAMS, tz=timezone.utc)
