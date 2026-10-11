@@ -619,14 +619,16 @@ def _split(t, k, cam):
     hits = max(1, min(t["hits"] - 1, round(t["hits"] * (k + 1) / (len(path) + 1))))
     pieces = []
     for i, p in enumerate((path[:k + 1], path[k:])):
+        # Travel-axis per-leg direction measured worse on the hand-count gate (abs +4, over +1).
         same = (i == 0) == first
         piece = dict(t, id=t["id"] if i == 0 else t["id"] + "~reverse", path=p,
                      t0=p[0][0], t1=p[-1][0], hits=hits if i == 0 else max(1, t["hits"] - hits),
                      direction=way if same else opposite, counted=t["counted"] and same,
+                     speed_kph=None,
                      reverse=True, source={key: t[key] for key in ("id", "camera", "t0", "t1", "counted")})
         piece.update(crops={"best": t["crops"]["best"]} if (t.get("crops") or {}).get("best") else {}, plate=None)
         if i != owner:
-            piece.update(mixed=True, app=None, crops={}, plate=None, attrs={}, speed_kph=None)
+            piece.update(mixed=True, app=None, crops={}, plate=None, attrs={})
         pieces.append(piece)
     return pieces
 
@@ -643,8 +645,10 @@ def _build(tracklets, cameras, tz=None, events=None, with_dropped=False, plant=N
     cfg = {c["name"]: c for c in cameras}
     tracklets = [piece for t in tracklets for k in [_reversal(t)] for piece in
                  (_split(t, k, cfg.get(t["camera"], {})) if k is not None else [t])]
-    tracklets = [t for t in tracklets if ((t.get("source") or t)["id"], None) not in frozen
-                 and ((t.get("source") or t)["id"], t["id"]) not in frozen]
+    claimed = {raw for raw, _ in frozen}
+    tracklets = [t for t in tracklets if (
+        (t["source"]["id"], None) not in frozen and (t["source"]["id"], t["id"]) not in frozen
+        if t.get("source") else t["id"] not in claimed)]
     chains = _chains(tracklets, cameras)
     links = _links(chains, cameras, tz)
     linked = {id(c) for pair in links for c in pair}
@@ -689,7 +693,8 @@ def build(tracklets, cameras, tz=None, events=None, with_dropped=False, plant=No
     also returns the lone chains the direction/lone_edge filter removed, flagged "dropped": True.
     plant: [(t0, t1, hits)] of e-plant tracklets for works mode, None = derive from tracklets (a caller
     that drops frozen tracklets passes the unfiltered list, or works mode flips off for open chains).
-    frozen: (raw id, piece id) pairs to exclude after splitting; None claims the whole raw tracklet."""
+    frozen: (raw id, piece id) pairs to exclude after splitting; None claims the whole raw tracklet.
+    Any claimed leg also excludes a later unsplit copy of its raw tracklet."""
     return _build(tracklets, cameras, tz, events, with_dropped, plant, frozen)[0]
 
 
@@ -864,7 +869,32 @@ def _selfcheck_reversal_findings(case):
     assert len(build([fragment, a], cams, plant=plant)) == 2, "independent count remains evidence"
 
 
+def _selfcheck_review(case):
+    a = _t("cam3", 48, "e-heavy", [(100, _b(.3, .65)), (102, _b(.6, .7)),
+            (105, _b(.9, .8)), (107, _b(.65, .7, .15)), (110, _b(.1, .55))],
+            counted=True, hits=100, direction="southbound", speed_kph=12.0)
+    if case == "frozen_unsplit":
+        from unittest.mock import patch
+        frozen = {(a["id"], a["id"] + "~reverse")}
+        assert len(_build([a], _CAMS, frozen=frozen)[1]) == 1, "unclaimed sibling remains available"
+        with patch(__name__ + ".REVERSE", .7):
+            assert _reversal(a) is None, "retuning removes the split"
+            js, chains, _ = _build([a], _CAMS, frozen=frozen)
+            assert not js and not chains, "claimed leg excludes a later unsplit raw tracklet"
+    elif case == "speed":
+        pieces = _split(a, 2, _CAMS[0])
+        assert all(p.get("speed_kph") is None for p in pieces), "neither leg inherits whole-track speed"
+        assert build([a], _CAMS)[0]["speed_kph"] is None
+    elif case == "events":
+        events = {a["id"]: {"class": "e-heavy", "hits": 100, "attrs": {"axles": 7}}}
+        [j] = build([a], _CAMS, events=events)
+        assert j["members"][0]["piece"] == a["id"] + "~reverse" and j["crops"], "second leg owns the photos"
+        assert j["attrs"] == {"axles": 7}, "photo-owning derived leg reads the raw event"
+
+
 def _selfcheck():
+    for case in ("frozen_unsplit", "speed", "events"):
+        _selfcheck_review(case)
     for case in ("photos", "plant", "fragment", "fragment_works"):
         _selfcheck_reversal_findings(case)
     for case in ("link", "small", "straight", "short", "uturn", "freeze"):
