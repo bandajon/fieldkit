@@ -1207,7 +1207,7 @@ def journeys_pass(cl, bucket, touched, cameras, tz, keys=(), classified=(), sinc
         return iter(_cache[prefix])
 
     def frozen_ids(where):
-        return {m["id"] for j in docs(f"{JOURNEYS}{where}final/") for m in j["members"]}
+        return {(m["id"], m.get("piece")) for j in docs(f"{JOURNEYS}{where}final/") for m in j["members"]}
 
     def side(day8):                 # a day's raw tracklets, whole (a queued truck's chain
         w = f"{gate}/{day8}/"       # can span several minutes either side of midnight)
@@ -1228,6 +1228,7 @@ def journeys_pass(cl, bucket, touched, cameras, tz, keys=(), classified=(), sinc
             # journey's ts landed there) even though the tracklet file itself lives under this
             # day — so the exclusion set is the union of all three days' frozen ids, applied to
             # all three days' tracklets alike, never each day's own final/ against only its own.
+            # Piece claims are applied after splitting, so a frozen leg leaves its sibling available.
             fids = frozen_ids(where) | frozen_ids(prev_w) | frozen_ids(next_w)
             # Works mode reads plant presence off the RAW lists: a plant tracklet frozen into a final
             # journey leaves `tracklets` below, but still marks the works for chains yet open.
@@ -1235,13 +1236,13 @@ def journeys_pass(cl, bucket, touched, cameras, tz, keys=(), classified=(), sinc
                      for t in raw if t.get("class") == "e-plant"]
             tracklets = [for_upload(t, gate, f"{TRACKLETS}{w}crops/")
                          for raw, w in ((own_raw, where), (prev_raw, prev_w), (next_raw, next_w))
-                         for t in raw if t["id"] not in fids]
+                         for t in raw if (t["id"], None) not in fids]
             events = {e["id"]: e for e in docs(EVENTS + where)}
             events.update({e["id"]: e for e in docs(EVENTS + prev_w)})
             events.update({e["id"]: e for e in docs(EVENTS + next_w)})
             # with_dropped: lone chains the direction/lone_edge filter removed are not journeys, but
             # as open chains they still hold the freeze watermark back (they can yet link to a partner).
-            everything = journeys.build(tracklets, cameras, tz, events, with_dropped=True, plant=plant)
+            everything = journeys.build(tracklets, cameras, tz, events, with_dropped=True, plant=plant, frozen=fids)
             built = [j for j in everything if not j.get("dropped")]
             # A boundary tracklet can pull in a journey that really belongs to the neighbouring
             # day (it's rebuilt there too, from its own side of the same boundary) — keep only
@@ -2301,6 +2302,34 @@ def journeys_check():
     assert n_fd1 == 0 and open_fd1 == set() and checked_fd1 == {("G", "2026-08-20")} \
         and not any("/final/" in k for k in cl2.put), \
         "D+1's pass must not mint a second final batch for the vehicle D already froze"
+
+
+    # Two linked reversal legs owned by adjacent days must each freeze exactly once.
+    import journeys
+    turn = datetime(2026, 8, 20, 0, 0, tzinfo=ZoneInfo(TZ)).timestamp()
+    a = journeys._t("cam3", 48, "e-heavy", [(turn - 5, journeys._b(.3, .65)),
+        (turn - 3, journeys._b(.6, .7)), (turn, journeys._b(.9, .8)),
+        (turn + 2, journeys._b(.65, .7, .15)), (turn + 5, journeys._b(.1, .55))],
+        counted=True, hits=100, direction="southbound")
+    b = journeys._north(30, turn, gap=.4, cls="e-heavy", k4={"hits": 3})[1]
+    c = journeys._t("cam4", 46, "e-heavy", [(turn - 3, journeys._b(.45, .35)),
+        (turn - 1, journeys._b(.1, .7))], hits=3, direction="southbound")
+    before = journeys.build([a, b, c], cams, timezone.utc)
+    assert len(before) == 2 and all(j["link"] for j in before)
+    assert sorted(datetime.fromisoformat(j["ts"]).astimezone(ZoneInfo(TZ)).strftime("%H:%M:%S")
+                  for j in before) == ["00:00:00", "23:59:59"]
+    cl3 = FakeS3({"fieldkit-tracklets/G/20260819/a.jsonl": json.dumps(a).encode(),
+                  "fieldkit-tracklets/G/20260820/b.jsonl": json.dumps(b).encode(),
+                  "fieldkit-tracklets/G/20260819/c.jsonl": json.dumps(c).encode()})
+    for day3 in ("2026-08-19", "2026-08-20", "2026-08-19", "2026-08-20"):
+        journeys_pass(cl3, "buck", {("G", day3)}, cams, timezone.utc,
+                      keys=later_keys, classified=later_keys, since="20260101-000000")
+        cl3.objs.update(cl3.put)
+        cl3.put = {}
+    finals = [json.loads(line) for key, body in cl3.objs.items() if "/final/" in key
+              for line in body.decode().splitlines()]
+    assert len(finals) == 2 and {j["id"] for j in finals} == {j["id"] for j in before}, \
+        ("both midnight siblings freeze once", finals)
 
 
 def selfcheck():

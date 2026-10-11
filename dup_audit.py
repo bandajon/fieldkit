@@ -38,7 +38,8 @@ def centre(p):
 
 def suspects(journeys, tracklets_by_id):
     js = sorted(journeys, key=lambda j: j["ts"])
-    mem = [[tracklets_by_id[m["id"]] for m in j["members"] if m["id"] in tracklets_by_id] for j in js]
+    # shortcut: skip reversal pieces until leg-specific timing and appearance can be resolved together.
+    mem = [[tracklets_by_id[m["id"]] for m in j["members"] if "piece" not in m and m["id"] in tracklets_by_id] for j in js]
     # ponytail: a journey's ts is its first member's, but members span minutes, so window on the member span
     span = [(min(t["t0"] for t in m), max(t["t1"] for t in m)) if m else (epoch(j["ts"]),) * 2 for j, m in zip(js, mem)]
     ts = [epoch(j["ts"]) for j in js]
@@ -125,4 +126,8 @@ if __name__ == "__main__":
     assert [(x["kind"], x["gap"]) for x in s] == [("fragment", 3.0)] and (s[0]["a"], s[0]["b"]) == ("A", "B"), s
     js = [jn("L", "2026-10-05T15:00:00Z", "cam3+cam4", ["a", "b"])]
     assert not check(js, l)                                                                 # own members never paired
-    print("dup_audit self-check ok: leftover, no-look and fragment flagged; late, clashing and own-member pairs not")
+    js = [jn("A", "1970-01-01T00:01:40Z", "cam3", ["a"]), jn("B", "1970-01-01T00:02:11Z", "cam4", ["b"])]
+    js[0]["members"][0].update(piece="a:0", t0=100, t1=105)
+    s = check(js, [tr("a", "cam3", 100, 130, code(1)), tr("b", "cam4", 131, 135, code(1))])
+    assert not s, s                                                                         # raw appearance belongs to the return leg
+    print("dup_audit self-check ok: leftover, no-look and fragment flagged; late, clashing, own-member and reversal-piece pairs not")

@@ -38,6 +38,7 @@ TWIN_FRAG_S = 2.0    # s: ...and it dies this soon after the whole truck's track
 TWIN_SNAP = 1.0      # s: a path sample stands for a moment this close to it (paths are ~1 sample/s)
 NEAR = 2.0           # a far, fast box outruns IoU between fragments; a continuation lands within
                      # this many box-sizes of where the last one was heading
+REVERSE = 0.2       # normalised centre displacement required on BOTH legs of a reversal
 MOVE = 0.03          # normalised displacement that counts as motion (detect.DIRECTION_MIN)
 SPAN = 0.5           # s: velocity is measured over at least this; the kept final box can be one
                      # frame after the sample before it, and a parked vehicle's jitter then reads as motion
@@ -515,6 +516,8 @@ def _doc(chains, link, cfg, tz, events):
     tops = [t for t in pics if (t.get("crops") or {}).get("top")]
     if tops:
         crops["best"] = max(tops, key=lambda t: t["conf"].get(cls, 0.0))["crops"]["top"]
+    elif bests := [t for t in pics if (t.get("crops") or {}).get("best")]:
+        crops["best"] = max(bests, key=_area)["crops"]["best"]
     if direction in OPPOSITE:
         # A camera sees the fronts of traffic coming at it and the rears of traffic it faces with.
         for side, way in (("front", OPPOSITE[direction]), ("rear", direction)):
@@ -530,10 +533,15 @@ def _doc(chains, link, cfg, tz, events):
             if plated:
                 p = max(plated, key=lambda t: t["plate"]["conf"])["plate"]
                 crops[side + "_plate"], plates[side] = p["crop"], p["conf"]
-    evs = [(t, e) for t in ms if (e := (events or {}).get(t["id"])) and e.get("class") == cls]
+    evs = [(t, e) for t in ms if (e := (events or {}).get((t.get("source") or t)["id"])) and e.get("class") == cls]
     # A switched track's event attrs are another vehicle's: only clean members' events speak; with none,
     # _member_attrs below (which also prefers clean members) decides.
     evs = [e for t, e in evs if not (t.get("mixed") or t.get("hijacked"))]
+    members = [{k: m[k] for k in ("id", "camera", "t0", "t1", "counted")} for m in ms]
+    # Keep raw ids for audit lookup, but freeze and time each reversal leg independently.
+    for m, member in zip(ms, members):
+        if m.get("source"):
+            member.update(id=m["source"]["id"], piece=m["id"])
     t = (link[0]["dep"] if link[0]["dep"] is not None else link[0]["early"]) if link else ms[0]["t0"]
     return t, {
         "id": "jny-" + hashlib.sha256("\0".join(sorted(m["id"] for m in ms)).encode()).hexdigest()[:24],
@@ -545,7 +553,7 @@ def _doc(chains, link, cfg, tz, events):
         "bound": next((b for n in names if (b := bound_of(cfg.get(n, {}), direction))), None),
         "attrs": (max(evs, key=lambda e: e.get("hits", 0)).get("attrs") if evs else None) or _member_attrs(ms, cls),
         "crops": crops, "plates": plates,
-        "members": [{k: m[k] for k in ("id", "camera", "t0", "t1", "counted")} for m in ms],
+        "members": members,
         "link": link and {"from": link[0]["camera"], "to": link[1]["camera"],
                           "gap_s": round((link[1]["arr"] if link[1]["arr"] is not None else link[1]["late"]) - t, 2)},
         "evidence": "handoff" if link else "line" if any(m["counted"] for m in ms) else "edge",
@@ -585,13 +593,58 @@ def _pulled(t, t_off):
                                      if len(p) >= 2 else {}))
 
 
-def _build(tracklets, cameras, tz=None, events=None, with_dropped=False, plant=None):
+
+def _reversal(t):
+    """Index of a substantial turn-around, or None for jitter, short paths and straight travel."""
+    path = t.get("path") or []
+    if len(path) < 4:
+        return None
+    centres = [complex(*_centre(p[1:])) for p in path]
+    k = max(range(len(path)), key=lambda i: abs(centres[i] - centres[0]))
+    a, b = centres[k] - centres[0], centres[-1] - centres[k]
+    return k if min(abs(a), abs(b)) >= REVERSE and (a.conjugate() * b).real < 0 else None
+
+
+def _split(t, k, cam):
+    """Share the turning box; keep the sole line count on the leg agreeing with net motion."""
+    path = t["path"]
+    centres = [complex(*_centre(p[1:])) for p in path]
+    first = ((centres[k] - centres[0]).conjugate() * (centres[-1] - centres[0])).real > 0
+    way = t.get("direction")
+    heading = HEADINGS.get(heading_of(cam))
+    pair = (cam.get("travel") or {}).get("neg"), (cam.get("travel") or {}).get("pos")
+    opposite = OPPOSITE.get(way) if way and (way in pair or way in (heading, OPPOSITE.get(heading))) else None
+    largest = max(range(len(path)), key=lambda i: (path[i][3] - path[i][1]) * (path[i][4] - path[i][2]))
+    owner = 0 if largest <= k else 1
+    hits = max(1, min(t["hits"] - 1, round(t["hits"] * (k + 1) / (len(path) + 1))))
+    pieces = []
+    for i, p in enumerate((path[:k + 1], path[k:])):
+        same = (i == 0) == first
+        piece = dict(t, id=t["id"] if i == 0 else t["id"] + "~reverse", path=p,
+                     t0=p[0][0], t1=p[-1][0], hits=hits if i == 0 else max(1, t["hits"] - hits),
+                     direction=way if same else opposite, counted=t["counted"] and same,
+                     reverse=True, source={key: t[key] for key in ("id", "camera", "t0", "t1", "counted")})
+        piece.update(crops={"best": t["crops"]["best"]} if (t.get("crops") or {}).get("best") else {}, plate=None)
+        if i != owner:
+            piece.update(mixed=True, app=None, crops={}, plate=None, attrs={}, speed_kph=None)
+        pieces.append(piece)
+    return pieces
+
+
+def _build(tracklets, cameras, tz=None, events=None, with_dropped=False, plant=None, frozen=()):
+    if plant is None:
+        plant = [(t["t0"], t["t1"], t["hits"]) for t in tracklets if t.get("class") == "e-plant"]
     hj = _hijacked(tracklets)
     by = {t["id"]: t for t in tracklets}
     hit = {a: hj[a] for a in hj if _held(by[a], hj[a][0]) and _stays(by[hj[a][1]])}   # a parked vehicle's stolen track, not a queue advance
     parked = {b for _, b in hit.values()}
     tracklets = [_pulled(t, hj[t["id"]][0]) if t["id"] in hit else dict(t, hijacked=True) if t["id"] in hj
                  else dict(t, parked=True) if t["id"] in parked else t for t in tracklets]
+    cfg = {c["name"]: c for c in cameras}
+    tracklets = [piece for t in tracklets for k in [_reversal(t)] for piece in
+                 (_split(t, k, cfg.get(t["camera"], {})) if k is not None else [t])]
+    tracklets = [t for t in tracklets if ((t.get("source") or t)["id"], None) not in frozen
+                 and ((t.get("source") or t)["id"], t["id"]) not in frozen]
     chains = _chains(tracklets, cameras)
     links = _links(chains, cameras, tz)
     linked = {id(c) for pair in links for c in pair}
@@ -601,7 +654,6 @@ def _build(tracklets, cameras, tz=None, events=None, with_dropped=False, plant=N
             any(t["counted"] for t in c["members"])
             or (c["dep"] is not None or c["arr"] is not None)
             and sum(t["hits"] for t in c["members"]) >= MIN_EDGE_HITS)]
-    cfg = {c["name"]: c for c in cameras}
     # A lone chain with no direction is no passage, and a camera with lone_edge: false (cam3: the toll
     # queue's tail sits in its zone) does not count lone edge-only chains. Measured 7 Oct: +6.5% -> -1.7%
     # vs hand counts; under-counting is preferred.
@@ -610,8 +662,6 @@ def _build(tracklets, cameras, tz=None, events=None, with_dropped=False, plant=N
     # Works mode: roadworks (rollers, graders, lanes closed) mean stop-start crawl and diversions, so lone
     # chains the filter drops are real vehicles, not queue-tail duplicates. Measured 9 Oct noon: 184 -> 262
     # vs hand count 272; 7 Oct morning unchanged (no plant track there has 20+ hits).
-    if plant is None:
-        plant = [(t["t0"], t["t1"], t["hits"]) for t in tracklets if t.get("class") == "e-plant"]
     plant = [p for p in plant if p[2] >= WORKS_PLANT_HITS]
 
     def works(c):    # plant never rescues itself, and a rescued chain needs substance (WORKS_RESCUE_HITS)
@@ -622,8 +672,11 @@ def _build(tracklets, cameras, tz=None, events=None, with_dropped=False, plant=N
         t = min(m["t0"] for m in ms)
         near = [p for p in plant if p[0] - WORKS_WINDOW <= t <= p[1] + WORKS_WINDOW]
         return len(near) >= WORKS_PLANT_TRACKS or any(p[2] >= WORKS_PLANT_LONG for p in near)
-    dropped = [c for c in lone if not keep(c) and not works(c)]
-    lone = [c for c in lone if keep(c) or works(c)]
+    # An uncounted reversal leg needs a partner: a genuine lone U-turn is still one vehicle.
+    accepted = lambda c: (not any(t.get("reverse") and not t["counted"] for t in c["members"])
+                          or any(t["counted"] for t in c["members"])) and (keep(c) or works(c))
+    dropped = [c for c in lone if not accepted(c)]
+    lone = [c for c in lone if accepted(c)]
     docs = [_doc(list(pair), pair, cfg, tz, events) for pair in links]
     docs += [_doc([c], None, cfg, tz, events) for c in lone]
     if with_dropped:    # lone chains the filter removed: not journeys, but a still-open one can yet link
@@ -631,12 +684,13 @@ def _build(tracklets, cameras, tz=None, events=None, with_dropped=False, plant=N
     return [d for _, d in sorted(docs, key=lambda td: (td[0], td[1]["id"]))], chains, links
 
 
-def build(tracklets, cameras, tz=None, events=None, with_dropped=False, plant=None):
+def build(tracklets, cameras, tz=None, events=None, with_dropped=False, plant=None, frozen=()):
     """Tracklets (detect.py) of paired cameras -> counted journeys, sorted by ts then id. with_dropped
     also returns the lone chains the direction/lone_edge filter removed, flagged "dropped": True.
     plant: [(t0, t1, hits)] of e-plant tracklets for works mode, None = derive from tracklets (a caller
-    that drops frozen tracklets passes the unfiltered list, or works mode flips off for open chains)."""
-    return _build(tracklets, cameras, tz, events, with_dropped, plant)[0]
+    that drops frozen tracklets passes the unfiltered list, or works mode flips off for open chains).
+    frozen: (raw id, piece id) pairs to exclude after splitting; None claims the whole raw tracklet."""
+    return _build(tracklets, cameras, tz, events, with_dropped, plant, frozen)[0]
 
 
 _CAMS = [{"name": "cam3", "heading": "south", "handoff": {"camera": "cam4", "zone": [0.80, 0.62, 0.20, 0.38]}},
@@ -733,7 +787,88 @@ def _selfcheck_early(case):
         assert j["ts"] == "1970-01-01T00:01:42+00:00", j
 
 
+
+def _selfcheck_reversal(case):
+    a = _t("cam3", 48, "e-heavy", [(100, _b(.3, .65)), (102, _b(.6, .7)),
+            (105, _b(.9, .8)), (107, _b(.65, .7, .15)), (110, _b(.1, .55))],
+            counted=True, hits=100, direction="southbound", app="look", app_v="m1")
+    if case in ("small", "straight", "short"):
+        xs = {"small": [.3, .35, .4, .35, .3], "straight": [.1, .3, .5, .7, .9],
+              "short": [.3, .9, .1]}[case]
+        a["path"] = [[100 + i, *_b(x, .7)] for i, x in enumerate(xs)]
+        assert _reversal(a) is None, case
+        assert len(_build([a], _CAMS)[1]) == 1, case
+        return
+    b = _north(30, 105, gap=4.4, cls="b-light", k4={"hits": 8, "counted": True})[1]
+    c = _t("cam4", 46, "e-heavy", [(102, _b(.45, .35)), (104, _b(.1, .7))],
+           hits=8, counted=True, direction="southbound")
+    js, ch, ll = _build([a, b, c] if case in ("link", "freeze") else [a], _CAMS)
+    pieces = sorted((t for chain in ch for t in chain["members"] if t["camera"] == "cam3"), key=lambda t: t["t0"])
+    assert len(pieces) == 2, (case, "two pieces", len(pieces))
+    first, second = pieces
+    assert first["path"][-1] == second["path"][0] == a["path"][2]
+    assert (first["direction"], second["direction"]) == ("northbound", "southbound")
+    assert not first["counted"] and second["counted"] and sum(t["hits"] for t in pieces) == 100
+    assert first.get("mixed") and not second.get("mixed") and _app([first]) is None
+    assert second["app"] == a["app"] and second["crops"] == {"best": a["crops"]["best"]}
+    assert a["t0"] == 100 and len(a["path"]) == 5 and not a.get("mixed"), "input immutable"
+    if case == "link":
+        assert len(ll) == len(js) == 2, (len(ll), len(js))
+        assert any({a["id"], b["id"]} <= {m["id"] for m in j["members"]} for j in js)
+        assert any({second["id"], c["id"]} <= {m.get("piece", m["id"]) for m in j["members"]} for j in js)
+        assert [j["id"] for j in js] == [j["id"] for j in build([c, b, a], _CAMS)]
+    elif case == "freeze":
+        from selfloop import finalize, FINAL_MARGIN
+        legs = [m for j in js for m in j["members"] if m["id"] == a["id"]]
+        assert {(m["piece"], m["t0"], m["t1"]) for m in legs} == {
+            (first["id"], 100, 105), (second["id"], 105, 110)}, "both raw-backed legs retain their own spans"
+        assert finalize(js, 110 + FINAL_MARGIN) == [], "open partner holds both pieces"
+        frozen = finalize(js, 112 + FINAL_MARGIN)
+        assert len(frozen) == 2
+        fids = {(m["id"], m.get("piece")) for j in frozen for m in j["members"]}
+        assert build([a, b, c], _CAMS, frozen=fids) == []
+        assert build([a, b, c], _CAMS, frozen={(a["id"], None), (b["id"], None), (c["id"], None)}) == [], "legacy raw claims exclude the whole tracklet"
+    else:
+        assert len(js) == 1, "a lone U-turn retains only the original count, including lone_edge cameras"
+        assert len(build([a], _CAMS, plant=[(90, 120, 150)])) == 1, "works cannot rescue the other leg"
+
+
+def _selfcheck_reversal_findings(case):
+    a = _t("cam3", 48, "e-heavy", [(100, _b(.3, .65, .2)), (102, _b(.6, .7)),
+            (105, _b(.9, .8)), (107, _b(.65, .7)), (110, _b(.1, .55))],
+            counted=True, hits=100, direction="southbound",
+            crops={"best": "first-best.jpg", "top": "second-top.jpg", "recede": "second-recede.jpg"},
+            plate={"crop": "second-plate.jpg", "conf": .9})
+    if case == "photos":
+        pieces = _split(a, 2, _CAMS[0])
+        assert pieces[0]["crops"] == {"best": "first-best.jpg"} and not pieces[0].get("plate"), "ambiguous photographs and plate cleared"
+        b = _north(30, 105, gap=4.4, cls="e-heavy", k4={"hits": 8, "crops": {}, "plate": None})[1]
+        j = next(j for j in build([a, b], _CAMS) if j["link"])
+        assert j["crops"]["best"] == "first-best.jpg" and not j["plates"], j
+        assert not any("second-" in crop for crop in j["crops"].values()), j
+        return
+    if case == "plant":
+        a["class"], a["votes"], a["hits"], a["counted"] = "e-plant", {"e-plant": 160}, 160, False
+        c = _t("cam4", 90, "e-heavy", [(100, _b(.1, .7)), (102, _b(.4, .4))], hits=25)
+        expected = build([a, c], _CAMS, plant=[(100, 110, 160)])
+        assert len(expected) == 1 and build([a, c], _CAMS) == expected, "raw plant evidence survives split"
+        return
+    fragment = _t("cam3", 47, "e-heavy", [(97, _b(.1, .55)), (99, _b(.3, .65, .2))],
+                  hits=20, direction="northbound")
+    cams = [dict(c, lone_edge=False) for c in _CAMS] if case == "fragment_works" else _CAMS
+    plant = [(90, 120, 150)] if case == "fragment_works" else None
+    js, chains, links = _build([fragment, a], cams, plant=plant)
+    assert not links and any(len(c["members"]) == 2 for c in chains), "fragment genuinely stitched"
+    assert len(js) == 1, "stitched uncounted fragment cannot rescue a lone U-turn leg"
+    fragment["counted"] = True
+    assert len(build([fragment, a], cams, plant=plant)) == 2, "independent count remains evidence"
+
+
 def _selfcheck():
+    for case in ("photos", "plant", "fragment", "fragment_works"):
+        _selfcheck_reversal_findings(case)
+    for case in ("link", "small", "straight", "short", "uturn", "freeze"):
+        _selfcheck_reversal(case)
     _selfcheck_ghost()
     for case in ("link", "look", "away", "priority", "late", "heavy", "dep_hits", "arr_hits", "last_end", "truck_convoy"):
         _selfcheck_early(case)
