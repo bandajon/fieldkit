@@ -2151,15 +2151,6 @@ def journeys_check():
         def put_object(self, Bucket, Key, Body, ContentType=None):
             self.put[Key] = Body
 
-    def tracklet(cam, samples):       # (t, centre x, centre y): a 0.2-wide box per sample
-        path = [[t, x - 0.1, y - 0.1, x + 0.1, y + 0.1] for t, x, y in samples]
-        return json.dumps({
-            "id": f"obs-{cam}", "camera": cam, "t0": path[0][0], "t1": path[-1][0], "hits": len(path),
-            "class": "e-heavy", "votes": {"e-heavy": len(path)}, "conf": {"e-heavy": 0.8},
-            "counted": True, "ghost_of": None, "direction": "northbound", "path": path,
-            "crops": {"top": f"crops/obs-{cam}-top.jpg", "best": f"crops/obs-{cam}-best.jpg"},
-            "plate": {"conf": 0.3, "crop": f"crops/obs-{cam}-plate.jpg"}}).encode() + b"\n"
-
     # Real 2026-08-19 epochs, not tiny synthetic ones: journeys_pass now keeps only journeys
     # whose own `ts` lands on the touched day (the midnight fix), so a journey's members
     # must actually fall within it.

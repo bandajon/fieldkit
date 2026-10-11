@@ -48,13 +48,12 @@ LAG_LATE = 12.0      # s: a late-locked chain (first seen past the zone) may sta
 LATE_COS = 0.45      # a late-locked chain links only on a known appearance cosine at least this
 MU = 0.5             # s: typical departure -> arrival gap across the blind strip (0.2-2.2 measured)
 CLASS_PEN = 1.0      # s-equivalent cost of pairing two different classes
-APP_PEN = 2.5        # s-equivalent cost per unit of (1 - cosine) between appearance codes, so 0..5 s.
-                     # Measured at Katuba 2026-10-01 10:30-11:30: at 2.5 the crossed near-simultaneous
-                     # pickups pair correctly and ~80% of changed links are visually right (~14% before)
+APP_PEN = 8.0        # gate 2493 vs hand 2493, abs 91, over 57; fixes the 11 Oct Land Cruiser crossing:
+                     # true cos .89 beats .28, 2 s closer
 APP_TYPICAL = 0.7    # cosine of a typical true match (Katuba median ~0.79): an uncoded candidate pays
-                     # the penalty of a typical match, so it never beats a coded one at equal timing
-APP_VETO = 0.2       # known cosine below this is never a link: true pairs' 1st percentile is far above, and
-                     # every linked pair under it audited on a real Katuba hour was two different vehicles
+                     # a typical-match penalty: at equal timing it beats only codes with cosine below .7
+APP_VETO = 0.2       # known cosine below this is never a link except same-class pairs at night:
+                     # true pairs' 1st percentile is far above; audited links under it were different vehicles
 DAY_HOURS = (6, 18)  # local hours (build's tz) the appearance veto applies to any pair; outside them only across classes
 HEAVY = ("d-medium", "e-heavy", "f-abnormal")
 SMALL = ("a-small",)  # never links to HEAVY: 0 of 43 labelled true cross-camera pairs do, 16 of 89 wrong candidates
@@ -312,12 +311,13 @@ def _chains(tracklets, cameras):
             ch["z"] = zt[0], zt[-1]
             ch["dep"] = zt[-1] if in1 and (not in0 or moved) else None
             ch["arr"] = zt[0] if in0 and (not in1 or moved) else None
-        elif zone and len(path) > 1:
+        elif zone and len(ms[0]["path"]) > 1:
             # Never in the zone yet moving away from it: cam3 at night locks on only mid-frame.
             zc = (zone[0] + zone[2] / 2, zone[1] + zone[3] / 2)
-            (x0, y0), (x1, y1) = _centre(path[0][1:]), _centre(path[-1][1:])
+            first = ms[0]["path"]
+            (x0, y0), (x1, y1) = _centre(first[0][1:]), _centre(first[-1][1:])
             if abs(complex(x1 - zc[0], y1 - zc[1])) - abs(complex(x0 - zc[0], y0 - zc[1])) >= MOVE:
-                ch["late"] = path[0][0]
+                ch["late"] = first[0][0]
         chains.append(ch)
     return sorted(chains, key=lambda c: (c["camera"], c["members"][0]["t0"], c["members"][0]["id"]))
 
@@ -376,8 +376,6 @@ def _links(chains, cameras, tz=None):
                     out.append((chains[i], chains[j]))
             return out
 
-        if late:
-            return greedy(cands, 1)
         # Appearance only re-pairs within a connected set of candidates, and only if that costs no
         # link: a re-pairing that strands a chain would turn one vehicle into two journeys.
         root = list(range(len(chains)))
@@ -713,6 +711,25 @@ def _selfcheck():
     nt = datetime(2026, 10, 6, 20, 0, tzinfo=lusaka).timestamp()
     pairn = _north(1, nt, k3={"app": code(1), "app_v": "m1", "counted": True}, k4={"app": code(-1), "app_v": "m1", "counted": True})
     assert len(build(pairn, _CAMS, lusaka)) == 1
+    # (LOOK-LATE) A moving first fragment can link late; a stationary first fragment cannot.
+    for moving, want in ((True, True), (False, False)):
+        la = _t("cam3", 81, "c-small", [(dt + 8, _b(.5, .4)), (dt + 9, _b(.4 if moving else .5, .4))],
+                app=code(1), app_v="m1", hits=6)
+        lb = _t("cam3", 82, "c-small", [(dt + 10, _b(.4 if moving else .5, .4)), (dt + 11, _b(.3, .3))],
+                app=code(1), app_v="m1", hits=4)
+        ld = _t("cam4", 81, "c-small", [(dt - 2, _b(.45, .35)), (dt - 1, _b(.3, .5)), (dt, _b(.1, .7))],
+                app=code(1), app_v="m1", counted=True, direction="southbound")
+        _, lc, ll = _build([la, lb, ld], _CAMS, lusaka)
+        assert len(lc) == 2 and bool(ll) == want, "LOOK-LATE"
+        assert ("late" in next(c for c in lc if c["camera"] == "cam3")) == want, "LOOK-LATE"
+    # (LOOK-LINK) A .89 look beats a .28 candidate 2 s closer; without codes timing wins.
+    for coded, want in ((True, "obs-cam4-81"), (False, "obs-cam4-82")):
+        def look(cosine):
+            return {"app": code(cosine, (1 - cosine ** 2) ** .5), "app_v": "m1"} if coded else {}
+        lp = _north(81, dt, gap=2.5, k3=look(1), k4=look(.89))
+        lp += _north(82, dt, gap=.5, k4=look(.28))[1:]
+        _, _, ll = _build(lp, _CAMS, lusaka)
+        assert len(ll) == 1 and ll[0][1]["members"][0]["id"] == want, ("LOOK-LINK", coded)
     pair[0]["mixed"] = pair[1]["mixed"] = True        # ...unless a code may belong to a switched track
     assert len(build(pair, _CAMS)) == 1
     # (b5) a mixed member's crops lose to a clean member's.
@@ -891,6 +908,19 @@ def _selfcheck():
     late = _t("cam3", 2, "c-small", [(103.5, _b(0.5, 0.4)), (104.5, _b(0.3, 0.3))], hits=6, **k(1))
     [j] = build([out, real, late], _CAMS)
     assert ids([j]) == [["obs-cam3-1", "obs-cam4-1"]], j
+    # (L5) late appearance re-pairing must keep timing's two links, not strand two counted chains.
+    late_pair = []
+    for i, t, look in ((1, 100, (.5, 3 ** .5 / 2)), (2, 104, (1, 0))):
+        late_pair.append(_t("cam4", i, "c-small", [(t - 3, _b(.45, .35)),
+                         (t - 2, _b(.15, .65)), (t, _b(.05, .75))],
+                            counted=True, hits=6, direction="southbound", app=code(*look), app_v="m1"))
+    for i, t, look in ((1, 101, (1, 0)), (2, 110, (.8, -.6))):
+        late_pair.append(_t("cam3", i, "c-small", [(t, _b(.5, .4)), (t + 1, _b(.3, .3))],
+                            counted=True, hits=6, direction="southbound", app=code(*look), app_v="m1"))
+    js, ch, ll = _build(late_pair, _CAMS, timezone.utc)
+    assert len(ch) == 4 and [c["z"] for c in ch if c["camera"] == "cam4"] == [(98, 100), (102, 104)], "L5 fixture"
+    assert [c.get("late") for c in ch if c["camera"] == "cam3"] == [101, 110], "L5 fixture"
+    assert len(js) == 2 and len(ll) == 2, ("L5", APP_PEN, len(js), len(ll))
     # (C) a slow truck's cam3 arrival 10 s after its cam4 departure (past LAG): linked only on like codes (C1);
     # a convoy never crosses (C2); cars are not widened (C3).
     k = lambda c: {"app": code(*c), "app_v": "m1"}
