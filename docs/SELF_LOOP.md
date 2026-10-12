@@ -32,9 +32,10 @@ bucket ─► selfloop classify (every 10 min)
 - `python selfloop.py classify` — vehicle events from the mirrored recordings, so a gate
   box that only records still reports. It runs the live detector, tracker and counting
   over the footage with both clocks driven by the segment's own name, so an event says
-  when the vehicle passed, not when the pass ran, and re-running a segment rewrites the
-  same keys instead of double-counting. Events land 10–20 minutes behind live; a quiet
-  segment publishes an empty jsonl, which is what marks it done.
+  when the vehicle passed, not when the pass ran. Published manifests mark segments
+  done and skip reruns, which could mint new tracklet IDs and duplicate frozen counts.
+  Events land 10–20 minutes behind live; a quiet segment publishes an empty jsonl,
+  which is what marks it done.
 - Direction and `bound` on those events need `heading:` on the camera in `config.yaml`
   (see `config.example.yaml`). Without one the events are still complete, just undirected
   — a heading is never guessed from the footage.
@@ -51,6 +52,10 @@ bucket instead of the 10 s one so they cannot overwrite each other. The classify
 decodes mirrored segments across the last 48 h and publishes vehicle events and
 tracklets; it does not capture dataset frames or push them to the curation queue.
 `CLASSIFY_WORKERS` in `selfloop.py` sets concurrent spawned classifiers (default 2).
+After the deadline, completed results still publish during a drain bounded by
+`CLASSIFY_DRAIN_S` (15 minutes); remaining work is discarded and the pool is killed
+through bounded cleanup. SIGTERM discards pending results and shortens the cleanup
+wait, including when it arrives during the normal shutdown grace.
 Classify tracks every frame, so `python selfloop.py hunt` (every 10 min, `HUNT_PER_PASS` segments a pass)
 sweeps the last `HUNT_HOURS` (48) of footage newest first at the ingest rate and keeps
 *only* wanted-class frames: a two-day backlog clears in hours, and after that the newest
