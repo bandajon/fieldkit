@@ -2044,6 +2044,85 @@ def valcheck_browser_delayed_back_and_writers():
     assert r.returncode == 0, r.stdout + r.stderr
 
 
+def valcheck_pay_audit():
+    from datetime import datetime, timezone
+    day = datetime.now(timezone.utc).date().isoformat()
+    return [
+        {"ts": day + "T10:00:00+00:00", "who": "alice", "action": "approve", "held": True, "assigned_hit": True, "assigned_class": "A"},
+        {"ts": day + "T10:01:00+00:00", "who": "reviewer", "action": "review", "released": True, "curator": "alice"},
+        {"ts": day + "T10:05:00+00:00", "who": "alice", "action": "review", "valcheck": True, "curator": "original"},
+        {"ts": day + "T10:10:00+00:00", "who": "alice", "action": "review", "valcheck": True, "note": "script"},
+        {"ts": day + "T11:00:00+00:00", "who": "bob", "action": "review", "valcheck": True},
+        {"ts": day + "T11:05:00+00:00", "who": "script", "action": "review", "valcheck": True, "note": "script"},
+        {"ts": day + "T10:09:00+00:00", "who": "alice", "action": "review", "vetted": True},
+    ]
+
+
+def valcheck_progress_pay():
+    import json, tempfile
+    from unittest.mock import patch
+    import app
+    with tempfile.TemporaryDirectory() as d, patch.object(app, "DATASET", Path(d)):
+        (Path(d) / "classes.txt").write_text("a-small\n")
+        app.write_yaml("assignments.yaml", {"alice": {"class": "A", "min": 10}})
+        audit = Path(d) / "audit.jsonl"
+        lines = valcheck_pay_audit()
+        audit.write_text("\n".join(map(json.dumps, lines[:2])))
+        before = app.dataset_progress()
+        audit.write_text("\n".join(map(json.dumps, lines)))
+        after = app.dataset_progress()
+        alice = after["by_who"]["alice"]
+        assert alice.get("checks") == 1, alice
+        assert alice["active_hours"] == 0.08, alice
+        assert before["by_who"]["alice"]["checks"] == 0
+        assert after["total"] == before["total"] == {"approve": 1, "discard": 0}
+        assert after["today"] == before["today"] == {"approve": 1, "discard": 0}
+        assert alice["assignment"]["done"] == 1, alice
+        for key, value in before["by_who"]["alice"].items():
+            if key not in ("checks", "active_hours", "per_hour"):
+                assert alice[key] == value, (key, alice)
+        bob = after["by_who"]["bob"]
+        assert (bob["checks"], bob["approve"], bob["discard"], bob["held"], bob["released"], bob["active_hours"]) == (1, 0, 0, 0, 0, 0)
+        assert set(after["by_who"]) == {"alice", "bob"}, after
+
+
+def valcheck_payroll_pay():
+    import csv, io, json, tempfile
+    from contextlib import redirect_stdout
+    from unittest.mock import patch
+    import payroll_report as payroll
+    with tempfile.TemporaryDirectory() as d, patch.object(payroll, "DATASET", Path(d)), \
+            patch.object(sys, "argv", ["payroll_report.py", "7"]):
+        (Path(d) / "audit.jsonl").write_text("\n".join(map(json.dumps, valcheck_pay_audit())))
+        output = io.StringIO()
+        with redirect_stdout(output):
+            payroll.main()
+        with open(next(Path(d).glob("payroll-*.csv")), newline="") as f:
+            rows = {r["curator"]: r for r in csv.DictReader(f)}
+        alice = rows["alice"]
+        assert alice.get("checks") == "1", alice
+        assert alice["active_hours"] == "0.08", alice
+        assert (alice["approvals"], alice["discards"], alice["held"], alice["released"]) == ("1", "0", "1", "1")
+        assert (alice["golds_seen"], alice["reviews"], alice["quality"]) == ("0", "0", "")
+        assert (rows["bob"]["checks"], rows["bob"]["approvals"], rows["bob"]["active_hours"]) == ("1", "0", "0.0")
+        assert set(rows) == {"alice", "bob"}, rows
+        assert "checks" in output.getvalue().splitlines()[2], output.getvalue()
+
+
+def valcheck_roster_pay():
+    src = (ROOT / "static/index.html").read_text()
+    start = src.index("function labPaceTag(")
+    fn = src[start:src.index("\n}\n", start) + 3]
+    js = "const labProg={by_who:{alice:{active_hours:.08,days:1,checks:1},bob:{active_hours:0,checks:1},zero:{active_hours:1,days:1,checks:0}}};\n" + fn + """
+      for(const who of ['alice','bob']) {
+        if(!labPaceTag(who).includes('· 1 checks') || !labPaceTag(who).includes('<i class="res">'))throw Error(who+' missing checks');
+      }
+      if(labPaceTag('zero').includes('checks') || labPaceTag('missing')!=='')throw Error('empty checks shown');
+    """
+    r = subprocess.run(["node", "-e", js], capture_output=True, text=True)
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
 def routes_point_at_their_handlers():
     """A helper inserted between a decorator and its function silently steals the route
     (FastAPI then demands the helper's arguments as query fields — a live 422). Pin the
@@ -2115,6 +2194,9 @@ check("valcheck without AI and unknown suggestion", valcheck_without_ai_and_unkn
 check("valcheck delayed main responses", valcheck_browser_load_races)
 check("valcheck pending transition blocks submission", valcheck_browser_pending_submission)
 check("valcheck delayed Back and async frame writers", valcheck_browser_delayed_back_and_writers)
+check("valcheck progress pay and hours", valcheck_progress_pay)
+check("valcheck payroll table and CSV", valcheck_payroll_pay)
+check("valcheck roster pay count", valcheck_roster_pay)
 check("routes point at their handlers", routes_point_at_their_handlers)
 
 print(f"\n{'FAILED: ' + ', '.join(FAILS) if FAILS else 'all passed'}")
