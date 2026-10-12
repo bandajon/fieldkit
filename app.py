@@ -39,6 +39,7 @@ import offload
 import recorder
 import dataset_retention as retention
 import retention_maintenance
+from train import is_val, reference
 
 ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = ROOT / "config.yaml"
@@ -1465,6 +1466,138 @@ def envelope(sid, tree, curator):
             "attrs": read_attrs(attrs_path(sid, tree))}
 
 
+VAL_HEADS = ("colour", "make")
+
+
+def valcheck_reference():
+    refs = reference()
+    f = DATASET / "reference.txt"
+    if f.is_file():
+        refs.update(line.strip() for line in f.read_text().splitlines() if line.strip())
+    for f in (DATASET / "classifier-crops").glob("*/manifest.json"):
+        try:
+            if json.loads(f.read_text()).get("reference"):
+                refs.add(f.parent.name)
+        except (OSError, ValueError, AttributeError):
+            continue
+    return refs
+
+
+def valcheck_heads(box, names, vocab, constraints):
+    if not 0 <= box["cls"] < len(names):
+        return {}
+    rules = constraints.get(names[box["cls"]], {})
+    return {h: rules.get(h, vocab.get(h, [])) for h in VAL_HEADS
+            if rules.get(h, vocab.get(h, []))}
+
+
+def valcheck_sample(sid, refs, names, vocab, constraints):
+    p = sample_paths(sid, "approved")[1]
+    if sid.startswith("external-") or not is_val(sid) or sid in refs or not is_active(sid) or not p.is_file():
+        return None
+    try:
+        s = envelope(sid, "approved", "")
+        # read_boxes skips malformed lines; attributes must keep their original indexes.
+        if len(s["boxes"]) != len(p.read_text().splitlines()):
+            return None
+        if any(h not in s["attrs"].get(str(i), {}) for i, b in enumerate(s["boxes"])
+               for h in valcheck_heads(b, names, vocab, constraints)):
+            return s
+    except OSError:
+        pass
+    return None
+
+
+def valcheck_suggestions(s, names, vocab, constraints):
+    rows = {}
+    for p in sorted((DATASET / "ai-attrs").glob("*.jsonl")):
+        try:
+            lines = p.read_text().splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            try:
+                r = json.loads(line)
+                if isinstance(r, dict) and r.get("sid") == s["id"] and type(r.get("box")) is int and r["box"] >= 0:
+                    rows[r["box"]] = r
+            except ValueError:
+                continue
+    out = {}
+    for i, b in enumerate(s["boxes"]):
+        row = rows.get(i, {})
+        try:
+            bbox = row["bbox"]
+            if not isinstance(bbox, list) or len(bbox) != 4 or not all(
+                    abs(float(a) - b[k]) <= 1e-4 for a, k in zip(bbox, ("cx", "cy", "w", "h"))):
+                continue
+            attrs = row.get("attrs")
+            if not isinstance(attrs, dict):
+                continue
+            sug = {h: attrs[h] for h, allowed in valcheck_heads(b, names, vocab, constraints).items()
+                   if h not in s["attrs"].get(str(i), {}) and attrs.get(h) in allowed}
+            if sug:
+                out[str(i)] = sug
+        except (KeyError, TypeError, ValueError):
+            continue
+    return out
+
+
+@app.get("/api/dataset/valcheck")
+def dataset_valcheck(who: str = "", count: bool = False, x_curator_token: str = Header("")):
+    if curators() and not who:
+        raise HTTPException(401, "unknown curator or bad token")
+    who = check_token(valid_who(who), x_curator_token)
+    with DATASET_LOCK:
+        refs, names, vocab, constraints = valcheck_reference(), dataset_classes(), attr_vocab(), attr_meta("constraints")
+        pool = [s for p in sorted((DATASET / "approved" / "labels").glob("*.txt"))
+                if (s := valcheck_sample(p.stem, refs, names, vocab, constraints))]
+        if not pool:
+            return {"done": True, "remaining": 0}
+        if count:
+            return {"remaining": len(pool)}
+        held = purge_claims()
+        available = [s for s in pool if held.get(s["id"], who) == who]
+        if not available:
+            return {"done": False, "remaining": len(pool)}
+        s = next((s for s in available if s["id"] in held), available[0])
+        hold([s["id"]], who)
+        return {**s, "rev": hashlib.sha1(sample_paths(s["id"], "approved")[1].read_bytes()).hexdigest()[:12],
+                "remaining": len(pool), "suggested": valcheck_suggestions(s, names, vocab, constraints),
+                "classes": names, "attributes": vocab,
+                **{f"attr_{k}": attr_meta(k) for k in ("defaults", "constraints", "implies", "restricts")},
+                "attr_ordinary_optional": attr_meta("optional"),
+                "attr_optional": {**attr_meta("optional"), **{h: False for h in VAL_HEADS}}}
+
+
+@dataset_mutation
+def valattrs_label(sid, who, body):
+    names, vocab, constraints = dataset_classes(), attr_vocab(), attr_meta("constraints")
+    s = valcheck_sample(sid, valcheck_reference(), names, vocab, constraints)
+    if s is None:
+        raise HTTPException(400, "frame is not awaiting validation colour/make")
+    if purge_claims().get(sid, who) != who:
+        raise HTTPException(409, "frame is claimed by another curator")
+    rev = hashlib.sha1(sample_paths(sid, "approved")[1].read_bytes()).hexdigest()[:12]
+    if body.get("rev") != rev:
+        raise HTTPException(409, "frame changed, reload")
+    attrs = valid_attrs(body.get("attrs"), len(s["boxes"]))
+    for i, b in enumerate(s["boxes"]):
+        allowed = valcheck_heads(b, names, vocab, constraints)
+        posted = attrs.get(str(i), {})
+        for h in VAL_HEADS:
+            if h in posted and posted[h] not in allowed.get(h, []):
+                raise HTTPException(400, f"box {i} does not allow {h}={posted[h]!r}")
+            if h in allowed and h not in posted:
+                raise HTTPException(400, f"box {i} needs an explicit {h} answer")
+        values = {h: posted[h] for h in allowed}
+        if values:
+            s["attrs"].setdefault(str(i), {}).update(values)
+    p = attrs_path(sid, "approved")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(s["attrs"]))
+    return finish(who, sid, "review", {"ok": True, "id": sid}, {"valcheck": True})
+
+
 def superadmin(who):
     """The one handle whose review RELEASES held work: SUPERVISOR when the node names one,
     else any reviewer — a node without a super admin keeps behaving as it always did."""
@@ -1539,11 +1672,8 @@ def review_label(sid, who, body):
     dst_lbl.parent.mkdir(parents=True, exist_ok=True)
     dst_lbl.write_text(box_lines(boxes))
     dst_attrs = attrs_path(sid, "approved")
-    if attrs:
-        dst_attrs.parent.mkdir(parents=True, exist_ok=True)
-        dst_attrs.write_text(json.dumps(attrs))
-    else:
-        dst_attrs.unlink(missing_ok=True)
+    dst_attrs.parent.mkdir(parents=True, exist_ok=True)
+    dst_attrs.write_text(json.dumps(attrs))   # {} publishes a clear through upload-only sync
     if tree == "holding":      # the approved copy is written first: never lose the only one
         dst_img.parent.mkdir(parents=True, exist_ok=True)
         src_img.rename(dst_img)
@@ -1725,12 +1855,12 @@ def r2():
 
 
 def sync_both(ds, cl, bucket):
-    """Our work up, everything else down. -> (uploaded, downloaded). Both directions skip
-    on same-name-same-size, so a steady state is one listing and a pile of stat calls."""
+    """Our work up, everything else down. Existing labels/attrs stay on their sole writer;
+    consumers use plain pull to harvest corrections. -> (uploaded, downloaded)."""
     import retention_maintenance
     retention_maintenance.maintenance_once(DATASET.resolve(), cl, bucket)
     sent, _ = ds.push(cl, bucket, names=ds.LEDGERS)
-    got, _ = ds.pull(cl, bucket)
+    got, _ = ds.pull(cl, bucket, preserve_attrs=True)
     try:
         settings = curation_cap.bucket_settings(cl, bucket, ds.PREFIX + curation_cap.SETTINGS)
         now = time.monotonic()
@@ -2340,8 +2470,12 @@ def send_back(sid, tree):
 def dataset_label(body: dict = Body(default={}), x_curator_token: str = Header("")):
     sid = valid_sample_id(body.get("id"))
     ensure_active(sid)
-    who = check_token(valid_who(body.get("who")), x_curator_token)
     action = body.get("action")
+    if action == "valattrs" and curators() and not body.get("who"):
+        raise HTTPException(401, "unknown curator or bad token")
+    who = check_token(valid_who(body.get("who")), x_curator_token)
+    if action == "valattrs":
+        return valattrs_label(sid, who, body)
     if sid.startswith("g-"):
         return gold_label(sid, who, action, body)
     if action == "review":
@@ -2381,11 +2515,11 @@ def dataset_label(body: dict = Body(default={}), x_curator_token: str = Header("
     dst_lbl.parent.mkdir(parents=True, exist_ok=True)
     dst_lbl.write_text(box_lines(boxes))   # the operator's edit wins over the model's guess
     dst_attrs = attrs_path(sid, tree)
-    if attrs:
+    if attrs or tree == "approved":
         dst_attrs.parent.mkdir(parents=True, exist_ok=True)
         dst_attrs.write_text(json.dumps(attrs))
     else:
-        dst_attrs.unlink(missing_ok=True)   # re-approved with the attributes cleared
+        dst_attrs.unlink(missing_ok=True)
     img.rename(dst_img)
     lbl.unlink(missing_ok=True)
     attrs_path(sid).unlink(missing_ok=True)

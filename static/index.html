@@ -291,6 +291,8 @@
       <div class="paired-controls"><input id="tr-title" placeholder="calibration title" aria-label="calibration title"><button class="btn go" id="tr-cal-save" disabled>Save calibration version</button><button class="btn go" id="tr-save" disabled>Save example</button></div>
       <div id="tr-res" class="res"></div><div class="paired-list"><div class="paired-controls"><button class="btn" id="tr-refresh">Refresh saved</button><select id="tr-calibration" aria-label="saved calibrations"></select><button class="btn" id="tr-cal-load" disabled>Load calibration</button><select id="tr-example" aria-label="saved examples"></select><button class="btn" id="tr-reopen" disabled>Reopen</button><button class="btn halt" id="tr-delete" disabled>Delete</button></div><div id="tr-list-note" class="res">Manual review examples are kept for 7 days.</div></div>
     </details>
+    <div class="acts"><button class="btn" id="l-valcheck">Check colour/make</button>
+      <button class="btn" id="l-valback" hidden>Back to labelling</button></div>
     <div class="acts" id="l-focus" hidden>
       <i class="res">focus</i>
       <select id="l-fsel" multiple size="3" title="cmd/ctrl-click for more than one"></select>
@@ -477,7 +479,7 @@ async function post(url, body) {
                                  headers: {'Content-Type': 'application/json', ...labHdr()}});
   let r = await send();
   if (r.status === 401 && labAskTok()) r = await send();   // one retry with a freshly typed token
-  return r.json();
+  return {...await r.json(), status: r.status};
 }
 
 async function rec(act, cam) {
@@ -965,7 +967,7 @@ const boxCls = b =>
 const clsColor = i => `hsl(${(i * 137.508) % 360} 85% 55%)`;
 
 const WHO_RE = /^[a-z0-9][a-z0-9_-]{0,23}$/;
-let labWho = localStorage.fieldkit_who || '', labAsked = false, labProg = null, labRev = false;
+let labWho = localStorage.fieldkit_who || '', labAsked = false, labProg = null, labRev = false, labVal = false;
 let labFocus = localStorage.fieldkit_focus || '';   // "c-bus,F": the queue narrowed to these
 let labSkipped = 0;                                  // frames passed over this sitting (see labSkip)
 
@@ -1006,7 +1008,7 @@ let labAssign = null;
 // A frame opened from the supervisor's search sits in the editor exactly like a review does:
 // one sample, no queue behind it, and Submit review writes the correction back.
 let labOpened = null;               // {id, tree}, or null when the queue is what is on screen
-const labOne = () => labRev || !!labOpened;
+const labOne = () => labVal || labRev || !!labOpened;
 
 function labAskWho() {
   for (;;) {
@@ -1044,10 +1046,21 @@ document.getElementById('l-who').onclick = () => {
   labLoad();
 };
 
+document.getElementById('l-valcheck').onclick = () => {
+  if (location.hash === '#valcheck') labLoad(); else location.hash = '#valcheck';
+};
+document.getElementById('l-valback').onclick = () => { location.hash = ''; };
 addEventListener('hashchange', () => { if (tab === 'label') labLoad(); });
 
+let labLoadSeq = 0;
 async function labLoad() {
+  const seq = ++labLoadSeq;
+  labQueue = [];
+  document.getElementById('l-ok').disabled = true;
+  document.getElementById('l-back').disabled = true;
   if (curation && typeof trInit === 'function') trInit();
+  labVal = location.hash === '#valcheck';
+  document.getElementById('l-valback').hidden = !labVal;
   labRev = location.hash === '#review';   // same tool, same taxonomy, different source
   labOpened = null;                       // loading the queue IS the way back out of a search hit
   labWhoShow();
@@ -1058,9 +1071,14 @@ async function labLoad() {
   const q = who + (labFocus ? `${who ? '&' : '?'}focus=${encodeURIComponent(labFocus)}` : '')
               + (labSkipped ? `${who || labFocus ? '&' : '?'}offset=${labSkipped}` : '');
   if (labWho) labFetch('/api/dataset/progress').then(r => r.json())
-    .then(p => { labProg = p; labStats(); if (labTeam) labRosterShow(labTeam); }).catch(() => {});
+    .then(p => { if (seq !== labLoadSeq) return; labProg = p; labStats(); if (labTeam) labRosterShow(labTeam); }).catch(() => {});
   try {
-    const r = await labFetch(labRev ? '/api/dataset/review' + who : '/api/dataset/samples' + q);
+    if (!labVal) labFetch('/api/dataset/valcheck' + who + (who ? '&' : '?') + 'count=true')
+      .then(r => r.ok ? r.json() : null).then(d => {
+        if (d && seq === labLoadSeq) document.getElementById('l-valcheck').textContent = `Check colour/make (${d.remaining} left)`;
+      }).catch(() => {});
+    const r = await labFetch(labVal ? '/api/dataset/valcheck' + who : labRev ? '/api/dataset/review' + who : '/api/dataset/samples' + q);
+    if (seq !== labLoadSeq) return;
     if (r.status === 403) return labNote('your handle is not on the reviewer list');
     // A 401 read as an empty response is the cruellest possible lie: it tells someone
     // whose token is wrong that there is no work, and both fixes are on this screen.
@@ -1069,15 +1087,17 @@ async function labLoad() {
       labQueue = []; labTotal = 0;
       return labShow();
     }
-    labAuthErr = false;
     const d = await r.json();
+    if (seq !== labLoadSeq) return;
+    labAuthErr = false;
     // Review serves one sample at a time; whatever the envelope omits keeps its current value.
     labClasses = d.classes || labClasses;
-    if (!labRev) { labFocusFill(); labFocusSug(d.focus_suggestions); }
-    labQueue = labRev ? (d.id ? [d] : []) : (d.pending || []);
-    labTotal = labRev ? labQueue.length : (d.pending_total ?? labQueue.length);
+    if (!labRev && !labVal) { labFocusFill(); labFocusSug(d.focus_suggestions); }
+    document.getElementById('l-focus').hidden = labVal || labRev;
+    labQueue = labOne() ? (d.id ? [d] : []) : (d.pending || []);
+    labTotal = labVal ? d.remaining : labRev ? labQueue.length : (d.pending_total ?? labQueue.length);
     // Skipped past everything that is pending: start over from the top, once.
-    if (!labRev && !labQueue.length && labSkipped) { labSkipped = 0; return labLoad(); }
+    if (!labOne() && !labQueue.length && labSkipped) { labSkipped = 0; return labLoad(); }
     labApproved = d.approved || labApproved;
     labAssign = d.assignment || null;
     labAttrs = d.attributes || labAttrs;
@@ -1085,10 +1105,13 @@ async function labLoad() {
     labDefaults = d.attr_defaults || labDefaults;
     labImplies = d.attr_implies || labImplies;
     labRestricts = d.attr_restricts || labRestricts;
-    labOptional = d.attr_optional || labOptional;
+    // Keep ordinary rules even on direct valcheck entry; labGap enforces its required taps.
+    labOptional = d.attr_ordinary_optional || d.attr_optional || labOptional;
+    if (labVal) document.getElementById('l-valcheck').textContent = `Check colour/make (${d.remaining} left)`;
     // /api/dataset/review 403s a non-reviewer, so reaching it is proof enough on its own.
     document.getElementById('l-admin').hidden = !(d.reviewer || labRev);
   } catch (e) {
+    if (seq !== labLoadSeq) return;
     labNote('Could not load samples — is the server reachable?');
     return;
   }
@@ -1103,12 +1126,17 @@ async function labLoad() {
 // any other call and handed to the tag as a blob.
 let labBlob = '';
 async function labImage(img, id) {
+  const seq = labLoadSeq;
   try {
     const r = await labFetch(`/api/dataset/image?id=${encodeURIComponent(id)}`);
+    if (seq !== labLoadSeq) return;
     if (!r.ok) throw new Error(`frame not loaded (${r.status})`);
+    const blob = await r.blob();
+    if (seq !== labLoadSeq) return;
     if (labBlob) URL.revokeObjectURL(labBlob);     // one frame at a time; do not leak the last
-    img.src = labBlob = URL.createObjectURL(await r.blob());
+    img.src = labBlob = URL.createObjectURL(blob);
   } catch (e) {
+    if (seq !== labLoadSeq) return;
     labNote(String(e.message || e));
   }
 }
@@ -1119,12 +1147,13 @@ function labShow() {
   wrap.hidden = !s;
   // The row survives an empty queue while Back can still reopen the last approval.
   document.getElementById('l-acts').hidden = !s && !labDone.length;
-  document.getElementById('l-back').disabled = !labDone.length;
+  document.getElementById('l-back').disabled = labOne() || !labDone.length;
   ['l-ok', 'l-skip', 'l-skip10', 'l-skip50', 'l-skip100', 'l-classify', 'l-clear', 'l-no', 'l-rej'].forEach(id => document.getElementById(id).disabled = !s);
   // Reviewers correct, they do not delete or rewind.
-  document.getElementById('l-ok').textContent = labOne() ? 'Submit review' : 'Approve';
+  document.getElementById('l-ok').textContent = labVal ? 'Save colour/make' : labOne() ? 'Submit review' : 'Approve';
   document.getElementById('l-no').hidden = document.getElementById('l-back').hidden = labOne();
   document.getElementById('l-toq').hidden = !labOpened;
+  ['l-clear', 'l-classify', 'l-skip'].forEach(id => document.getElementById(id).hidden = labVal);
   labHitButtons();
   // Reject exists only where holding does: a supervisor's review or search hit. A curator's own
   // queue carries no held flag, so the button never appears for them even if one leaked through.
@@ -1133,7 +1162,7 @@ function labShow() {
     document.getElementById(id).hidden = labOne());   // one frame: nothing behind it to skip
   if (!s) {
     // The batch is done but more may wait on disk (the fetch is capped at 100).
-    if (labTotal > 0) return labLoad();
+    if (labTotal > 0 && !labVal) return labLoad();
     // An empty queue is usually temporary: a curation node pulls new work from the bucket
     // every couple of minutes, and this tab is the only one, so nothing else would ever
     // trigger another load. Re-check on a timer instead of making people reload the page.
@@ -1142,19 +1171,20 @@ function labShow() {
       return labNote('Not signed in. Open Supervisor below to sign in with your password, '
                      + 'or press (change) beside your name to enter your curator token.');
     labIdle = setTimeout(labLoad, IDLE_RECHECK);
-    return labNote('No samples waiting — checking again shortly.');
+    return labNote(labVal ? (labTotal ? 'Remaining frames are claimed by other curators — checking again shortly.'
+      : 'Colour/make checks complete — checking again shortly.') : 'No samples waiting — checking again shortly.');
   }
   // Sidecar attrs are keyed by the sample's own box order, so hydrate before anything filters.
-  // Hydrated values count as touched: they were set deliberately in an earlier pass.
-  // VLM suggestions sit under confirmed attrs: lit and part of the payload, but untouched,
+  // Validation checks require a fresh tap even on a previously confirmed value.
+  // VLM suggestions sit under confirmed attrs: lit but untouched,
   // so the operator can see and correct what the machine proposed.
   labBoxes = s.boxes.map((b, i) => {
     const confirmed = {...(s.attrs || {})[i]}, sug = {...(s.suggested || {})[i]};
-    const touched = new Set(Object.keys(confirmed));
+    const touched = new Set(labVal ? [] : Object.keys(confirmed));
     return {...b, attrs: {...sug, ...confirmed}, touched,
             suggested: new Set(Object.keys(sug).filter(h => !touched.has(h)))};
   });
-  labNote(labOpened
+  labNote(labVal ? `${labTotal} remaining · tap each box, then confirm or correct its colour and make. Boxes stay fixed.` : labOpened
     ? `open: ${labOpened.id} from ${labOpened.tree} — Submit review saves your corrections back, ` +
       `Back to queue leaves it as it is`
     : labRev
@@ -1178,12 +1208,12 @@ function labSelect(i) {
   // A box the operator never opens contributes nothing, so defaults land on first selection.
   if (!b.seen) {
     b.seen = true;
-    if (!Object.keys(b.attrs).length) labDefault(b);
+    if (!labVal && !Object.keys(b.attrs).length) labDefault(b);
   }
   const name = labClasses[b.cls], row = (l, chips) => `<div class="acts toggle"><i class="res">${l}</i>${chips}</div>`;
   // A removed box takes no attributes; its class row stays so the removal can be undone.
   const heads = b.cls >= labClasses.length ? '' :
-    Object.keys(labAttrs).map(head => {
+    Object.keys(labAttrs).filter(h => !labVal || ['colour', 'make'].includes(h)).map(head => {
       const vocab = labVocab(head, name, b.attrs[head], b.attrs);
       // Hide only when the CLASS opts out (constraint []). A row the cross-filter emptied
       // (an axle count with no known config yet) stays visible with just its "+" — that is
@@ -1191,12 +1221,12 @@ function labSelect(i) {
       if (!labVocab(head, name, null).length) return '';
       return row(esc(head), vocab.map(([v, stale]) =>
         `<button class="btn${b.attrs[head] === v ? ' on' : ''}${stale ? ' halt' : ''}${
-                  b.suggested.has(head) && b.attrs[head] === v ? ' sug' : ''}"
+                  (labVal ? !b.touched.has(head) : b.suggested.has(head)) && b.attrs[head] === v ? ' sug' : ''}"
                   data-head="${esc(head)}" data-val="${esc(v)}"
           >${esc(v)}</button>`).join('') +
-        `<button class="btn rm" data-add="${esc(head)}">+</button>`);
+        (labVal ? '' : `<button class="btn rm" data-add="${esc(head)}">+</button>`));
     }).join('');
-  el.innerHTML = row('class', labSorted().map(([n, j]) =>
+  el.innerHTML = labVal ? row('class', esc(name)) + heads : row('class', labSorted().map(([n, j]) =>
       `<button class="btn${b.cls === j ? ' on' : ''}" style="--c:${clsColor(j)}" data-cls="${j}"
         >${esc(n)}</button>`).join('') +
       `<button class="btn rm${b.cls >= labClasses.length ? ' on' : ''}"
@@ -1342,13 +1372,14 @@ document.getElementById('l-attrs').onclick = e => {
   if (!t || !b) return;
   const head = t.dataset.head;
   if (t.dataset.ex) return labExShow(labExFor === t.dataset.ex ? '' : t.dataset.ex);
+  if (labVal && (!head || !['colour', 'make'].includes(head))) return;
   if (t.dataset.add) return labAddValue(t.dataset.add, labClasses[b.cls]);
   if (t.dataset.cls !== undefined) {
     b.cls = +t.dataset.cls;
     if (b.cls < labClasses.length) labLastCls = b.cls;   // runs of one missed class draw as that class
     labDefault(b);
     labRepaint(labSel);
-  } else if (b.attrs[head] === t.dataset.val) {
+  } else if (b.attrs[head] === t.dataset.val && (!labVal || b.touched.has(head))) {
     delete b.attrs[head];           // tap the active chip to unset
     b.touched.delete(head);
     b.suggested.delete(head);       // any tap in a head is the operator taking it over
@@ -1357,7 +1388,7 @@ document.getElementById('l-attrs').onclick = e => {
     b.touched.add(head);
     b.suggested.delete(head);
     // One level, deliberately: chained implies are how a tap starts rewriting the whole strip.
-    labFill(b, (labImplies[head] || {})[t.dataset.val], true);
+    if (!labVal) labFill(b, (labImplies[head] || {})[t.dataset.val], true);
   }
   labSelect(labSel);
 };
@@ -1369,14 +1400,18 @@ function labGap(all) {
   for (let i = 0; i < all.length; i++) {
     const b = all[i], name = labClasses[b.cls];
     if (b.del || b.cls >= labClasses.length) continue;
-    for (const head of Object.keys(labAttrs))
-      if (!labOptional[head] && !b.attrs[head] && labVocab(head, name, null, b.attrs).length) return {i, head, name};
+    for (const head of Object.keys(labAttrs)) {
+      if (labVal && !['colour', 'make'].includes(head)) continue;
+      if ((labVal ? !b.touched.has(head) || !b.attrs[head] : !labOptional[head] && !b.attrs[head])
+          && labVocab(head, name, null, b.attrs).length) return {i, head, name};
+    }
   }
   return null;
 }
 
 // Not auto-applied to the selected box: the chip renders right there for the operator to tap.
 async function labAddValue(head, name) {
+  const seq = labLoadSeq;
   // The same box removes: "-1222" drops a value, "-1222=1+2+2+2" drops it and rewrites
   // every frame that used it. Reviewers only; the server says so to anyone else.
   let value = (prompt(`New ${head} value (reviewers: -value removes, -old=new remaps):`) || '')
@@ -1388,6 +1423,7 @@ async function labAddValue(head, name) {
   if (remove && !confirm(`Remove ${head} "${value}"${replace ? ` and rewrite frames to "${replace}"` : ''}?`)) return;
   try {
     const r = await post('/api/dataset/attr_value', {head, value, remove, replace});
+    if (seq !== labLoadSeq) return;
     if (!r.ok) throw new Error(r.detail || 'rejected');
     labAttrs = r.attributes;
     labImplies = r.attr_implies;   // the server derives implies for shapes like 1+3+3
@@ -1399,6 +1435,7 @@ async function labAddValue(head, name) {
               (r.published ? '' : ' — NOT published to the bucket, try again in a minute'));
     }
   } catch (e) {
+    if (seq !== labLoadSeq) return;
     return labNote(String(e.message || e));
   }
   labSelect(labSel);
@@ -1411,16 +1448,21 @@ async function labAddValue(head, name) {
 // Attr keys index the POSTED boxes array, and filtering out deleted/removed boxes renumbers
 // them — pure so the self-check can pin the remap.
 function labPayload(all) {
-  const kept = all.filter(b => !b.del && b.cls < labClasses.length);
+  const kept = labVal ? all : all.filter(b => !b.del && b.cls < labClasses.length);
   const attrs = {};
-  kept.forEach((b, i) => { if (b.attrs && Object.keys(b.attrs).length) attrs[i] = b.attrs; });
+  kept.forEach((b, i) => {
+    const values = labVal ? Object.fromEntries(['colour', 'make']
+      .filter(h => b.touched.has(h) && b.attrs[h]).map(h => [h, b.attrs[h]])) : {...b.attrs};
+    for (const head of b.suggested) if (labOptional[head]) delete values[head];
+    if (values && Object.keys(values).length) attrs[i] = values;
+  });
   return {boxes: kept.map(({cls, cx, cy, w, h}) => ({cls, cx, cy, w, h})), attrs};
 }
 
 const boxHtml = (b, i) => `<div class="${boxCls(b)}" data-i="${i}"
     style="--c:${clsColor(b.cls)}; left:${(b.cx - b.w / 2) * 100}%; top:${(b.cy - b.h / 2) * 100}%;
            width:${b.w * 100}%; height:${b.h * 100}%">
-    <span>${esc(labClasses[b.cls] || 'removed')}</span><b class="x">&times;</b><i class="grip"></i></div>`;
+    <span>${esc(labClasses[b.cls] || 'removed')}</span>${labVal ? '' : '<b class="x">&times;</b><i class="grip"></i>'}</div>`;
 
 // Rubber-band draw: the two corners in any order → a normalized box clamped to the frame
 // (pointer capture happily reports coordinates outside the image).
@@ -1453,6 +1495,7 @@ const labPlace = (d, b) => {
 // threshold is the class-cycle tap, anything beyond it drags (or resizes, from the grip).
 document.getElementById('l-wrap').onpointerdown = e => {
   const d = e.target.closest('.box');
+  if (labVal) return d ? labSelect(+d.dataset.i) : labSelect(-1);
   if (!d) return labDraw(e);
   const b = labBoxes[d.dataset.i], b0 = {...b}, r = d.parentElement.getBoundingClientRect();
   if (!e.target.classList.contains('x')) labSelect(+d.dataset.i);
@@ -1482,6 +1525,7 @@ document.getElementById('l-wrap').onpointerdown = e => {
 // is best-effort: the drawn box survives a missing model, a stale index or a dead network.
 let labClassifySaid = false;
 async function labClassify(b, i) {
+  const seq = labLoadSeq;
   const s = labQueue[0];
   if (!s) return;
   const tree = s.tree || (labOpened && labOpened.tree) || 'pending';
@@ -1491,9 +1535,10 @@ async function labClassify(b, i) {
     r = await post('/api/dataset/classify',
                    {id: s.id, tree, who: labWho, box: {cx: b.cx, cy: b.cy, w: b.w, h: b.h}});
   } catch (e) {                              // the box is drawn either way; say so and offer the retry
+    if (seq !== labLoadSeq) return;
     return labNote('could not reach the classifier — press Classify to try that box again');
   }
-  if (labBoxes[i] !== b || b.del) return;    // the curator moved on; nothing left to suggest onto
+  if (seq !== labLoadSeq || labBoxes[i] !== b || b.del) return;    // the curator moved on; nothing left to suggest onto
   if (b.cls >= labClasses.length) return;    // an explicit removal outranks a late suggestion
   // Said once: a node with no champion fails on every box, and the queue note is worth more
   // than the same complaint restated per draw.
@@ -1520,6 +1565,7 @@ async function labClassify(b, i) {
 
 // Press on the image itself: rubber-band a new box for a vehicle the detector missed.
 function labDraw(e) {
+  if (labVal) return;
   const wrap = e.currentTarget, r = wrap.getBoundingClientRect();
   const ax = (e.clientX - r.left) / r.width, ay = (e.clientY - r.top) / r.height;
   const x0 = e.clientX, y0 = e.clientY;
@@ -1549,23 +1595,30 @@ function labDraw(e) {
 }
 
 async function labSend(action) {
+  const seq = labLoadSeq;
   const s = labQueue[0];
-  if (!s) return;
+  if (!s || document.getElementById('l-ok').disabled) return;
   // A review becomes the record too, so it is held to the same bar — but a discard keeps
   // nothing and a reject hands the frame back untouched, so neither has anything to complete.
   const gap = !['discard', 'reject'].includes(action) && labGap(labBoxes);
   if (gap) {
     labSelect(gap.i);   // open the offending box's strip right where the fix goes
     return labNote(`box ${gap.i + 1} (${gap.name}): missing ${gap.head} — ` +
-                   `required attributes must be set before Approve`);
+                   (labVal ? `tap to confirm or correct before saving` : `required attributes must be set before Approve`));
   }
   labNote('saving…');
   const {boxes, attrs} = labPayload(labBoxes);
   try {
-    const r = await post('/api/dataset/label', {id: s.id, action, boxes, attrs, who: labWho});
+    const r = await post('/api/dataset/label', {id: s.id, rev: s.rev, action, boxes, attrs, who: labWho});
+    if (seq !== labLoadSeq) return;
+    if (labVal && r.status === 409) {
+      labNote('This frame changed — reloading');
+      return labLoad();
+    }
     if (!r.ok) throw new Error(r.detail || 'rejected');
     if (r.vetted) labNote('vetted — it waits in holding for the super admin to release');
   } catch (e) {
+    if (seq !== labLoadSeq) return;
     // Finished by someone else while it was open here (a synced approval, or a slice
     // handed out twice across a restart): there is nothing left to save, so say so and
     // move on rather than offer a retry that can never succeed.
@@ -1602,7 +1655,7 @@ async function labSend(action) {
   labTotal = Math.max(0, labTotal - 1);   // skip leaves the total: the frame stays on disk
   labShow();
 }
-document.getElementById('l-ok').onclick = () => labSend(labOne() ? 'review' : 'approve');
+document.getElementById('l-ok').onclick = () => labSend(labVal ? 'valattrs' : labOne() ? 'review' : 'approve');
 // Skipped samples stay pending and age out of the rolling capture buffer on their own;
 // Skip is for near-duplicates (parked vehicles) not worth a decision.
 // Skipped frames stay pending AND claimed by this curator, so the next page is asked for
@@ -1644,13 +1697,17 @@ document.getElementById('l-toq').onclick = () => labLoad();
 // Reopen the last approval to amend it. Undoes the optimistic stats bump the same way
 // labSend applied it; the next labLoad trues both up from disk.
 document.getElementById('l-back').onclick = async () => {
+  if (labOne() || document.getElementById('l-back').disabled) return;
+  const seq = labLoadSeq;
   const id = labDone.pop();
   if (!id) return;
   let r;
   try {
     r = await post('/api/dataset/label', {id, action: 'unapprove', who: labWho});
+    if (seq !== labLoadSeq) return;
     if (!r.ok) throw new Error(r.detail || 'rejected');
   } catch (e) {
+    if (seq !== labLoadSeq) return;
     labNote(String(e.message || e));   // id stays popped: it is not coming back
     return labShow();
   }
@@ -2122,16 +2179,22 @@ const labThumbs = new IntersectionObserver(entries => entries.forEach(async en =
 
 // A hit opens in the ordinary editor — same boxes, same gestures, same Submit.
 async function labOpenHit(id, tree, scroll) {
+  const seq = ++labLoadSeq;
+  document.getElementById('l-back').disabled = true;
   let s;
   try {
     const r = await labFetch(`/api/dataset/sample?id=${encodeURIComponent(id)}` +
                              `&tree=${encodeURIComponent(tree)}`);
+    if (seq !== labLoadSeq) return;
     if (!r.ok) throw new Error(`sample not loaded (${r.status})`);
     s = await r.json();
+    if (seq !== labLoadSeq) return;
   } catch (err) {
+    if (seq !== labLoadSeq) return;
     return labNote(String(err.message || err));
   }
   clearTimeout(labIdle);        // the empty-queue re-check would pull this frame out from under
+  labVal = false;
   labOpened = {id, tree};
   labQueue = [{...s, id, boxes: s.boxes || []}];   // the id we asked for is the one that answered
   labShow();
@@ -2156,9 +2219,11 @@ function labHitButtons() {
 }
 async function labHitStep(dir) {
   if (!labOpened) return;
+  const seq = labLoadSeq;
   let rows = labHitRows(), i = rows.findIndex(r => r.dataset.open === labOpened.id) + dir;
   if (i >= rows.length && !document.getElementById('l-smore').hidden) {
     await labSearch(labSearchOffset);         // the next page appends; the index still holds
+    if (seq !== labLoadSeq) return;
     rows = labHitRows();
   }
   const r = rows[i];

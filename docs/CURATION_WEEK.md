@@ -63,6 +63,13 @@ Two independent measurements, both running in the background of ordinary work:
 Accuracies print "insufficient sample" under three measurements — small-sample
 honesty matters when the number decides a payment.
 
+## Check colour/make
+
+Open **Check colour/make** (or `#valcheck`) to complete a human validation set.
+Every colour and make must be tapped to confirm or correct it; AI prefill is
+only a suggestion. A blank means no AI answer, so fill it. Use "unknown" when
+you cannot identify the make; when a colour cannot be read, pick the closest colour or "other". This work is not scored against the original curator.
+
 ## Daily rhythm
 
     morning:  python ingest_video.py pull <toll-gate-id>/<cam> && python dataset_sync.py push
