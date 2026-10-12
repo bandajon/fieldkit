@@ -23,6 +23,7 @@ import time
 from bisect import bisect_left, bisect_right
 from collections import Counter
 from datetime import datetime, timezone
+from math import isfinite
 from statistics import median
 from zoneinfo import ZoneInfo
 
@@ -84,10 +85,11 @@ def _clash(a, b):
     return a in SMALL and b in HEAVY or b in SMALL and a in HEAVY
 
 
-def _hijacked(tracklets):
+def _hijacked(tracklets, anchors=None):
     """{id: (pull-away time, re-park tracklet id)} of tracklets that sat still, then pulled away as a new
     track was born on the parked box: the track slid onto passing traffic, so its crops, attrs and
-    look are the parked vehicle's, and the re-park track is the parked vehicle itself."""
+    look are the parked vehicle's, and the re-park track is the parked vehicle itself.
+    If supplied, anchors receives the still box that triggered each hijack."""
     by = {}
     for t in tracklets:
         by.setdefault(t["camera"], []).append(t)
@@ -106,6 +108,8 @@ def _hijacked(tracklets):
                               if b is not a and b.get("path") and iou(anchor[0][1:], b["path"][0][1:]) >= REPARK_IOU), None)
                     if b:
                         out[a["id"]] = s[0], b["id"]
+                        if anchors is not None:
+                            anchors[a["id"]] = anchor[0][1:]
                     break
                 anchor = [s]
     return out
@@ -477,7 +481,15 @@ def _links(chains, cameras, tz=None, shadows=None, absorbed=None):
     links += _trucks(chains, links, pairs)
     used = {id(c) for link in links for c in link}
     ta = lambda r: r["arr"] if r["arr"] is not None else r["late"]
-    # Swap ordinary links only into late arrivals unused by all passes; no matching follows.
+
+    def crosses(d, r, accepted):
+        dep = d["dep"] if d["dep"] is not None else d["early"]
+        return d["class"] in HEAVY and r["class"] in HEAVY and any(
+            ((dd["dep"] if dd["dep"] is not None else dd["early"]) - dep) * (ta(aa) - ta(r)) < 0
+            for dd, aa in accepted if dd["class"] in HEAVY and aa["class"] in HEAVY
+            and (dd["camera"], aa["camera"]) == (d["camera"], r["camera"]))
+
+    # Swap into unused late arrivals; only restricted weak-ghost recovery follows the shadow pass.
     for k in range(ordinary_count):
         d, r = links[k]
         sim = _similar(d["app"], r["app"])
@@ -489,10 +501,7 @@ def _links(chains, cameras, tz=None, shadows=None, absorbed=None):
             L = chains[c[3]]
             if chains[c[2]] is not d or L["class"] != d["class"]:
                 continue
-            if d["class"] in HEAVY and any(
-                    ((dd["dep"] if dd["dep"] is not None else dd["early"]) - d["dep"]) * (ta(aa) - ta(L)) < 0
-                    for dd, aa in links if dd["class"] in HEAVY and aa["class"] in HEAVY
-                    and (dd["camera"], aa["camera"]) == (d["camera"], L["camera"])):
+            if crosses(d, L, links):
                 continue
             replacements.append(c)
         if replacements:
@@ -500,14 +509,14 @@ def _links(chains, cameras, tz=None, shadows=None, absorbed=None):
             links[k] = (d, chains[j])
             used.remove(id(r))
             used.add(id(chains[j]))
-    if not shadows:
-        return links
+    shadows = shadows or {}
     linked_shadows = {}
     for k, (s, L) in enumerate(links):
         parent = shadows.get(id(s))
         if parent is not None:
             linked_shadows.setdefault(id(parent), []).append((s, L, k))
     removed = set()
+    absorbing = set()
     # Re-point d, absorb s for freezing, and release only the decoy r.
     for k, (d, r) in enumerate(links[:]):
         if k in removed or id(d) not in linked_shadows:
@@ -527,11 +536,7 @@ def _links(chains, cameras, tz=None, shadows=None, absorbed=None):
             shadow_sim = _similar(s["app"], L["app"])
             if shadow_sim is None or shadow_sim < LATE_COS or (sim is not None and shadow_sim <= sim):
                 continue
-            if d["class"] in HEAVY and any(
-                    ((dd["dep"] if dd["dep"] is not None else dd["early"]) - dep) * (ta(aa) - ta(L)) < 0
-                    for i, (dd, aa) in enumerate(links) if i not in removed
-                    and dd["class"] in HEAVY and aa["class"] in HEAVY
-                    and (dd["camera"], aa["camera"]) == (d["camera"], L["camera"])):
+            if crosses(d, L, (pair for i, pair in enumerate(links) if i not in removed)):
                 continue
             replacements.append((abs(ta(L) - dep - MU), s["members"][0]["id"], L["members"][0]["id"], j, s, L))
         if replacements:
@@ -540,7 +545,36 @@ def _links(chains, cameras, tz=None, shadows=None, absorbed=None):
             if absorbed is not None:
                 absorbed[id(d)] = s
             removed.add(j)
+            absorbing.add(id(d))
     links = [pair for k, pair in enumerate(links) if k not in removed]
+    used = {id(c) for pair in links for c in pair}
+    used |= {id(c) for c in chains if id(shadows.get(id(c))) in absorbing}
+    recovered = []
+    for c in chains:
+        if id(c) in used or c["arr"] is not None or c["dep"] is not None:
+            continue
+        ms = c["members"]
+        first = next((i for i, t in enumerate(ms) if t["hits"] >= MIN_EDGE_HITS and t.get("direction")), 0)
+        prefix, tail = ms[:first], ms[first:]
+        if (not prefix or any(t["hits"] >= MIN_EDGE_HITS or t.get("direction") for t in prefix)
+                or tail[0].get("ghost_of") not in {t["id"] for t in prefix}
+                or max(t["t1"] for t in prefix) >= tail[0]["t0"]):
+            continue
+        clean = _chains(tail, cameras)
+        if len(clean) == 1 and clean[0]["arr"] is not None:
+            # A weak ghost prefix can hide a real entry; repair only after established matches.
+            recovered.append((c, c.get("z")))
+            c["arr"], c["z"] = clean[0]["arr"], clean[0]["z"]
+    if recovered:
+        recovered_ids = {id(c) for c, _ in recovered}
+        for d, r in match(False, used):
+            if id(r) in recovered_ids and not crosses(d, r, links):
+                links.append((d, r))
+        used = {id(c) for pair in links for c in pair}
+        for c, z in recovered:
+            if id(c) not in used:
+                c["arr"] = None
+                c["z"] = z
     return links
 
 
@@ -763,13 +797,36 @@ def _split(t, k, cam):
 def _build(tracklets, cameras, tz=None, events=None, with_dropped=False, plant=None, frozen=()):
     if plant is None:
         plant = [(t["t0"], t["t1"], t["hits"]) for t in tracklets if t.get("class") == "e-plant"]
-    hj = _hijacked(tracklets)
+    cfg = {c["name"]: c for c in cameras}
+    boxes = {}
+    for name, cam in cfg.items():
+        boxes[name] = []
+        raw = cam.get("phantoms")
+        if not isinstance(raw, (list, tuple)):
+            continue
+        for box in raw:
+            try:
+                box = tuple(float(v) for v in box)
+                if (len(box) == 4 and all(isfinite(v) and 0 <= v <= 1 for v in box)
+                        and box[0] < box[2] and box[1] < box[3]):
+                    boxes[name].append(box)
+            except (TypeError, ValueError, OverflowError):
+                continue
+    anchors = {}
+    hj = _hijacked(tracklets, anchors)
     by = {t["id"]: t for t in tracklets}
     hit = {a: hj[a] for a in hj if _held(by[a], hj[a][0]) and _stays(by[hj[a][1]])}   # a parked vehicle's stolen track, not a queue advance
     parked = {b for _, b in hit.values()}
+    # Fixed-camera calibration identifies empty road; track evidence alone also fits a booth queue.
+    phantoms = {t["id"]: [box for box in boxes.get(t["camera"], [])
+                          if iou(t["path"][0][1:], box) >= REPARK_IOU]
+                for t in tracklets if t.get("path")}
+    hit.update({a: hj[a] for a in hj
+                if any(iou(anchors[a], box) >= REPARK_IOU for box in boxes.get(by[a]["camera"], []))})
     tracklets = [_pulled(t, hj[t["id"]][0]) if t["id"] in hit else dict(t, hijacked=True) if t["id"] in hj
-                 else dict(t, parked=True) if t["id"] in parked else t for t in tracklets]
-    cfg = {c["name"]: c for c in cameras}
+                 else dict(t, parked=True) if t["id"] in parked else t for t in tracklets
+                 if not any(all(iou(p[1:], box) >= REPARK_IOU for p in t["path"])
+                            for box in phantoms.get(t["id"], []))]
     tracklets = [piece for t in tracklets for k in [_reversal(t)] for piece in
                  (_split(t, k, cfg.get(t["camera"], {})) if k is not None else [t])]
     claimed = {raw for raw, _ in frozen}
@@ -856,6 +913,197 @@ def _north(i, t, gap=0.4, cls="c-small", k3={}, k4={}):
                direction="northbound", **k3),
             _t("cam4", i, cls, [(t + gap, _b(0.1, 0.7)), (t + gap + 1, _b(0.3, 0.5)),
                                 (t + gap + 2, _b(0.45, 0.35))], direction="northbound", **k4)]
+
+
+def _selfcheck_phantoms(case):
+    from selfloop import cleared
+
+    box = _b(.845, .845, .055)
+    cams = [dict(c, phantoms=[box]) if c["name"] == "cam3" else c for c in _CAMS]
+    def stolen(name, born, off):
+        return _t("cam3", name, "b-minibuses",
+                  [(t, box) for t in range(born, off)] +
+                  [(off, _b(.70, .80, .055)), (off + 4, _b(.30, .60, .03))],
+                  hits=60, counted=True, direction="southbound")
+    def departure(name, end):
+        return _t("cam4", name, "b-minibuses",
+                  [(end - 2, _b(.5, .4)), (end - 1, _b(.15, .7)), (end, _b(.02, .7))],
+                  hits=30, counted=True, direction="southbound")
+    a, b = stolen("first", 100, 108), stolen("second", 107, 451)
+    park = _t("cam3", "phantom", "b-minibuses", [(t, box) for t in range(450, 461)],
+              counted=True, direction="southbound")
+    da, db = departure("first", 106), departure("second", 449)
+    tracks = [a, b, park, da, db]
+    if case == "unconfigured":
+        _, chains, _ = _build(tracks, _CAMS)
+        members = {m["id"]: m for c in chains for m in c["members"]}
+        assert members[a["id"]]["path"] == a["path"], "no calibration: first relay keeps origin/main timing"
+        assert members[b["id"]]["path"] == _pulled(b, 451)["path"], "ordinary held-and-stays trim retained"
+        assert members[park["id"]].get("parked"), "ordinary re-park retained"
+        return
+    if case == "queue":
+        cams = [dict(c, phantoms=[_b(.2, .2, .03)], lone_edge=False) if c["name"] == "cam3" else c for c in _CAMS]
+        for gap in (1, 3):
+            queue = []
+            born = 100
+            for i in range(4):
+                off = born + 7
+                queue.append(_t("cam4", f"v{i}", "a-small",
+                    [(born - 4, _b(.5, .4)), (born - 2, _b(.2, .65)), (born - .5, _b(.05, .7))],
+                    hits=20, counted=True, direction="southbound"))
+                queue.append(_t("cam3", f"v{i}", "a-small",
+                    [(born + k, _b(.9, .8, .06)) for k in range(8)] +
+                    [(off + 1, _b(.7, .75, .05)), (off + 3, _b(.4, .65, .04)), (off + 6, _b(.05, .55, .02))],
+                    hits=60, counted=True, direction="southbound"))
+                born = off + gap
+            js = build(queue, cams)
+            assert len(js) == 4, ("booth queue with unrelated calibration", gap, len(js))
+            assert all({m["id"] for m in j["members"]} == {f"obs-cam3-v{i}", f"obs-cam4-v{i}"}
+                       for i, j in enumerate(js)), "queue vehicles keep their own partners"
+        return
+    js, chains, links = _build(tracks, cams)
+    assert len(js) == 2 and len(links) == 2, ("calibrated phantom relay", len(js), len(links))
+    assert [{m["id"] for m in j["members"]} for j in js] == [
+        {a["id"], da["id"]}, {b["id"], db["id"]}], "still phantom never forms a counting journey"
+    assert [r["arr"] for _, r in links] == [107, 450], "still heads excluded from handoff timing"
+    assert not build([park], cams, with_dropped=True, plant=[(0, 1000, WORKS_PLANT_LONG)]), "still phantom cannot count even in works mode"
+    if case == "freeze":
+        final = cleared(js, js, cutoff=1000)
+        assert final == js, "calibrated phantom freeze"
+        claims = {(m["id"], m.get("piece")) for j in final for m in j["members"]}
+        assert build(tracks, cams, frozen=claims) == [], "phantom cannot count after full freeze"
+        still = dict(b, path=[p for p in b["path"] if p[0] <= 420], t1=420, counted=False, direction=None)
+        early = build([a, still, da], cams)
+        assert early == js[:1], "first vehicle links while phantom still holds"
+        final = cleared(early, early, cutoff=420)
+        assert final == js[:1], "first vehicle freezes before second arrives"
+        claims = {(m["id"], m.get("piece")) for j in final for m in j["members"]}
+        assert build(tracks, cams, frozen=claims) == js[1:], "phantom partial freeze stable"
+
+
+def _selfcheck_phantom_regressions(case):
+    box = _b(.845, .845, .055)
+    if case in ("moving_prefix", "moved_onto"):
+        anchor = _b(.6, .7, .055)
+        birth = box
+        if case == "moved_onto":
+            birth, anchor = anchor, box
+        a = _t("cam3", "moving-prefix", "b-minibuses",
+               [(100, birth)] + [(t, anchor) for t in range(101, 108)] +
+               [(108, _b(.7, .8, .055)), (112, _b(.3, .6, .03))],
+               hits=60, counted=True, direction="southbound")
+        b = _t("cam3", "replacement", "b-minibuses",
+               [(107, anchor), (108, anchor), (113, _b(.4, .4, .03))])
+        d = _t("cam4", "departure", "b-minibuses",
+               [(96, _b(.5, .4)), (97, _b(.15, .7)), (98, _b(.02, .7))],
+               hits=30, counted=True, direction="southbound")
+        tracks = [a, b, d]
+        expected = build(tracks, _CAMS)
+        if case == "moving_prefix":
+            assert len(expected) == 1, ("moving prefix baseline", expected)
+        cams = [dict(c, phantoms=[box]) if c["name"] == "cam3" else c for c in _CAMS]
+        if case == "moved_onto":
+            _, chains, _ = _build(tracks, cams)
+            member = next(m for c in chains for m in c["members"] if m["id"] == a["id"])
+            assert member["path"] == _pulled(a, 108)["path"], "actual phantom anchor must trim despite a different birth box"
+        else:
+            assert build(tracks, cams) == expected, "birth phantom must not trim a different still anchor"
+        return
+    malformed = {
+        "null": None, "number": 3, "string": "bad",
+        "null_entry": [None], "number_entry": [3], "string_entry": ["bad"],
+        "short": [[.1, .2, .3]], "long": [[.1, .2, .3, .4, .5]],
+        "non_numeric": [[.1, .2, "bad", .4]],
+        "nan": [[.1, .2, float("nan"), .4]],
+        "inf": [[.1, .2, float("inf"), .4]],
+        "outside": [[-.1, .2, .3, .4]],
+        "reversed": [[.3, .2, .1, .4]], "flat": [[.1, .2, .3, .2]],
+    }
+    tracks = [_t("cam3", "real", "b-minibuses", [(100, box), (101, box)],
+                 hits=30, counted=True, direction="southbound")]
+    expected = build(tracks, _CAMS)
+    assert len(expected) == 1, "invalid calibration baseline counts"
+    cams = [dict(c, phantoms=malformed[case]) if c["name"] == "cam3" else c for c in _CAMS]
+    assert build(tracks, cams) == expected, ("malformed phantom is absent", case)
+    if isinstance(malformed[case], list):
+        cams = [dict(c, phantoms=[*malformed[case], box]) if c["name"] == "cam3" else c for c in _CAMS]
+        assert build(tracks, cams) == [], ("invalid entries do not discard valid calibration", case)
+
+
+def _selfcheck_ghost_handoff():
+    from selfloop import cleared
+
+    sliver = _t("cam3", "sliver", "e-heavy", [(2959.6, _b(.04, .51, .02)),
+                                             (2960.6, _b(.02, .51, .02))], hits=4, counted=True)
+    truck = _t("cam3", "truck", "e-heavy", [(2991.4, _b(.89, .67, .05)),
+                                           (2995.6, _b(.82, .67, .05)),
+                                           (3012.8, _b(.02, .51, .02))],
+               hits=101, direction="southbound", ghost_of=sliver["id"])
+    departure = _t("cam4", "truck", "e-heavy", [(2959.2, _b(.64, .61, .05)),
+                                               (2986.8, _b(.15, .67, .05)),
+                                               (2989.6, _b(.02, .67, .05))],
+                   hits=133, direction="southbound")
+    tracks = [sliver, truck, departure]
+    js, chains, links = _build(tracks, _CAMS)
+    assert len(js) == 1 and len(links) == 1, ("weak ghost prefix hides handoff", js)
+    assert {m["id"] for m in js[0]["members"]} == {t["id"] for t in tracks}, js
+    assert js[0]["link"]["gap_s"] == 1.8, js
+    final = cleared(js, js, cutoff=4000)
+    assert final == js, ("ghost handoff freeze", final)
+    claims = {(m["id"], m.get("piece")) for j in final for m in j["members"]}
+    assert build(tracks, _CAMS, frozen=claims) == [], "ghost handoff rebuilt after freeze"
+
+    for guard in ({"hits": MIN_EDGE_HITS}, {"direction": "southbound"}):
+        assert not _build([dict(sliver, **guard), truck, departure], _CAMS)[2], (
+            "substantive ghost prefix must retain its geometry", guard)
+    ordinary = dict(truck, id="obs-cam3-ordinary", ghost_of=None,
+                    t0=truck["t0"] + .2, t1=truck["t1"] + .2,
+                    path=[[t + .2, x1, y1 + .2, x2, y2 + .2] for t, x1, y1, x2, y2 in truck["path"]])
+    _, _, links = _build([*tracks, ordinary], _CAMS)
+    assert len(links) == 1 and links[0][1]["members"] == [ordinary], "ordinary handoff keeps priority"
+    far = dict(departure, t0=departure["t0"] - 100, t1=departure["t1"] - 100,
+               path=[[p[0] - 100, *p[1:]] for p in departure["path"]])
+    _, chains, links = _build([sliver, truck, far], _CAMS)
+    assert not links, "recovered arrival still obeys timing window"
+    assert next(c for c in chains if c["camera"] == "cam3") == _chains([sliver, truck], _CAMS)[0], (
+        "unmatched ghost retains original evidence")
+
+    later_dep = _t("cam4", "later", "e-heavy", [(2987, _b(.5, .4, .02)),
+                    (2990, _b(.12, .8, .02)), (2990.5, _b(.02, .8, .02))],
+                    hits=30, counted=True, direction="southbound")
+    later_arr = _t("cam3", "later", "e-heavy", [(2990.8, _b(.95, .85, .02)),
+                    (2991.8, _b(.7, .85, .02)), (2993, _b(.4, .8, .02))],
+                    hits=30, counted=True, direction="southbound")
+    _, _, links = _build([*tracks, later_dep, later_arr], _CAMS)
+    assert len(links) == 1 and links[0][0]["members"] == [later_dep], "ghost recovery refuses heavy crossing"
+
+
+def _selfcheck_ghost_decoy():
+    from selfloop import cleared
+
+    code = lambda x, y: {"app": base64.b64encode(struct.pack("<32e", x, y, *[0.] * 30)).decode(), "app_v": "m1"}
+    a = _north("A", 36100, cls="b-minibuses", k3={"hits": 8, "counted": True, **code(1, 0)})[0]
+    b = _north("B", 36095.5, cls="c-bus", k3={"hits": 8, "counted": True, **code(0, 1)})[0]
+    r = dict(_north("r", 36100, cls="b-light", gap=.5, k4={"hits": 8, **code(.4, .9165)})[1], direction=None)
+    late = _t("cam4", "L", "b-minibuses", [(36108, _b(.35, .45, .05)), (36110, _b(.55, .25, .05))],
+              hits=8, counted=True, direction="northbound", **code(.8, -.6))
+    sliver = _t("cam3", "sliver", "e-heavy", [(2959.6, _b(.04, .51, .02)), (2960.6, _b(.02, .51, .02))],
+                hits=4, counted=True)
+    truck = _t("cam3", "truck", "e-heavy", [(2991.4, _b(.89, .67, .05)),
+               (2995.6, _b(.82, .67, .05)), (3012.8, _b(.02, .51, .02))],
+               hits=101, direction="southbound", ghost_of=sliver["id"])
+    dep = _t("cam4", "truck", "e-heavy", [(2959.2, _b(.64, .61, .05)),
+             (2986.8, _b(.15, .67, .05)), (2989.6, _b(.02, .67, .05))], hits=133, direction="southbound")
+    cams = [dict(c, lone_edge=False) for c in _CAMS]
+    unrelated = [a, b, r, late]
+    expected = build(unrelated, cams)
+    tracks = [sliver, truck, dep, *unrelated]
+    js = build(tracks, cams)
+    assert [j for j in js if not any(m["id"] == truck["id"] for m in j["members"])] == expected, "distant ghost must not relink released decoy"
+    final = cleared(js, js, cutoff=4000)
+    assert len(final) == 1 and truck["id"] in {m["id"] for m in final[0]["members"]}, "only recovered truck freezes"
+    claims = {(m["id"], m.get("piece")) for j in final for m in j["members"]}
+    assert build(tracks, cams, frozen=claims) == [j for j in js if j not in final], "ghost recovery partial freeze stable"
 
 
 def _selfcheck_ghost():
@@ -1460,6 +1708,13 @@ def _selfcheck_late_priority(case):
 
 
 def _selfcheck():
+    for case in ("null", "number", "string", "null_entry", "number_entry", "string_entry",
+                 "short", "long", "non_numeric", "nan", "inf", "outside", "reversed", "flat", "moving_prefix", "moved_onto"):
+        _selfcheck_phantom_regressions(case)
+    for case in ("relay", "unconfigured", "queue", "freeze"):
+        _selfcheck_phantoms(case)
+    _selfcheck_ghost_decoy()
+    _selfcheck_ghost_handoff()
     _selfcheck_contradictory_swap()
     _selfcheck_twin_permutations()
     for case in ("heavy_crossing", "minimum_similarity", "arrival_class", "same_class"):
@@ -1843,13 +2098,17 @@ def _selfcheck():
     start = time.perf_counter()
     assert len(build([t for i in range(10_000) for t in _north(i, 100.0 + 5 * i)], _CAMS)) == 10_000
     took = time.perf_counter() - start
+    start = time.perf_counter()
+    assert len(build([t for i in range(10_000) for t in _north(
+        i, 100.0 + 5 * i, cls="b-minibuses", k4={"class": "b-light"})], _CAMS)) == 10_000
+    cross_took = time.perf_counter() - start
     print("journeys self-check ok: handoff links front to rear, queues pair in order, long trucks "
           "link across the overlap, opposed fragments stay apart, parked vehicles never count, "
           "classes fuse by votes, weak ghosts do not veto continuations, opposite roots never bridge, "
           "refused joins leave slots free, eligible shadow swaps repair cross-class links without changing parent evidence, "
-          "shared weak ghosts cannot poison roots, works skips shadows, glare blips drop, far fast fragments join, twins merge and anchor nothing, ids are stable, "
+          "weak ghost prefixes recover unused handoffs and freeze together, calibrated phantoms trim relay heads and freeze stably, shared weak ghosts cannot poison roots, works skips shadows, glare blips drop, far fast fragments join, twins merge and anchor nothing, ids are stable, "
           "lone chains need a direction and honour lone_edge unless plant marks roadworks; "
-          f"10k passes (20k tracklets) in {took:.1f} s")
+          f"10k passes (20k tracklets) in {took:.1f} s; cross-class in {cross_took:.1f} s")
 
 
 if __name__ == "__main__":
