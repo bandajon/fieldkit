@@ -33,6 +33,7 @@ ARGS = set(sys.argv[1:])
 BASELINE = "all" in ARGS      # see build()
 EXTERNAL = "external" in ARGS
 SOURCES = {}
+AI_VAL_TARGETS = []
 
 INPUT = 224               # mobilenet's native size
 PAD = 0.10                # crop context: a truck's neighbours help read its type
@@ -42,6 +43,8 @@ LR = 3e-4
 FLOORED = dict.fromkeys(FLOORED_ATTR_HEADS, 0.90)
 MIN_VAL = 100
 MIN_EMIT = 50
+AI_TARGET = 0.95
+MIN_VALUE_EMIT = 10
 MIN_BOXES = 200           # below this the heads memorise instead of generalising
 IMAGENET = ((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
 
@@ -104,9 +107,10 @@ def merged_attrs(human, row, bbox):
 
 
 def build(heads):
-    """-> (crops, targets, stems, classes); -1 = unlabelled. SOURCES counts contributors."""
+    """-> (crops, targets, stems, classes); -1 = unlabelled. SOURCES counts contributors; AI_VAL_TARGETS parallels crops."""
     names = list(heads)
     cnames = class_names()
+    AI_VAL_TARGETS.clear()
     SOURCES.clear()
     SOURCES.update(human=0, ai=0, archive=0, external={})
     ai = ai_labels()
@@ -156,14 +160,19 @@ def build(heads):
             if not 0 <= i < len(boxes) or not isinstance(human, dict):
                 skipped += 1          # sidecar written against a different label file
                 continue
-            a, filled = merged_attrs(human, None if is_validation(sid) else ai.get(sid, {}).get(i), boxes[i][1:5])
+            validation = is_validation(sid)
+            ai_attrs, _ = merged_attrs({}, ai.get(sid, {}).get(i), boxes[i][1:5])
+            av = [heads[n].index(ai_attrs[n]) if validation and n in FLOORED
+                  and ai_attrs.get(n) in heads[n] else -1 for n in names]
+            a, filled = merged_attrs(human, None if validation else ai.get(sid, {}).get(i), boxes[i][1:5])
             t = [heads[n].index(a[n]) if a.get(n) in heads[n] else -1 for n in names]
             crop = crop_box(img, boxes[i][1:5])
-            if crop is None or all(v < 0 for v in t):
+            if crop is None or all(v < 0 for v in t + av):
                 skipped += 1
                 continue
             crops.append(crop)
             targets.append(t)
+            AI_VAL_TARGETS.append(av)
             stems.append(sid)
             SOURCES["human"] += any(human.get(n) in heads[n] for n in names)
             SOURCES["ai"] += any(filled.get(n) in heads[n] for n in names)
@@ -177,13 +186,18 @@ def build(heads):
                     continue
                 if s["source_sid"] in current_sids:
                     continue
-                a, filled = merged_attrs(s["attrs"], None if is_validation(s["source_sid"]) else ai.get(s["source_sid"], {}).get(s["box_index"]), s["bbox"])
+                validation = is_validation(s["source_sid"])
+                ai_attrs, _ = merged_attrs({}, ai.get(s["source_sid"], {}).get(s["box_index"]), s["bbox"])
+                av = [heads[n].index(ai_attrs[n]) if validation and n in FLOORED
+                      and ai_attrs.get(n) in heads[n] else -1 for n in names]
+                a, filled = merged_attrs(s["attrs"], None if validation else ai.get(s["source_sid"], {}).get(s["box_index"]), s["bbox"])
                 t = [heads[n].index(a[n]) if a.get(n) in heads[n] else -1 for n in names]
-                if all(v < 0 for v in t):
+                if all(v < 0 for v in t + av):
                     continue
                 crop = Image.open(d / s["crop"]).convert("RGB")
                 crops.append(crop)
                 targets.append(t)
+                AI_VAL_TARGETS.append(av)
                 stems.append(s["source_sid"])
                 SOURCES["archive"] += 1
                 SOURCES["human"] += any(s["attrs"].get(n) in heads[n] for n in names)
@@ -212,6 +226,7 @@ def build(heads):
                     raise ValueError("external make samples require a-small in classes.txt")
                 crops.append(crop)
                 targets.append(t)
+                AI_VAL_TARGETS.append([-1] * len(names))
                 stems.append(f"external-make-{source.name}-{i}")
                 classes.append(cnames.index("a-small"))
                 SOURCES["external"][source.name] += 1
@@ -243,9 +258,12 @@ def check(heads, crops, targets, stems):
     assert all(c.size == (INPUT, INPUT) for c in crops), "a crop is not INPUT square"
     assert all(-1 <= v < len(heads[names[j]]) for t in targets for j, v in enumerate(t)), \
         "a target id is outside its head's vocabulary"
-    assert all(any(v >= 0 for v in t) for t in targets), "a crop with no labelled head got in"
-    local = sum(not s.startswith("external-") for s in stems)
-    frac = len(val) / local if local else 0
+    assert len(AI_VAL_TARGETS) == len(targets), "AI validation targets are misaligned"
+    assert all(any(v >= 0 for v in t + av) for t, av in zip(targets, AI_VAL_TARGETS)), \
+        "a crop with no labelled head got in"
+    local = sum(not s.startswith("external-") and any(v >= 0 for v in t)
+                for s, t in zip(stems, targets))
+    frac = sum(any(v >= 0 for v in targets[i]) for i in val) / local if local else 0
     if not local:
         print(f"ok — {len(heads)} heads, external-only train split")
         return
@@ -261,14 +279,24 @@ def class_names():
         return []
 
 
-def calibrate_floors(probabilities, labels, heads, allowed=None):
+def wilson_lower(correct, count):
+    """90% one-sided Wilson precision lower bound (also for each value)."""
+    if not count:
+        return 0.0
+    precision, z = correct / count, 1.2816
+    return (precision + z*z / (2*count) - z * sqrt(
+        precision * (1 - precision) / count + z*z / (4*count*count))) / (1 + z*z / count)
+
+
+def calibrate_floors(probabilities, labels, heads, allowed=None, ai_labels=None):
     """Smallest observed floor meeting the Wilson lower bound and emission minimum.
 
+    Proof is recomputed on proven values only; each value also needs a Wilson bound.
     Coverage divides emitted labelled crops by known truths; unknown-truth emissions are wrong.
     """
     from detect import constrained
 
-    floors, withheld, stats = {}, [], {}
+    floors, withheld, stats, emittable = {}, [], {}, {}
     for head, target in FLOORED.items():
         if head not in heads:
             continue
@@ -276,13 +304,22 @@ def calibrate_floors(probabilities, labels, heads, allowed=None):
         rows = probabilities.get(head, [])
         truth = labels.get(head, [])
         rules = (allowed or {}).get(head)
-        labelled_known = sum(label >= 0 and values[label] != "unknown" for label in truth)
-        stats[head] = {"labelled_known": labelled_known, "emitted": 0, "coverage": 0.0,
+        human_known = labelled_known = sum(label >= 0 and values[label] != "unknown" for label in truth)
+        source = "human"
+        if labelled_known < MIN_VAL:
+            source, target = "ai", AI_TARGET
+            ai_truth = (ai_labels or {}).get(head, [])
+            truth = [truth[i] if i < len(truth) and truth[i] >= 0
+                     else ai_truth[i] if i < len(ai_truth) else -1 for i in range(len(rows))]
+            labelled_known = sum(label >= 0 and values[label] != "unknown" for label in truth)
+        emittable[head] = []
+        stats[head] = {"source": source, "human_known": human_known, "labelled_known": labelled_known, "emitted": 0, "coverage": 0.0,
                        "precision": None, "lower_bound": None}
         if labelled_known < MIN_VAL:
             withheld.append(head)
             continue
         groups = {}
+        emissions = []
         for i, (probs, label) in enumerate(zip(rows, truth)):
             if label < 0:
                 continue
@@ -291,6 +328,7 @@ def calibrate_floors(probabilities, labels, heads, allowed=None):
                 continue
             choice = values.index(value)
             confidence = probs[choice]
+            emissions.append((value, confidence, choice == label))
             count, correct = groups.get(confidence, (0, 0))
             groups[confidence] = (count + 1, correct + (choice == label))
         count = correct = 0
@@ -299,30 +337,43 @@ def calibrate_floors(probabilities, labels, heads, allowed=None):
             count += size
             correct += hits
             precision = correct / count
-            z = 1.2816   # 90% one-sided Wilson bound
-            lower = (precision + z*z / (2*count) - z * sqrt(
-                precision * (1 - precision) / count + z*z / (4*count*count))) / (1 + z*z / count)
+            lower = wilson_lower(correct, count)
             if count >= MIN_EMIT and lower >= target:
                 floors[head] = float(confidence)
-                stats[head] = {"labelled_known": labelled_known,
+                stats[head] = {"source": source, "human_known": human_known, "labelled_known": labelled_known,
                                "emitted": count, "coverage": count / labelled_known,
                                "precision": precision, "lower_bound": lower}
-        if head not in floors:
+        if head in floors:
+            counts = {}
+            for value, confidence, hit in emissions:
+                if confidence >= floors[head]:
+                    size, hits = counts.get(value, (0, 0))
+                    counts[value] = (size + 1, hits + hit)
+            emittable[head] = [v for v in values if v in counts
+                               and counts[v][0] >= MIN_VALUE_EMIT
+                               and wilson_lower(counts[v][1], counts[v][0]) >= target]
+            count = sum(counts[v][0] for v in emittable[head])
+            correct = sum(counts[v][1] for v in emittable[head])
+            lower = wilson_lower(correct, count)
+            stats[head].update(emitted=count, coverage=count / labelled_known,
+                               precision=correct / count if count else None, lower_bound=lower)
+        if head not in floors or stats[head]["emitted"] < MIN_EMIT or stats[head]["lower_bound"] < target:
             withheld.append(head)
-    return floors, withheld, stats
+    return floors, withheld, stats, emittable
 
 
-def report_dict(run_name, accs, val_crops, labelled, confusion, floors=None, withheld=None, calibration=None):
+def report_dict(run_name, accs, val_crops, labelled, confusion, floors=None, withheld=None, calibration=None, values=None):
     ok = [a for a in accs.values() if a is not None]
     return {"run": run_name, "per_head_acc": accs,
             "mean_acc": sum(ok) / len(ok) if ok else None,
             "val_crops": val_crops, "labelled": labelled, "axles_confusion": confusion,
             "baseline": BASELINE, "sources": SOURCES,
             "floors": floors or {}, "withheld": withheld or [],
-            "calibration": calibration or {}}
+            "calibration": calibration or {}, "values": values or {}}
 
 
 def train(heads, crops, targets, stems, classes):
+    assert len(AI_VAL_TARGETS) == len(targets), "AI validation targets are misaligned"
     import numpy as np
     import torch
     from torch import nn
@@ -423,20 +474,24 @@ def train(heads, crops, targets, stems, classes):
     val_classes = [cnames[c] if 0 <= c < len(cnames) else None
                    for c, flag in zip(classes, val.tolist()) if flag]
     allowed = {n: [(cons.get(c) or {}).get(n) for c in val_classes] for n in probabilities}
-    floors, withheld, calibration = calibrate_floors(
-        probabilities, {n: yv[:, names.index(n)].tolist() for n in probabilities}, heads, allowed)
+    floors, withheld, calibration, values = calibrate_floors(
+        probabilities, {n: yv[:, names.index(n)].tolist() for n in probabilities}, heads, allowed,
+        {n: [t[names.index(n)] for t, flag in zip(AI_VAL_TARGETS, val.tolist()) if flag]
+         for n in probabilities})
     torch.save({"state_dict": {**{f"features.{k}": v for k, v in backbone.state_dict().items()},
                                **{f"fc.{k}": v for k, v in heads_fc.state_dict().items()}},
                 "heads": {n: heads[n] for n in names},
                 "classes": cnames,          # the one-hot's order; absent in older checkpoints
                 "backbone": "mobilenet_v3_small", "input": INPUT,
-                "floors": floors, "withheld": withheld}, out)
+                "floors": floors, "withheld": withheld, "values": values}, out)
     # The printed report is for a human reading the log; this one is for selfloop.py,
     # which compares measured shared heads. A head nobody labelled in the val split
     # scores null rather than 0 — it was not tested.
     (run / "report.json").write_text(json.dumps(
-        report_dict(run.name, accs, len(xv), labelled, confusion,
-                    floors, withheld, calibration), indent=1))
+        report_dict(run.name, accs,
+                    sum(any(v >= 0 for v in t) for t, flag in zip(targets, val.tolist()) if flag),
+                    labelled, confusion,
+                    floors, withheld, calibration, values), indent=1))
     print(f"\nattrs: {out}")
     print(f"to deploy: set attr_weights: {out} in config.yaml and restart FieldKit")
 
@@ -444,7 +499,8 @@ def train(heads, crops, targets, stems, classes):
 if __name__ == "__main__":
     heads = vocab()
     crops, targets, stems, classes = build(heads)
-    local_boxes = sum(not s.startswith("external-") for s in stems)
+    local_boxes = sum(not s.startswith("external-") and any(v >= 0 for v in t)
+                      for s, t in zip(stems, targets))
     if local_boxes < MIN_BOXES:
         report_counts(heads, targets, stems) if targets else None
         sys.exit(f"only {local_boxes} local enriched boxes — attribute training needs at least "

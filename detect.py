@@ -271,7 +271,7 @@ def attr_classifier(path, dev="cpu"):
         a = {}
         for n in names:
             v = select_attr(n, scores[n], vocab[n], allowed.get(n),
-                            ck.get("floors"), ck.get("withheld"))
+                            ck.get("floors"), ck.get("withheld"), ck.get("values"))
             if v is not None:
                 a[n] = v
         # The config head reads the wheel grouping better than the axles head counts, so
@@ -397,17 +397,19 @@ def softmax_scores(scores):
     return [w / total for w in weights]
 
 
-def select_attr(head, scores, values, allowed, floors=None, withheld=None):
+def select_attr(head, scores, vocabulary, allowed, floors=None, withheld=None, values=None):
     """Legacy checkpoints keep their choices; calibrated heads may stay silent."""
     if head in (withheld or []):
         return None
-    value = constrained(scores, values, allowed)
+    value = constrained(scores, vocabulary, allowed)
+    if values is not None and head in values and value not in values[head]:
+        return None
     if value is None:
         return None
     if (head in FLOORED_ATTR_HEADS and value in SUPPRESSED_ATTR_VALUES
             and (floors is not None or withheld is not None)):
         return None
-    if head in (floors or {}) and softmax_scores(scores)[values.index(value)] < floors[head]:
+    if head in (floors or {}) and softmax_scores(scores)[vocabulary.index(value)] < floors[head]:
         return None
     return value
 

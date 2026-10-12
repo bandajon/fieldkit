@@ -33,11 +33,19 @@ bucket ─► selfloop classify (every 10 min)
   and absent from `withheld`; a legacy champion without floors emits none. Only a newly
   emitted floored head earns the tolerance, by passing calibration rather than accuracy.
   Champion state carries an `earned` history across every crown, so each floored head earns its 0.005 allowance only once, limiting colour/make to 0.010 cumulative loss even when emissions alternate or are withheld and restored.
-  A floor needs at least 100 labelled human val crops, at least 50 emitted crops, and a
-  90% one-sided Wilson precision lower bound (z = 1.2816) of at least .90. Choose the lowest
+  A floor uses human truths once a head has at least 100 known human val crops; otherwise
+  it fills missing truths with AI-agreed val labels at a stricter .95 target (.90 for humans),
+  retaining every human label on the same crop/head. Both need at
+  least 100 known truths, 50 emitted crops, and a 90% one-sided Wilson precision lower
+  bound (z = 1.2816) meeting their target. Each value also needs at least 10 emissions
+  and the same Wilson lower bound meeting that target. Recompute the head proof on
+  emissions at/above the floor of proven values only; withhold unless that population
+  still has 50 emissions and meets the Wilson target.
+  Checkpoints and champion metadata carry the proven-value lists in `values`. Choose the lowest
   qualifying threshold; otherwise withhold the head. `unknown` and `other` stay silent and
-  never count as emissions. Calibration records emitted count, point precision, lower bound
-  and coverage. Champion publication includes `models/attributes.yaml` when available, so
+  never count as emissions. Calibration records recomputed emitted count, point precision, lower bound
+  and coverage, plus `human_known` and `labelled_known` (truths actually used). AI-only
+  validation crops do not count toward the training minimum or human validation crop counts. Champion publication includes `models/attributes.yaml` when available, so
   deployed weights retain their class constraints; a failed attribute run leaves detector promotion standing.
 - Ingest pre-fills `pending/suggest/<stem>.json` with the attrs champion's guesses, so
   curators correct attributes instead of typing them. A suggestion is never a record — the
