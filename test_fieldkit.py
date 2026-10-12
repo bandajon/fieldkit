@@ -739,13 +739,14 @@ def label_strip_rules():
     cfg = yaml.safe_load((app.DATASET / "attributes.yaml").read_text()) or {}
     vocab = {k: v for k, v in cfg.items() if isinstance(v, list)}
     cons, defs = cfg.get("constraints") or {}, cfg.get("defaults") or {}
+    optional = cfg.get("optional") or {}
     for cls, dd in defs.items():
         for head, v in dd.items():
             allowed = (cons.get(cls) or {}).get(head, vocab.get(head, []))
             assert v in allowed, f"{cls}: default {head}={v!r} is not one of {allowed}"
     z = defs.get("z-emergency") or {}
     for head in vocab:
-        if (cons.get("z-emergency") or {}).get(head, vocab[head]):     # visible means required
+        if not optional.get(head) and (cons.get("z-emergency") or {}).get(head, vocab[head]):
             assert head in z, f"z-emergency: no default for {head}, so it is not one tap"
     if not shutil.which("node"):
         print("  (node not installed: JS rules not run)")
@@ -755,10 +756,10 @@ def label_strip_rules():
     def fn(name):
         i = src.index(f"function {name}(")
         return src[i:src.index("\n}\n", i) + 3]
-    js = "const labClasses=%s, labAttrs=%s, labConstraints=%s, labDefaults=%s, labImplies=%s, labRestricts=%s;\n" % (
+    js = "const labClasses=%s, labAttrs=%s, labConstraints=%s, labDefaults=%s, labImplies=%s, labRestricts=%s, labOptional=%s;\n" % (
         json.dumps([l.strip() for l in (app.DATASET / "classes.txt").read_text().splitlines() if l.strip()]),
         json.dumps(vocab), json.dumps(cons), json.dumps(defs), json.dumps(cfg.get("implies") or {}),
-        json.dumps(cfg.get("restricts") or {}))
+        json.dumps(cfg.get("restricts") or {}), json.dumps(optional))
     js += src[src.index("const labLocked"):src.index("\n", src.index("const labLocked"))] + "\n"
     js += "\n".join(fn(n) for n in ("labVocab", "labFill", "labDefault", "labGap"))
     js += r"""
@@ -812,6 +813,22 @@ for (const order of [['trailers', 'axles'], ['axles', 'trailers']]) {
      'five-axle configuration is selectable');
   eq(labGap([b]), null, 'medium truck and trailer can be submitted');
 }
+{
+// Future heads are fixtures in memory; the live dataset stays untouched.
+Object.assign(labAttrs, {colour: ['other', 'unknown'], make: ['other', 'unknown']});
+Object.assign(labOptional, {colour: true, make: true});
+let b = box(Z, {...Zdef});
+eq(labGap([b]), null, 'missing only optional heads stays approvable');
+delete b.attrs.type;
+eq(labGap([b]), {i: 0, head: 'type', name: 'z-emergency'}, 'missing required head still blocks');
+b.attrs.type = Zdef.type;
+labOptional.colour = false;
+eq(labGap([b]), {i: 0, head: 'colour', name: 'z-emergency'}, 'false optional flag still requires head');
+delete labOptional.colour;
+eq(labGap([b]), {i: 0, head: 'colour', name: 'z-emergency'}, 'absent optional flag still requires head');
+labOptional.colour = true;
+}
+
 console.log('  js rules ok');
 """
     r = subprocess.run(["node", "-e", js], capture_output=True, text=True)

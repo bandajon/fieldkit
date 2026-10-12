@@ -936,7 +936,7 @@ const labSorted = () =>
 let labClasses = [], labQueue = [], labBoxes = [], labTotal = 0,
     labApproved = {frames: 0, boxes: {}};
 let labAttrs = {}, labConstraints = {}, labDefaults = {}, labImplies = {},
-    labRestricts = {}, labSel = -1;   // attribute vocab {head: [values]}; index of the selected box
+    labRestricts = {}, labOptional = {}, labSel = -1;   // attribute vocab {head: [values]}; index of the selected box
 const labNote = t => document.getElementById('l-note').textContent = t;
 const labNum = v => typeof v === 'number' ? v : (v && v.approve) || 0;   // {approve, discard} or a count
 const labStats = () => {
@@ -1085,6 +1085,7 @@ async function labLoad() {
     labDefaults = d.attr_defaults || labDefaults;
     labImplies = d.attr_implies || labImplies;
     labRestricts = d.attr_restricts || labRestricts;
+    labOptional = d.attr_optional || labOptional;
     // /api/dataset/review 403s a non-reviewer, so reaching it is proof enough on its own.
     document.getElementById('l-admin').hidden = !(d.reviewer || labRev);
   } catch (e) {
@@ -1228,7 +1229,7 @@ function labVocab(head, name, cur, attrs) {
     const imp = labImplies['axle-config'] || {};
     allowed = allowed.filter(v => !(imp[v] || {}).axles || imp[v].axles === attrs.axles);
   }
-  // Invariant: a head the class allows is visible, and visible means required — only the
+  // Invariant: a head the class allows is visible, and visible means required unless optional — only the
   // class may waive it, by giving the head an empty constraint list. So a filter above that
   // matches nothing hands back the class's whole list, every value flagged as disagreeing,
   // rather than an empty row whose requirement labGap can no longer see.
@@ -1361,7 +1362,7 @@ document.getElementById('l-attrs').onclick = e => {
   labSelect(labSel);
 };
 
-// First box missing a required attribute, or null. A head is required exactly when the class
+// First box missing a required attribute, or null. A non-optional head is required when the class
 // shows it (non-empty vocab); deleted boxes, the removed rung and wheels are exempt, and a frame
 // with no surviving boxes stays approvable — negative samples are legal.
 function labGap(all) {
@@ -1369,7 +1370,7 @@ function labGap(all) {
     const b = all[i], name = labClasses[b.cls];
     if (b.del || b.cls >= labClasses.length) continue;
     for (const head of Object.keys(labAttrs))
-      if (!b.attrs[head] && labVocab(head, name, null, b.attrs).length) return {i, head, name};
+      if (!labOptional[head] && !b.attrs[head] && labVocab(head, name, null, b.attrs).length) return {i, head, name};
   }
   return null;
 }
@@ -1556,7 +1557,7 @@ async function labSend(action) {
   if (gap) {
     labSelect(gap.i);   // open the offending box's strip right where the fix goes
     return labNote(`box ${gap.i + 1} (${gap.name}): missing ${gap.head} — ` +
-                   `every visible attribute is required before Approve`);
+                   `required attributes must be set before Approve`);
   }
   labNote('saving…');
   const {boxes, attrs} = labPayload(labBoxes);
