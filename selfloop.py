@@ -27,9 +27,11 @@ rides the same pass on the same curated set — trained after the detector and p
 on strictly better mean accuracy across shared non-floored heads, or a newly emitted
 colour/make head with that mean no more than 0.005 below the champion, without losing
 any non-floored champion measurement. Colour/make accuracies never enter the mean.
-The next ingest uses it to pre-fill suggestions. Their floors require 100 labelled human val crops,
-50 emitted crops, and a 90% one-sided Wilson precision lower bound of at least .90;
-unknown/other stay silent.
+The next ingest uses it to pre-fill suggestions. Their floors use human truths when at least 100 known val crops exist, otherwise
+human truths filled with AI-agreed val labels where missing, with a .95 target (.90 for humans). Both require 100 known truths,
+50 emissions and a 90% one-sided Wilson lower bound meeting the target, recomputed on
+proven values only. Each emitted value also needs 10 emissions and the same Wilson
+lower bound meeting that target; unknown/other stay silent.
 
 Classify is the other direction: the same champion, run over the mirrored recordings, is
 what turns a gate that only records into a gate that reports. Its events go to the bucket
@@ -1990,6 +1992,7 @@ def crown_attrs(s, run, rep, cl, bucket):
                            "per_head_acc": rep and rep["per_head_acc"],
                            "floors": (rep or {}).get("floors", {}),
                            "withheld": (rep or {}).get("withheld", []),
+                           "values": (rep or {}).get("values", {}),
                            "earned": sorted(earned),
                            "calibration": (rep or {}).get("calibration", {})}
     for key in (f"{ATTR_MODELS}{run.name}/attrs.pt", f"{MODELS}attrs-champion.pt"):
@@ -3410,8 +3413,10 @@ def selfcheck():
           "strictly better reference score (detector); attributes need a better shared non-floored "
           "mean or a newly emitted floored head within 0.005, without losing champion measurements, "
           "unless there is no comparable champion. colour/make are emitted only at or above "
-          "floors with a 90% one-sided Wilson lower bound >= .90, 100 labelled human val crops "
-          "and 50 emissions; unknown/other stay silent; "
+          "floors with a 90% one-sided Wilson lower bound >= .90 on humans when 100 known val crops "
+          "exist, else >= .95 on human truths filled with AI-agreed val labels where missing; "
+          "both need 100 known truths and 50 emissions with proof recomputed on proven values only; "
+          "each value needs 10 emissions and the same Wilson bound meeting its target; unknown/other stay silent; "
           "unclassified segments drained oldest first "
           "under their gate's id")
 

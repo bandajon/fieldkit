@@ -119,7 +119,8 @@ def external():
         with patch.object(ta, 'is_val', return_value=True):
             assert ta.report_counts(heads, targets, stems) == [], 'external always train even if hash says val'
             assert ta.is_validation(stems[0]) is False and ta.is_validation('road') is True
-        with patch.object(ta, 'is_val', side_effect=lambda sid: sid == 'road-val'):
+        with patch.object(ta, 'is_val', side_effect=lambda sid: sid == 'road-val'), \
+             patch.object(ta, 'AI_VAL_TARGETS', [[-1] * len(heads)] * 110):
             ta.check(heads, crops * 110, targets * 110,
                      ['road-val'] + ['road-train'] * 9 + stems * 100)
         for sid in ['road', 'katuba-20261010-120000', 'retained']:
@@ -179,18 +180,20 @@ def training_mask_and_report():
         with patch.object(ta, 'SOURCES', sources):
             floors, withheld = {'colour': .8}, ['make']
             calibration = {'colour': {'coverage': .8, 'precision': 1.}}
+            values = {'colour': ['white'], 'make': []}
             report = ta.report_dict(run.name, {'make': .75, 'type': None}, 4,
-                                    {'make': 4}, {}, floors, withheld, calibration)
+                                    {'make': 4}, {}, floors, withheld, calibration, values)
             assert report['floors'] == floors and report['withheld'] == withheld
-            assert report['calibration'] == calibration
+            assert report['calibration'] == calibration and report['values'] == values
             assert report['sources'] == sources, 'report preserves source counts'
             assert report['mean_acc'] == .75 and report['val_crops'] == 4
             assert report['baseline'] == ta.BASELINE
             write = next(node for node in ast.walk(tree) if isinstance(node, ast.Call)
                          and isinstance(node.func, ast.Attribute) and node.func.attr == 'write_text')
             namespace = {**vars(ta), 'run': run, 'accs': {'make': .75, 'type': None},
-                         'ok': [.75], 'xv': [0] * 4, 'labelled': {'make': 4}, 'confusion': {},
-                         'floors': floors, 'withheld': withheld, 'calibration': calibration}
+                         'ok': [.75], 'xv': [0] * 4, 'targets': [[0]] * 4,
+                         'val': Mock(tolist=lambda: [True] * 4), 'labelled': {'make': 4}, 'confusion': {},
+                         'floors': floors, 'withheld': withheld, 'calibration': calibration, 'values': values}
             eval(compile(ast.Expression(write), '<train report>', 'eval'), namespace)
             assert json.loads((run / 'report.json').read_text()) == report, \
                 'actual report.json must carry sources and all report fields'
@@ -203,7 +206,7 @@ def training_mask_and_report():
                              heads={'colour': ['white'], 'make': ['unknown']},
                              names=['colour', 'make'], cnames=[])
             checkpoint = eval(compile(ast.Expression(save.args[0]), '<train checkpoint>', 'eval'), namespace)
-            assert checkpoint['floors'] == floors and checkpoint['withheld'] == withheld, \
+            assert checkpoint['floors'] == floors and checkpoint['withheld'] == withheld and checkpoint['values'] == values, \
                 'actual checkpoint must carry calibration metadata'
 
 
@@ -215,7 +218,7 @@ def review_validation():
             ai(root, sid, {'make': 'Toyota'}, box=1)
         with patch.object(ta, 'is_val', side_effect=lambda sid: sid == 'road-val'):
             _, targets, stems, _ = ta.build(heads)
-        assert [t for t, sid in zip(targets, stems) if sid == 'road-val'] == [[-1, 0, -1]], 'validation is human-only, AI-only box excluded'
+        assert [t for t, sid in zip(targets, stems) if sid == 'road-val'] == [[-1, 0, -1], [-1, -1, -1]], 'AI validation crops keep human targets unchanged'
         assert [t for t, sid in zip(targets, stems) if sid == 'road-train'] == [[-1, 0, 1], [-1, -1, 0]]
 
 
@@ -238,7 +241,7 @@ def review_archive_validation():
             ai(root, sid, {'make': 'Toyota'}, box=1)
         with patch.object(ta, 'is_val', side_effect=lambda sid: sid == 'archive-val'):
             _, targets, stems, _ = ta.build(heads)
-        assert [t for t, sid in zip(targets, stems) if sid == 'archive-val'] == [[-1, 0, -1]], 'archive validation uses only human labels'
+        assert [t for t, sid in zip(targets, stems) if sid == 'archive-val'] == [[-1, 0, -1], [-1, -1, -1]], 'archive validation keeps human targets unchanged'
         assert [t for t, sid in zip(targets, stems) if sid == 'archive-train'] == [[-1, 0, 1], [-1, -1, 0]], 'archive training uses AI fill and AI-only boxes'
 
 
@@ -377,33 +380,33 @@ def calibration_floors():
     probs = {'colour': [[.6, .4]] * 20 + [[.8, .2]] * 80,
              'make': [[.95, .05]] * 99}
     labels = {'colour': [1] * 20 + [0] * 80, 'make': [0] * 99}
-    floors, withheld, stats = ta.calibrate_floors(probs, labels, heads)
+    floors, withheld, stats, values = ta.calibrate_floors(probs, labels, heads)
     assert floors == {'colour': .8} and withheld == ['make'], (floors, withheld)
     assert stats['colour']['coverage'] == .8 and stats['colour']['precision'] == 1.0
     assert stats['colour']['emitted'] == 80 and .97 < stats['colour']['lower_bound'] < 1.
-    floors, withheld, _ = ta.calibrate_floors({'colour': [[.8, .2]] * 100},
+    floors, withheld, _, values = ta.calibrate_floors({'colour': [[.8, .2]] * 100},
                                             {'colour': [0] * 89 + [1] * 11}, {'colour': heads['colour']})
     assert not floors and withheld == ['colour'], 'ties cannot be split to fake precision'
-    floors, withheld, stats = ta.calibrate_floors({'colour': [[.6, .4]] * 100},
+    floors, withheld, stats, values = ta.calibrate_floors({'colour': [[.6, .4]] * 100},
                                                 {'colour': [0] * 90 + [1] * 10}, {'colour': heads['colour']})
     assert not floors and withheld == ['colour'], 'point precision .90 has a Wilson lower bound below .90'
-    floors, withheld, stats = ta.calibrate_floors({'colour': [[.6, .4]] * 100},
+    floors, withheld, stats, values = ta.calibrate_floors({'colour': [[.6, .4]] * 100},
                                                 {'colour': [0] * 92 + [1] * 8}, {'colour': heads['colour']})
     assert not floors and withheld == ['colour'], '92/100 must be withheld by the 90% one-sided Wilson bound'
-    floors, withheld, _ = ta.calibrate_floors({}, {}, heads)
+    floors, withheld, _, values = ta.calibrate_floors({}, {}, heads)
     assert not floors and withheld == ['colour', 'make'], 'missing validation is withheld'
-    floors, withheld, stats = ta.calibrate_floors({'make': [[.1, .9]] * 100},
+    floors, withheld, stats, values = ta.calibrate_floors({'make': [[.1, .9]] * 100},
                                                 {'make': [1] * 100}, {'make': heads['make']})
     assert not floors and withheld == ['make'], 'unknown is not covered'
-    floors, withheld, stats = ta.calibrate_floors({'colour': [[.8, .2]] * 100},
+    floors, withheld, stats, values = ta.calibrate_floors({'colour': [[.8, .2]] * 100},
         {'colour': [1] * 100}, {'colour': heads['colour']}, {'colour': [['blue']] * 100})
     assert floors == {'colour': .2} and stats['colour']['precision'] == 1., 'same constrained choice, full-head probability'
-    floors, withheld, _ = ta.calibrate_floors({'colour': [[.8, .2]] * 100},
+    floors, withheld, _, values = ta.calibrate_floors({'colour': [[.8, .2]] * 100},
         {'colour': [0] * 99 + [-1]}, {'colour': heads['colour']})
     assert withheld == ['colour'], 'unlabelled crops do not count toward MIN_VAL'
 
     # Precision need not rise monotonically with threshold; choose the lowest success.
-    floors, withheld, stats = ta.calibrate_floors({'colour': [[.9, .1]] * 10 + [[.8, .2]] * 10 + [[.7, .3]] * 180},
+    floors, withheld, stats, values = ta.calibrate_floors({'colour': [[.9, .1]] * 10 + [[.8, .2]] * 10 + [[.7, .3]] * 180},
         {'colour': [0] * 10 + [1] * 10 + [0] * 180}, {'colour': heads['colour']})
     assert floors == {'colour': .7} and stats['colour']['coverage'] == 1. and stats['colour']['precision'] == .95
     assert stats['colour']['emitted'] == 200 and stats['colour']['lower_bound'] >= .9
@@ -411,7 +414,7 @@ def calibration_floors():
 
 def calibration_min_emit():
     for emitted in (1, 49, 50):
-        floors, withheld, stats = ta.calibrate_floors(
+        floors, withheld, stats, values = ta.calibrate_floors(
             {'make': [[.99, .01]] * emitted + [[.01, .99]] * (100 - emitted)},
             {'make': [0] * emitted + [1] * (100 - emitted)}, {'make': ['Toyota', 'other']})
         if emitted < 50:
@@ -424,19 +427,19 @@ def calibration_min_emit():
 def calibration_unknown_truth():
     for head in ('colour', 'make'):
         heads = {head: ['valid', 'unknown', 'other']}
-        floors, withheld, stats = ta.calibrate_floors(
+        floors, withheld, stats, values = ta.calibrate_floors(
             {head: [[.9, .05, .05]] * 70 + [[.05, .9, .05]] * 30},
             {head: [0] * 70 + [1] * 30}, heads)
         assert not floors and withheld == [head], '70 known truths cannot meet MIN_VAL'
-        assert stats[head]['labelled_known'] == 70
+        assert stats[head]['human_known'] == stats[head]['labelled_known'] == 70 and stats[head]['source'] == 'ai', 'AI fallback retains the insufficient human truths'
 
-        floors, withheld, stats = ta.calibrate_floors(
+        floors, withheld, stats, values = ta.calibrate_floors(
             {head: [[.9, .05, .05]] * 100 + [[.05, .9, .05]] * 30},
             {head: [0] * 100 + [1] * 30}, heads)
         assert floors == {head: .9} and not withheld
         assert stats[head]['labelled_known'] == 100 and stats[head]['coverage'] == 1.
 
-        floors, withheld, stats = ta.calibrate_floors(
+        floors, withheld, stats, values = ta.calibrate_floors(
             {head: [[.9, .05, .05]] * 100 + [[.05, .9, .05]]},
             {head: [0] * 99 + [1, 0]}, heads)
         assert floors == {head: .9} and not withheld
@@ -444,7 +447,7 @@ def calibration_unknown_truth():
             'emission on an unknown truth must count as wrong'
         assert stats[head]['labelled_known'] == 100 and stats[head]['coverage'] == 1.
 
-        floors, withheld, stats = ta.calibrate_floors(
+        floors, withheld, stats, values = ta.calibrate_floors(
             {head: [[.9, .05, .05]] * 70 + [[.05, .05, .9]] * 30},
             {head: [0] * 70 + [2] * 30}, heads)
         assert floors == {head: .9} and not withheld, 'other truths count toward MIN_VAL'
@@ -454,7 +457,7 @@ def calibration_unknown_truth():
 def suppressed_calibration():
     for head in ('colour', 'make'):
         for value in ('unknown', 'other'):
-            floors, withheld, stats = ta.calibrate_floors(
+            floors, withheld, stats, values = ta.calibrate_floors(
                 {head: [[.99, .01]] * 100}, {head: [0] * 100}, {head: [value, 'valid']})
             assert not floors and withheld == [head], f'{head}/{value} must not count as emissions'
             assert stats[head]['coverage'] == 0.
@@ -477,7 +480,7 @@ def training_constraint_path():
                  and any(isinstance(t, ast.Name) and t.id == 'cons' for t in node.targets))
     end = next(i for i, node in enumerate(body) if isinstance(node, ast.Assign)
                and isinstance(node.targets[0], ast.Tuple)
-               and [t.id for t in node.targets[0].elts] == ['floors', 'withheld', 'calibration'])
+               and [t.id for t in node.targets[0].elts] == ['floors', 'withheld', 'calibration', 'values'])
     wiring = compile(ast.Module(body=body[start:end + 1], type_ignores=[]), '<train calibration>', 'exec')
     with dataset() as (root, _):
         heads = {'colour': ['white', 'blue']}
@@ -489,7 +492,7 @@ def training_constraint_path():
         namespace = {**vars(ta), 'attr_constraints': detect.attr_constraints, 'out': out,
                      'heads': heads, 'names': ['colour'], 'cnames': ['car', 'truck'],
                      'classes': [0] + [1] * 100, 'val': torch.tensor([False] + [True] * 100),
-                     'yv': torch.tensor([[1]] * 100), 'probabilities': {'colour': [[.8, .2]] * 100}}
+                     'yv': torch.tensor([[1]] * 100), 'AI_VAL_TARGETS': [[-1]] * 101, 'probabilities': {'colour': [[.8, .2]] * 100}}
         exec(wiring, namespace)
         assert namespace['floors'] == {'colour': .2}, 'train must load dataset constraints, not run-local YAML'
         assert namespace['withheld'] == []
@@ -540,7 +543,7 @@ def champion_calibration_metadata():
         run = root / 'round2'; run.mkdir()
         (run / 'attrs.pt').write_bytes(b'checkpoint')
         rep = {'mean_acc': .9, 'per_head_acc': {'colour': .9}, 'floors': {'colour': .2},
-               'withheld': ['make'], 'calibration': {'colour': {'coverage': 1., 'precision': 1.}}}
+               'withheld': ['make'], 'values': {'colour': ['blue'], 'make': []}, 'calibration': {'colour': {'coverage': 1., 'precision': 1.}}}
         for report in (rep, {'mean_acc': .9, 'per_head_acc': {'colour': .9}},
                        {**rep, 'floors': None, 'withheld': None}):
             state, client = {}, Mock()
@@ -551,7 +554,7 @@ def champion_calibration_metadata():
             assert published['Bucket'] == 'test-bucket'
             assert published['Key'] == f'{sl.MODELS}attrs-champion.json'
             assert json.loads(published['Body']) == state['attrs_champion']
-            for key, default in (('floors', {}), ('withheld', []), ('calibration', {})):
+            for key, default in (('floors', {}), ('withheld', []), ('values', {}), ('calibration', {})):
                 assert state['attrs_champion'].get(key) == report.get(key, default), \
                     f'champion must preserve {key}, including legacy defaults'
             assert (root / 'attrs-champion.pt').read_bytes() == b'checkpoint'
@@ -649,18 +652,164 @@ def selection_floors():
         ck.update(floors={'colour': .9}, withheld=[])
         torch.save(ck, path)
         assert detect.attr_classifier(path)(image) == {'type': 'bus'}, 'loader uses floors and suppresses unknown'
+        ck.update(floors={'colour': .5}, withheld=[], values={'colour': ['blue']})
+        torch.save(ck, path)
+        assert detect.attr_classifier(path)(image) == {'type': 'bus'}, 'loader must pass proven values to selection'
+        ck['values'] = {'colour': ['white']}
+        torch.save(ck, path)
+        assert detect.attr_classifier(path)(image) == {'colour': 'white', 'type': 'bus'}
         ck.update(floors={'colour': .5}, withheld=['colour'])
         torch.save(ck, path)
         assert detect.attr_classifier(path)(image) == {'type': 'bus'}, 'withheld overrides passing floor'
 
 
+
+def ai_validation_and_value_proof():
+    import detect
+    heads = {'colour': ['white', 'blue']}
+    probs = {'colour': [[.9, .1]] * 200}
+    human = {'colour': [-1] * 200}
+    floors, withheld, stats, values = ta.calibrate_floors(probs, human, heads, ai_labels={'colour': [0] * 200})
+    assert floors == {'colour': .9} and not withheld and values == {'colour': ['white']}
+    assert stats['colour']['source'] == 'ai'
+    floors, withheld, stats, values = ta.calibrate_floors(probs, human, heads, ai_labels={'colour': [0] * 184 + [1] * 16})
+    assert not floors and withheld == ['colour'], 'AI .92 precision cannot meet .95 target'
+    floors, withheld, stats, values = ta.calibrate_floors(probs, {'colour': [0] * 192 + [1] * 8}, heads,
+                                                       ai_labels={'colour': [1] * 200})
+    assert floors == {'colour': .9} and not withheld and stats['colour']['source'] == 'human'
+    heads = {'make': ['toyota', 'nissan']}
+    floors, withheld, stats, values = ta.calibrate_floors(
+        {'make': [[.9, .1]] * 197 + [[.1, .9]] * 3}, {'make': [-1] * 200}, heads,
+        ai_labels={'make': [0] * 197 + [1] * 3})
+    assert floors == {'make': .9} and not withheld and values == {'make': ['toyota']}
+    assert detect.select_attr('make', [0., 4.], heads['make'], None, floors, [], values) is None
+    assert detect.select_attr('make', [0., 4.], heads['make'], None, floors, []) == 'nissan'
+    many = {'make': [str(i) for i in range(20)]}
+    rows = [[.9 if j == i else .1 / 19 for j in range(20)] for i in range(20) for _ in range(5)]
+    floors, withheld, stats, values = ta.calibrate_floors(
+        {'make': rows}, {'make': [i for i in range(20) for _ in range(5)]}, many)
+    assert floors == {'make': .9} and withheld == ['make'] and values == {'make': []}, 'empty value proof withholds head'
+
+
+def ai_validation_build():
+    with dataset() as (root, heads), patch.object(ta, 'is_val', side_effect=lambda sid: sid.endswith('val')):
+        frame(root, 'ai-val', rows=3)
+        ai(root, 'ai-val', {'colour': 'white', 'make': 'Toyota', 'type': 'van'})
+        ai(root, 'ai-val', {'type': 'van'}, box=1)
+        ai(root, 'ai-val', {'colour': 'blue'}, box=2, bbox=[.6, .5, .4, .4])
+        frame(root, 'ai-train'); ai(root, 'ai-train', {'make': 'Ford'})
+        crops, targets, stems, classes = ta.build(heads)
+        assert stems == ['ai-train', 'ai-val'] and targets == [[-1, -1, 1], [-1, -1, -1]]
+        assert ta.validation_mask(stems) == [False, True]
+        assert ta.AI_VAL_TARGETS == [[-1, -1, -1], [-1, 0, 0]] and len(crops) == len(classes) == 2
+        ta.build({'type': ['van']})
+        assert ta.AI_VAL_TARGETS == [], 'parallel targets reset on every build'
+
+
+def calibration_proven_population():
+    heads = {'make': ['toyota'] + [f'make{i}' for i in range(6)] + ['other']}
+    ids = [0] * 12 + [i for i in range(1, 7) for _ in range(9)] + [7] * 34
+    rows = [[.9 if j == i else .1 / 7 for j in range(8)] for i in ids]
+    floors, withheld, stats, values = ta.calibrate_floors(
+        {'make': rows}, {'make': [-1] * 100}, heads, ai_labels={'make': ids})
+    assert withheld == ['make'], '66 pooled emissions leave too few proven emissions'
+    assert values == {'make': []} and stats['make']['emitted'] == 0
+    assert stats['make']['precision'] is None and stats['make']['lower_bound'] == 0.
+    # A value can prove .90 individually yet still fall short of the head's 50 crops.
+    ids = [0] * 20 + [i for i in range(1, 7) for _ in range(9)] + [7] * 26
+    rows = [[.9 if j == i else .1 / 7 for j in range(8)] for i in ids]
+    floors, withheld, stats, values = ta.calibrate_floors({'make': rows}, {'make': ids}, heads)
+    assert withheld == ['make'] and values == {'make': ['toyota']}
+    assert stats['make']['emitted'] == 20 and stats['make']['precision'] == 1.
+    assert stats['make']['coverage'] == .2 and .90 < stats['make']['lower_bound'] < .95
+
+
+def calibration_value_wilson():
+    heads = {'make': ['toyota', 'nissan']}
+    rows = {'make': [[.9, .1]] * 180 + [[.1, .9]] * 20}
+    floors, withheld, stats, values = ta.calibrate_floors(
+        rows, {'make': [0] * 180 + [1] * 18 + [0] * 2}, heads)
+    assert floors == {'make': .9} and not withheld and values == {'make': ['toyota']}
+    assert stats['make']['emitted'] == 180 and stats['make']['precision'] == 1.
+    floors, withheld, stats, values = ta.calibrate_floors(
+        {'make': [[.9, .1]] * 190 + [[.1, .9]] * 10}, {'make': [-1] * 200}, heads,
+        ai_labels={'make': [0] * 190 + [1] * 10})
+    assert values == {'make': ['toyota']}, '10/10 cannot prove a value at .95; 190/190 can'
+    assert stats['make']['emitted'] == 190
+
+
+def calibration_human_override():
+    floors, withheld, stats, values = ta.calibrate_floors(
+        {'make': [[.9, .1]] * 200}, {'make': [1] * 99 + [-1] * 101},
+        {'make': ['toyota', 'nissan']}, ai_labels={'make': [0] * 200})
+    assert not floors and withheld == ['make'], '99 human nissan truths override AI toyota'
+    assert stats['make']['human_known'] == 99 and stats['make']['labelled_known'] == 200
+
+
+def calibration_ai_target():
+    args = ({'make': [[.9, .1]] * 200}, {'make': [-1] * 200}, {'make': ['toyota', 'nissan']})
+    ai = {'make': [0] * 188 + [1] * 12}
+    assert ta.calibrate_floors(*args, ai_labels=ai)[1] == ['make'], '.94 AI precision fails .95'
+    with patch.object(ta, 'AI_TARGET', .90):
+        assert ta.calibrate_floors(*args, ai_labels=ai)[0] == {'make': .9}, '.94 at n=200 proves .90'
+
+
+def training_ai_wiring():
+    tree = ast.parse(inspect.getsource(ta.train))
+    call = next(n for n in ast.walk(tree) if isinstance(n, ast.Call)
+                and isinstance(n.func, ast.Name) and n.func.id == 'calibrate_floors')
+    class Mask:
+        def tolist(self):
+            return [False, True, True]
+    namespace = {**vars(ta), 'probabilities': {'make': [[.9, .1]] * 2}, 'names': ['make'],
+                 'val': Mask(), 'AI_VAL_TARGETS': [[1], [0], [1]]}
+    assert eval(compile(ast.Expression(call.args[4]), '<train AI argument>', 'eval'), namespace) == {'make': [0, 1]}, \
+        'actual train calibration argument must deliver validation AI truths'
+
+
+def training_ai_alignment():
+    body = ast.parse(inspect.getsource(ta.train)).body[0].body
+    checks = [n for n in body if isinstance(n, ast.Assert) and 'AI_VAL_TARGETS' in ast.unparse(n.test)]
+    assert checks, 'train must assert AI target alignment before tensor/model work'
+    for count, should_fail in ((2, False), (1, True)):
+        try:
+            exec(compile(ast.Module(body=checks, type_ignores=[]), '<train alignment>', 'exec'),
+                 {'AI_VAL_TARGETS': [[0]] * count, 'targets': [[0], [0]]})
+        except AssertionError:
+            assert should_fail
+        else:
+            assert not should_fail, 'misaligned AI validation targets must fail'
+
+
+def human_training_crop_counts():
+    heads = {'make': ['toyota', 'nissan']}
+    targets = [[0]] * 10 + [[-1]] * 100
+    stems = ['train'] * 9 + ['val'] * 101
+    crop = Image.new('RGB', (ta.INPUT, ta.INPUT))
+    with patch.object(ta, 'AI_VAL_TARGETS', [[-1]] * 10 + [[0]] * 100), \
+         patch.object(ta, 'is_val', side_effect=lambda s: s == 'val'):
+        ta.check(heads, [crop] * 110, targets, stems)
+    tree = ast.parse(Path(ta.__file__).read_text())
+    count = next(n.value for n in ast.walk(tree) if isinstance(n, ast.Assign)
+                 and any(isinstance(t, ast.Name) and t.id == 'local_boxes' for t in n.targets))
+    assert eval(compile(ast.Expression(count), '<local boxes>', 'eval'), {**vars(ta), 'targets': targets, 'stems': stems}) == 10
+    train = ast.parse(inspect.getsource(ta.train))
+    report = next(n for n in ast.walk(train) if isinstance(n, ast.Call)
+                  and isinstance(n.func, ast.Name) and n.func.id == 'report_dict')
+    class Mask:
+        def tolist(self):
+            return [False] * 9 + [True] * 101
+    assert eval(compile(ast.Expression(report.args[2]), '<val crops>', 'eval'),
+                {**vars(ta), 'targets': targets, 'val': Mask(), 'xv': [crop] * 101}) == 1
+
+
 def main():
     failures = []
-    for test in [calibration_unknown_truth, calibration_min_emit, suppressed_calibration, suppressed_selection, training_constraint_path, champion_constraints_publication, champion_constraints_download, champion_calibration_metadata, promotion_floors, promotion_floor_gain, promotion_floor_gain_history, promotion_floor_gain_null_metadata, calibration_floors, selection_floors, review_archive_validation, review_cli_gate, review_validation, review_external_default, human_wins, stale_bbox, ai_only_and_last_line, archive_and_reference, external, counts_and_sync, run_file_order, training_mask_and_report]:
+    for test in [calibration_proven_population, calibration_value_wilson, calibration_human_override, calibration_ai_target, training_ai_wiring, training_ai_alignment, human_training_crop_counts, ai_validation_and_value_proof, ai_validation_build, calibration_unknown_truth, calibration_min_emit, suppressed_calibration, suppressed_selection, training_constraint_path, champion_constraints_publication, champion_constraints_download, champion_calibration_metadata, promotion_floors, promotion_floor_gain, promotion_floor_gain_history, promotion_floor_gain_null_metadata, calibration_floors, selection_floors, review_archive_validation, review_cli_gate, review_validation, review_external_default, human_wins, stale_bbox, ai_only_and_last_line, archive_and_reference, external, counts_and_sync, run_file_order, training_mask_and_report]:
         try:
             test()
             print(f'PASS {test.__name__}')
-        except (AssertionError, AttributeError, ValueError) as exc:
+        except (AssertionError, AttributeError, ValueError, TypeError) as exc:
             failures.append(test.__name__)
             print(f'FAIL {test.__name__}: {type(exc).__name__}: {exc}')
     assert not failures, f'{len(failures)} source checks failed: {", ".join(failures)}'
