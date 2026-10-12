@@ -40,6 +40,7 @@ for the RDA importer, ten to twenty minutes behind live.
 import hashlib
 import json
 import os
+import re
 import shutil
 import signal
 import contextlib
@@ -687,12 +688,15 @@ def r2(download_timeout=None):
 def recording_keys(cl, bucket):
     """Keys under the gates' recording folders only (site1/, RDA-TG-*/). The bucket is ~900k
     objects, nearly all curation samples and evidence crops: listing it whole cost 15-20 min
-    of every pass and grew by the day. The top level is one Delimiter page."""
+    of every pass and grew by the day. The top level is one Delimiter page.
+    Only recording timestamp stems are yielded: stray uploads like exports/ crashed classify."""
     tops = [p["Prefix"] for page in cl.get_paginator("list_objects_v2").paginate(Bucket=bucket, Delimiter="/")
             for p in page.get("CommonPrefixes", [])]
     for top in tops:
         if not top.startswith(SKIP + ("curation-", "fieldkit-", "classifier-crops-")):
-            yield from bucket_keys(cl, bucket, top)
+            for key in bucket_keys(cl, bucket, top):
+                if re.fullmatch(r"\d{8}-\d{6}", Path(key).stem):
+                    yield key
 
 
 def bucket_keys(cl, bucket, prefix="", delimiter=None):
@@ -2381,6 +2385,8 @@ def listing_check():
     """A pass lists the gates' recording folders, never curation, evidence or models."""
     class Tops:
         keys = ["site1/cam3/20260923-101636.mkv", "RDA-TG-X/north/20260923-101636.mkv",
+                "exports/RDA-TG-KTB/2026-10-10/RDA-TG-KTB_cam3_2026-10-10_1100-1200.mp4",
+                "site1/cam3/notes.txt",
                 "curation/pending/images/x.jpg", "curation-paired/v1/c.json", "models/champion.pt",
                 "fieldkit-events/G/20260923/m.jsonl", "classifier-crops-history/2026-09-09/c.jpg"]
         listed = []
@@ -2398,7 +2404,7 @@ def listing_check():
     t = Tops()
     assert sorted(recording_keys(t, "b")) == ["RDA-TG-X/north/20260923-101636.mkv",
                                               "site1/cam3/20260923-101636.mkv"], t.listed
-    assert sorted(t.listed) == ["RDA-TG-X/", "site1/"], t.listed
+    assert sorted(t.listed) == ["RDA-TG-X/", "exports/", "site1/"], t.listed
 
 
 def journeys_check():

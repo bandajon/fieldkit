@@ -1858,8 +1858,9 @@ function labCorrTag(h) {
 // the figures to hold against an invoice.
 function labPaceTag(h) {
   const p = (labProg && labProg.by_who || {})[h];
-  return p && p.active_hours ? `<i class="res">${p.active_hours}h active over ${p.days} day${p.days === 1 ? '' : 's'}` +
+  const pace = p && p.active_hours ? `<i class="res">${p.active_hours}h active over ${p.days} day${p.days === 1 ? '' : 's'}` +
     (p.per_hour ? ` · ${p.per_hour}/h` : '') + '</i>' : '';
+  return pace + (p && p.checks > 0 ? `<i class="res">· ${p.checks} checks</i>` : '');
 }
 function labRosterShow(d) {
   labTeam = d;
