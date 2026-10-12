@@ -264,7 +264,7 @@ def class_names():
 def calibrate_floors(probabilities, labels, heads, allowed=None):
     """Smallest observed floor meeting the Wilson lower bound and emission minimum.
 
-    Coverage divides emitted labelled crops by all labelled crops; suppressed values are silent.
+    Coverage divides emitted labelled crops by known truths; unknown-truth emissions are wrong.
     """
     from detect import constrained
 
@@ -276,9 +276,10 @@ def calibrate_floors(probabilities, labels, heads, allowed=None):
         rows = probabilities.get(head, [])
         truth = labels.get(head, [])
         rules = (allowed or {}).get(head)
-        labelled = sum(label >= 0 for label in truth)
-        stats[head] = {"emitted": 0, "coverage": 0.0, "precision": None, "lower_bound": None}
-        if labelled < MIN_VAL:
+        labelled_known = sum(label >= 0 and values[label] != "unknown" for label in truth)
+        stats[head] = {"labelled_known": labelled_known, "emitted": 0, "coverage": 0.0,
+                       "precision": None, "lower_bound": None}
+        if labelled_known < MIN_VAL:
             withheld.append(head)
             continue
         groups = {}
@@ -303,7 +304,8 @@ def calibrate_floors(probabilities, labels, heads, allowed=None):
                 precision * (1 - precision) / count + z*z / (4*count*count))) / (1 + z*z / count)
             if count >= MIN_EMIT and lower >= target:
                 floors[head] = float(confidence)
-                stats[head] = {"emitted": count, "coverage": count / labelled,
+                stats[head] = {"labelled_known": labelled_known,
+                               "emitted": count, "coverage": count / labelled_known,
                                "precision": precision, "lower_bound": lower}
         if head not in floors:
             withheld.append(head)
