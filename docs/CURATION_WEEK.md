@@ -63,6 +63,16 @@ Two independent measurements, both running in the background of ordinary work:
 Accuracies print "insufficient sample" under three measurements — small-sample
 honesty matters when the number decides a payment.
 
+## Check colour/make
+
+Open **Check colour/make** (or `#valcheck`) to complete a human validation set.
+Every colour and make must be tapped to confirm or correct it; AI prefill is
+only a suggestion. A blank means no AI answer, so fill it. Can't read the colour
+or make → tap "Can't tell"; don't guess the closest colour. This work is not scored against the original curator.
+
+Edits made directly in R2 under `curation/approved/` are overwritten by the
+curation node. Edit through the app, or stop curation before editing R2.
+
 ## Daily rhythm
 
     morning:  python ingest_video.py pull <toll-gate-id>/<cam> && python dataset_sync.py push

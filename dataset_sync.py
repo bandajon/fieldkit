@@ -266,8 +266,9 @@ def once(rel):
 def always(rel):
     """Config is compared by name and size like everything else, and a one-character edit
     — "2" to "3" in a default — keeps the size identical, so the change would never move.
-    These files are a few KB: send them every pass and let content decide, not length."""
-    return rel.split("/", 1)[0] in CONFIG or rel in CONFIG or rel.startswith("classifier-crops/") and rel.endswith("/manifest.json")
+    Approved labels and attrs also change in place. These files are a few KB: compare their
+    content against the listing ETag, so unchanged files do not move."""
+    return rel.startswith(("approved/labels/", "approved/attrs/")) or rel.split("/", 1)[0] in CONFIG or rel in CONFIG or rel.startswith("classifier-crops/") and rel.endswith("/manifest.json")
 
 
 def have(dest, size):
@@ -300,7 +301,7 @@ def merge_jsonl(dest, extra):
     os.replace(tmp, dest)               # a torn ledger would be worse than a stale one
 
 
-def fetch(cl, bucket, dest, key, root=None, policy=None, sid=None):
+def fetch(cl, bucket, dest, key, root=None, policy=None, sid=None, preserve_attrs=False):
     """One object down. An existing ledger is merged; everything else is write-once."""
     if root is not None:
         dest = safe_dest(root, dest.relative_to(root).as_posix())
@@ -324,6 +325,8 @@ def fetch(cl, bucket, dest, key, root=None, policy=None, sid=None):
                 if policy and latest is None: return
                 if sid and latest and retention.expired(sid, latest): return
                 safe_dest(root, dest.relative_to(root).as_posix())
+                # The curation node owns labels and attrs; a curator may save while we download.
+                if preserve_attrs and dest.relative_to(root).as_posix().startswith(("approved/labels/", "approved/attrs/")) and dest.exists(): return
                 os.replace(tmp, dest)
         finally:
             tmp.unlink(missing_ok=True)
@@ -398,8 +401,9 @@ def sweep_consumed(root, in_bucket=()):
     return gone
 
 
-def pull(cl, bucket, prefix=PREFIX, root=DATASET, names=None):
-    """Download the curation instance's work. names limits it to the daily harvest."""
+def pull(cl, bucket, prefix=PREFIX, root=DATASET, names=None, preserve_attrs=False):
+    """Download the curation instance's work. names limits it to the daily harvest.
+    preserve_attrs protects existing approvals on their sole writer, the curation node."""
     root = Path(root).resolve()
     done = consumed(root)
     todo, skipped = [], 0
@@ -420,13 +424,16 @@ def pull(cl, bucket, prefix=PREFIX, root=DATASET, names=None):
             skipped += 1                  # already labelled: do not hand it back
             continue
         dest = safe_dest(root, rel)
+        if preserve_attrs and rel.startswith(("approved/labels/", "approved/attrs/")) and dest.exists():
+            skipped += 1
+            continue
         if have(dest, size) and (not always(rel) or same(dest, etags.get(key))):
             skipped += 1
             continue
         dest.parent.mkdir(parents=True, exist_ok=True)
         todo.append((dest, key, sid))
     def download(dest, key, sid):
-        fetch(cl, bucket, dest, key, root, policy, sid)
+        fetch(cl, bucket, dest, key, root, policy, sid, preserve_attrs=preserve_attrs)
     got = transfer(download, todo, "pulled")
     swept = sweep_consumed(root, {Path(k).stem for k in listing
                                   if k.startswith(prefix + "pending/images/")})

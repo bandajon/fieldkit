@@ -39,6 +39,7 @@ import offload
 import recorder
 import dataset_retention as retention
 import retention_maintenance
+from train import is_val, reference
 
 ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = ROOT / "config.yaml"
@@ -94,16 +95,21 @@ CLAIMS_LOCK = threading.Lock()
 INTAKE = {"at": None, "report": {}}   # last curation_cap.enforce() pass, for /api/dataset/intake
 INTAKE_EVERY = 900.0      # enforce() lists ~674k objects — only worth a full pass this often
 DATASET_LOCK = retention.DATASET_LOCK
+VAL_POOL = None
+VAL_EPOCH = 0
+VAL_AI = {}
 
 
 def dataset_mutation(fn):
     @functools.wraps(fn)
     def wrapped(*args, **kwargs):
+        global VAL_EPOCH
         if not DATASET_LOCK.acquire(blocking=False):
             raise HTTPException(503, "dataset is busy")
         try:
             return fn(*args, **kwargs)
         finally:
+            VAL_EPOCH += 1
             DATASET_LOCK.release()
     wrapped.__name__ = fn.__name__
     wrapped.__doc__ = fn.__doc__
@@ -1465,6 +1471,177 @@ def envelope(sid, tree, curator):
             "attrs": read_attrs(attrs_path(sid, tree))}
 
 
+VAL_HEADS = ("colour", "make")
+
+
+def valcheck_reference():
+    refs = reference()
+    f = DATASET / "reference.txt"
+    if f.is_file():
+        refs.update(line.strip() for line in f.read_text().splitlines() if line.strip())
+    for f in (DATASET / "classifier-crops").glob("*/manifest.json"):
+        try:
+            if json.loads(f.read_text()).get("reference"):
+                refs.add(f.parent.name)
+        except (OSError, ValueError, AttributeError):
+            continue
+    return refs
+
+
+def valcheck_heads(box, names, vocab, constraints):
+    if not 0 <= box["cls"] < len(names):
+        return {}
+    rules = constraints.get(names[box["cls"]], {})
+    return {h: rules.get(h, vocab.get(h, [])) for h in VAL_HEADS
+            if rules.get(h, vocab.get(h, []))}
+
+
+def valcheck_revision(sid):
+    label = sample_paths(sid, "approved")[1].read_bytes()
+    attrs = attrs_path(sid, "approved")
+    return hashlib.sha1(label + (attrs.read_bytes() if attrs.exists() else b"")).hexdigest()[:12]
+
+
+def valcheck_pool(names, vocab, constraints):
+    global VAL_POOL
+    def mtime(p):
+        try:
+            return p.stat().st_mtime_ns
+        except OSError:
+            return None
+    labels, attrs = DATASET / "approved" / "labels", DATASET / "approved" / "attrs"
+    manifests = sorted((DATASET / "classifier-crops").glob("*/manifest.json"))
+    key = (str(DATASET), VAL_EPOCH, mtime(labels), mtime(attrs),
+           mtime(DATASET / "reference.txt"), tuple((str(p), mtime(p)) for p in manifests),
+           mtime(DATASET / "classes.txt"), mtime(DATASET / "attributes.yaml"))
+    # In-place edits need not change directory mtimes; refresh them within a minute.
+    if VAL_POOL and VAL_POOL[0] == key and time.monotonic() - VAL_POOL[1] < 60:
+        return VAL_POOL[2]
+    refs = valcheck_reference()
+    pool = [s for p in sorted(labels.glob("*.txt"))
+            if (s := valcheck_sample(p.stem, refs, names, vocab, constraints))]
+    VAL_POOL = (key, time.monotonic(), pool)
+    return pool
+
+
+def valcheck_sample(sid, refs, names, vocab, constraints):
+    p = sample_paths(sid, "approved")[1]
+    if sid.startswith("external-") or not is_val(sid) or sid in refs or not is_active(sid) or not p.is_file():
+        return None
+    try:
+        rev = valcheck_revision(sid)
+        s = {**envelope(sid, "approved", ""), "rev": rev}
+        # read_boxes skips malformed lines; attributes must keep their original indexes.
+        if len(s["boxes"]) != len(p.read_text().splitlines()):
+            return None
+        if any(h not in s["attrs"].get(str(i), {}) for i, b in enumerate(s["boxes"])
+               for h in valcheck_heads(b, names, vocab, constraints)):
+            return s
+    except OSError:
+        pass
+    return None
+
+
+def valcheck_suggestions(s, names, vocab, constraints):
+    rows = {}
+    paths = sorted((DATASET / "ai-attrs").glob("*.jsonl"))
+    for old in list(VAL_AI):
+        if old not in paths:
+            VAL_AI.pop(old, None)
+    for p in paths:
+        try:
+            mtime = p.stat().st_mtime_ns
+            cached = VAL_AI.get(p)
+            if cached is None or cached[0] != mtime:
+                index = {}
+                for line in p.read_text().splitlines():
+                    try:
+                        r = json.loads(line)
+                        if isinstance(r, dict) and isinstance(r.get("sid"), str) and type(r.get("box")) is int and r["box"] >= 0:
+                            index.setdefault(r["sid"], {})[r["box"]] = r
+                    except ValueError:
+                        continue
+                cached = (mtime, index)
+                VAL_AI[p] = cached
+            rows.update(cached[1].get(s["id"], {}))
+        except OSError:
+            continue
+    out = {}
+    for i, b in enumerate(s["boxes"]):
+        row = rows.get(i, {})
+        try:
+            bbox = row["bbox"]
+            if not isinstance(bbox, list) or len(bbox) != 4 or not all(
+                    abs(float(a) - b[k]) <= 1e-4 for a, k in zip(bbox, ("cx", "cy", "w", "h"))):
+                continue
+            attrs = row.get("attrs")
+            if not isinstance(attrs, dict):
+                continue
+            sug = {h: attrs[h] for h, allowed in valcheck_heads(b, names, vocab, constraints).items()
+                   if h not in s["attrs"].get(str(i), {}) and attrs.get(h) in allowed}
+            if sug:
+                out[str(i)] = sug
+        except (KeyError, TypeError, ValueError):
+            continue
+    return out
+
+
+@app.get("/api/dataset/valcheck")
+def dataset_valcheck(who: str = "", count: bool = False, x_curator_token: str = Header("")):
+    if curators() and not who:
+        raise HTTPException(401, "unknown curator or bad token")
+    who = check_token(valid_who(who), x_curator_token)
+    names, vocab, constraints = dataset_classes(), attr_vocab(), attr_meta("constraints")
+    pool = valcheck_pool(names, vocab, constraints)
+    if not pool:
+        return {"done": True, "remaining": 0}
+    if count:
+        return {"remaining": len(pool)}
+    purge_claims()
+    with CLAIMS_LOCK:
+        held = {sid: w for sid, (w, exp) in CLAIMS.items() if exp > time.time()}
+        available = [s for s in pool if held.get(s["id"], who) == who]
+        if not available:
+            return {"done": False, "remaining": len(pool)}
+        s = next((s for s in available if s["id"] in held), available[0])
+        CLAIMS[s["id"]] = (who, time.time() + CLAIM_TTL)
+        save_claims()
+    return {**s, "remaining": len(pool), "suggested": valcheck_suggestions(s, names, vocab, constraints),
+            "classes": names, "attributes": vocab,
+            **{f"attr_{k}": attr_meta(k) for k in ("defaults", "constraints", "implies", "restricts")},
+            "attr_ordinary_optional": attr_meta("optional"),
+            "attr_optional": {**attr_meta("optional"), **{h: False for h in VAL_HEADS}}}
+
+
+@dataset_mutation
+def valattrs_label(sid, who, body):
+    names, vocab, constraints = dataset_classes(), attr_vocab(), attr_meta("constraints")
+    s = valcheck_sample(sid, valcheck_reference(), names, vocab, constraints)
+    if s is None:
+        raise HTTPException(409, "frame is not awaiting validation colour/make")
+    if sid not in (held := purge_claims()) or held[sid] != who:
+        raise HTTPException(409, "frame is claimed by another curator")
+    rev = valcheck_revision(sid)
+    if body.get("rev") != rev:
+        raise HTTPException(409, "frame changed, reload")
+    attrs = valid_attrs(body.get("attrs"), len(s["boxes"]))
+    for i, b in enumerate(s["boxes"]):
+        allowed = valcheck_heads(b, names, vocab, constraints)
+        posted = attrs.get(str(i), {})
+        for h in VAL_HEADS:
+            if h in posted and posted[h] not in allowed.get(h, []):
+                raise HTTPException(400, f"box {i} does not allow {h}={posted[h]!r}")
+            if h in allowed and h not in posted:
+                raise HTTPException(400, f"box {i} needs an explicit {h} answer")
+        values = {h: posted[h] for h in allowed}
+        if values:
+            s["attrs"].setdefault(str(i), {}).update(values)
+    p = attrs_path(sid, "approved")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(s["attrs"]))
+    return finish(who, sid, "review", {"ok": True, "id": sid}, {"valcheck": True})
+
+
 def superadmin(who):
     """The one handle whose review RELEASES held work: SUPERVISOR when the node names one,
     else any reviewer — a node without a super admin keeps behaving as it always did."""
@@ -1539,11 +1716,8 @@ def review_label(sid, who, body):
     dst_lbl.parent.mkdir(parents=True, exist_ok=True)
     dst_lbl.write_text(box_lines(boxes))
     dst_attrs = attrs_path(sid, "approved")
-    if attrs:
-        dst_attrs.parent.mkdir(parents=True, exist_ok=True)
-        dst_attrs.write_text(json.dumps(attrs))
-    else:
-        dst_attrs.unlink(missing_ok=True)
+    dst_attrs.parent.mkdir(parents=True, exist_ok=True)
+    dst_attrs.write_text(json.dumps(attrs))   # {} publishes a clear through upload-only sync
     if tree == "holding":      # the approved copy is written first: never lose the only one
         dst_img.parent.mkdir(parents=True, exist_ok=True)
         src_img.rename(dst_img)
@@ -1725,12 +1899,16 @@ def r2():
 
 
 def sync_both(ds, cl, bucket):
-    """Our work up, everything else down. -> (uploaded, downloaded). Both directions skip
-    on same-name-same-size, so a steady state is one listing and a pile of stat calls."""
+    """Curation publishes its ledgers and preserves its approvals; other nodes only pull.
+    -> (uploaded, downloaded)."""
     import retention_maintenance
     retention_maintenance.maintenance_once(DATASET.resolve(), cl, bucket)
-    sent, _ = ds.push(cl, bucket, names=ds.LEDGERS)
-    got, _ = ds.pull(cl, bucket)
+    if CURATION:
+        sent, _ = ds.push(cl, bucket, names=ds.LEDGERS)
+        got, _ = ds.pull(cl, bucket, preserve_attrs=True)
+    else:
+        sent = 0
+        got, _ = ds.pull(cl, bucket)
     try:
         settings = curation_cap.bucket_settings(cl, bucket, ds.PREFIX + curation_cap.SETTINGS)
         now = time.monotonic()
@@ -2340,8 +2518,12 @@ def send_back(sid, tree):
 def dataset_label(body: dict = Body(default={}), x_curator_token: str = Header("")):
     sid = valid_sample_id(body.get("id"))
     ensure_active(sid)
-    who = check_token(valid_who(body.get("who")), x_curator_token)
     action = body.get("action")
+    if action == "valattrs" and curators() and not body.get("who"):
+        raise HTTPException(401, "unknown curator or bad token")
+    who = check_token(valid_who(body.get("who")), x_curator_token)
+    if action == "valattrs":
+        return valattrs_label(sid, who, body)
     if sid.startswith("g-"):
         return gold_label(sid, who, action, body)
     if action == "review":
@@ -2381,11 +2563,11 @@ def dataset_label(body: dict = Body(default={}), x_curator_token: str = Header("
     dst_lbl.parent.mkdir(parents=True, exist_ok=True)
     dst_lbl.write_text(box_lines(boxes))   # the operator's edit wins over the model's guess
     dst_attrs = attrs_path(sid, tree)
-    if attrs:
+    if attrs or tree == "approved":
         dst_attrs.parent.mkdir(parents=True, exist_ok=True)
         dst_attrs.write_text(json.dumps(attrs))
     else:
-        dst_attrs.unlink(missing_ok=True)   # re-approved with the attributes cleared
+        dst_attrs.unlink(missing_ok=True)
     img.rename(dst_img)
     lbl.unlink(missing_ok=True)
     attrs_path(sid).unlink(missing_ok=True)
