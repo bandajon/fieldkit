@@ -13,6 +13,7 @@ never guessed at.
 """
 
 import json
+from math import sqrt
 import shutil
 import sys
 from datetime import datetime, timezone
@@ -21,6 +22,7 @@ from pathlib import Path
 import yaml
 from PIL import Image
 
+from detect import FLOORED_ATTR_HEADS, SUPPRESSED_ATTR_VALUES
 from train import is_val, reference   # same split, same frozen benchmark
 
 ROOT = Path(__file__).resolve().parent
@@ -37,8 +39,9 @@ PAD = 0.10                # crop context: a truck's neighbours help read its typ
 EPOCHS = 30
 BATCH = 64
 LR = 3e-4
-FLOORED = {"colour": 0.90, "make": 0.90}
+FLOORED = dict.fromkeys(FLOORED_ATTR_HEADS, 0.90)
 MIN_VAL = 100
+MIN_EMIT = 50
 MIN_BOXES = 200           # below this the heads memorise instead of generalising
 IMAGENET = ((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
 
@@ -259,9 +262,9 @@ def class_names():
 
 
 def calibrate_floors(probabilities, labels, heads, allowed=None):
-    """Smallest observed floor meeting precision, using detect's constrained choice.
+    """Smallest observed floor meeting the Wilson lower bound and emission minimum.
 
-    Coverage divides emitted labelled crops by all labelled crops; unknown is silent.
+    Coverage divides emitted labelled crops by all labelled crops; suppressed values are silent.
     """
     from detect import constrained
 
@@ -274,7 +277,7 @@ def calibrate_floors(probabilities, labels, heads, allowed=None):
         truth = labels.get(head, [])
         rules = (allowed or {}).get(head)
         labelled = sum(label >= 0 for label in truth)
-        stats[head] = {"coverage": 0.0, "precision": None}
+        stats[head] = {"emitted": 0, "coverage": 0.0, "precision": None, "lower_bound": None}
         if labelled < MIN_VAL:
             withheld.append(head)
             continue
@@ -283,7 +286,7 @@ def calibrate_floors(probabilities, labels, heads, allowed=None):
             if label < 0:
                 continue
             value = constrained(probs, values, rules[i] if rules is not None else None)
-            if value is None or (head == "make" and value == "unknown"):
+            if value is None or value in SUPPRESSED_ATTR_VALUES:
                 continue
             choice = values.index(value)
             confidence = probs[choice]
@@ -295,9 +298,13 @@ def calibrate_floors(probabilities, labels, heads, allowed=None):
             count += size
             correct += hits
             precision = correct / count
-            if precision >= target:
+            z = 1.2816   # 90% one-sided Wilson bound
+            lower = (precision + z*z / (2*count) - z * sqrt(
+                precision * (1 - precision) / count + z*z / (4*count*count))) / (1 + z*z / count)
+            if count >= MIN_EMIT and lower >= target:
                 floors[head] = float(confidence)
-                stats[head] = {"coverage": count / labelled, "precision": precision}
+                stats[head] = {"emitted": count, "coverage": count / labelled,
+                               "precision": precision, "lower_bound": lower}
         if head not in floors:
             withheld.append(head)
     return floors, withheld, stats

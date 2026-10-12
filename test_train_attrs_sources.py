@@ -274,14 +274,19 @@ def promotion_floors():
     champ = rep(type=.89, axles=.91, colour=None)
     assert sl.promote_attrs(rep(type=.90, axles=.92, colour=.50), champ), 'compare shared heads'
     assert not sl.promote_attrs(rep(type=.89, axles=.91, colour=None), champ), 'shared tie without new measurement'
-    assert sl.promote_attrs(rep(type=.885, axles=.905, colour=.50), champ), 'added-head tolerance includes boundary'
-    assert not sl.promote_attrs(rep(type=.884, axles=.904, colour=.99), champ), 'outside tolerance'
-    assert sl.promote_attrs(rep(type=.89, axles=.91, colour=.50), champ), 'added-head tie'
+    assert not sl.promote_attrs(rep(type=.885, axles=.905, colour=.50), champ), 'added colour cannot excuse regression'
+    assert not sl.promote_attrs(rep(type=.884, axles=.904, colour=.99), champ), 'colour gains cannot excuse type and axles regression'
+    assert not sl.promote_attrs(rep(type=.89, axles=.91, colour=.50), champ), 'added colour cannot break a tie'
+    assert not sl.promote_attrs(rep(type=.86, axles=.88, make=.80), rep(type=.89, axles=.91, make=.40)), 'make gains cannot offset established-head regression'
+    assert not sl.promote_attrs(rep(type=.90, axles=.92, **{'axle-config': None}), rep(type=.89, axles=.91, **{'axle-config': .8})), 'candidate cannot drop a measured non-floored head'
     assert not sl.promote_attrs(rep(make=.99), champ), 'no shared measurements'
     assert not sl.promote_attrs(None, champ)
     assert sl.promote_attrs(None, None), 'no champion behaves as before'
     assert sl.promote_attrs(rep(type=.1), {'mean_acc': None})
-    assert sl.promote_attrs(rep(type=.90, axles=.92, colour=None), rep(type=.89, axles=.91, colour=.99))
+    assert sl.promote_attrs(rep(type=.90, axles=.92, colour=None), rep(type=.89, axles=.91, colour=.99)), 'missing floored colour does not enter promotion'
+    assert not sl.promote_attrs(rep(type=.8, make=1.), {'mean_acc': .85}), 'legacy comparison excludes floored heads'
+    assert sl.promote_attrs(rep(type=.9, colour=.1), {'mean_acc': .85}), 'legacy comparison uses established-head mean'
+
 
 
 def calibration_floors():
@@ -292,13 +297,14 @@ def calibration_floors():
     labels = {'colour': [1] * 20 + [0] * 80, 'make': [0] * 99}
     floors, withheld, stats = ta.calibrate_floors(probs, labels, heads)
     assert floors == {'colour': .8} and withheld == ['make'], (floors, withheld)
-    assert stats['colour'] == {'coverage': .8, 'precision': 1.0}
+    assert stats['colour']['coverage'] == .8 and stats['colour']['precision'] == 1.0
+    assert stats['colour']['emitted'] == 80 and .97 < stats['colour']['lower_bound'] < 1.
     floors, withheld, _ = ta.calibrate_floors({'colour': [[.8, .2]] * 100},
                                             {'colour': [0] * 89 + [1] * 11}, {'colour': heads['colour']})
     assert not floors and withheld == ['colour'], 'ties cannot be split to fake precision'
     floors, withheld, stats = ta.calibrate_floors({'colour': [[.6, .4]] * 100},
                                                 {'colour': [0] * 90 + [1] * 10}, {'colour': heads['colour']})
-    assert floors == {'colour': .6} and not withheld and stats['colour']['precision'] == .9
+    assert not floors and withheld == ['colour'], 'point precision .90 has a Wilson lower bound below .90'
     floors, withheld, _ = ta.calibrate_floors({}, {}, heads)
     assert not floors and withheld == ['colour', 'make'], 'missing validation is withheld'
     floors, withheld, stats = ta.calibrate_floors({'make': [[.1, .9]] * 100},
@@ -312,9 +318,39 @@ def calibration_floors():
     assert withheld == ['colour'], 'unlabelled crops do not count toward MIN_VAL'
 
     # Precision need not rise monotonically with threshold; choose the lowest success.
-    floors, withheld, stats = ta.calibrate_floors({'colour': [[.9, .1]] * 10 + [[.8, .2]] * 10 + [[.7, .3]] * 80},
-        {'colour': [0] * 10 + [1] * 10 + [0] * 80}, {'colour': heads['colour']})
-    assert floors == {'colour': .7} and stats['colour'] == {'coverage': 1., 'precision': .9}
+    floors, withheld, stats = ta.calibrate_floors({'colour': [[.9, .1]] * 10 + [[.8, .2]] * 10 + [[.7, .3]] * 180},
+        {'colour': [0] * 10 + [1] * 10 + [0] * 180}, {'colour': heads['colour']})
+    assert floors == {'colour': .7} and stats['colour']['coverage'] == 1. and stats['colour']['precision'] == .95
+    assert stats['colour']['emitted'] == 200 and stats['colour']['lower_bound'] >= .9
+
+
+def calibration_min_emit():
+    for emitted in (1, 49, 50):
+        floors, withheld, stats = ta.calibrate_floors(
+            {'make': [[.99, .01]] * emitted + [[.01, .99]] * (100 - emitted)},
+            {'make': [0] * emitted + [1] * (100 - emitted)}, {'make': ['Toyota', 'unknown']})
+        if emitted < 50:
+            assert not floors and withheld == ['make'], f'{emitted} emissions cannot qualify'
+        else:
+            assert floors == {'make': .99} and not withheld, '50 perfect emissions qualify'
+            assert stats['make']['emitted'] == 50 and stats['make']['lower_bound'] >= .9
+
+
+def suppressed_calibration():
+    for head in ('colour', 'make'):
+        for value in ('unknown', 'other'):
+            floors, withheld, stats = ta.calibrate_floors(
+                {head: [[.99, .01]] * 100}, {head: [0] * 100}, {head: [value, 'valid']})
+            assert not floors and withheld == [head], f'{head}/{value} must not count as emissions'
+            assert stats[head]['coverage'] == 0.
+
+
+def suppressed_selection():
+    import detect
+    for head in ('colour', 'make'):
+        for value in ('unknown', 'other'):
+            assert detect.select_attr(head, [4., 0.], [value, 'valid'], None, {}, []) is None, f'{head}/{value} must stay silent'
+    assert detect.select_attr('type', [4., 0.], ['other', 'van'], None, {}, []) == 'other', 'only floored heads suppress'
 
 
 def training_constraint_path():
@@ -331,25 +367,26 @@ def training_constraint_path():
     with dataset() as (root, _):
         heads = {'colour': ['white', 'blue']}
         (root / 'attributes.yaml').write_text(yaml.safe_dump(
-            {**heads, 'constraints': {'truck': {'colour': ['blue']}}}))
+            {**heads, 'constraints': {'truck': {'colour': ['blue']}, 'car': {'colour': ['white']}}}))
         out = root / 'attr_runs/round2/attrs.pt'
         out.parent.mkdir(parents=True)
         assert not (out.parent / 'attributes.yaml').exists()
         namespace = {**vars(ta), 'attr_constraints': detect.attr_constraints, 'out': out,
-                     'heads': heads, 'names': ['colour'], 'cnames': ['truck'],
-                     'classes': [0] * 101, 'val': torch.tensor([False] + [True] * 100),
+                     'heads': heads, 'names': ['colour'], 'cnames': ['car', 'truck'],
+                     'classes': [0] + [1] * 100, 'val': torch.tensor([False] + [True] * 100),
                      'yv': torch.tensor([[1]] * 100), 'probabilities': {'colour': [[.8, .2]] * 100}}
         exec(wiring, namespace)
         assert namespace['floors'] == {'colour': .2}, 'train must load dataset constraints, not run-local YAML'
         assert namespace['withheld'] == []
-        assert namespace['calibration'] == {'colour': {'coverage': 1., 'precision': 1.}}
+        assert namespace['val_classes'] == ['truck'] * 100, 'validation classes exclude the training car'
+        assert namespace['calibration']['colour']['coverage'] == 1. and namespace['calibration']['colour']['precision'] == 1.
         assert detect.select_attr('colour', [0., -1.3862943611198906], heads['colour'], ['blue'],
                                   namespace['floors'], []) == 'blue'
 
         # Execute the actual run-save path, then load both deployment locations.
         from torchvision.models import mobilenet_v3_small
         model = mobilenet_v3_small(weights=None)
-        fc = torch.nn.ModuleList([torch.nn.Linear(577, 2)])
+        fc = torch.nn.ModuleList([torch.nn.Linear(578, 2)])
         with torch.no_grad():
             fc[0].weight.zero_()
             fc[0].bias.copy_(torch.tensor([0., -1.3862943]))
@@ -404,6 +441,58 @@ def champion_calibration_metadata():
             assert (root / 'attrs-champion.pt').read_bytes() == b'checkpoint'
 
 
+def champion_constraints_publication():
+    import selfloop as sl
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        run = root / 'round'; run.mkdir()
+        (run / 'attrs.pt').write_bytes(b'checkpoint')
+        rules = root / 'attributes.yaml'
+        rules.write_text('constraints: {truck: {colour: [blue]}}\n')
+        for exists in (True, False):
+            if not exists:
+                rules.unlink()
+            client = Mock()
+            with patch.object(sl, 'DATASET', root), patch.object(sl, 'ATTRS_CHAMPION', root / 'attrs-champion.pt'), contextlib.redirect_stdout(io.StringIO()):
+                sl.crown_attrs({}, run, {'mean_acc': .9, 'per_head_acc': {'type': .9}}, client, 'test-bucket')
+            yaml_calls = [c.args for c in client.upload_file.call_args_list if c.args[2] == f'{sl.MODELS}attributes.yaml']
+            assert yaml_calls == ([(str(rules), 'test-bucket', f'{sl.MODELS}attributes.yaml')] if exists else []), 'publish dataset constraints alongside deployed champion when present'
+
+
+def champion_constraints_download():
+    import detect
+    import selfloop as sl
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        run = root / 'round'; run.mkdir()
+        (run / 'attrs.pt').write_bytes(b'checkpoint')
+        rules = root / 'attributes.yaml'
+        deployed = root / 'deployed'; deployed.mkdir()
+        objects = {}
+        client = Mock()
+        client.upload_file.side_effect = lambda path, bucket, key: objects.update({key: Path(path).read_bytes()})
+        client.put_object.side_effect = lambda **kw: objects.update({kw['Key']: kw['Body']})
+        client.head_object.side_effect = lambda **kw: {'ContentLength': len(objects[kw['Key']])}
+        client.download_file.side_effect = lambda bucket, key, path: Path(path).write_bytes(objects[key])
+        for colour in ('blue', 'grey'):
+            rules.write_text(f'constraints: {{truck: {{colour: [{colour}]}}}}\n')
+            with patch.object(sl, 'DATASET', root), patch.object(sl, 'ATTRS_CHAMPION', root / 'attrs-champion.pt'), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                sl.crown_attrs({}, run, {'mean_acc': .9, 'per_head_acc': {'type': .9}}, client, 'test-bucket')
+                got = dataset_sync.models(client, 'test-bucket', deployed)
+            assert (deployed / 'attrs-champion.pt').read_bytes() == b'checkpoint'
+            assert 'attributes.yaml' in got, 'download published constraints, including same-size updates'
+            assert (deployed / 'attributes.yaml').read_bytes() == rules.read_bytes()
+            assert detect.attr_constraints(deployed / 'attrs-champion.pt') == {'truck': {'colour': [colour]}}, \
+                'deployed champion must read the published constraints beside its weights'
+        del objects[f'{sl.MODELS}attributes.yaml']
+        (deployed / 'attributes.yaml').unlink()
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            got = dataset_sync.models(client, 'test-bucket', deployed)
+        assert 'attributes.yaml' not in got and 'attributes.yaml' not in output.getvalue(), 'missing remote constraints skipped silently'
+        assert not (deployed / 'attributes.yaml').exists()
+
+
 def selection_floors():
     import detect
     select = detect.select_attr
@@ -446,7 +535,7 @@ def selection_floors():
 
 def main():
     failures = []
-    for test in [training_constraint_path, champion_calibration_metadata, promotion_floors, calibration_floors, selection_floors, review_archive_validation, review_cli_gate, review_validation, review_external_default, human_wins, stale_bbox, ai_only_and_last_line, archive_and_reference, external, counts_and_sync, run_file_order, training_mask_and_report]:
+    for test in [calibration_min_emit, suppressed_calibration, suppressed_selection, training_constraint_path, champion_constraints_publication, champion_constraints_download, champion_calibration_metadata, promotion_floors, calibration_floors, selection_floors, review_archive_validation, review_cli_gate, review_validation, review_external_default, human_wins, stale_bbox, ai_only_and_last_line, archive_and_reference, external, counts_and_sync, run_file_order, training_mask_and_report]:
         try:
             test()
             print(f'PASS {test.__name__}')

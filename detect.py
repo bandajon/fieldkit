@@ -31,6 +31,8 @@ CLASS_IDS = {n: i for i, n in enumerate(CLASSES.values())}       # dataset ids, 
 COLORS = {}               # class -> RGB, filled by palette() when a model loads
 WEIGHTS = "yolov8n.pt"
 WHEEL = "wheel"          # a detector class, but never a vehicle: it feeds axle counting
+FLOORED_ATTR_HEADS = ("colour", "make")
+SUPPRESSED_ATTR_VALUES = {"unknown", "other"}
 CONF = 0.4
 IMGSZ = 1280      # sub-streams are 1280x720, so this is ~native; 640 missed distant trucks
 FPS = 5           # ffmpeg decimates to this — the loop then runs flat out
@@ -402,7 +404,8 @@ def select_attr(head, scores, values, allowed, floors=None, withheld=None):
     value = constrained(scores, values, allowed)
     if value is None:
         return None
-    if head == "make" and value == "unknown" and (floors is not None or withheld is not None):
+    if (head in FLOORED_ATTR_HEADS and value in SUPPRESSED_ATTR_VALUES
+            and (floors is not None or withheld is not None)):
         return None
     if head in (floors or {}) and softmax_scores(scores)[values.index(value)] < floors[head]:
         return None

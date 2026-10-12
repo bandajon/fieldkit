@@ -661,18 +661,17 @@ def selfcheck():
 def models(cl, bucket, root=DATASET):
     """The crowned weights (selfloop adopt publishes them under models/) into dataset/,
     where config.yaml's detect_weights / attr_weights point on a console. Same size and
-    name = same file, like push/pull; the .json beside each says which run it is."""
+    name = same weights, like push/pull; metadata and attribute rules always refresh."""
     got = []
-    for name in ("champion.pt", "champion.json", "attrs-champion.pt", "attrs-champion.json"):
+    for name in ("champion.pt", "champion.json", "attrs-champion.pt", "attrs-champion.json", "attributes.yaml"):
         key = "models/" + name
         try:
             size = cl.head_object(Bucket=bucket, Key=key)["ContentLength"]
         except Exception:
             continue                      # nothing crowned yet
         dest = root / name
-        # The .json beside each model is a few hundred bytes whose size barely changes
-        # between runs — a same-size skip served a stale run name once. Always fetch those.
-        if not name.endswith(".json") and dest.exists() and dest.stat().st_size == size:
+        # Small metadata and attribute rules can change without changing size.
+        if name.endswith(".pt") and dest.exists() and dest.stat().st_size == size:
             continue
         cl.download_file(bucket, key, str(dest))
         got.append(name)
