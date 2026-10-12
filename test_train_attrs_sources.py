@@ -289,6 +289,88 @@ def promotion_floors():
 
 
 
+def promotion_floor_gain():
+    import selfloop as sl
+    champ = {'mean_acc': .90, 'per_head_acc': {'type': .89, 'axles': .91},
+             'floors': {}, 'withheld': []}
+    def candidate(delta=0., head='colour', withheld=()):
+        return {'mean_acc': .99, 'per_head_acc': {'type': .89 + delta, 'axles': .91 + delta,
+                                                 head: .01},
+                'floors': {head: .8}, 'withheld': list(withheld)}
+    cases = [
+        ('equal old heads, new emitted make', candidate(head='make'), champ, True),
+        ('old heads -0.004, new emitted colour', candidate(-.004), champ, True),
+        ('old heads -0.005 at tolerance', candidate(-.005), champ, True),
+        ('old heads -0.006, new emitted colour', candidate(-.006), champ, False),
+        ('make floor also withheld', candidate(head='make', withheld=['make']), champ, False),
+        ('champion already emits make', candidate(head='make'),
+         {**champ, 'floors': {'make': .7}}, False),
+        ('legacy champion without floors', candidate(),
+         {'mean_acc': .90, 'per_head_acc': champ['per_head_acc']}, True),
+        ('legacy mean-only champion', candidate(), {'mean_acc': .90}, True),
+        ('legacy mean-only excessive regression', candidate(-.006), {'mean_acc': .90}, False),
+        ('champion make floor withheld', candidate(head='make'),
+         {**champ, 'floors': {'make': .7}, 'withheld': ['make']}, True),
+        ('lost champion measurement despite new emission',
+         {**candidate(), 'per_head_acc': {'type': .99, 'colour': .99}}, champ, False),
+        ('non-floored head does not earn gain', candidate(head='cargo'), champ, False),
+    ]
+    failures = [(name, expected, sl.promote_attrs(rep, champion))
+                for name, rep, champion, expected in cases
+                if sl.promote_attrs(rep, champion) != expected]
+    assert not failures, failures
+
+
+def promotion_floor_gain_history():
+    import selfloop as sl
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        run = root / 'alternating'; run.mkdir()
+        (run / 'attrs.pt').write_bytes(b'checkpoint')
+        for toggle_withheld in (False, True):
+            state = {'attrs_champion': {'mean_acc': .9, 'per_head_acc': {'type': .9}}}
+            client, crowns = Mock(), 0
+            with patch.object(sl, 'ATTRS_CHAMPION', root / 'attrs-champion.pt'), \
+                 patch.object(sl, 'DATASET', root), contextlib.redirect_stdout(io.StringIO()):
+                for i in range(180):
+                    head = ('colour', 'make')[i % 2]
+                    score = state['attrs_champion']['per_head_acc']['type'] - .005
+                    report = {'mean_acc': score, 'per_head_acc': {'type': score},
+                              'floors': {'colour': .8, 'make': .8} if toggle_withheld else {head: .8},
+                              'withheld': [('make', 'colour')[i % 2]] if toggle_withheld else []}
+                    if sl.promote_attrs(report, state['attrs_champion']):
+                        sl.crown_attrs(state, run, report, client, 'test-bucket')
+                        crowns += 1
+            loss = .9 - state['attrs_champion']['per_head_acc']['type']
+            assert loss <= .010 + 1e-12, f'180 alternating attempts lost {loss:.3f} over {crowns} crowns'
+            assert crowns == 2, 'each floored head earns its allowance once'
+            assert state['attrs_champion']['earned'] == ['colour', 'make']
+            assert json.loads(client.put_object.call_args.kwargs['Body']) == state['attrs_champion']
+            # A strict improvement dropping both emissions must retain their earned history.
+            report = {'mean_acc': .91, 'per_head_acc': {'type': .91}, 'floors': {}, 'withheld': []}
+            assert sl.promote_attrs(report, state['attrs_champion'])
+            with patch.object(sl, 'ATTRS_CHAMPION', root / 'attrs-champion.pt'), \
+                 patch.object(sl, 'DATASET', root), contextlib.redirect_stdout(io.StringIO()):
+                sl.crown_attrs(state, run, report, client, 'test-bucket')
+            assert state['attrs_champion']['earned'] == ['colour', 'make']
+            for head in ('colour', 'make'):
+                assert not sl.promote_attrs({**report, 'mean_acc': .906,
+                                            'per_head_acc': {'type': .906}, 'floors': {head: .8}},
+                                           state['attrs_champion']), 'strict crowns cannot renew allowances'
+
+
+def promotion_floor_gain_null_metadata():
+    import selfloop as sl
+    champ = {'mean_acc': .9, 'per_head_acc': {'type': .9}}
+    candidate = {'mean_acc': .896, 'per_head_acc': {'type': .896}, 'floors': {'make': .8}}
+    for key in ('floors', 'withheld'):
+        assert sl.promote_attrs(candidate, {**champ, key: None}), f'null champion {key}'
+    assert sl.promote_attrs({**candidate, 'withheld': None}, champ), 'null candidate withheld'
+    assert not sl.promote_attrs({**candidate, 'floors': None}, champ), 'null candidate floors earns nothing'
+    assert not sl.promote_attrs(candidate, {**champ, 'earned': ['make']}), 'earned gain cannot repeat'
+    assert sl.promote_attrs(candidate, {**champ, 'earned': None}), 'null earned is legacy history'
+
+
 def calibration_floors():
     heads = {'colour': ['white', 'blue'], 'make': ['Toyota', 'unknown'], 'type': ['van']}
     # Low-confidence errors are withheld; tied confidence crops enter together.
@@ -429,7 +511,8 @@ def champion_calibration_metadata():
         (run / 'attrs.pt').write_bytes(b'checkpoint')
         rep = {'mean_acc': .9, 'per_head_acc': {'colour': .9}, 'floors': {'colour': .2},
                'withheld': ['make'], 'calibration': {'colour': {'coverage': 1., 'precision': 1.}}}
-        for report in (rep, {'mean_acc': .9, 'per_head_acc': {'colour': .9}}):
+        for report in (rep, {'mean_acc': .9, 'per_head_acc': {'colour': .9}},
+                       {**rep, 'floors': None, 'withheld': None}):
             state, client = {}, Mock()
             with patch.object(sl, 'ATTRS_CHAMPION', root / 'attrs-champion.pt'), \
                  contextlib.redirect_stdout(io.StringIO()):
@@ -543,7 +626,7 @@ def selection_floors():
 
 def main():
     failures = []
-    for test in [calibration_min_emit, suppressed_calibration, suppressed_selection, training_constraint_path, champion_constraints_publication, champion_constraints_download, champion_calibration_metadata, promotion_floors, calibration_floors, selection_floors, review_archive_validation, review_cli_gate, review_validation, review_external_default, human_wins, stale_bbox, ai_only_and_last_line, archive_and_reference, external, counts_and_sync, run_file_order, training_mask_and_report]:
+    for test in [calibration_min_emit, suppressed_calibration, suppressed_selection, training_constraint_path, champion_constraints_publication, champion_constraints_download, champion_calibration_metadata, promotion_floors, promotion_floor_gain, promotion_floor_gain_history, promotion_floor_gain_null_metadata, calibration_floors, selection_floors, review_archive_validation, review_cli_gate, review_validation, review_external_default, human_wins, stale_bbox, ai_only_and_last_line, archive_and_reference, external, counts_and_sync, run_file_order, training_mask_and_report]:
         try:
             test()
             print(f'PASS {test.__name__}')

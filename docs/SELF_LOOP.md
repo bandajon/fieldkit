@@ -9,7 +9,7 @@ curators approve ─► bucket ─► selfloop train (checked hourly)
         (waits while classify has a backlog, except 00:00–05:00 Lusaka when the gates are near-empty and the backlog is under NIGHT_LEFT segments)
         ≥ 1,000 new frames outside the reference set ─► train.py ─► score on the reference
         ─► better than the champion? ─► champion.pt (pre-labels the next ingest) + models/ in the bucket
-        then train_attrs.py on the same set ─► strictly better mean on shared non-floored heads, without losing champion measurements?
+        then train_attrs.py on the same set ─► better shared non-floored mean, or new floored emission within 0.005, without losing champion measurements?
         ─► attrs-champion.pt (suggests attributes on the next ingest) + models/attrs/ in the bucket
 bucket ─► selfloop classify (every 10 min)
         newest un-classified segments ─► the LIVE pipeline on footage time (champion +
@@ -25,9 +25,14 @@ bucket ─► selfloop classify (every 10 min)
   the same for a `dataset/attr_runs/` run (the 2026-08-27 baseline was one).
 - The attribute classifier is judged separately from the detector on shared non-floored heads
   in `report.json` (type, axles, cargo, trailers, axle-config): their mean must strictly
-  improve, and any such head measured by the champion must remain measured. For a legacy
+  improve, or the candidate must newly emit colour/make with that mean at least the
+  champion's mean minus `ATTRS_FLOOR_GAIN_TOLERANCE` (0.005). Any such non-floored head
+  measured by the champion must remain measured. For a legacy
   champion without per-head scores, compare the candidate's non-floored mean to its `mean_acc`.
-  Colour/make never affect promotion; their floors and withheld lists govern emission.
+  Colour/make accuracies never enter the mean. A head is emitted when it is in `floors`
+  and absent from `withheld`; a legacy champion without floors emits none. Only a newly
+  emitted floored head earns the tolerance, by passing calibration rather than accuracy.
+  Champion state carries an `earned` history across every crown, so each floored head earns its 0.005 allowance only once, limiting colour/make to 0.010 cumulative loss even when emissions alternate or are withheld and restored.
   A floor needs at least 100 labelled human val crops, at least 50 emitted crops, and a
   90% one-sided Wilson precision lower bound (z = 1.2816) of at least .90. Choose the lowest
   qualifying threshold; otherwise withhold the head. `unknown` and `other` stay silent and

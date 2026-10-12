@@ -24,9 +24,10 @@ pre-labels the next ingest pass — the loop closes there. Site boxes keep whate
 they were given until someone deploys models/champion.pt: promoting the pre-labeller is
 cheap to be wrong about, promoting a toll gate's detector is not. The attribute classifier
 rides the same pass on the same curated set — trained after the detector and promoted
-on strictly better mean accuracy across shared non-floored heads, without losing any
-non-floored head measured by the champion. The next ingest uses it to pre-fill suggestions;
-colour/make do not affect promotion. Their floors require 100 labelled human val crops,
+on strictly better mean accuracy across shared non-floored heads, or a newly emitted
+colour/make head with that mean no more than 0.005 below the champion, without losing
+any non-floored champion measurement. Colour/make accuracies never enter the mean.
+The next ingest uses it to pre-fill suggestions. Their floors require 100 labelled human val crops,
 50 emitted crops, and a 90% one-sided Wilson precision lower bound of at least .90;
 unknown/other stay silent.
 
@@ -58,6 +59,7 @@ LOCK = DATASET / "loop.lock"
 VIDEOS = DATASET / "loop-videos"      # a segment lives here only while it is being sampled
 CHAMPION = DATASET / "champion.pt"
 ATTRS_CHAMPION = DATASET / "attrs-champion.pt"
+ATTRS_FLOOR_GAIN_TOLERANCE = 0.005
 THRESHOLD = 1000      # new curated frames (outside the reference set) that earn a run
 PER_CAM = 6           # newest segments per camera per pass: coverage, not volume
 REMEMBER = 5000       # segment keys remembered as already sampled
@@ -256,7 +258,7 @@ def promote(candidate, champion):
 
 
 def promote_attrs(candidate, champion):
-    """Require improvement on shared non-floored heads without losing measurements."""
+    """Improve the non-floored mean, or gain emission within tolerance; lose no measurements."""
     from detect import FLOORED_ATTR_HEADS
 
     if champion is None or champion.get("mean_acc") is None:
@@ -267,20 +269,27 @@ def promote_attrs(candidate, champion):
     if ch is None:     # legacy champion reports containing only the mean
         measured = [acc for h, acc in (ca or {}).items()
                     if h not in FLOORED_ATTR_HEADS and acc is not None]
-        mean = candidate.get("mean_acc") if ca is None else None
+        candidate_mean = candidate.get("mean_acc") if ca is None else None
         if measured:
-            mean = sum(measured) / len(measured)
-        return mean is not None and mean > champion["mean_acc"]
-    if ca is None or any(h not in FLOORED_ATTR_HEADS and acc is not None and ca.get(h) is None
-                         for h, acc in ch.items()):
+            candidate_mean = sum(measured) / len(measured)
+        champion_mean = champion["mean_acc"]
+    else:
+        if ca is None or any(h not in FLOORED_ATTR_HEADS and acc is not None and ca.get(h) is None
+                             for h, acc in ch.items()):
+            return False
+        shared = [h for h, acc in ca.items()
+                  if h not in FLOORED_ATTR_HEADS and acc is not None and ch.get(h) is not None]
+        if not shared:
+            return False
+        candidate_mean = sum(ca[h] for h in shared) / len(shared)
+        champion_mean = sum(ch[h] for h in shared) / len(shared)
+    if candidate_mean is None:
         return False
-    shared = [h for h, acc in ca.items()
-              if h not in FLOORED_ATTR_HEADS and acc is not None and ch.get(h) is not None]
-    if not shared:
-        return False
-    candidate_mean = sum(ca[h] for h in shared) / len(shared)
-    champion_mean = sum(ch[h] for h in shared) / len(shared)
-    return candidate_mean > champion_mean
+    candidate_emits = set(candidate.get("floors") or {}) - set(candidate.get("withheld") or [])
+    champion_emits = set(champion.get("floors") or {}) - set(champion.get("withheld") or [])
+    gained = (candidate_emits - champion_emits - set(champion.get("earned") or [])) & set(FLOORED_ATTR_HEADS)
+    return candidate_mean > champion_mean or (
+        bool(gained) and candidate_mean >= champion_mean - ATTRS_FLOOR_GAIN_TOLERANCE)
 
 
 def local_path(key):
@@ -1965,12 +1974,19 @@ def crown(s, run, frames, ev, cl, bucket):
 def crown_attrs(s, run, rep, cl, bucket):
     """Make this run the attribute champion: it suggests attributes on the next ingest
     here, and models/attrs-champion.pt is the offer for whoever deploys `attr_weights`."""
+    from detect import FLOORED_ATTR_HEADS
+
+    champion = s.get("attrs_champion") or {}
+    candidate_emits = set((rep or {}).get("floors") or {}) - set((rep or {}).get("withheld") or [])
+    champion_emits = set(champion.get("floors") or {}) - set(champion.get("withheld") or [])
+    earned = set(champion.get("earned") or []) | ((candidate_emits - champion_emits) & set(FLOORED_ATTR_HEADS))
     weights = run / "attrs.pt"
     shutil.copy2(weights, ATTRS_CHAMPION)
     s["attrs_champion"] = {"run": run.name, "at": now(), "mean_acc": rep and rep["mean_acc"],
                            "per_head_acc": rep and rep["per_head_acc"],
                            "floors": (rep or {}).get("floors", {}),
                            "withheld": (rep or {}).get("withheld", []),
+                           "earned": sorted(earned),
                            "calibration": (rep or {}).get("calibration", {})}
     for key in (f"{ATTR_MODELS}{run.name}/attrs.pt", f"{MODELS}attrs-champion.pt"):
         cl.upload_file(str(weights), bucket, key)
@@ -3168,6 +3184,11 @@ def selfcheck():
     assert not promote_attrs({"mean_acc": .99, "per_head_acc": {"make": .99}}, attrs_champ)
     assert not promote_attrs({"mean_acc": .92, "per_head_acc": {"type": .92}}, attrs_champ), "do not lose a champion measurement"
     assert not promote_attrs({"mean_acc": .90, "per_head_acc": {"type": .8, "make": 1.}}, {"mean_acc": .85}), "legacy comparison excludes floored heads"
+    attrs_gain = {"mean_acc": .50, "per_head_acc": {"type": .89, "axles": .91, "make": .01},
+                  "floors": {"make": .8}, "withheld": []}
+    assert promote_attrs(attrs_gain, attrs_champ), "new emitted make earns a shared tie"
+    assert not promote_attrs({**attrs_gain, "withheld": ["make"]}, attrs_champ), "withheld make earns no gain"
+    assert not promote_attrs(attrs_gain, {**attrs_champ, "floors": {"make": .7}}), "existing emission earns no gain"
     assert local_path("site1/cam3/20260827-100000.mkv").parent.name == "cam3", \
         "the camera must be the parent directory, or every camera samples as one"
     assert wanted_classes({"a": 5, "b": 300, "c": 299, "d": 0}, target=300) == ["a", "c", "d"]
@@ -3380,8 +3401,8 @@ def selfcheck():
     assert lag["cam"][2] == lag["cam"][0] and lag["other"][2] == lag["other"][0]   # oldest hole, not newest
     print("selfloop self-check ok: cameras found under any gate prefix, newest unsampled segments "
           "picked per camera, training triggers on the cumulative threshold, promotion needs a "
-          "strictly better reference score (detector) or mean accuracy on shared non-floored heads "
-          "(attributes), without losing champion measurements, "
+          "strictly better reference score (detector); attributes need a better shared non-floored "
+          "mean or a newly emitted floored head within 0.005, without losing champion measurements, "
           "unless there is no comparable champion. colour/make are emitted only at or above "
           "floors with a 90% one-sided Wilson lower bound >= .90, 100 labelled human val crops "
           "and 50 emissions; unknown/other stay silent; "
