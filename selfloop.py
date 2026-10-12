@@ -1316,8 +1316,6 @@ def journeys_pass(cl, bucket, touched, cameras, tz, keys=(), classified=(), sinc
 def _classify_worker_init(expected_parent):
     # ffmpeg inherits this group, so even an abruptly dead worker leaves killable children.
     os.setsid()
-    if os.getppid() != expected_parent:
-        os.killpg(0, signal.SIGKILL)
     def guard_parent():
         while os.getppid() == expected_parent:
             time.sleep(1)
@@ -1570,6 +1568,7 @@ def classify_pass():
                         if not running:
                             break
                         if time.monotonic() >= deadline + CLASSIFY_DRAIN_S:
+                            print(f"  ! classify drain exhausted, discarding {len(running)} running", flush=True)
                             stop.set()
                             break
                     # Publish completed segments in the parent; failed workers never
@@ -1653,6 +1652,9 @@ def classify_pass():
                                 cleanup(video, out)
                         running.clear()
                         downloads = {**retry, **downloads}  # interrupted live jobs keep priority
+                        if time.monotonic() > deadline:
+                            expired = True
+                            break
                         if recreations >= CLASSIFY_POOL_RECREATIONS:
                             print("  ! classify pool recovery exhausted", flush=True)
                             expired = True
@@ -1707,7 +1709,6 @@ def classify_pass():
                     if time.monotonic() <= deadline and not stop.is_set():
                         prefetch()
         finally:
-            downloads.update(abandoned)
             # Stop discards inference; launchd's 20s kill cannot wait for its full grace.
             try:
                 try:
@@ -1726,7 +1727,7 @@ def classify_pass():
                 print(f"  ! classify pool cleanup: {e}", flush=True)
             try:
                 try:
-                    for future, key in downloads.items():
+                    for future, key in {**abandoned, **downloads}.items():
                         # Register first so even a failed unlink gets late-transfer cleanup.
                         future.add_done_callback(lambda f: shutil.rmtree(download_root, ignore_errors=True))
                         cleanup(download_root / key)
@@ -2588,6 +2589,7 @@ def classify_parallel_check(scenarios=None):
             keys = [f"site1/cam3/20261011-11000{i}.mkv" for i in range(3)]
             state, published, saves, active = {}, [], [], [0, 0]
             entered = threading.Event()
+            download_started = threading.Event()
             journeys_observed = threading.Event()
             first_started = threading.Event()
             release = threading.Event()
@@ -2604,9 +2606,10 @@ def classify_parallel_check(scenarios=None):
                     Path(dest).write_bytes(b"video")
                     if scenario == "download_failure" and key == keys[0]:
                         raise OSError("partial download")
-                    if scenario == "late_stop":
-                        assert release.wait(12), "late stop fixture was not released"
-                    if scenario in ("deadline", "cleanup_file_failure") or (scenario == "priority" and key == keys[0]):
+                    if scenario == "deadline":
+                        download_started.set()
+                        assert release.wait(5), "abandoned download fixture was not released"
+                    if scenario == "cleanup_file_failure" or (scenario == "priority" and key == keys[0]):
                         time.sleep(0.08)
                 def upload_file(self, *a, **kw):
                     raise OSError("bonus clip upload")
@@ -2626,7 +2629,7 @@ def classify_parallel_check(scenarios=None):
                         entered.set()
                 try:
                     assert entered.wait(2), "two segments must classify concurrently"
-                    if scenario == "stop":
+                    if scenario in ("stop", "late_stop"):
                         assert release.wait(10), "stop fixture was not released"
                         return "2026-10-11", 0, False
                     if scenario == "deadline_running":
@@ -2687,7 +2690,7 @@ def classify_parallel_check(scenarios=None):
                 "live_lane": lambda keys, classified, since, at, failed: [
                     k for k in keys if k not in classified and k not in failed],
                 "journeys_pass": journeys,
-                "CLASSIFY_BUDGET": 0.02 if scenario in ("deadline", "cleanup_file_failure", "late_stop") else (0.04 if scenario == "deadline_running" else 10),
+                "CLASSIFY_BUDGET": 0.02 if scenario in ("deadline", "cleanup_file_failure") else (0.04 if scenario == "deadline_running" else 10),
                 "JOURNEYS_EVERY_S": 0, "ALERTS": [],
             }
             for name, value in replacements.items():
@@ -2713,6 +2716,15 @@ def classify_parallel_check(scenarios=None):
                         raise OSError("injected file cleanup failure")
                     return real_unlink(path, *a, **kw)
                 stack.enter_context(patch.object(Path, "unlink", failing_unlink))
+            if scenario == "deadline":
+                stack.enter_context(patch.object(me, "CLASSIFY_SHUTDOWN_GRACE_S", 2))
+            if scenario == "late_stop":
+                real_wait = concurrent.futures.wait
+                def interrupted_wait(fs, **kw):
+                    if "return_when" in kw and entered.is_set():
+                        raise RuntimeError("injected pass interruption")
+                    return real_wait(fs, **kw)
+                stack.enter_context(patch.object(concurrent.futures, "wait", interrupted_wait))
             stop_waits = []
             if scenario == "stop":
                 real_wait = concurrent.futures.wait
@@ -2724,7 +2736,15 @@ def classify_parallel_check(scenarios=None):
                 stack.enter_context(patch.object(concurrent.futures, "wait", bounded_wait))
             before = time.monotonic()
             try:
-                classify_pass()
+                try:
+                    classify_pass()
+                except RuntimeError as e:
+                    assert scenario == "late_stop" and str(e) == "injected pass interruption", e
+                else:
+                    assert scenario != "late_stop", "pass interruption was not exercised"
+                if scenario == "deadline":
+                    assert time.monotonic() - before < 1.5, "abandoned download waited for shutdown grace"
+                    assert download_started.is_set(), "slow abandoned download never started"
             finally:
                 release.set()
             if scenario == "stop":
@@ -2876,7 +2896,7 @@ if __name__ == '__main__':
                 except ProcessLookupError:
                     pass
     code = """
-import concurrent.futures, multiprocessing, os
+import concurrent.futures, multiprocessing, os, time
 from selfloop import _classify_worker_init
 from concurrent.futures.process import BrokenProcessPool
 if __name__ == '__main__':
@@ -2884,7 +2904,7 @@ if __name__ == '__main__':
             mp_context=multiprocessing.get_context('spawn'),
             initializer=_classify_worker_init, initargs=(-1,)) as pool:
         try:
-            pool.submit(os.getpid).result(timeout=5)
+            pool.submit(time.sleep, 2).result(timeout=5)
         except BrokenProcessPool:
             pass
         else:
