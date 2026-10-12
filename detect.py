@@ -1675,7 +1675,8 @@ def _h264_encoder():
 
 RENDER_SIZE = (960, 540)
 TRAIL_MAX = 30       # centres kept per track — enough trail to read, not a frame's worth of history
-RENDER_DEADLINE_S = 900   # a wedged ffmpeg must never hold up classification this long
+RENDER_STALL_S = 120       # no completed frame write: abort a blocked encoder pipe
+RENDER_HARD_LIMIT_S = 2 * 3600  # bound the clip even while frames keep progressing
 
 
 def classify_segment(path, cam, cfg, tz, events_dir, source_key=None, render_to=None, gate=""):
@@ -1691,10 +1692,13 @@ def classify_segment(path, cam, cfg, tz, events_dir, source_key=None, render_to=
 
     `render_to`, if given, is a path to write a DeepStream-style annotated MP4 to (for the
     RDA dashboard's live view). Any render failure — a wedged ffmpeg included, via the
-    RENDER_DEADLINE_S watchdog — is logged and the partial file dropped, never raised:
+    progress watchdog (with a separate overall hard limit) — is logged and the partial
+    file dropped, never raised:
     counting must be identical whether or not this is set. -> (day, captured, render_ok).
     """
     from PIL import Image
+    import cv2
+    import numpy as np
 
     import ingest_video          # imports detect: keep the import inside the call
 
@@ -1709,15 +1713,15 @@ def classify_segment(path, cam, cfg, tz, events_dir, source_key=None, render_to=
     track = d._load()
     d._dataset_init()            # makes pending/ when capturing; hands off classes.txt
     name = cam["name"]
-    proc = timer = None
+    proc = watchdog_stop = None
 
     def abort_render(reason):
         # Single exit for every failure: write error, bad exit, or the watchdog's kill.
         # Never raises — a broken clip must not strand the segment's counts.
         nonlocal proc
         print(f"render failed, dropping the clip: {reason}")
-        if timer is not None:
-            timer.cancel()
+        if watchdog_stop is not None:
+            watchdog_stop.set()
         if proc is not None:
             try:
                 proc.kill()
@@ -1737,9 +1741,17 @@ def classify_segment(path, cam, cfg, tz, events_dir, source_key=None, render_to=
                 stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             # A hung ffmpeg (full pipe, no reader) would otherwise wedge stdin.write()
             # forever; the kill makes that write raise instead, which abort_render catches.
-            timer = threading.Timer(RENDER_DEADLINE_S, proc.kill)
-            timer.daemon = True
-            timer.start()
+            watchdog_stop = threading.Event()
+            encoder = proc
+            begun = time.monotonic()
+            progress = [begun]
+            def watchdog():
+                while not watchdog_stop.wait(min(0.25, RENDER_STALL_S / 4)):
+                    at = time.monotonic()
+                    if at - progress[0] >= RENDER_STALL_S or at - begun >= RENDER_HARD_LIMIT_S:
+                        encoder.kill()
+                        return
+            threading.Thread(target=watchdog, daemon=True).start()
         except Exception as e:
             print(f"render skipped, ffmpeg would not start: {e}")
             proc = None
@@ -1747,10 +1759,10 @@ def classify_segment(path, cam, cfg, tz, events_dir, source_key=None, render_to=
     for i, jpeg in enumerate(ingest_video.frames(path, fps=FPS)):
         at[0] = start + i / FPS
         img = Image.open(io.BytesIO(jpeg)).convert("RGB")
-        shown = d._track(name, track(name, img), img)
-        # This pass already decodes every mirrored segment, so it is the cheapest place
-        # to hunt the classes the curated set is short of — 48 h of footage, not the
-        # slice a sampling pass happens to land on.
+        # Same contiguous BGR bytes as ultralytics, without its redundant RGB copy.
+        bgr = cv2.cvtColor(np.asarray(img), cv2.COLOR_RGB2BGR)
+        shown = d._track(name, track(name, bgr), img)
+        # Capture is opt-in for ingest callers; the classify pass supplies no dataset.
         d._capture(name, jpeg, shown, img.width, img.height)
         if proc is not None:
             try:
@@ -1762,6 +1774,7 @@ def classify_segment(path, cam, cfg, tz, events_dir, source_key=None, render_to=
                 header = f"{gate} · {name} · {when} · counted {sum(d.totals.values())}"
                 frame = render_frame(img, seen, d.display, trails, cam, header)
                 proc.stdin.write(frame.tobytes())
+                progress[0] = time.monotonic()
             except Exception as e:      # any render-side error, or a write against a wedged/dead ffmpeg
                 abort_render(e)
     d.flush(name)                # the last frame's vehicles are events too
@@ -1770,7 +1783,7 @@ def classify_segment(path, cam, cfg, tz, events_dir, source_key=None, render_to=
         try:
             proc.stdin.close()
             proc.wait(timeout=30)
-            timer.cancel()
+            watchdog_stop.set()
             if proc.returncode:
                 raise OSError(f"ffmpeg exited {proc.returncode}")
             render_ok = True
@@ -2590,9 +2603,18 @@ if __name__ == "__main__":
             out = Path(tempfile.mkdtemp())
             path.parent.mkdir(parents=True, exist_ok=True)
             path.touch()
-            tracker = lambda name, img: [("truck", 0.9, VEH, tid)]
+            coloured = io.BytesIO()
+            Image.new("RGB", (300, 200), (17, 83, 201)).save(coloured, "JPEG")
+            frame = coloured.getvalue()
+            def tracker(name, img):
+                import numpy as np
+                expected = np.ascontiguousarray(
+                    np.asarray(Image.open(io.BytesIO(frame)).convert("RGB"))[..., ::-1])
+                assert isinstance(img, np.ndarray) and img.flags.c_contiguous
+                assert np.array_equal(img, expected), "offline YOLO input must match PIL-to-BGR bytes"
+                return [("truck", 0.9, VEH, tid)]
             with patch.object(ingest_video, "cam_and_start", return_value=("c", base)), \
-                 patch.object(ingest_video, "frames", return_value=[jpeg, jpeg]), \
+                 patch.object(ingest_video, "frames", return_value=[frame, frame]), \
                  patch.object(Detector, "_load", return_value=tracker):
                 classify_segment(path, CAM, {"toll_gate_id": "G"}, CAT, out,
                                  source_key=source_key)
@@ -2817,16 +2839,38 @@ if __name__ == "__main__":
                 return real_popen(["python3", "-c", "import time; time.sleep(30)"], **kw)
             return real_popen(cmd, **kw)
 
-        with patch.object(Detector, "_load", return_value=lambda name, img: []), \
+        # Healthy progress can outlive the old total-elapsed watchdog.
+        import ingest_video as _ingest
+        real_frames = _ingest.frames
+        def slow_frames(*args, **kw):
+            for jpeg in real_frames(*args, **kw):
+                time.sleep(0.07)
+                yield jpeg
+        with patch.object(Detector, "_load", return_value=lambda name, img: det("car")), \
+             patch.object(_ingest, "frames", slow_frames), \
+             patch.dict(globals(), {"RENDER_STALL_S": 2,
+                                    "RENDER_HARD_LIMIT_S": 5}):
+            assert classify_segment(video, cam, {}, timezone.utc, Path(tmp) / "healthy",
+                                    render_to=clip)[2], "progressing render must survive total elapsed > old deadline"
+
+        with patch.object(Detector, "_load", return_value=lambda name, img: det("car")), \
              patch("detect.subprocess.Popen", side_effect=wedged_popen), \
-             patch("detect.RENDER_DEADLINE_S", 0.2):
+             patch.dict(globals(), {"RENDER_STALL_S": 0.2}):
             events = Path(tmp) / "events"
+            started = time.monotonic()
             day, cap, ok = classify_segment(video, cam, {}, timezone.utc, events,
                                             source_key="c/seg.mkv", render_to=clip, gate="G")
-            day2, cap2, ok2 = classify_segment(video, cam, {}, timezone.utc, events,
+            plain = Path(tmp) / "plain"
+            day2, cap2, ok2 = classify_segment(video, cam, {}, timezone.utc, plain,
                                                source_key="c/seg.mkv")   # no render, for comparison
+            assert time.monotonic() - started < 5, "stalled render exceeded watchdog + slack"
             assert not ok and cap == cap2 and day == day2, (ok, cap, cap2)
             assert not clip.exists(), "a wedged render must not leave a partial clip behind"
+            counted = [json.loads(line) for p in events.glob("*.jsonl") for line in p.read_text().splitlines()]
+            assert len(counted) == 1 and counted[0]["class"] == "car", counted
+            rendered_files = {str(p.relative_to(events)): p.read_bytes() for p in events.rglob("*") if p.is_file()}
+            plain_files = {str(p.relative_to(plain)): p.read_bytes() for p in plain.rglob("*") if p.is_file()}
+            assert rendered_files == plain_files, "stalled rendering changed event/tracklet/crop bytes"
 
     # Appearance code: a unit 32-d float16 vector; a stale PCA (other champion) is off.
     import base64

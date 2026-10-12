@@ -59,7 +59,7 @@ def creds():
                        or "fieldkit-recordings")}
 
 
-def client(o):
+def client(o, download_timeout=None):
     """The same R2 client offload.py builds."""
     missing = [k for k in ("account_id", "access_key_id", "secret_access_key") if not o.get(k)]
     if missing:
@@ -78,7 +78,9 @@ def client(o):
         aws_access_key_id=o["access_key_id"],
         aws_secret_access_key=o["secret_access_key"], region_name="auto",
         config=Config(request_checksum_calculation="when_required",
-                      response_checksum_validation="when_required"))
+                      response_checksum_validation="when_required",
+                      **({"connect_timeout": download_timeout, "read_timeout": download_timeout}
+                         if download_timeout is not None else {})))
 
 
 def remote(cl, bucket, prefix, etags=None):
