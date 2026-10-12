@@ -43,7 +43,6 @@ LR = 3e-4
 FLOORED = dict.fromkeys(FLOORED_ATTR_HEADS, 0.90)
 MIN_VAL = 100
 MIN_EMIT = 50
-AI_TARGET = 0.95
 MIN_VALUE_EMIT = 10
 MIN_BOXES = 200           # below this the heads memorise instead of generalising
 IMAGENET = ((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
@@ -307,7 +306,7 @@ def calibrate_floors(probabilities, labels, heads, allowed=None, ai_labels=None)
         human_known = labelled_known = sum(label >= 0 and values[label] != "unknown" for label in truth)
         source = "human"
         if labelled_known < MIN_VAL:
-            source, target = "ai", AI_TARGET
+            source = "ai"
             ai_truth = (ai_labels or {}).get(head, [])
             truth = [truth[i] if i < len(truth) and truth[i] >= 0
                      else ai_truth[i] if i < len(ai_truth) else -1 for i in range(len(rows))]

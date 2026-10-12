@@ -34,11 +34,11 @@ bucket ─► selfloop classify (every 10 min)
   emitted floored head earns the tolerance, by passing calibration rather than accuracy.
   Champion state carries an `earned` history across every crown, so each floored head earns its 0.005 allowance only once, limiting colour/make to 0.010 cumulative loss even when emissions alternate or are withheld and restored.
   A floor uses human truths once a head has at least 100 known human val crops; otherwise
-  it fills missing truths with AI-agreed val labels at a stricter .95 target (.90 for humans),
+  it fills missing truths with AI-agreed val labels at the same .90 target,
   retaining every human label on the same crop/head. Both need at
   least 100 known truths, 50 emitted crops, and a 90% one-sided Wilson precision lower
-  bound (z = 1.2816) meeting their target. Each value also needs at least 10 emissions
-  and the same Wilson lower bound meeting that target. Recompute the head proof on
+  bound (z = 1.2816) meeting their target. Each value also needs the same Wilson lower
+  bound meeting that target, requiring at least 15 clean emissions. Recompute the head proof on
   emissions at/above the floor of proven values only; withhold unless that population
   still has 50 emissions and meets the Wilson target.
   Checkpoints and champion metadata carry the proven-value lists in `values`. Choose the lowest

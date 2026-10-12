@@ -672,8 +672,8 @@ def ai_validation_and_value_proof():
     floors, withheld, stats, values = ta.calibrate_floors(probs, human, heads, ai_labels={'colour': [0] * 200})
     assert floors == {'colour': .9} and not withheld and values == {'colour': ['white']}
     assert stats['colour']['source'] == 'ai'
-    floors, withheld, stats, values = ta.calibrate_floors(probs, human, heads, ai_labels={'colour': [0] * 184 + [1] * 16})
-    assert not floors and withheld == ['colour'], 'AI .92 precision cannot meet .95 target'
+    floors, withheld, stats, values = ta.calibrate_floors(probs, human, heads, ai_labels={'colour': [0] * 176 + [1] * 24})
+    assert not floors and withheld == ['colour'], 'AI .88 precision cannot meet .90 target'
     floors, withheld, stats, values = ta.calibrate_floors(probs, {'colour': [0] * 192 + [1] * 8}, heads,
                                                        ai_labels={'colour': [1] * 200})
     assert floors == {'colour': .9} and not withheld and stats['colour']['source'] == 'human'
@@ -722,6 +722,10 @@ def calibration_proven_population():
     assert withheld == ['make'] and values == {'make': ['toyota']}
     assert stats['make']['emitted'] == 20 and stats['make']['precision'] == 1.
     assert stats['make']['coverage'] == .2 and .90 < stats['make']['lower_bound'] < .95
+    floors, withheld, stats, values = ta.calibrate_floors(
+        {'make': rows}, {'make': [-1] * 100}, heads, ai_labels={'make': ids})
+    assert withheld == ['make'] and values == {'make': ['toyota']}, 'AI 20/20 proves .90 but needs 50 head emissions'
+    assert stats['make']['source'] == 'ai' and stats['make']['emitted'] == 20
 
 
 def calibration_value_wilson():
@@ -734,8 +738,13 @@ def calibration_value_wilson():
     floors, withheld, stats, values = ta.calibrate_floors(
         {'make': [[.9, .1]] * 190 + [[.1, .9]] * 10}, {'make': [-1] * 200}, heads,
         ai_labels={'make': [0] * 190 + [1] * 10})
-    assert values == {'make': ['toyota']}, '10/10 cannot prove a value at .95; 190/190 can'
+    assert values == {'make': ['toyota']}, '10/10 cannot prove a value at .90; at least 15 clean emissions are needed'
     assert stats['make']['emitted'] == 190
+    floors, withheld, stats, values = ta.calibrate_floors(
+        {'make': [[.9, .1]] * 180 + [[.1, .9]] * 20}, {'make': [-1] * 200}, heads,
+        ai_labels={'make': [0] * 180 + [1] * 20})
+    assert floors == {'make': .9} and not withheld and values == {'make': ['toyota', 'nissan']}, 'AI 20/20 proves a value at .90'
+    assert stats['make']['emitted'] == 200 and stats['make']['source'] == 'ai'
 
 
 def calibration_human_override():
@@ -749,9 +758,14 @@ def calibration_human_override():
 def calibration_ai_target():
     args = ({'make': [[.9, .1]] * 200}, {'make': [-1] * 200}, {'make': ['toyota', 'nissan']})
     ai = {'make': [0] * 188 + [1] * 12}
-    assert ta.calibrate_floors(*args, ai_labels=ai)[1] == ['make'], '.94 AI precision fails .95'
-    with patch.object(ta, 'AI_TARGET', .90):
-        assert ta.calibrate_floors(*args, ai_labels=ai)[0] == {'make': .9}, '.94 at n=200 proves .90'
+    floors, withheld, stats, values = ta.calibrate_floors(*args, ai_labels=ai)
+    assert floors == {'make': .9} and not withheld, '.94 AI precision at n=200 proves .90'
+    assert values == {'make': ['toyota']} and stats['make']['source'] == 'ai'
+    assert stats['make']['precision'] == .94 and stats['make']['lower_bound'] >= ta.FLOORED['make']
+    with patch.object(ta, 'FLOORED', {'make': .95}):
+        assert ta.calibrate_floors(*args, ai_labels=ai)[1] == ['make'], 'AI uses the head target unchanged'
+    floors, withheld, _, _ = ta.calibrate_floors(*args, ai_labels={'make': [0] * 176 + [1] * 24})
+    assert not floors and withheld == ['make'], '.88 AI precision still fails .90'
 
 
 def training_ai_wiring():

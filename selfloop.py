@@ -28,10 +28,10 @@ on strictly better mean accuracy across shared non-floored heads, or a newly emi
 colour/make head with that mean no more than 0.005 below the champion, without losing
 any non-floored champion measurement. Colour/make accuracies never enter the mean.
 The next ingest uses it to pre-fill suggestions. Their floors use human truths when at least 100 known val crops exist, otherwise
-human truths filled with AI-agreed val labels where missing, with a .95 target (.90 for humans). Both require 100 known truths,
+human truths filled with AI-agreed val labels where missing, at the same .90 target. Both require 100 known truths,
 50 emissions and a 90% one-sided Wilson lower bound meeting the target, recomputed on
-proven values only. Each emitted value also needs 10 emissions and the same Wilson
-lower bound meeting that target; unknown/other stay silent.
+proven values only. Each emitted value also needs the same Wilson lower bound meeting
+that target, requiring at least 15 clean emissions; unknown/other stay silent.
 
 Classify is the other direction: the same champion, run over the mirrored recordings, is
 what turns a gate that only records into a gate that reports. Its events go to the bucket
@@ -3414,9 +3414,9 @@ def selfcheck():
           "mean or a newly emitted floored head within 0.005, without losing champion measurements, "
           "unless there is no comparable champion. colour/make are emitted only at or above "
           "floors with a 90% one-sided Wilson lower bound >= .90 on humans when 100 known val crops "
-          "exist, else >= .95 on human truths filled with AI-agreed val labels where missing; "
+          "exist, else the same .90 target on human truths filled with AI-agreed val labels where missing; "
           "both need 100 known truths and 50 emissions with proof recomputed on proven values only; "
-          "each value needs 10 emissions and the same Wilson bound meeting its target; unknown/other stay silent; "
+          "each value needs the same Wilson bound meeting its target, requiring at least 15 clean emissions; unknown/other stay silent; "
           "unclassified segments drained oldest first "
           "under their gate's id")
 
