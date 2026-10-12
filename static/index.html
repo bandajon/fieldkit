@@ -376,7 +376,7 @@
       <button class="btn go" id="l-srel" hidden>Release all</button>
     </details>
     <div id="l-stats" class="res"></div>
-    <div id="l-note" class="res"></div>
+    <div id="l-note" class="res" role="status" aria-live="polite"></div>
   </section>
   <section id="review">
     <h2 id="cnt-review"></h2>
@@ -414,7 +414,7 @@ document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
   document.querySelectorAll('section').forEach(s => s.classList.toggle('on', s.id === tab));
   if (tab === 'record') recPoll();
   if (tab === 'monitor') monRender();
-  if (tab === 'label') labLoad();
+  if (tab === 'label') labLoad(true);
   if (tab === 'review') revInit();
 });
 
@@ -1053,7 +1053,7 @@ document.getElementById('l-valback').onclick = () => { location.hash = ''; };
 addEventListener('hashchange', () => { if (tab === 'label') labLoad(); });
 
 let labLoadSeq = 0;
-async function labLoad() {
+async function labLoad(count = false) {
   const seq = ++labLoadSeq;
   labQueue = [];
   document.getElementById('l-ok').disabled = true;
@@ -1073,7 +1073,7 @@ async function labLoad() {
   if (labWho) labFetch('/api/dataset/progress').then(r => r.json())
     .then(p => { if (seq !== labLoadSeq) return; labProg = p; labStats(); if (labTeam) labRosterShow(labTeam); }).catch(() => {});
   try {
-    if (!labVal) labFetch('/api/dataset/valcheck' + who + (who ? '&' : '?') + 'count=true')
+    if (!labVal && count) labFetch('/api/dataset/valcheck' + who + (who ? '&' : '?') + 'count=true')
       .then(r => r.ok ? r.json() : null).then(d => {
         if (d && seq === labLoadSeq) document.getElementById('l-valcheck').textContent = `Check colour/make (${d.remaining} left)`;
       }).catch(() => {});
@@ -1215,6 +1215,8 @@ function labSelect(i) {
   const heads = b.cls >= labClasses.length ? '' :
     Object.keys(labAttrs).filter(h => !labVal || ['colour', 'make'].includes(h)).map(head => {
       const vocab = labVocab(head, name, b.attrs[head], b.attrs);
+      const cantTell = labVal && ['colour', 'make'].includes(head);
+      if (cantTell) vocab.sort(([a], [b]) => (a === 'unknown') - (b === 'unknown'));
       // Hide only when the CLASS opts out (constraint []). A row the cross-filter emptied
       // (an axle count with no known config yet) stays visible with just its "+" — that is
       // precisely the moment the operator needs to add the new configuration.
@@ -1222,15 +1224,15 @@ function labSelect(i) {
       return row(esc(head), vocab.map(([v, stale]) =>
         `<button class="btn${b.attrs[head] === v ? ' on' : ''}${stale ? ' halt' : ''}${
                   (labVal ? !b.touched.has(head) : b.suggested.has(head)) && b.attrs[head] === v ? ' sug' : ''}"
-                  data-head="${esc(head)}" data-val="${esc(v)}"
-          >${esc(v)}</button>`).join('') +
+                  data-head="${esc(head)}" data-val="${esc(v)}" aria-pressed="${b.attrs[head] === v}"
+          >${b.suggested.has(head) && b.attrs[head] === v ? 'AI · ' : ''}${esc(cantTell && v === 'unknown' ? "Can't tell" : v)}</button>`).join('') +
         (labVal ? '' : `<button class="btn rm" data-add="${esc(head)}">+</button>`));
     }).join('');
   el.innerHTML = labVal ? row('class', esc(name)) + heads : row('class', labSorted().map(([n, j]) =>
-      `<button class="btn${b.cls === j ? ' on' : ''}" style="--c:${clsColor(j)}" data-cls="${j}"
+      `<button class="btn${b.cls === j ? ' on' : ''}" style="--c:${clsColor(j)}" data-cls="${j}" aria-pressed="${b.cls === j}"
         >${esc(n)}</button>`).join('') +
       `<button class="btn rm${b.cls >= labClasses.length ? ' on' : ''}"
-                data-cls="${labClasses.length}">remove</button>` +
+                data-cls="${labClasses.length}" aria-pressed="${b.cls >= labClasses.length}">remove</button>` +
       (name ? `<button class="btn rm${labExFor === name ? ' on' : ''}"
                 data-ex="${esc(name)}">examples</button>` : '')) + heads;
   // Only on a class change: labSelect reruns on every attribute tap, and a reopen refetches frames.
@@ -1459,7 +1461,7 @@ function labPayload(all) {
   return {boxes: kept.map(({cls, cx, cy, w, h}) => ({cls, cx, cy, w, h})), attrs};
 }
 
-const boxHtml = (b, i) => `<div class="${boxCls(b)}" data-i="${i}"
+const boxHtml = (b, i) => `<div class="${boxCls(b)}" data-i="${i}" ${labVal ? 'tabindex="0" role="button" aria-label="Select box ' + (i + 1) + '"' : ''}
     style="--c:${clsColor(b.cls)}; left:${(b.cx - b.w / 2) * 100}%; top:${(b.cy - b.h / 2) * 100}%;
            width:${b.w * 100}%; height:${b.h * 100}%">
     <span>${esc(labClasses[b.cls] || 'removed')}</span>${labVal ? '' : '<b class="x">&times;</b><i class="grip"></i>'}</div>`;
@@ -1489,6 +1491,14 @@ const labPlace = (d, b) => {
     left: `${(b.cx - b.w / 2) * 100}%`, top: `${(b.cy - b.h / 2) * 100}%`,
     width: `${b.w * 100}%`, height: `${b.h * 100}%`});
   d.classList.toggle('in', b.cy - b.h / 2 < 0.05);   // dragged to the top edge: chip flips inside
+};
+
+document.getElementById('l-wrap').onkeydown = e => {
+  const d = e.target.closest('.box');
+  if (labVal && d && ['Enter', ' '].includes(e.key)) {
+    e.preventDefault();
+    labSelect(+d.dataset.i);
+  }
 };
 
 // One delegated pointer handler for both gestures: a press that never travels past the
@@ -1611,8 +1621,8 @@ async function labSend(action) {
   try {
     const r = await post('/api/dataset/label', {id: s.id, rev: s.rev, action, boxes, attrs, who: labWho});
     if (seq !== labLoadSeq) return;
-    if (labVal && r.status === 409) {
-      labNote('This frame changed — reloading');
+    if (labVal && [400, 403, 404, 409].includes(r.status)) {
+      labNote(r.status === 409 ? 'This frame changed — reloading' : 'This frame cannot be saved — reloading');
       return labLoad();
     }
     if (!r.ok) throw new Error(r.detail || 'rejected');

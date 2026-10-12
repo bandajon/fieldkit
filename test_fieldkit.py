@@ -1158,7 +1158,7 @@ def validation_attrs_queue():
                     raise AssertionError("invalid valattrs accepted")
             reject(body, 401, "wrong")
             for sid in [frozen, archived, expired, complete, exempt, train_sid, external, "missing"]:
-                reject({**body, "id": sid})
+                reject({**body, "id": sid}, 409)
             for attrs in [{"0": {"colour": "pink", "make": "toyota"}}, {"2": {"colour": "white"}},
                           {"1": {"colour": "white"}}, {}, {"0": {"colour": "white"}}]:
                 reject({**body, "attrs": attrs})
@@ -1178,6 +1178,144 @@ def validation_attrs_queue():
             app.CLAIMS.clear()
             app.CLAIMS.update(claims)
 
+
+
+def valcheck_slow_scan_allows_write():
+    import tempfile, threading
+    from concurrent.futures import ThreadPoolExecutor
+    from unittest.mock import patch
+    import app
+    entered, release = threading.Event(), threading.Event()
+    with tempfile.TemporaryDirectory() as d, patch.object(app, "DATASET", Path(d)), \
+            patch.object(app, "curators", return_value={}), patch.object(app, "valcheck_reference", return_value=set()):
+        labels = Path(d) / "approved" / "labels"
+        labels.mkdir(parents=True)
+        (labels / "v.txt").write_text("0 .5 .5 .1 .1\n")
+        def slow(*args):
+            entered.set()
+            assert release.wait(5), "scan release timed out"
+        @app.dataset_mutation
+        def write():
+            (labels / "new.txt").write_text("0 .5 .5 .1 .1\n")
+        with patch.object(app, "valcheck_sample", side_effect=slow), ThreadPoolExecutor(1) as pool:
+            scan = pool.submit(app.dataset_valcheck, count=True, x_curator_token="")
+            try:
+                assert entered.wait(5), "scan did not start"
+                write()
+            finally:
+                release.set()
+                scan.result(timeout=5)
+        assert (labels / "new.txt").exists(), "write overlapping pool scan was rejected"
+
+
+
+def valcheck_pool_cache():
+    import tempfile
+    from unittest.mock import patch
+    import app
+    with tempfile.TemporaryDirectory() as d, patch.object(app, "DATASET", Path(d)), \
+            patch.object(app, "curators", return_value={}), patch.object(app, "valcheck_reference", return_value=set()), \
+            patch.object(app, "valcheck_sample", return_value=None) as scan:
+        root = Path(d)
+        labels = root / "approved" / "labels"
+        labels.mkdir(parents=True)
+        (labels / "v.txt").write_text("0 .5 .5 .1 .1\n")
+        get = lambda: app.dataset_valcheck(count=True, x_curator_token="")
+        get(); first = scan.call_count
+        get(); assert scan.call_count == first, "unchanged pool was rescanned"
+        for path in [labels / "new.txt", root / "approved" / "attrs" / "v.json",
+                     root / "reference.txt", root / "classifier-crops" / "v" / "manifest.json"]:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("{}")
+            get(); assert scan.call_count > first, f"cache missed {path} change"
+            first = scan.call_count
+        manifest = root / "classifier-crops" / "v" / "manifest.json"
+        manifest.write_text('{"reference":true}')
+        get(); assert scan.call_count > first, "manifest edit left cached eligibility"
+        first = scan.call_count
+        with patch.object(app.time, "monotonic", return_value=app.time.monotonic() + 61):
+            get(); assert scan.call_count > first, "pool cache lived longer than 60 seconds"
+
+
+def valcheck_ai_index_cache():
+    import json, tempfile
+    from unittest.mock import patch
+    import app
+    with tempfile.TemporaryDirectory() as d, patch.object(app, "DATASET", Path(d)):
+        path = Path(d) / "ai-attrs" / "run.jsonl"
+        path.parent.mkdir()
+        row = {"sid": "v", "box": 0, "bbox": [.5,.5,.1,.1], "attrs": {"colour": "white"}}
+        path.write_text(json.dumps(row) + "\n")
+        sample = {"id": "v", "boxes": [{"cls":0,"cx":.5,"cy":.5,"w":.1,"h":.1}], "attrs":{}}
+        original, reads = Path.read_text, []
+        def read(p, *a, **kw):
+            if p == path: reads.append(p)
+            return original(p, *a, **kw)
+        with patch.object(Path, "read_text", read):
+            get = lambda: app.valcheck_suggestions(sample, ["car"], {"colour":["white","black"]}, {})
+            assert get() == {"0":{"colour":"white"}}
+            assert get() == {"0":{"colour":"white"}}
+            assert len(reads) == 1, "unchanged AI file was reparsed"
+            path.write_text(json.dumps({**row,"attrs":{"colour":"black"}}) + "\n")
+            assert get() == {"0":{"colour":"black"}}, "AI index ignored a file edit"
+            assert len(reads) == 2
+
+def valcheck_attrs_revision_and_claim():
+    import json, tempfile
+    from unittest.mock import patch
+    import app
+    from train import is_val
+    with tempfile.TemporaryDirectory() as d, patch.object(app, "DATASET", Path(d)), \
+            patch.object(app, "reference", return_value=set()), patch.object(app, "is_active", return_value=True), \
+            patch.dict(app.CLAIMS, {}, clear=True):
+        root = Path(d)
+        sid = next(f"v{i}" for i in range(100) if is_val(f"v{i}"))
+        (root / "classes.txt").write_text("a-small\n")
+        app.write_yaml("attributes.yaml", {"colour": ["white", "black"], "make": ["toyota"]})
+        label = app.sample_paths(sid, "approved")[1]
+        label.parent.mkdir(parents=True)
+        label.write_text("0 .5 .5 .1 .1\n")
+        frame = app.dataset_valcheck(who="alice", x_curator_token="")
+        body = {"id": sid, "who": "alice", "action": "valattrs", "rev": frame["rev"],
+                "attrs": {"0": {"colour": "black", "make": "toyota"}}}
+        attrs = app.attrs_path(sid, "approved")
+        attrs.parent.mkdir(parents=True)
+        attrs.write_text('{"0":{"colour":"white"}}')
+        def reject(reason):
+            before = attrs.read_bytes()
+            try:
+                app.dataset_label(body, x_curator_token="")
+            except app.HTTPException as e:
+                assert e.status_code == 409, (reason, e.status_code, e.detail)
+            else:
+                raise AssertionError(reason)
+            assert attrs.read_bytes() == before, "rejected save changed attrs"
+        reject("attrs-only edit was silently overwritten")
+        fresh = app.dataset_valcheck(who="alice", x_curator_token="")
+        assert fresh["rev"] != frame["rev"], "attrs edit did not change revision"
+        body["rev"] = fresh["rev"]
+        app.CLAIMS.clear()
+        reject("unclaimed frame accepted")
+        app.hold([sid], "alice")
+        attrs.write_text(json.dumps(body["attrs"]))
+        reject("completed frame must conflict, not ask for another tap")
+
+
+def noncuration_sync_both():
+    import tempfile
+    from types import SimpleNamespace
+    from unittest.mock import Mock, patch
+    import app, retention_maintenance, curation_cap
+    ds = SimpleNamespace(LEDGERS=("approved/labels", "approved/attrs"), PREFIX="curation/",
+                         push=Mock(return_value=(1, 0)), pull=Mock(return_value=(2, 0)), models=Mock())
+    with tempfile.TemporaryDirectory() as d, patch.object(app, "DATASET", Path(d)), \
+            patch.object(app, "CURATION", False), patch.object(retention_maintenance, "maintenance_once"), \
+            patch.object(app, "curation_cap", curation_cap, create=True), \
+            patch.object(curation_cap, "bucket_settings", side_effect=RuntimeError("offline test")), \
+            patch.object(app, "model_cfg", return_value={"detect_weights": ""}):
+        assert app.sync_both(ds, object(), "b") == (0, 2), "console published curation ledgers"
+        ds.push.assert_not_called()
+        assert "preserve_attrs" not in ds.pull.call_args.kwargs, "console must harvest cloud corrections"
 
 def valcheck_rejects_changed_boxes():
     import hashlib, json, tempfile
@@ -1223,13 +1361,88 @@ def valcheck_rejects_changed_boxes():
             reject(body)
             assert frame["rev"] == expected_rev
             fresh = app.dataset_valcheck(who="alice", x_curator_token="a")
-            assert fresh["rev"] == hashlib.sha1(before).hexdigest()[:12] != expected_rev
+            assert fresh["rev"] == hashlib.sha1(before + before_attrs).hexdigest()[:12] != expected_rev
             reject({k: v for k, v in body.items() if k != "rev"})
             assert app.dataset_label({**body, "rev": fresh["rev"]}, x_curator_token="a")["ok"]
             assert json.loads(app.attrs_path(sid, "approved").read_text()) == body["attrs"]
         finally:
             app.CLAIMS.clear()
             app.CLAIMS.update(claims)
+
+
+
+def valcheck_accessibility():
+    src = (ROOT / "static/index.html").read_text()
+    assert re.search(r'id="l-note"[^>]*role="status"[^>]*aria-live="polite"', src), "note must announce status"
+    def fn(name):
+        i = src.index(f"function {name}(")
+        return src[i:src.index("\n}\n", i) + 3]
+    start = src.index("const boxHtml =")
+    boxhtml = src[start:src.index("</div>`;", start)+len("</div>`;")]
+    start = src.index("document.getElementById('l-wrap').onkeydown =")
+    keyboard = src[start:src.index("\n};", start)+3]
+    js = """
+      const assert=(x,msg)=>{if(!x)throw Error(msg)};
+      let labVal=true,labSel=-1,labExFor='';
+      const labClasses=['car'],labAttrs={colour:['white']},labConstraints={},labRestricts={};
+      const labBoxes=[{cls:0,cx:.5,cy:.5,w:.1,h:.1,attrs:{colour:'white'},touched:new Set(),suggested:new Set(['colour'])}];
+      const els={},document={getElementById:id=>(els[id] ||= {}),querySelectorAll:()=>[]};
+      const esc=x=>x,clsColor=()=>'',boxCls=()=>'',labExShow=()=>{};
+    """ + fn("labVocab") + fn("labSelect") + boxhtml + keyboard + """
+      labSelect(0);
+      assert(els['l-attrs'].innerHTML.includes('aria-pressed="true"'),'selected chips need pressed state');
+      assert(els['l-attrs'].innerHTML.includes('AI'),'AI suggestion needs visible text');
+      labBoxes[0].suggested.clear();labBoxes[0].touched.add('colour');labSelect(0);
+      assert(!els['l-attrs'].innerHTML.includes('AI'),'confirmed human value must not say AI');
+      assert(boxHtml(labBoxes[0],0).includes('tabindex="0"'),'validation boxes must be tabbable');
+      labSel=-1;let prevented=false;
+      els['l-wrap'].onkeydown({key:'Enter',target:{closest:()=>({dataset:{i:'0'}})},preventDefault:()=>prevented=true});
+      assert(labSel===0&&prevented,'Enter must select validation box');
+    """
+    r = subprocess.run(["node", "-e", js], capture_output=True, text=True)
+    assert r.returncode == 0, r.stdout + r.stderr
+
+def valcheck_cant_tell():
+    src = (ROOT / "static/index.html").read_text()
+    def fn(name):
+        i = src.index(f"function {name}(")
+        return src[i:src.index("\n}\n", i) + 3]
+    start = src.index("document.getElementById('l-attrs').onclick =")
+    handler = src[start:src.index("\n};", start) + 3]
+    js = """
+      const assert=(x,msg)=>{if(!x)throw Error(msg)};
+      let labVal=true,labRev=false,labSel=0,labExFor='';
+      const labClasses=['car'],labAttrs={colour:['white','maroon','other','unknown'],make:['unknown','toyota','other']},
+        labConstraints={},labRestricts={},labOptional={};
+      const b={cls:0,cx:.5,cy:.5,w:.1,h:.1,seen:true,attrs:{},touched:new Set(),suggested:new Set()},labBoxes=[b];
+      const els={},document={getElementById:id=>(els[id] ||= {}),querySelectorAll:()=>[]};
+      const esc=x=>x,clsColor=()=>'',labExShow=()=>{},labSorted=()=>[['car',0]];
+    """ + "\n".join(fn(n) for n in ("labVocab", "labSelect", "labGap", "labPayload")) + handler + r"""
+      const chips=head=>[...els['l-attrs'].innerHTML.matchAll(/data-head="([^"]+)" data-val="([^"]+)"[^>]*>\s*([^<]*)<\/button>/g)]
+        .filter(m=>m[1]===head).map(m=>({value:m[2],label:m[3]}));
+      labSelect(0);
+      for(const head of ['colour','make']){
+        const row=chips(head),unknown=row.find(c=>c.value==='unknown');
+        assert(unknown && unknown.label==="Can't tell",head+' unknown needs the visible escape label');
+        assert(row[row.length-1]===unknown,head+' escape must be last regardless of vocabulary index');
+        assert(row.filter(c=>c.value!=='unknown').map(c=>c.value).join()===labAttrs[head].filter(v=>v!=='unknown').join(),
+          head+' ordinary values retain their order');
+        els['l-attrs'].onclick({target:{closest:()=>({dataset:{head,val:unknown.value}})}});
+        assert(b.touched.has(head),head+' escape is an explicit answer');
+        assert(labPayload([b]).attrs[0][head]==='unknown',head+' escape sends unknown');
+      }
+      assert(labGap([b])===null,'both escape answers satisfy validation');
+      for(const review of [false,true]){
+        labVal=false;labRev=review;labSelect(0);
+        for(const head of ['colour','make']){
+          const row=chips(head);
+          assert(row.find(c=>c.value==='unknown').label==='unknown','ordinary label remains unknown');
+          assert(row.map(c=>c.value).join()===labAttrs[head].join(),'ordinary vocabulary order unchanged');
+        }
+      }
+    """
+    r = subprocess.run(["node", "-e", js], capture_output=True, text=True)
+    assert r.returncode == 0, r.stdout + r.stderr
 
 
 def valcheck_browser_rules():
@@ -1252,6 +1465,10 @@ def valcheck_browser_rules():
       assert(JSON.stringify(labPayload([b]).attrs)==='{"0":{"colour":"white"}}','only touched colour/make');
       b.touched.add('make');b.suggested.delete('make');assert(labGap([b])===null,'both tapped');
       assert(labGap([{...b,cls:1,touched:new Set()}])===null,'class exclusions');
+      const removed={...b,cls:99,attrs:{},touched:new Set(),suggested:new Set()};
+      const aligned=labPayload([removed,b]);
+      assert(aligned.boxes.length===2 && aligned.boxes[0].cls===99,'valcheck keeps unknown class boxes');
+      assert(aligned.attrs[1].colour==='white' && !aligned.attrs[0],'attrs indexes follow original box order');
       labVal=false;assert(labPayload([b]).attrs[0].type==='car','ordinary payload unchanged');
     """
     handler_start = src.index("document.getElementById('l-attrs').onclick =")
@@ -1413,8 +1630,14 @@ def valcheck_browser_conflict_reload():
         await labSend('valattrs');assert(sent.length===1,'fresh boxes submitted without confirmation');
         labBoxes[0].touched.add('colour');status=500;await labSend('valattrs');
         assert(loads===2&&notes.at(-1).includes('tap again to retry'),'ordinary failure must keep sample');
+        for(status of [400,403,404]){
+          labBoxes[0].touched.add('colour');const before=loads;await labSend('valattrs');
+          assert(loads===before+1, status+' must reload rather than retry');
+          assert(notes.some(n=>n.includes('reloading')), 'reload needs a clear message');
+        }
+        labBoxes[0].touched.add('colour');
         status=409;detail='frame is claimed by another curator';fail=true;await labSend('valattrs');
-        assert(loads===3&&els['l-ok'].disabled,'failed conflict reload left stale sample enabled');
+        assert(loads===6&&els['l-ok'].disabled,'failed conflict reload left stale sample enabled');
         const count=sent.length;await labSend('valattrs');assert(sent.length===count,'retry resent stale revision');
       })().catch(e=>{console.error(e);process.exitCode=1});
     """
@@ -1486,7 +1709,7 @@ def curation_sync_preserves_attrs():
         ds = SimpleNamespace(LEDGERS=sync.LEDGERS, PREFIX=sync.PREFIX,
             push=lambda client, bucket, **kw: sync.push(client, bucket, root=root, **kw),
             pull=pull, models=lambda *a, **kw: None)
-        with patch.object(app, "DATASET", root), patch.object(retention_maintenance, "maintenance_once"), \
+        with patch.object(app, "DATASET", root), patch.object(app, "CURATION", True), patch.object(retention_maintenance, "maintenance_once"), \
                 patch.object(app, "curation_cap", curation_cap, create=True), \
                 patch.object(curation_cap, "bucket_settings", side_effect=RuntimeError("offline test")), \
                 patch.object(app, "model_cfg", return_value={"detect_weights": ""}):
@@ -1531,6 +1754,8 @@ def valcheck_browser_transition_and_count():
         await labOpenHit('v1','approved',false);
         assert(labGap(sample.boxes)===null,'direct valcheck to search lost ordinary optional flags');
         location.hash='';await labLoad();await labLoad();
+        assert(counts.length===0,'frame/idle loads must not fetch validation counts');
+        await labLoad(true);await labLoad(true);
         const old=counts[counts.length-2],latest=counts[counts.length-1];
         latest(reply({remaining:1}));await new Promise(r=>setImmediate(r));
         old(reply({remaining:9}));await new Promise(r=>setImmediate(r));
@@ -1759,6 +1984,12 @@ def valcheck_browser_delayed_back_and_writers():
     """ + "\n".join(fn(n) for n in ("labLoad", "labOpenHit", "labShow", "labSend", "labImage",
                                        "labClassify", "labAddValue", "labHitStep")) + back + """
       (async()=>{
+        location.hash='#valcheck';await labLoad();await tick();
+        assert(!labBoxes[0].touched.has('colour'),'loaded human colour needs a fresh tap');
+        labQueue=[{id:'indexed',boxes:[{cls:99},{cls:0}],attrs:{0:{type:'removed'},1:{colour:'white'}}}];
+        labShow();
+        assert(labBoxes.length===2&&labBoxes[0].cls===99,'load must keep unknown class box');
+        assert(labBoxes[1].attrs.colour==='white'&&!labBoxes[0].attrs.colour,'loaded attrs must keep original indexes');
         // Back succeeds in the queue, but a response from before any new load is inert.
         for(const mode of ['#valcheck','#review','opened',''])for(fail of [false,true]){
           location.hash='';await labLoad();await tick();labDone=['old-approval'];labShow();await tick();
@@ -1865,6 +2096,13 @@ check("approved counts split new from frozen", approved_counts_split_new_from_fr
 check("queue focus filters and suggests", queue_focus_filters_and_suggests)
 check("classify suggests a class and its attributes", classify_suggests_class_and_attrs)
 check("validation attrs queue and merge", validation_attrs_queue)
+check("slow valcheck scan permits concurrent writes", valcheck_slow_scan_allows_write)
+check("valcheck pool cache invalidation", valcheck_pool_cache)
+check("valcheck AI index cache", valcheck_ai_index_cache)
+check("valcheck accessibility", valcheck_accessibility)
+check("valcheck Can't tell chips and payload", valcheck_cant_tell)
+check("valcheck attrs revisions and required claims", valcheck_attrs_revision_and_claim)
+check("non-curation sync never publishes approved", noncuration_sync_both)
 check("valcheck rejects changed box indexes", valcheck_rejects_changed_boxes)
 check("valcheck browser explicit confirmation", valcheck_browser_rules)
 check("same-size approved attrs sync", same_size_attrs_sync)
