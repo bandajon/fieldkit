@@ -358,7 +358,7 @@ def _shadows(chains, works):
         for parent in cs:
             direction = next((t["direction"] for t in parent["members"]
                               if t.get("direction") and t["hits"] >= MIN_EDGE_HITS), None)
-            if not direction or works(parent):
+            if not direction:
                 continue
             path = sorted((p for t in parent["members"] for p in t["path"]), key=lambda p: p[0])
             lo = bisect_left(shadows, path[0][0], key=start)
@@ -383,7 +383,7 @@ def _shadows(chains, works):
     return owners
 
 
-def _links(chains, cameras, tz=None, shadows=None):
+def _links(chains, cameras, tz=None, shadows=None, absorbed=None):
     """Departures from one camera's zone to arrivals in its partner's, cheapest first; a
     chain takes part in one link at most. Overlap, not order, gates a candidate: a long
     truck fills both zones at once and can arrive seconds before it has finished leaving."""
@@ -508,7 +508,7 @@ def _links(chains, cameras, tz=None, shadows=None):
         if parent is not None:
             linked_shadows.setdefault(id(parent), []).append((s, L, k))
     removed = set()
-    # Re-point d and release s and r; neither released chain counts on its own outside works.
+    # Re-point d, absorb s for freezing, and release only the decoy r.
     for k, (d, r) in enumerate(links[:]):
         if k in removed or id(d) not in linked_shadows:
             continue
@@ -533,10 +533,12 @@ def _links(chains, cameras, tz=None, shadows=None):
                     and dd["class"] in HEAVY and aa["class"] in HEAVY
                     and (dd["camera"], aa["camera"]) == (d["camera"], L["camera"])):
                 continue
-            replacements.append((abs(ta(L) - dep - MU), s["members"][0]["id"], L["members"][0]["id"], j, L))
+            replacements.append((abs(ta(L) - dep - MU), s["members"][0]["id"], L["members"][0]["id"], j, s, L))
         if replacements:
-            *_, j, L = min(replacements, key=lambda c: c[:3])
+            *_, j, s, L = min(replacements, key=lambda c: c[:3])
             links[k] = (d, L)
+            if absorbed is not None:
+                absorbed[id(d)] = s
             removed.add(j)
     links = [pair for k, pair in enumerate(links) if k not in removed]
     return links
@@ -621,7 +623,7 @@ def _member_attrs(ms, cls):
     return max(same or have, key=lambda t: t["hits"], default={}).get("attrs") or {}
 
 
-def _doc(chains, link, cfg, tz, events):
+def _doc(chains, link, cfg, tz, events, absorbed=()):
     ms = sorted((t for c in chains for t in c["members"]), key=lambda t: (t["t0"], t["id"]))
     votes, conf = Counter(), {}
     for c in chains:
@@ -660,14 +662,16 @@ def _doc(chains, link, cfg, tz, events):
     # A switched track's event attrs are another vehicle's: only clean members' events speak; with none,
     # _member_attrs below (which also prefers clean members) decides.
     evs = [e for t, e in evs if not (t.get("mixed") or t.get("hijacked"))]
-    members = [{k: m[k] for k in ("id", "camera", "t0", "t1", "counted")} for m in ms]
+    # Absorbed shadows freeze with their parent but contribute no journey evidence.
+    member_ms = sorted([*ms, *absorbed], key=lambda t: (t["t0"], t["id"]))
+    members = [{k: m[k] for k in ("id", "camera", "t0", "t1", "counted")} for m in member_ms]
     # Keep raw ids for audit lookup, but freeze and time each reversal leg independently.
-    for m, member in zip(ms, members):
+    for m, member in zip(member_ms, members):
         if m.get("source"):
             member.update(id=m["source"]["id"], piece=m["id"])
     t = (link[0]["dep"] if link[0]["dep"] is not None else link[0]["early"]) if link else ms[0]["t0"]
     return t, {
-        "id": "jny-" + hashlib.sha256("\0".join(sorted(m["id"] for m in ms)).encode()).hexdigest()[:24],
+        "id": "jny-" + hashlib.sha256("\0".join(sorted(m["id"] for m in member_ms)).encode()).hexdigest()[:24],
         "ts": datetime.fromtimestamp(t, timezone.utc).astimezone(tz).isoformat(timespec="seconds"),
         "cameras": names, "camera": "+".join(names),
         "class": cls, "letter": letter_of(cls), "conf": conf.get(cls),
@@ -784,8 +788,13 @@ def _build(tracklets, cameras, tz=None, events=None, with_dropped=False, plant=N
         return len(near) >= WORKS_PLANT_TRACKS or any(p[2] >= WORKS_PLANT_LONG for p in near)
     chains = _chains(tracklets, cameras)
     shadows = _shadows(chains, lambda c: works(c, rescue=False))
-    links = _links(chains, cameras, tz, shadows)
+    absorbed = {}
+    links = _links(chains, cameras, tz, shadows, absorbed)
     linked = {id(c) for pair in links for c in pair}
+    # A swap claims every eligible shadow still free after all link passes.
+    absorbed = {parent: [c for c in chains if shadows.get(id(c)) is shadows[id(s)] and id(c) not in linked]
+                for parent, s in absorbed.items()}
+    linked |= {id(c) for cs in absorbed.values() for c in cs}
     # A lone chain counts if its camera counted it, or it crossed a handoff zone the partner
     # missed and stayed in view long enough to be a vehicle rather than headlight glare.
     lone = [c for c in chains if id(c) not in linked and (
@@ -805,7 +814,8 @@ def _build(tracklets, cameras, tz=None, events=None, with_dropped=False, plant=N
                           or any(t["counted"] for t in c["members"])) and (keep(c) or works(c))
     dropped = [c for c in lone if not accepted(c)]
     lone = [c for c in lone if accepted(c)]
-    docs = [_doc(list(pair), pair, cfg, tz, events) for pair in links]
+    docs = [_doc(list(pair), pair, cfg, tz, events,
+                 [t for c in absorbed.get(id(pair[0]), ()) for t in c["members"]]) for pair in links]
     docs += [_doc([c], None, cfg, tz, events) for c in lone]
     if with_dropped:    # lone chains the filter removed: not journeys, but a still-open one can yet link
         docs += [(ts, dict(d, dropped=True)) for ts, d in (_doc([c], None, cfg, tz, events) for c in dropped)]
@@ -974,6 +984,8 @@ def _selfcheck_shadow_rejections(case):
     b = _t("cam3", 92, "a-small" if case == "class" else "b-minibuses",
            [(t, _b(.65 + .05 * (min(t, 104) - 100) + .096, .8, .04)) for t in (start, end)],
            hits=20, counted=case == "counted", app=code(0, 1), app_v="m1")
+    if case == "too_far":
+        b["path"] = [[t, *_b(.65 + .05 * (t - 100) + .104, .8, .04)] for t in (start, end)]
     if case == "weak_parent":
         a["hits"] = MIN_EDGE_HITS - 1
     elif case == "directionless_parent":
@@ -1054,13 +1066,11 @@ def _selfcheck_shadow_links():
             d["early"], d["dep"] = d["dep"], None
         assert _links(chains, _CAMS) == [(d, r)], (mode, "fixture")
         for c in chains:
-            c["shadow"] = "absent-parent"
-            assert _links(chains, _CAMS) == [(d, r)], (mode, c["camera"], "uncontested shadow")
-            del c["shadow"]
+            parent = dict(c, members=[dict(c["members"][0], id="absent-parent")])
+            assert _links(chains, _CAMS, shadows={id(c): parent}) == [(d, r)], (mode, c["camera"], "uncontested shadow")
         parent = dict(d, members=[dict(d["members"][0], id="parent")])
         expected = _links([d, parent, r], _CAMS)
-        d["shadow"] = "parent"
-        assert _links([d, parent, r], _CAMS) == expected, (mode, "shadow cannot filter candidates")
+        assert _links([d, parent, r], _CAMS, shadows={id(d): parent}) == expected, (mode, "shadow cannot filter candidates")
 
 
 def _selfcheck_shadow_swap():
@@ -1083,13 +1093,40 @@ def _selfcheck_shadow_swap():
         assert abs(_similar(_app([a]), _app([car])) - .67) < .001
         assert abs(_similar(_app([shadow]), _app([arrival])) - (.60 if guard == "weaker_shadow" else .87)) < .001
         assert abs(_similar(_app([a]), _app([arrival])) - .52) < .001
-        js, chains, links = _build([a, shadow, arrival, car], _CAMS)
+        a["speed_kph"], arrival["speed_kph"] = 30, 50
+        shadow = dict(shadow, speed_kph=170, conf={"b-minibuses": .99}, attrs={"colour": "shadow"})
+        events = {shadow["id"]: {"class": "b-minibuses", "hits": 100, "attrs": {"colour": "shadow-event"}}}
+        js, chains, links = _build([a, shadow, arrival, car], _CAMS, events=events)
         actual = [{m["id"] for c in pair for m in c["members"]} for pair in links]
         if guard:
             assert actual == [{b["id"], arrival["id"]}, {a["id"], car["id"]}], (guard, actual)
         else:
             assert actual == [{a["id"], arrival["id"]}], ("shadow decoy swap", actual)
-            assert len(js) == 1 and {m["id"] for m in js[0]["members"]} == actual[0], js
+            expected = _doc(list(links[0]), links[0], {c["name"]: c for c in _CAMS}, None, events)[1]
+            assert {k: v for k, v in js[0].items() if k not in ("id", "members")} == {
+                k: v for k, v in expected.items() if k not in ("id", "members")}, ("shadow changed evidence", js)
+            assert js[0]["id"] != expected["id"], "absorbed shadow must change journey id"
+            frozen_ids = {(m["id"], m.get("piece")) for j in js for m in j["members"]}
+            rebuilt = build([a, shadow, arrival, car], _CAMS, frozen=frozen_ids)
+            assert rebuilt == [], ("shadow swap after freeze", rebuilt)
+            assert len(js) == 1 and {m["id"] for m in js[0]["members"]} == actual[0] | {b["id"]}, js
+
+            from selfloop import cleared
+            extra = dict(shadow, id="obs-cam3-extra", app=code(.98, -.2),
+                         path=[[t, x1 - .08, y1, x2 - .08, y2] for t, x1, y1, x2, y2 in shadow["path"]])
+            tracks = [a, shadow, extra, arrival, car]
+            events[extra["id"]] = events[shadow["id"]]
+            assert abs(_similar(_app([extra]), _app([car])) - .508) < .001
+            js, _, links = _build(tracks, _CAMS, events=events)
+            assert len(js) == 1 and links[0][0]["members"] == [a], ("five-tracklet swap", js)
+            final = cleared(js, js, cutoff=1000)
+            assert final == js, ("five-tracklet freeze", final)
+            claims = {(m["id"], m.get("piece")) for j in final for m in j["members"]}
+            rebuilt = build(tracks, _CAMS, events=events, frozen=claims)
+            assert rebuilt == [], ("second shadow re-paired after freeze", rebuilt)
+            assert {m["id"] for m in js[0]["members"]} == {a["id"], shadow["id"], extra["id"], arrival["id"]}, js
+            assert {k: v for k, v in js[0].items() if k not in ("id", "members")} == {
+                k: v for k, v in expected.items() if k not in ("id", "members")}, ("second shadow changed evidence", js)
 
 
 def _selfcheck_swap_rejections(case):
@@ -1111,6 +1148,8 @@ def _selfcheck_swap_rejections(case):
               None, 103.5, (.3, y, (1 - .3 ** 2 - y ** 2) ** .5, 0), "northbound")
     r = chain("cam4", "decoy", "b-minibuses" if cls in HEAVY else "a-small",
               None, 106, (x, 0, (1 - x ** 2) ** .5, 0))
+    if case == "same_class":
+        r["class"] = cls
     chains = [d, s, L, r]
     if case == "heavy_crossing":
         dd = chain("cam3", "convoy-departure", cls, 103.5, None, (0, 0, 0, 1), "northbound")
@@ -1423,13 +1462,13 @@ def _selfcheck_late_priority(case):
 def _selfcheck():
     _selfcheck_contradictory_swap()
     _selfcheck_twin_permutations()
-    for case in ("heavy_crossing", "minimum_similarity", "arrival_class"):
+    for case in ("heavy_crossing", "minimum_similarity", "arrival_class", "same_class"):
         _selfcheck_swap_rejections(case)
     _selfcheck_shadow_swap()
     for case in ("heavy", "contradicting_appearance"):
         _selfcheck_shadow_competition(case)
     _selfcheck_ghost_permutations()
-    for case in ("start", "class", "end", "counted", "weak_parent", "directionless_parent", "eligible"):
+    for case in ("start", "class", "end", "counted", "weak_parent", "directionless_parent", "too_far", "eligible"):
         _selfcheck_shadow_rejections(case)
     _selfcheck_shadow_links()
     for case in ("endpoint", "appearance", "shared_ghost"):
@@ -1645,8 +1684,8 @@ def _selfcheck():
     assert _similar(_app([a]), _app([car])) < LATE_COS
     js = build([a, b, arrival, car], _CAMS)
     j = next(j for j in js if any(m["id"] == a["id"] for m in j["members"]))
-    assert {m["id"] for m in j["members"]} == {a["id"], arrival["id"]}, ("shadow link decoy", j)
-    assert len(js) == 1, ("shadow and car released", js)
+    assert {m["id"] for m in j["members"]} == {a["id"], b["id"], arrival["id"]}, ("shadow link decoy", j)
+    assert len(js) == 1, ("shadow absorbed and car released", js)
     # (f) parked in the zone, jittering, never counted: nothing.
     park = _t("cam3", 1, "c-small", [(100 + k, _b(0.9 + k % 2 * 0.005, 0.8)) for k in range(6)], direction="southbound")
     assert build([park], _CAMS) == []
