@@ -35,6 +35,7 @@ TWIN_COVER = 0.8     # a box this much inside another is the same vehicle seen i
 TWIN_COS = 0.5       # ...when the class agrees and the appearance codes cosine is at least this
 TWIN_HEAVY_SHARE = 0.25  # a fragment of another class is the same truck if this share of its votes is heavy
 TWIN_FRAG_S = 2.0    # s: ...and it dies this soon after the whole truck's track is born (the real cab fragment: 1.0)
+CONTAIN_NEAR = 1.27  # interpolated box widths: the minibus switch is 1.21 at birth, 1.263 at its end
 TWIN_SNAP = 1.0      # s: a path sample stands for a moment this close to it (paths are ~1 sample/s)
 NEAR = 2.0           # a far, fast box outruns IoU between fragments; a continuation lands within
                      # this many box-sizes of where the last one was heading
@@ -246,23 +247,36 @@ def _chains(tracklets, cameras):
             i = up[i]
         return i
 
+    directions = {}
     for t in by.values():
-        if t.get("ghost_of") in by and not (t["hits"] >= MIN_EDGE_HITS and by[t["ghost_of"]]["hits"] >= MIN_EDGE_HITS
-                                             and t.get("direction") and by[t["ghost_of"]].get("direction")
-                                             and t["direction"] != by[t["ghost_of"]]["direction"]):
-            up[find(t["id"])] = find(t["ghost_of"])
+        directions.setdefault(find(t["id"]), set()).update(
+            [t["direction"]] if t.get("direction") and t["hits"] >= MIN_EDGE_HITS else [])
+
+    def join(a, b):
+        a, b = find(a), find(b)
+        if a != b:
+            if any(OPPOSITE.get(d) in directions[b] for d in directions[a]):
+                return False    # a directionless member cannot bridge opposite ways
+            up[b] = a
+            directions[a].update(directions[b])
+        return True
+
+    for t in sorted(by.values(), key=lambda t: (t["t0"], t["id"])):
+        if t.get("ghost_of") in by:
+            join(t["ghost_of"], t["id"])
+
     per = {}
     for t in by.values():
         per.setdefault(t["camera"], []).append(t)
     for ts in per.values():
-        ts.sort(key=lambda t: t["t0"])
+        ts.sort(key=lambda t: (t["t0"], t["id"]))
         for a in ts:
             # Forced like a ghost, any class (twins flicker), and no stitch slot used: detect's
             # recount guard only tags a twin once it crosses the count line.
             for b in ts[bisect_left(ts, a["t0"], key=lambda t: t["t0"]):
                         bisect_left(ts, a["t1"], key=lambda t: t["t0"])]:
                 if b is not a and _twin(a, b):
-                    up[find(b["id"])] = find(a["id"])
+                    join(a["id"], b["id"])
     end = {}
     for t in by.values():
         r = find(t["id"])
@@ -282,10 +296,9 @@ def _chains(tracklets, cameras):
     cands.sort()
     succ, pred = set(), set()
     for _, a, b in cands:
-        if a not in succ and b not in pred:
+        if a not in succ and b not in pred and join(a, b):
             succ.add(a)
             pred.add(b)
-            up[find(b)] = find(a)
     groups = {}
     for i, t in by.items():
         groups.setdefault(find(i), []).append(t)
@@ -330,7 +343,47 @@ def _chains(tracklets, cameras):
     return sorted(chains, key=lambda c: (c["camera"], c["members"][0]["t0"], c["members"][0]["id"]))
 
 
-def _links(chains, cameras, tz=None):
+def _shadows(chains, works):
+    # Keep shadow ownership separate from matching candidates.
+    owners, per = {}, {}
+    for c in chains:
+        per.setdefault(c["camera"], []).append(c)
+    for cs in per.values():
+        shadows = [c for c in cs if all(not t.get("direction") and not t["counted"] for t in c["members"])
+                   and not works(c)]
+        if not shadows:
+            continue
+        start = lambda c: min(t["t0"] for t in c["members"])
+        shadows.sort(key=start)
+        for parent in cs:
+            direction = next((t["direction"] for t in parent["members"]
+                              if t.get("direction") and t["hits"] >= MIN_EDGE_HITS), None)
+            if not direction:
+                continue
+            path = sorted((p for t in parent["members"] for p in t["path"]), key=lambda p: p[0])
+            lo = bisect_left(shadows, path[0][0], key=start)
+            for c in shadows[lo:bisect_right(shadows, path[-1][0] + .5, key=start)]:
+                if (c.get("shadow") or max(t["t1"] for t in c["members"]) > path[-1][0] + .5
+                        or c["class"] != parent["class"]):
+                    continue
+                samples = sorted((p for t in c["members"] for p in t["path"]), key=lambda p: p[0])
+                if _opposed({"path": path, "direction": direction}, {"path": samples}):
+                    continue
+                for sample in samples:
+                    i = bisect_left(path, sample[0], key=lambda p: p[0])
+                    p, q = path[max(0, i - 1)], path[min(i, len(path) - 1)]
+                    f = (sample[0] - p[0]) / (q[0] - p[0]) if q[0] > p[0] else 0
+                    box = [x + f * (y - x) for x, y in zip(p[1:], q[1:])]
+                    distance = abs(complex(*_centre(box)) - complex(*_centre(sample[1:])))
+                    if distance > CONTAIN_NEAR * (box[2] - box[0]):
+                        break
+                else:
+                    c["shadow"] = parent["members"][0]["id"]
+                    owners[id(c)] = parent
+    return owners
+
+
+def _links(chains, cameras, tz=None, shadows=None, absorbed=None):
     """Departures from one camera's zone to arrivals in its partner's, cheapest first; a
     chain takes part in one link at most. Overlap, not order, gates a candidate: a long
     truck fills both zones at once and can arrive seconds before it has finished leaving."""
@@ -447,6 +500,47 @@ def _links(chains, cameras, tz=None):
             links[k] = (d, chains[j])
             used.remove(id(r))
             used.add(id(chains[j]))
+    if not shadows:
+        return links
+    linked_shadows = {}
+    for k, (s, L) in enumerate(links):
+        parent = shadows.get(id(s))
+        if parent is not None:
+            linked_shadows.setdefault(id(parent), []).append((s, L, k))
+    removed = set()
+    # Re-point d, absorb s for freezing, and release only the decoy r.
+    for k, (d, r) in enumerate(links[:]):
+        if k in removed or id(d) not in linked_shadows:
+            continue
+        sim = _similar(d["app"], r["app"])
+        if (d["class"] == r["class"]
+                or any(t.get("counted") or t.get("direction") for t in r["members"])):
+            continue
+        replacements = []
+        dep = d["dep"] if d["dep"] is not None else d["early"]
+        for s, L, j in linked_shadows[id(d)]:
+            if j in removed or L["class"] != d["class"]:
+                continue
+            parent_sim = _similar(d["app"], s["app"])
+            if parent_sim is not None and parent_sim < LATE_COS:
+                continue
+            shadow_sim = _similar(s["app"], L["app"])
+            if shadow_sim is None or shadow_sim < LATE_COS or (sim is not None and shadow_sim <= sim):
+                continue
+            if d["class"] in HEAVY and any(
+                    ((dd["dep"] if dd["dep"] is not None else dd["early"]) - dep) * (ta(aa) - ta(L)) < 0
+                    for i, (dd, aa) in enumerate(links) if i not in removed
+                    and dd["class"] in HEAVY and aa["class"] in HEAVY
+                    and (dd["camera"], aa["camera"]) == (d["camera"], L["camera"])):
+                continue
+            replacements.append((abs(ta(L) - dep - MU), s["members"][0]["id"], L["members"][0]["id"], j, s, L))
+        if replacements:
+            *_, j, s, L = min(replacements, key=lambda c: c[:3])
+            links[k] = (d, L)
+            if absorbed is not None:
+                absorbed[id(d)] = s
+            removed.add(j)
+    links = [pair for k, pair in enumerate(links) if k not in removed]
     return links
 
 
@@ -529,7 +623,7 @@ def _member_attrs(ms, cls):
     return max(same or have, key=lambda t: t["hits"], default={}).get("attrs") or {}
 
 
-def _doc(chains, link, cfg, tz, events):
+def _doc(chains, link, cfg, tz, events, absorbed=()):
     ms = sorted((t for c in chains for t in c["members"]), key=lambda t: (t["t0"], t["id"]))
     votes, conf = Counter(), {}
     for c in chains:
@@ -568,14 +662,16 @@ def _doc(chains, link, cfg, tz, events):
     # A switched track's event attrs are another vehicle's: only clean members' events speak; with none,
     # _member_attrs below (which also prefers clean members) decides.
     evs = [e for t, e in evs if not (t.get("mixed") or t.get("hijacked"))]
-    members = [{k: m[k] for k in ("id", "camera", "t0", "t1", "counted")} for m in ms]
+    # Absorbed shadows freeze with their parent but contribute no journey evidence.
+    member_ms = sorted([*ms, *absorbed], key=lambda t: (t["t0"], t["id"]))
+    members = [{k: m[k] for k in ("id", "camera", "t0", "t1", "counted")} for m in member_ms]
     # Keep raw ids for audit lookup, but freeze and time each reversal leg independently.
-    for m, member in zip(ms, members):
+    for m, member in zip(member_ms, members):
         if m.get("source"):
             member.update(id=m["source"]["id"], piece=m["id"])
     t = (link[0]["dep"] if link[0]["dep"] is not None else link[0]["early"]) if link else ms[0]["t0"]
     return t, {
-        "id": "jny-" + hashlib.sha256("\0".join(sorted(m["id"] for m in ms)).encode()).hexdigest()[:24],
+        "id": "jny-" + hashlib.sha256("\0".join(sorted(m["id"] for m in member_ms)).encode()).hexdigest()[:24],
         "ts": datetime.fromtimestamp(t, timezone.utc).astimezone(tz).isoformat(timespec="seconds"),
         "cameras": names, "camera": "+".join(names),
         "class": cls, "letter": letter_of(cls), "conf": conf.get(cls),
@@ -680,9 +776,25 @@ def _build(tracklets, cameras, tz=None, events=None, with_dropped=False, plant=N
     tracklets = [t for t in tracklets if (
         (t["source"]["id"], None) not in frozen and (t["source"]["id"], t["id"]) not in frozen
         if t.get("source") else t["id"] not in claimed)]
+    plant = [p for p in plant if p[2] >= WORKS_PLANT_HITS]
+
+    def works(c, rescue=True):    # plant never rescues itself, and a rescued chain needs substance
+        ms = c["members"]
+        if rescue and (2 * sum(t["hits"] for t in ms if t.get("class") == "e-plant") > sum(t["hits"] for t in ms)
+                       or sum(t["hits"] for t in ms) < WORKS_RESCUE_HITS):
+            return False
+        t = min(m["t0"] for m in ms)
+        near = [p for p in plant if p[0] - WORKS_WINDOW <= t <= p[1] + WORKS_WINDOW]
+        return len(near) >= WORKS_PLANT_TRACKS or any(p[2] >= WORKS_PLANT_LONG for p in near)
     chains = _chains(tracklets, cameras)
-    links = _links(chains, cameras, tz)
+    shadows = _shadows(chains, lambda c: works(c, rescue=False))
+    absorbed = {}
+    links = _links(chains, cameras, tz, shadows, absorbed)
     linked = {id(c) for pair in links for c in pair}
+    # A swap claims every eligible shadow still free after all link passes.
+    absorbed = {parent: [c for c in chains if shadows.get(id(c)) is shadows[id(s)] and id(c) not in linked]
+                for parent, s in absorbed.items()}
+    linked |= {id(c) for cs in absorbed.values() for c in cs}
     # A lone chain counts if its camera counted it, or it crossed a handoff zone the partner
     # missed and stayed in view long enough to be a vehicle rather than headlight glare.
     lone = [c for c in chains if id(c) not in linked and (
@@ -697,22 +809,13 @@ def _build(tracklets, cameras, tz=None, events=None, with_dropped=False, plant=N
     # Works mode: roadworks (rollers, graders, lanes closed) mean stop-start crawl and diversions, so lone
     # chains the filter drops are real vehicles, not queue-tail duplicates. Measured 9 Oct noon: 184 -> 262
     # vs hand count 272; 7 Oct morning unchanged (no plant track there has 20+ hits).
-    plant = [p for p in plant if p[2] >= WORKS_PLANT_HITS]
-
-    def works(c):    # plant never rescues itself, and a rescued chain needs substance (WORKS_RESCUE_HITS)
-        ms = c["members"]
-        if 2 * sum(t["hits"] for t in ms if t.get("class") == "e-plant") > sum(t["hits"] for t in ms) \
-                or sum(t["hits"] for t in ms) < WORKS_RESCUE_HITS:
-            return False
-        t = min(m["t0"] for m in ms)
-        near = [p for p in plant if p[0] - WORKS_WINDOW <= t <= p[1] + WORKS_WINDOW]
-        return len(near) >= WORKS_PLANT_TRACKS or any(p[2] >= WORKS_PLANT_LONG for p in near)
     # An uncounted reversal leg needs a partner: a genuine lone U-turn is still one vehicle.
     accepted = lambda c: (not any(t.get("reverse") and not t["counted"] for t in c["members"])
                           or any(t["counted"] for t in c["members"])) and (keep(c) or works(c))
     dropped = [c for c in lone if not accepted(c)]
     lone = [c for c in lone if accepted(c)]
-    docs = [_doc(list(pair), pair, cfg, tz, events) for pair in links]
+    docs = [_doc(list(pair), pair, cfg, tz, events,
+                 [t for c in absorbed.get(id(pair[0]), ()) for t in c["members"]]) for pair in links]
     docs += [_doc([c], None, cfg, tz, events) for c in lone]
     if with_dropped:    # lone chains the filter removed: not journeys, but a still-open one can yet link
         docs += [(ts, dict(d, dropped=True)) for ts, d in (_doc([c], None, cfg, tz, events) for c in dropped)]
@@ -766,6 +869,325 @@ def _selfcheck_ghost():
         aa = dict(a, hits=3) if short == "original" else a
         bb = dict(b, hits=3, direction="southbound") if short == "ghost" else dict(b, direction="southbound")
         assert len(_chains([aa, bb], _CAMS)) == 1, ("short ghost direction", short)
+
+
+def _selfcheck_chain_guards(case):
+    if case in ("end_escape", "works", "motion", "interior_escape"):
+        a = _t("cam3", 91, "b-minibuses", [(100, _b(.33, .66, .04)), (101, _b(.46, .70, .04)),
+                                           (104.4, _b(.90, .84, .04))], hits=11, counted=True, direction="northbound")
+        b = _t("cam3", 92, "b-minibuses", [(103.2, _b(.84, .79, .04)), (104.6, _b(.70, .40, .04))], hits=6)
+        arrival = _north(93, 104.4, gap=0, cls="b-minibuses", k4={"hits": 11})[1]
+        if case == "end_escape":
+            js, chains, links = _build([a, b, arrival], _CAMS)
+            assert len(js) == 1 and len(chains) == 3 and len(links) == 1, (case, len(js), len(chains), len(links))
+            assert not any(c.get("shadow") for c in chains), case
+        elif case == "works":
+            # Two non-overlapping vehicles, 1.2 parent widths apart; B counts through works rescue.
+            a = _t("cam3", 91, "b-minibuses", [(100, _b(.65, .8, .04)), (104, _b(.85, .8, .04))],
+                   hits=20, counted=True, direction="northbound")
+            b = _t("cam3", 92, "b-minibuses", [(102, _b(.846, .8, .04)), (103, _b(.896, .8, .04))], hits=20)
+            assert all(iou(_b(.65 + .05 * (p[0] - 100), .8, .04), p[1:]) == 0 for p in b["path"])
+            # The second window starts after A's birth: only B qualifies for works rescue.
+            for plant in ([(90, 120, WORKS_PLANT_LONG)], [(1001.5, 1020, WORKS_PLANT_LONG)]):
+                js, chains, _ = _build([a, b], _CAMS, plant=plant)
+                assert len(js) == 2 and len(chains) == 2, (case, plant, len(js), len(chains))
+                assert not any(c.get("shadow") for c in chains), (case, plant)
+                _, thin, _ = _build([a, dict(b, hits=6)], _CAMS, plant=plant)
+                assert not any(c.get("shadow") for c in thin), (case, "works context below rescue hits")
+        elif case == "interior_escape":
+            # Birth and end qualify; the intervening sample belongs to a different path.
+            a = _t("cam3", 91, "b-minibuses", [(100, _b(.5, .4, .04)), (104, _b(.7, .4, .04))],
+                   hits=11, counted=True, direction="northbound")
+            b = _t("cam3", 92, "b-minibuses", [(102, _b(.69, .4, .04)), (102.5, _b(.9, .4, .04)),
+                                             (103, _b(.70, .4, .04))], hits=6)
+            assert not _opposed(a, b)
+            _, chains, _ = _build([a, b], _CAMS)
+            assert len(chains) == 2 and not any(c.get("shadow") for c in chains), case
+        else:
+            # Every sample stays near A, but B moves the other way and is no ID switch.
+            a = _t("cam3", 91, "b-minibuses", [(100, _b(.5, .4, .04)), (104, _b(.6, .4, .04))],
+                   hits=11, counted=True, direction="northbound")
+            b = _t("cam3", 92, "b-minibuses", [(102, _b(.64, .4, .04)), (103, _b(.62, .4, .04))], hits=6)
+            assert _opposed(a, b)
+            _, chains, _ = _build([a, b], _CAMS)
+            assert len(chains) == 2 and not any(c.get("shadow") for c in chains), case
+    elif case == "weak_ghost":
+        a = _t("cam3", 91, "c-small", [(100, _b(.5, .4)), (102, _b(.5, .4))],
+               hits=8, counted=True, direction="northbound")
+        g = _t("cam3", 92, "c-small", [(101, _b(.5, .4)), (101.5, _b(.5, .4))],
+               hits=3, ghost_of=a["id"], direction="southbound")
+        c = _t("cam3", 93, "c-small", [(102.4, _b(.5, .4)), (103.4, _b(.5, .4))],
+               hits=8, counted=True, direction="northbound")
+        js = build([a, g, c], _CAMS)
+        assert len(js) == 1 and len(js[0]["members"]) == 3, (case, len(js))
+        # 12 Oct #5c (10 hits) and #5e (5 hits) both have reliable directions.
+        assert len(_chains([dict(a, hits=10), dict(g, hits=5)], _CAMS)) == 2, "solid ghost remains opposed"
+    else:
+        assert case == "refused_slot"
+        ts = [_t("cam3", i, "c-small", [(start, _b(.5, .4)), (end, _b(.5, .4))],
+                 hits=5, counted=True, direction=direction)
+              for i, start, end, direction in ((91, 100, 101, "southbound"), (92, 101.2, 102, None),
+                                              (93, 102.2, 103, "northbound"), (94, 102.4, 103.4, "southbound"))]
+        chains = _chains(ts, _CAMS)
+        groups = [{m["id"] for m in c["members"]} for c in chains]
+        assert {ts[i]["id"] for i in (0, 1, 3)} in groups and {ts[2]["id"]} in groups, (case, groups)
+
+
+def _selfcheck_shadows(case):
+    code = lambda x, y: base64.b64encode(struct.pack("<32e", x, y, *[0.0] * 30)).decode()
+    if case == "shared_ghost":
+        g = _t("cam3", 90, "c-small", [(90, _b(.1, .2)), (91, _b(.1, .2))], hits=3)
+        a = _t("cam3", 91, "c-small", [(100, _b(.5, .4)), (102, _b(.5, .4))],
+               hits=8, counted=True, direction="northbound", ghost_of=g["id"])
+        b = _t("cam3", 92, "c-small", [(95, _b(.1, .2)), (96, _b(.1, .2))],
+               hits=8, direction="southbound", ghost_of=g["id"])
+        c = _t("cam3", 93, "c-small", [(102.4, _b(.5, .4)), (103.4, _b(.5, .4))],
+               hits=8, counted=True, direction="northbound")
+        js, chains, links = _build([g, a, b, c], _CAMS)
+        assert len(js) == 1 and not links, (case, len(js), len(links))
+        assert all(len({m["direction"] for m in ch["members"]
+                        if m.get("direction") and m["hits"] >= MIN_EDGE_HITS}) <= 1 for ch in chains), case
+        assert {m["id"] for m in js[0]["members"]} == {a["id"], c["id"]}, case
+        assert any({m["id"] for m in ch["members"]} == {g["id"], b["id"]} for ch in chains), case
+        return
+    if case == "endpoint":
+        a = _t("cam3", 91, "b-minibuses", [(100, _b(.84, .80, .04)), (104, _b(.88, .80, .04))],
+               hits=11, counted=True, direction="northbound")
+        b = _t("cam3", 92, "b-minibuses", [(103, _b(.85, .80, .04)), (104.2, _b(.86, .80, .04))], hits=6)
+    else:
+        assert case == "appearance"
+        a = _t("cam3", 91, "b-minibuses", [(100, _b(.65, .8, .04)), (104, _b(.85, .8, .04))],
+               hits=11, counted=True, direction="northbound", app=code(1, 0), app_v="m1")
+        b = _t("cam3", 92, "b-minibuses", [(102, _b(.846, .8, .04)), (103, _b(.896, .8, .04))],
+               hits=20, app=code(0, 1), app_v="m1")
+    arrival = _north(93, 104, gap=.4, cls="b-minibuses",
+                     k4={"hits": 11, "app": code(1, 0), "app_v": "m1"})[1]
+    # Noon applies the appearance veto to same-class vehicles too.
+    shift = 12 * 3600
+    ts = [dict(t, t0=t["t0"] + shift, t1=t["t1"] + shift,
+               path=[[p[0] + shift, *p[1:]] for p in t["path"]]) for t in (a, b, arrival)]
+    js, chains, links = _build(ts, _CAMS, timezone.utc)
+    assert len(js) == 1 and len(links) == 1, (case, len(js), len(links))
+    assert {m["id"] for m in js[0]["members"]} == {a["id"], arrival["id"]}, (case, js)
+    assert len(chains) == 3, (case, "parent evidence changed")
+    parent = next(c for c in chains if c["members"][0]["id"] == a["id"])
+    assert parent == _chains(parent["members"], _CAMS)[0], (case, "parent evidence changed")
+    assert next(c for c in chains if c["members"][0]["id"] == b["id"]).get("shadow"), case
+
+
+def _selfcheck_shadow_rejections(case):
+    code = lambda x, y: base64.b64encode(struct.pack("<32e", x, y, *[0.0] * 30)).decode()
+    a = _t("cam3", 91, "b-minibuses", [(100, _b(.65, .8, .04)), (104, _b(.85, .8, .04))],
+           hits=11, counted=True, direction="northbound", app=code(1, 0), app_v="m1")
+    start = 99.6 if case == "start" else 102
+    end = 104.6 if case == "end" else 103
+    b = _t("cam3", 92, "a-small" if case == "class" else "b-minibuses",
+           [(t, _b(.65 + .05 * (min(t, 104) - 100) + .096, .8, .04)) for t in (start, end)],
+           hits=20, counted=case == "counted", app=code(0, 1), app_v="m1")
+    if case == "too_far":
+        b["path"] = [[t, *_b(.65 + .05 * (t - 100) + .104, .8, .04)] for t in (start, end)]
+    if case == "weak_parent":
+        a["hits"] = MIN_EDGE_HITS - 1
+    elif case == "directionless_parent":
+        a["direction"] = None
+    assert all(iou(_b(.65 + .05 * (min(p[0], 104) - 100), .8, .04), p[1:]) == 0 for p in b["path"]), case
+    chains = _chains([a, b], _CAMS)
+    assert len(chains) == 2, (case, "fixture merged")
+    _shadows(chains, lambda c: False)
+    shadow = next(c for c in chains if c["members"][0]["id"] == b["id"])
+    assert bool(shadow.get("shadow")) == (case == "eligible"), (case, "shadow eligibility")
+    if case == "start":
+        arrival = _north(93, 104, gap=.4, cls="b-minibuses",
+                         k4={"hits": 11, "app": code(0, 1), "app_v": "m1"})[1]
+        shift = 12 * 3600
+        ts = [dict(t, t0=t["t0"] + shift, t1=t["t1"] + shift,
+                   path=[[p[0] + shift, *p[1:]] for p in t["path"]]) for t in (a, b, arrival)]
+        cameras = [dict(c, lone_edge=False) for c in _CAMS]
+        js, chains, links = _build(ts, cameras, timezone.utc)
+        assert len(js) == 2 and len(chains) == 3 and len(links) == 1, (case, len(js), len(chains), len(links))
+        assert {m["id"] for c in links[0] for m in c["members"]} == {b["id"], arrival["id"]}, case
+
+
+def _selfcheck_shadow_competition(case):
+    if case == "heavy":
+        # Exact five-tracklet chain_gate_over fixture: shadow removal crosses the truck convoy.
+        ts = json.loads('''[
+        {"id":"obs-cam3-91","camera":"cam3","t0":43300,"t1":43304,"hits":11,"dim":[1920,1080],"class":"e-heavy","votes":{"e-heavy":2},"conf":{"e-heavy":0.8},"counted":true,"ghost_of":null,"direction":"northbound","path":[[43300,0.61,0.76,0.69,0.84],[43304,0.81,0.76,0.89,0.84]],"crops":{"top":"cam3-91-top.jpg","best":"cam3-91-best.jpg"},"plate":null,"app":"8jScOwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==","app_v":"m1"},
+        {"id":"obs-cam3-92","camera":"cam3","t0":43302,"t1":43303,"hits":20,"dim":[1920,1080],"class":"e-heavy","votes":{"e-heavy":2},"conf":{"e-heavy":0.8},"counted":false,"ghost_of":null,"direction":null,"path":[[43302,0.806,0.76,0.886,0.84],[43303,0.856,0.76,0.936,0.84]],"crops":{"top":"cam3-92-top.jpg","best":"cam3-92-best.jpg"},"plate":null,"app":"yjDpOwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==","app_v":"m1"},
+        {"id":"obs-cam3-0","camera":"cam3","t0":43302.243,"t1":43304.243,"hits":8,"dim":[1920,1080],"class":"e-heavy","votes":{"e-heavy":3},"conf":{"e-heavy":0.8},"counted":false,"ghost_of":null,"direction":"northbound","path":[[43302.243,0.4,0.3,0.6,0.5],[43303.243,0.6,0.5,0.8,0.7],[43304.243,0.8,0.7,1.0,0.9]],"crops":{"top":"cam3-0-top.jpg","best":"cam3-0-best.jpg"},"plate":null,"app":"IDDvOwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==","app_v":"m1"},
+        {"id":"obs-cam4-1","camera":"cam4","t0":43313.13,"t1":43315.13,"hits":8,"dim":[1920,1080],"class":"e-heavy","votes":{"e-heavy":3},"conf":{"e-heavy":0.8},"counted":true,"ghost_of":null,"direction":"northbound","path":[[43313.13,0.0,0.6,0.2,0.8],[43314.13,0.2,0.4,0.4,0.6],[43315.13,0.35,0.25,0.55,0.45]],"crops":{"top":"cam4-1-top.jpg","best":"cam4-1-best.jpg"},"plate":null,"app":"+TrZNwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==","app_v":"m1"},
+        {"id":"obs-cam4-2","camera":"cam4","t0":43303.603,"t1":43305.603,"hits":8,"dim":[1920,1080],"class":"e-heavy","votes":{"e-heavy":3},"conf":{"e-heavy":0.8},"counted":false,"ghost_of":null,"direction":"northbound","path":[[43303.603,0.0,0.6,0.2,0.8],[43304.603,0.2,0.4,0.4,0.6],[43305.603,0.35,0.25,0.55,0.45]],"crops":{"top":"cam4-2-top.jpg","best":"cam4-2-best.jpg"},"plate":null,"app":"MrkVOgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==","app_v":"m1"}
+        ]''')
+        cameras = [dict(c, lone_edge=False) if c["name"] == "cam3" else c for c in _CAMS]
+        js, chains, links = _build(ts, cameras, timezone.utc)
+        assert (len(js), len(links)) == (2, 2), (case, len(js), len(links))
+        return
+    code = lambda x, y: base64.b64encode(struct.pack("<32e", x, y, *[0.0] * 30)).decode()
+    a = _t("cam3", 91, "b-minibuses", [(43300, _b(.65, .8, .04)), (43304, _b(.85, .8, .04))],
+           hits=11, counted=True, direction="northbound", app=code(1, 0), app_v="m1")
+    b = _t("cam3", 92, "b-minibuses", [(43302, _b(.846, .8, .04)), (43303, _b(.896, .8, .04))],
+           hits=20, app=code(0, 1), app_v="m1")
+    arrival = _north(93, 43304, cls="b-minibuses",
+                     k4={"hits": 11, "app": code(0, 1), "app_v": "m1"})[1]
+    cameras = [dict(c, lone_edge=False) for c in _CAMS]
+    js, chains, links = _build([a, b, arrival], cameras, timezone.utc)
+    assert (len(js), len(links)) == (2, 1), (case, len(js), len(links))
+    assert {m["id"] for c in links[0] for m in c["members"]} == {b["id"], arrival["id"]}, case
+    assert next(c for c in chains if c["members"][0]["id"] == b["id"]).get("shadow"), case
+
+
+def _selfcheck_ghost_permutations():
+    from itertools import permutations
+
+    g = _t("cam3", 90, "c-small", [(90, _b(.1, .2)), (91, _b(.1, .2))], hits=3)
+    a = _t("cam3", 91, "c-small", [(100, _b(.5, .4)), (102, _b(.5, .4))],
+           hits=8, counted=True, direction="northbound", ghost_of=g["id"])
+    b = _t("cam3", 92, "c-small", [(95, _b(.1, .2)), (96, _b(.1, .2))],
+           hits=8, counted=True, direction="southbound", ghost_of=g["id"])
+    ts = [g, b, a]
+    expected = build(ts, _CAMS)
+    assert len(expected) == 2
+    assert {m["id"] for j in expected if j["direction"] == "southbound" for m in j["members"]} == {g["id"], b["id"]}
+    for shuffled in permutations(ts):
+        actual = build(shuffled, _CAMS)
+        assert actual == expected, ("ghost permutation", [t["id"] for t in shuffled], actual, expected)
+
+
+def _selfcheck_shadow_links():
+    code = base64.b64encode(struct.pack("<32e", 1, *[0.0] * 31)).decode()
+    for mode in ("ordinary", "late", "early", "truck"):
+        ts = _north(91, 104, cls="e-heavy", k3={"hits": 8, "app": code, "app_v": "m1"},
+                    k4={"hits": 8, "app": code, "app_v": "m1"}, gap=10 if mode == "truck" else .4)
+        chains = _chains(ts, _CAMS)
+        d, r = chains
+        if mode == "late":
+            r["late"], r["arr"] = r["arr"], None
+        elif mode == "early":
+            d["early"], d["dep"] = d["dep"], None
+        assert _links(chains, _CAMS) == [(d, r)], (mode, "fixture")
+        for c in chains:
+            parent = dict(c, members=[dict(c["members"][0], id="absent-parent")])
+            assert _links(chains, _CAMS, shadows={id(c): parent}) == [(d, r)], (mode, c["camera"], "uncontested shadow")
+        parent = dict(d, members=[dict(d["members"][0], id="parent")])
+        expected = _links([d, parent, r], _CAMS)
+        assert _links([d, parent, r], _CAMS, shadows={id(d): parent}) == expected, (mode, "shadow cannot filter candidates")
+
+
+def _selfcheck_shadow_swap():
+    code = lambda x, y: base64.b64encode(struct.pack("<32e", x, y, *[0.0] * 30)).decode()
+    a = _t("cam3", 91, "b-minibuses", [(100, _b(.33, .66, .04)), (101, _b(.46, .70, .04)),
+                                       (104.4, _b(.90, .84, .04))], hits=11, counted=True,
+           direction="northbound", app=code(1, 0), app_v="m1")
+    b = _t("cam3", 92, "b-minibuses", [(103.2, _b(.84, .79, .04)), (104.2, _b(.97, .80, .04))],
+           hits=6, app=code(.873548, .486738), app_v="m1")
+    arrival = _north(93, 104.4, gap=0, cls="b-minibuses",
+                     k4={"hits": 11, "app": code(.52, .854166), "app_v": "m1"})[1]
+    for guard in (None, "direction", "counted", "weaker_shadow"):
+        shadow = dict(b, app=code(.995333, .096500)) if guard == "weaker_shadow" else b
+        car = _north(94, 104.4, gap=2, cls="a-small",
+                     k4={"hits": 11, "app": code(.67, .742361), "app_v": "m1"})[1]
+        car["direction"] = None
+        if guard in ("direction", "counted"):
+            car[guard] = "northbound" if guard == "direction" else True
+        # Real replay: parent/car .67, shadow/arrival .87, parent/arrival .52.
+        assert abs(_similar(_app([a]), _app([car])) - .67) < .001
+        assert abs(_similar(_app([shadow]), _app([arrival])) - (.60 if guard == "weaker_shadow" else .87)) < .001
+        assert abs(_similar(_app([a]), _app([arrival])) - .52) < .001
+        a["speed_kph"], arrival["speed_kph"] = 30, 50
+        shadow = dict(shadow, speed_kph=170, conf={"b-minibuses": .99}, attrs={"colour": "shadow"})
+        events = {shadow["id"]: {"class": "b-minibuses", "hits": 100, "attrs": {"colour": "shadow-event"}}}
+        js, chains, links = _build([a, shadow, arrival, car], _CAMS, events=events)
+        actual = [{m["id"] for c in pair for m in c["members"]} for pair in links]
+        if guard:
+            assert actual == [{b["id"], arrival["id"]}, {a["id"], car["id"]}], (guard, actual)
+        else:
+            assert actual == [{a["id"], arrival["id"]}], ("shadow decoy swap", actual)
+            expected = _doc(list(links[0]), links[0], {c["name"]: c for c in _CAMS}, None, events)[1]
+            assert {k: v for k, v in js[0].items() if k not in ("id", "members")} == {
+                k: v for k, v in expected.items() if k not in ("id", "members")}, ("shadow changed evidence", js)
+            assert js[0]["id"] != expected["id"], "absorbed shadow must change journey id"
+            frozen_ids = {(m["id"], m.get("piece")) for j in js for m in j["members"]}
+            rebuilt = build([a, shadow, arrival, car], _CAMS, frozen=frozen_ids)
+            assert rebuilt == [], ("shadow swap after freeze", rebuilt)
+            assert len(js) == 1 and {m["id"] for m in js[0]["members"]} == actual[0] | {b["id"]}, js
+
+            from selfloop import cleared
+            extra = dict(shadow, id="obs-cam3-extra", app=code(.98, -.2),
+                         path=[[t, x1 - .08, y1, x2 - .08, y2] for t, x1, y1, x2, y2 in shadow["path"]])
+            tracks = [a, shadow, extra, arrival, car]
+            events[extra["id"]] = events[shadow["id"]]
+            assert abs(_similar(_app([extra]), _app([car])) - .508) < .001
+            js, _, links = _build(tracks, _CAMS, events=events)
+            assert len(js) == 1 and links[0][0]["members"] == [a], ("five-tracklet swap", js)
+            final = cleared(js, js, cutoff=1000)
+            assert final == js, ("five-tracklet freeze", final)
+            claims = {(m["id"], m.get("piece")) for j in final for m in j["members"]}
+            rebuilt = build(tracks, _CAMS, events=events, frozen=claims)
+            assert rebuilt == [], ("second shadow re-paired after freeze", rebuilt)
+            assert {m["id"] for m in js[0]["members"]} == {a["id"], shadow["id"], extra["id"], arrival["id"]}, js
+            assert {k: v for k, v in js[0].items() if k not in ("id", "members")} == {
+                k: v for k, v in expected.items() if k not in ("id", "members")}, ("second shadow changed evidence", js)
+
+
+def _selfcheck_swap_rejections(case):
+    # Isolate the final swap from geometry: each shadow already has a linked arrival.
+    def chain(cam, tid, cls, dep, arr, app, direction=None):
+        dep = dep + 43200 if dep is not None else None
+        arr = arr + 43200 if arr is not None else None
+        return {"camera": cam, "class": cls, "dep": dep, "arr": arr,
+                "z": (dep if dep is not None else arr,) * 2, "app": (app, "m1"),
+                "members": [{"id": tid, "hits": 8, "counted": False, "direction": direction}]}
+
+    cls = "e-heavy" if case == "heavy_crossing" else "b-minibuses"
+    d = chain("cam3", "parent", cls, 104, None, (1, 0, 0, 0), "northbound")
+    s = chain("cam3", "shadow", cls, 103, None, (.6, .8, 0, 0))
+    low = case == "minimum_similarity"
+    y = .325 if low else .875
+    x = .21 if low else .67
+    L = chain("cam4", "arrival", "c-bus" if case == "arrival_class" else cls,
+              None, 103.5, (.3, y, (1 - .3 ** 2 - y ** 2) ** .5, 0), "northbound")
+    r = chain("cam4", "decoy", "b-minibuses" if cls in HEAVY else "a-small",
+              None, 106, (x, 0, (1 - x ** 2) ** .5, 0))
+    if case == "same_class":
+        r["class"] = cls
+    chains = [d, s, L, r]
+    if case == "heavy_crossing":
+        dd = chain("cam3", "convoy-departure", cls, 103.5, None, (0, 0, 0, 1), "northbound")
+        aa = chain("cam4", "convoy-arrival", cls, None, 106, (0, 0, 0, 1), "northbound")
+        chains.extend([dd, aa])
+    expected = _links(chains, _CAMS)
+    assert (s, L) in expected and (d, r) in expected, (case, "fixture", expected)
+    assert _links(chains, _CAMS, shadows={id(s): d}) == expected, (case, "swap must reject")
+
+
+def _selfcheck_contradictory_swap():
+    code = lambda x, y: base64.b64encode(struct.pack("<32e", x, y, *[0.0] * 30)).decode()
+    a = _t("cam3", 91, "b-minibuses", [(43300, _b(.65, .8, .04)), (43304, _b(.85, .8, .04))],
+           hits=11, counted=True, direction="northbound", app=code(1, 0), app_v="m1")
+    b = _t("cam3", 92, "b-minibuses", [(43302, _b(.846, .8, .04)), (43303, _b(.896, .8, .04))],
+           hits=20, app=code(0, 1), app_v="m1")
+    arrival = _north(93, 43304, cls="b-minibuses",
+                     k4={"hits": 11, "app": code(0, 1), "app_v": "m1"})[1]
+    car = _north(94, 43304, gap=2, cls="a-small",
+                 k4={"hits": 11, "app": code(.67, .742361), "app_v": "m1"})[1]
+    car["direction"] = None
+    js, chains, links = _build([a, b, arrival, car], _CAMS, timezone.utc)
+    assert (len(js), len(links)) == (2, 2), ("contradictory swap", len(js), len(links))
+    assert [{m["id"] for c in pair for m in c["members"]} for pair in links] == [
+        {b["id"], arrival["id"]}, {a["id"], car["id"]}], "contradictory swap membership"
+
+
+def _selfcheck_twin_permutations():
+    from itertools import permutations
+
+    ts = [_t("cam3", i, "c-small", [(100, _b(.5, .4)), (102, _b(.5, .4))],
+             hits=8, counted=True, direction=d)
+          for i, d in ((91, "northbound"), (92, None), (93, "southbound"))]
+    expected = build(ts, _CAMS)
+    assert len(expected) == 2
+    assert {ts[0]["id"], ts[1]["id"]} in [{m["id"] for m in j["members"]} for j in expected]
+    for shuffled in permutations(ts):
+        assert build(shuffled, _CAMS) == expected, ("equal-time twin permutation", [t["id"] for t in shuffled])
 
 
 def _selfcheck_early(case):
@@ -1038,6 +1460,21 @@ def _selfcheck_late_priority(case):
 
 
 def _selfcheck():
+    _selfcheck_contradictory_swap()
+    _selfcheck_twin_permutations()
+    for case in ("heavy_crossing", "minimum_similarity", "arrival_class", "same_class"):
+        _selfcheck_swap_rejections(case)
+    _selfcheck_shadow_swap()
+    for case in ("heavy", "contradicting_appearance"):
+        _selfcheck_shadow_competition(case)
+    _selfcheck_ghost_permutations()
+    for case in ("start", "class", "end", "counted", "weak_parent", "directionless_parent", "too_far", "eligible"):
+        _selfcheck_shadow_rejections(case)
+    _selfcheck_shadow_links()
+    for case in ("endpoint", "appearance", "shared_ghost"):
+        _selfcheck_shadows(case)
+    for case in ("end_escape", "works", "motion", "interior_escape", "weak_ghost", "refused_slot"):
+        _selfcheck_chain_guards(case)
     for case in ("yield", "same_class", "weak_late", "strong_ordinary", "shared_late", "shared_late_three",
                  "uncontested_replacement", "ordinary_count_protection", "truck_wider_window",
                  "truck_swap_protection", "early_swap_protection", "truck_swap_crossing",
@@ -1225,6 +1662,30 @@ def _selfcheck():
     f2 = _t("cam4", 2, "c-small", [(101.4, _b(0.22, 0.58)), (102.4, _b(0.35, 0.45))], hits=5)
     [j] = build([f1, f2], _CAMS)
     assert len(j["members"]) == 2 and j["evidence"] == "edge", j
+    # A directionless fragment must not bridge opposite ways, by stitching or by twins.
+    for twin in (False, True):
+        times = ((100, 102), (101, 104), (103, 105)) if twin else ((100, 101), (101.5, 102), (102.2, 103))
+        fragments = [_t("cam4", i, "c-small", [(t, _b(.1, .7)) for t in span], hits=5, direction=direction)
+                     for i, span, direction in zip(range(3), times, ("southbound", None, "northbound"))]
+        chains = _chains(fragments, _CAMS)
+        assert len(chains) == 2 and all(len({t["direction"] for t in c["members"] if t["direction"]}) <= 1
+                                       for c in chains), ("directionless bridge", "twins" if twin else "stitch")
+    # A sparse-path ID switch must not steal the minibus link and send A to a later car.
+    a = _t("cam3", 91, "b-minibuses", [(100, _b(.33, .66, .04)), (101, _b(.46, .70, .04)),
+                                       (104.4, _b(.90, .84, .04))], hits=11, counted=True, direction="northbound",
+           app=code(1, 0), app_v="m1")
+    b = _t("cam3", 92, "b-minibuses", [(103.2, _b(.84, .79, .04)), (104.2, _b(.97, .80, .04))],
+           hits=6, app=code(1, 0), app_v="m1")
+    arrival = _north(93, 104.4, gap=0, cls="b-minibuses",
+                     k4={"hits": 11, "app": code(1, 0), "app_v": "m1"})[1]
+    car = _north(94, 104.4, gap=2, cls="a-small",
+                 k4={"hits": 12, "counted": False, "app": code(.3, .954), "app_v": "m1"})[1]
+    car["direction"] = None
+    assert _similar(_app([a]), _app([car])) < LATE_COS
+    js = build([a, b, arrival, car], _CAMS)
+    j = next(j for j in js if any(m["id"] == a["id"] for m in j["members"]))
+    assert {m["id"] for m in j["members"]} == {a["id"], b["id"], arrival["id"]}, ("shadow link decoy", j)
+    assert len(js) == 1, ("shadow absorbed and car released", js)
     # (f) parked in the zone, jittering, never counted: nothing.
     park = _t("cam3", 1, "c-small", [(100 + k, _b(0.9 + k % 2 * 0.005, 0.8)) for k in range(6)], direction="southbound")
     assert build([park], _CAMS) == []
@@ -1384,7 +1845,10 @@ def _selfcheck():
     took = time.perf_counter() - start
     print("journeys self-check ok: handoff links front to rear, queues pair in order, long trucks "
           "link across the overlap, opposed fragments stay apart, parked vehicles never count, "
-          "classes fuse by votes, ghosts join, glare blips drop, far fast fragments join, twins merge and anchor nothing, ids are stable, lone chains need a direction and honour lone_edge unless plant marks roadworks; "
+          "classes fuse by votes, weak ghosts do not veto continuations, opposite roots never bridge, "
+          "refused joins leave slots free, eligible shadow swaps repair cross-class links without changing parent evidence, "
+          "shared weak ghosts cannot poison roots, works skips shadows, glare blips drop, far fast fragments join, twins merge and anchor nothing, ids are stable, "
+          "lone chains need a direction and honour lone_edge unless plant marks roadworks; "
           f"10k passes (20k tracklets) in {took:.1f} s")
 
 
