@@ -23,7 +23,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 DATASET = ROOT / "dataset"
 MIN_SCORES = 3        # same honesty rule as the Progress panel
-COLUMNS = ("curator", "approvals", "discards", "held", "released", "days", "active_hours",
+COLUMNS = ("curator", "approvals", "discards", "checks", "held", "released", "days", "active_hours",
            "per_hour", "golds_seen", "gold_accuracy", "reviews", "review_accuracy",
            "corrections", "quality")
 IDLE_GAP = 600        # seconds between two decisions past which the curator was away
@@ -54,7 +54,7 @@ def blank():
     """held: approvals that landed in the holding pen instead of the training set.
     released: how many of those a reviewer has since cleared. The gap is work nobody
     has proved yet — pay for it at your own risk."""
-    return {"approvals": 0, "discards": 0, "held": 0, "released": 0, "gold": [], "review": [],
+    return {"approvals": 0, "discards": 0, "checks": 0, "held": 0, "released": 0, "gold": [], "review": [],
             "corrections": {}, "stamps": []}
 
 
@@ -93,6 +93,12 @@ def main():
             # A release credits the CURATOR whose held work cleared, not the reviewer.
             people.setdefault(r.get("curator") or "anon", blank())["released"] += 1
             continue
+        if act == "review" and r.get("valcheck"):
+            if not r.get("note"):
+                p = people.setdefault(r.get("who") or "anon", blank())
+                p["checks"] += 1
+                p["stamps"].append(r.get("ts"))
+            continue
         if act not in ("approve", "discard"):
             continue          # a reviewer's own audit lines are not curation work
         if r.get("note"):
@@ -117,7 +123,7 @@ def main():
         both = [v for v in (gold, review) if v is not None]
         quality = round(sum(both) / len(both), 3) if both else None   # equal weight when both exist
         table.append({"curator": who, "approvals": p["approvals"], "discards": p["discards"],
-                      "held": p["held"], "released": p["released"], **pace(p["stamps"]),
+                      "checks": p["checks"], "held": p["held"], "released": p["released"], **pace(p["stamps"]),
                       "golds_seen": len(p["gold"]), "gold_accuracy": gold,
                       "reviews": len(p["review"]), "review_accuracy": review,
                       "corrections": " ".join(f"{k}:{v}" for k, v in
@@ -127,10 +133,10 @@ def main():
         sys.exit(f"no labelling logged in the last {days} day(s)")
 
     print(f"last {days} day(s), since {since}\n")
-    print(f"{'curator':<16}{'appr':>6}{'disc':>6}{'held':>6}{'rel':>6}{'days':>5}{'hours':>7}{'/h':>5}"
+    print(f"{'curator':<16}{'appr':>6}{'disc':>6}{'checks':>7}{'held':>6}{'rel':>6}{'days':>5}{'hours':>7}{'/h':>5}"
           f"{'golds':>7}{'gold acc':>22}{'reviews':>9}{'review acc':>22}{'quality':>22}")
     for t in table:
-        print(f"{t['curator']:<16}{t['approvals']:>6}{t['discards']:>6}{t['held']:>6}"
+        print(f"{t['curator']:<16}{t['approvals']:>6}{t['discards']:>6}{t['checks']:>7}{t['held']:>6}"
               f"{t['released']:>6}{t['days']:>5}{t['active_hours']:>7}{show(t['per_hour']) if t['per_hour'] is None else t['per_hour']:>5}"
               f"{t['golds_seen']:>7}"
               f"{show(t['gold_accuracy']):>22}{t['reviews']:>9}"

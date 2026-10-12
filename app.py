@@ -2396,7 +2396,7 @@ def dataset_progress():
 
     def tally(handle):
         return by_who.setdefault(handle or "anon",
-                                 {"approve": 0, "discard": 0, "held": 0, "released": 0})
+                                 {"approve": 0, "discard": 0, "checks": 0, "held": 0, "released": 0})
 
     try:
         lines = (DATASET / "audit.jsonl").read_text().splitlines()
@@ -2413,6 +2413,11 @@ def dataset_progress():
         if act == "review" and r.get("released"):
             # Credited to the CURATOR: it is their work that cleared, not the reviewer's.
             tally(r.get("curator"))["released"] += 1
+            continue
+        if act == "review" and r.get("valcheck"):
+            if not r.get("note"):
+                tally(r.get("who"))["checks"] += 1
+                stamps.setdefault(r.get("who") or "anon", []).append(r.get("ts"))
             continue
         if act not in ("approve", "discard", "unapprove"):
             continue

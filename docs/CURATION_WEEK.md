@@ -68,7 +68,9 @@ honesty matters when the number decides a payment.
 Open **Check colour/make** (or `#valcheck`) to complete a human validation set.
 Every colour and make must be tapped to confirm or correct it; AI prefill is
 only a suggestion. A blank means no AI answer, so fill it. Can't read the colour
-or make → tap "Can't tell"; don't guess the closest colour. This work is not scored against the original curator.
+or make → tap "Can't tell"; don't guess the closest colour. This work is paid as its own
+`checks` column, at a rate set by the operator separately from approvals. It is still
+not scored against the original curator.
 
 Edits made directly in R2 under `curation/approved/` are overwritten by the
 curation node. Edit through the app, or stop curation before editing R2.
