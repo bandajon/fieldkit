@@ -13,6 +13,8 @@ never guessed at.
 """
 
 import json
+from math import sqrt
+import shutil
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,6 +22,7 @@ from pathlib import Path
 import yaml
 from PIL import Image
 
+from detect import FLOORED_ATTR_HEADS, SUPPRESSED_ATTR_VALUES
 from train import is_val, reference   # same split, same frozen benchmark
 
 ROOT = Path(__file__).resolve().parent
@@ -36,6 +39,9 @@ PAD = 0.10                # crop context: a truck's neighbours help read its typ
 EPOCHS = 30
 BATCH = 64
 LR = 3e-4
+FLOORED = dict.fromkeys(FLOORED_ATTR_HEADS, 0.90)
+MIN_VAL = 100
+MIN_EMIT = 50
 MIN_BOXES = 200           # below this the heads memorise instead of generalising
 IMAGENET = ((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
 
@@ -255,12 +261,63 @@ def class_names():
         return []
 
 
-def report_dict(run_name, accs, val_crops, labelled, confusion):
+def calibrate_floors(probabilities, labels, heads, allowed=None):
+    """Smallest observed floor meeting the Wilson lower bound and emission minimum.
+
+    Coverage divides emitted labelled crops by all labelled crops; suppressed values are silent.
+    """
+    from detect import constrained
+
+    floors, withheld, stats = {}, [], {}
+    for head, target in FLOORED.items():
+        if head not in heads:
+            continue
+        values = heads[head]
+        rows = probabilities.get(head, [])
+        truth = labels.get(head, [])
+        rules = (allowed or {}).get(head)
+        labelled = sum(label >= 0 for label in truth)
+        stats[head] = {"emitted": 0, "coverage": 0.0, "precision": None, "lower_bound": None}
+        if labelled < MIN_VAL:
+            withheld.append(head)
+            continue
+        groups = {}
+        for i, (probs, label) in enumerate(zip(rows, truth)):
+            if label < 0:
+                continue
+            value = constrained(probs, values, rules[i] if rules is not None else None)
+            if value is None or value in SUPPRESSED_ATTR_VALUES:
+                continue
+            choice = values.index(value)
+            confidence = probs[choice]
+            count, correct = groups.get(confidence, (0, 0))
+            groups[confidence] = (count + 1, correct + (choice == label))
+        count = correct = 0
+        for confidence in sorted(groups, reverse=True):
+            size, hits = groups[confidence]
+            count += size
+            correct += hits
+            precision = correct / count
+            z = 1.2816   # 90% one-sided Wilson bound
+            lower = (precision + z*z / (2*count) - z * sqrt(
+                precision * (1 - precision) / count + z*z / (4*count*count))) / (1 + z*z / count)
+            if count >= MIN_EMIT and lower >= target:
+                floors[head] = float(confidence)
+                stats[head] = {"emitted": count, "coverage": count / labelled,
+                               "precision": precision, "lower_bound": lower}
+        if head not in floors:
+            withheld.append(head)
+    return floors, withheld, stats
+
+
+def report_dict(run_name, accs, val_crops, labelled, confusion, floors=None, withheld=None, calibration=None):
     ok = [a for a in accs.values() if a is not None]
     return {"run": run_name, "per_head_acc": accs,
             "mean_acc": sum(ok) / len(ok) if ok else None,
             "val_crops": val_crops, "labelled": labelled, "axles_confusion": confusion,
-            "baseline": BASELINE, "sources": SOURCES}
+            "baseline": BASELINE, "sources": SOURCES,
+            "floors": floors or {}, "withheld": withheld or [],
+            "calibration": calibration or {}}
 
 
 def train(heads, crops, targets, stems, classes):
@@ -325,11 +382,17 @@ def train(heads, crops, targets, stems, classes):
         print(f"  epoch {epoch + 1:>2}/{EPOCHS}  loss {total / max(len(xt), 1):.3f}", flush=True)
 
     net.eval()
+    from detect import attr_constraints, softmax_scores
+
     preds = []
+    probabilities = {n: [] for n in names if n in FLOORED}
     with torch.no_grad():
         for i in torch.arange(len(xv)).split(BATCH):
-            preds.append(torch.stack([o.argmax(1).cpu()
-                                      for o in forward(xv[i].to(dev), zv[i].to(dev))], 1))
+            logits = forward(xv[i].to(dev), zv[i].to(dev))
+            preds.append(torch.stack([o.argmax(1).cpu() for o in logits], 1))
+            for j, n in enumerate(names):
+                if n in probabilities:
+                    probabilities[n].extend(softmax_scores(row) for row in logits[j].cpu().tolist())
     P = torch.cat(preds) if preds else torch.zeros((0, len(names)), dtype=torch.long)
     print()
     accs, labelled, confusion = {}, {}, {}
@@ -351,17 +414,27 @@ def train(heads, crops, targets, stems, classes):
 
     run = RUNS / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     run.mkdir(parents=True, exist_ok=True)
+    if (DATASET / "attributes.yaml").is_file():
+        shutil.copy2(DATASET / "attributes.yaml", run / "attributes.yaml")
     out = run / "attrs.pt"
+    cons = attr_constraints(DATASET / "attrs-champion.pt")
+    val_classes = [cnames[c] if 0 <= c < len(cnames) else None
+                   for c, flag in zip(classes, val.tolist()) if flag]
+    allowed = {n: [(cons.get(c) or {}).get(n) for c in val_classes] for n in probabilities}
+    floors, withheld, calibration = calibrate_floors(
+        probabilities, {n: yv[:, names.index(n)].tolist() for n in probabilities}, heads, allowed)
     torch.save({"state_dict": {**{f"features.{k}": v for k, v in backbone.state_dict().items()},
                                **{f"fc.{k}": v for k, v in heads_fc.state_dict().items()}},
                 "heads": {n: heads[n] for n in names},
                 "classes": cnames,          # the one-hot's order; absent in older checkpoints
-                "backbone": "mobilenet_v3_small", "input": INPUT}, out)
+                "backbone": "mobilenet_v3_small", "input": INPUT,
+                "floors": floors, "withheld": withheld}, out)
     # The printed report is for a human reading the log; this one is for selfloop.py,
-    # which promotes on mean_acc and quotes the confusion in its summary. A head nobody
-    # has labelled in the val split scores null rather than 0 — it was not tested.
+    # which compares measured shared heads. A head nobody labelled in the val split
+    # scores null rather than 0 — it was not tested.
     (run / "report.json").write_text(json.dumps(
-        report_dict(run.name, accs, len(xv), labelled, confusion), indent=1))
+        report_dict(run.name, accs, len(xv), labelled, confusion,
+                    floors, withheld, calibration), indent=1))
     print(f"\nattrs: {out}")
     print(f"to deploy: set attr_weights: {out} in config.yaml and restart FieldKit")
 

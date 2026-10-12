@@ -9,7 +9,7 @@ import runpy
 import sys
 import tempfile
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from PIL import Image
 import yaml
@@ -177,18 +177,35 @@ def training_mask_and_report():
         run = Path(td)
         sources = {'human': 2, 'ai': 1, 'archive': 1, 'external': {'cars': 3}}
         with patch.object(ta, 'SOURCES', sources):
+            floors, withheld = {'colour': .8}, ['make']
+            calibration = {'colour': {'coverage': .8, 'precision': 1.}}
             report = ta.report_dict(run.name, {'make': .75, 'type': None}, 4,
-                                    {'make': 4}, {})
+                                    {'make': 4}, {}, floors, withheld, calibration)
+            assert report['floors'] == floors and report['withheld'] == withheld
+            assert report['calibration'] == calibration
             assert report['sources'] == sources, 'report preserves source counts'
             assert report['mean_acc'] == .75 and report['val_crops'] == 4
             assert report['baseline'] == ta.BASELINE
             write = next(node for node in ast.walk(tree) if isinstance(node, ast.Call)
                          and isinstance(node.func, ast.Attribute) and node.func.attr == 'write_text')
             namespace = {**vars(ta), 'run': run, 'accs': {'make': .75, 'type': None},
-                         'ok': [.75], 'xv': [0] * 4, 'labelled': {'make': 4}, 'confusion': {}}
+                         'ok': [.75], 'xv': [0] * 4, 'labelled': {'make': 4}, 'confusion': {},
+                         'floors': floors, 'withheld': withheld, 'calibration': calibration}
             eval(compile(ast.Expression(write), '<train report>', 'eval'), namespace)
             assert json.loads((run / 'report.json').read_text()) == report, \
                 'actual report.json must carry sources and all report fields'
+            save = next(node for node in ast.walk(tree) if isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Attribute) and node.func.attr == 'save')
+            class EmptyState:
+                def state_dict(self):
+                    return {}
+            namespace.update(backbone=EmptyState(), heads_fc=EmptyState(),
+                             heads={'colour': ['white'], 'make': ['unknown']},
+                             names=['colour', 'make'], cnames=[])
+            checkpoint = eval(compile(ast.Expression(save.args[0]), '<train checkpoint>', 'eval'), namespace)
+            assert checkpoint['floors'] == floors and checkpoint['withheld'] == withheld, \
+                'actual checkpoint must carry calibration metadata'
+
 
 def review_validation():
     with dataset() as (root, heads):
@@ -249,9 +266,284 @@ def review_cli_gate():
         assert False, '199 road crops must reject training/check'
 
 
+def promotion_floors():
+    import selfloop as sl
+    def rep(**accs):
+        measured = [v for v in accs.values() if v is not None]
+        return {'per_head_acc': accs, 'mean_acc': sum(measured) / len(measured) if measured else None}
+    champ = rep(type=.89, axles=.91, colour=None)
+    assert sl.promote_attrs(rep(type=.90, axles=.92, colour=.50), champ), 'compare shared heads'
+    assert not sl.promote_attrs(rep(type=.89, axles=.91, colour=None), champ), 'shared tie without new measurement'
+    assert not sl.promote_attrs(rep(type=.885, axles=.905, colour=.50), champ), 'added colour cannot excuse regression'
+    assert not sl.promote_attrs(rep(type=.884, axles=.904, colour=.99), champ), 'colour gains cannot excuse type and axles regression'
+    assert not sl.promote_attrs(rep(type=.89, axles=.91, colour=.50), champ), 'added colour cannot break a tie'
+    assert not sl.promote_attrs(rep(type=.86, axles=.88, make=.80), rep(type=.89, axles=.91, make=.40)), 'make gains cannot offset established-head regression'
+    assert not sl.promote_attrs(rep(type=.90, axles=.92, **{'axle-config': None}), rep(type=.89, axles=.91, **{'axle-config': .8})), 'candidate cannot drop a measured non-floored head'
+    assert not sl.promote_attrs(rep(make=.99), champ), 'no shared measurements'
+    assert not sl.promote_attrs(None, champ)
+    assert sl.promote_attrs(None, None), 'no champion behaves as before'
+    assert sl.promote_attrs(rep(type=.1), {'mean_acc': None})
+    assert sl.promote_attrs(rep(type=.90, axles=.92, colour=None), rep(type=.89, axles=.91, colour=.99)), 'missing floored colour does not enter promotion'
+    assert not sl.promote_attrs(rep(type=.8, make=1.), {'mean_acc': .85}), 'legacy comparison excludes floored heads'
+    assert sl.promote_attrs(rep(type=.9, colour=.1), {'mean_acc': .85}), 'legacy comparison uses established-head mean'
+
+
+
+def calibration_floors():
+    heads = {'colour': ['white', 'blue'], 'make': ['Toyota', 'unknown'], 'type': ['van']}
+    # Low-confidence errors are withheld; tied confidence crops enter together.
+    probs = {'colour': [[.6, .4]] * 20 + [[.8, .2]] * 80,
+             'make': [[.95, .05]] * 99}
+    labels = {'colour': [1] * 20 + [0] * 80, 'make': [0] * 99}
+    floors, withheld, stats = ta.calibrate_floors(probs, labels, heads)
+    assert floors == {'colour': .8} and withheld == ['make'], (floors, withheld)
+    assert stats['colour']['coverage'] == .8 and stats['colour']['precision'] == 1.0
+    assert stats['colour']['emitted'] == 80 and .97 < stats['colour']['lower_bound'] < 1.
+    floors, withheld, _ = ta.calibrate_floors({'colour': [[.8, .2]] * 100},
+                                            {'colour': [0] * 89 + [1] * 11}, {'colour': heads['colour']})
+    assert not floors and withheld == ['colour'], 'ties cannot be split to fake precision'
+    floors, withheld, stats = ta.calibrate_floors({'colour': [[.6, .4]] * 100},
+                                                {'colour': [0] * 90 + [1] * 10}, {'colour': heads['colour']})
+    assert not floors and withheld == ['colour'], 'point precision .90 has a Wilson lower bound below .90'
+    floors, withheld, stats = ta.calibrate_floors({'colour': [[.6, .4]] * 100},
+                                                {'colour': [0] * 92 + [1] * 8}, {'colour': heads['colour']})
+    assert not floors and withheld == ['colour'], '92/100 must be withheld by the 90% one-sided Wilson bound'
+    floors, withheld, _ = ta.calibrate_floors({}, {}, heads)
+    assert not floors and withheld == ['colour', 'make'], 'missing validation is withheld'
+    floors, withheld, stats = ta.calibrate_floors({'make': [[.1, .9]] * 100},
+                                                {'make': [1] * 100}, {'make': heads['make']})
+    assert not floors and withheld == ['make'], 'unknown is not covered'
+    floors, withheld, stats = ta.calibrate_floors({'colour': [[.8, .2]] * 100},
+        {'colour': [1] * 100}, {'colour': heads['colour']}, {'colour': [['blue']] * 100})
+    assert floors == {'colour': .2} and stats['colour']['precision'] == 1., 'same constrained choice, full-head probability'
+    floors, withheld, _ = ta.calibrate_floors({'colour': [[.8, .2]] * 100},
+        {'colour': [0] * 99 + [-1]}, {'colour': heads['colour']})
+    assert withheld == ['colour'], 'unlabelled crops do not count toward MIN_VAL'
+
+    # Precision need not rise monotonically with threshold; choose the lowest success.
+    floors, withheld, stats = ta.calibrate_floors({'colour': [[.9, .1]] * 10 + [[.8, .2]] * 10 + [[.7, .3]] * 180},
+        {'colour': [0] * 10 + [1] * 10 + [0] * 180}, {'colour': heads['colour']})
+    assert floors == {'colour': .7} and stats['colour']['coverage'] == 1. and stats['colour']['precision'] == .95
+    assert stats['colour']['emitted'] == 200 and stats['colour']['lower_bound'] >= .9
+
+
+def calibration_min_emit():
+    for emitted in (1, 49, 50):
+        floors, withheld, stats = ta.calibrate_floors(
+            {'make': [[.99, .01]] * emitted + [[.01, .99]] * (100 - emitted)},
+            {'make': [0] * emitted + [1] * (100 - emitted)}, {'make': ['Toyota', 'unknown']})
+        if emitted < 50:
+            assert not floors and withheld == ['make'], f'{emitted} emissions cannot qualify'
+        else:
+            assert floors == {'make': .99} and not withheld, '50 perfect emissions qualify'
+            assert stats['make']['emitted'] == 50 and stats['make']['lower_bound'] >= .9
+
+
+def suppressed_calibration():
+    for head in ('colour', 'make'):
+        for value in ('unknown', 'other'):
+            floors, withheld, stats = ta.calibrate_floors(
+                {head: [[.99, .01]] * 100}, {head: [0] * 100}, {head: [value, 'valid']})
+            assert not floors and withheld == [head], f'{head}/{value} must not count as emissions'
+            assert stats[head]['coverage'] == 0.
+
+
+def suppressed_selection():
+    import detect
+    for head in ('colour', 'make'):
+        for value in ('unknown', 'other'):
+            assert detect.select_attr(head, [4., 0.], [value, 'valid'], None, {}, []) is None, f'{head}/{value} must stay silent'
+    assert detect.select_attr('type', [4., 0.], ['other', 'van'], None, {}, []) == 'other', 'only floored heads suppress'
+
+
+def training_constraint_path():
+    import detect
+    import torch
+    # Execute train's actual calibration wiring, including the real YAML path lookup.
+    body = ast.parse(inspect.getsource(ta.train)).body[0].body
+    start = next(i for i, node in enumerate(body) if isinstance(node, ast.Assign)
+                 and any(isinstance(t, ast.Name) and t.id == 'cons' for t in node.targets))
+    end = next(i for i, node in enumerate(body) if isinstance(node, ast.Assign)
+               and isinstance(node.targets[0], ast.Tuple)
+               and [t.id for t in node.targets[0].elts] == ['floors', 'withheld', 'calibration'])
+    wiring = compile(ast.Module(body=body[start:end + 1], type_ignores=[]), '<train calibration>', 'exec')
+    with dataset() as (root, _):
+        heads = {'colour': ['white', 'blue']}
+        (root / 'attributes.yaml').write_text(yaml.safe_dump(
+            {**heads, 'constraints': {'truck': {'colour': ['blue']}, 'car': {'colour': ['white']}}}))
+        out = root / 'attr_runs/round2/attrs.pt'
+        out.parent.mkdir(parents=True)
+        assert not (out.parent / 'attributes.yaml').exists()
+        namespace = {**vars(ta), 'attr_constraints': detect.attr_constraints, 'out': out,
+                     'heads': heads, 'names': ['colour'], 'cnames': ['car', 'truck'],
+                     'classes': [0] + [1] * 100, 'val': torch.tensor([False] + [True] * 100),
+                     'yv': torch.tensor([[1]] * 100), 'probabilities': {'colour': [[.8, .2]] * 100}}
+        exec(wiring, namespace)
+        assert namespace['floors'] == {'colour': .2}, 'train must load dataset constraints, not run-local YAML'
+        assert namespace['withheld'] == []
+        assert namespace['val_classes'] == ['truck'] * 100, 'validation classes exclude the training car'
+        assert namespace['calibration']['colour']['coverage'] == 1. and namespace['calibration']['colour']['precision'] == 1.
+        assert detect.select_attr('colour', [0., -1.3862943611198906], heads['colour'], ['blue'],
+                                  namespace['floors'], []) == 'blue'
+
+        # Execute the actual run-save path, then load both deployment locations.
+        from torchvision.models import mobilenet_v3_small
+        model = mobilenet_v3_small(weights=None)
+        fc = torch.nn.ModuleList([torch.nn.Linear(578, 2)])
+        with torch.no_grad():
+            fc[0].weight.zero_()
+            fc[0].bias.copy_(torch.tensor([0., -1.3862943]))
+        save_start = next(i for i, node in enumerate(body) if isinstance(node, ast.Assign)
+                          and any(isinstance(t, ast.Name) and t.id == 'run' for t in node.targets))
+        save_end = next(i for i, node in enumerate(body) if isinstance(node, ast.Expr)
+                        and isinstance(node.value, ast.Call)
+                        and isinstance(node.value.func, ast.Attribute) and node.value.func.attr == 'save')
+        saving = compile(ast.Module(body=body[save_start:save_end + 1], type_ignores=[]),
+                         '<train save>', 'exec')
+        namespace.update(torch=torch, RUNS=root / 'attr_runs', backbone=model.features, heads_fc=fc)
+        exec(saving, namespace)
+        deployed = root / 'attrs-champion.pt'
+        deployed.write_bytes(namespace['out'].read_bytes())
+        image = Image.new('RGB', (32, 32))
+        for path in (namespace['out'], deployed):
+            checkpoint = torch.load(path, weights_only=True)
+            assert checkpoint['floors'] == namespace['floors'] == {'colour': .2}
+            assert detect.attr_classifier(path)(image, 'truck') == {'colour': 'blue'}, \
+                f'{path.parent.name} deployment must use calibrated constraints and floor'
+            checkpoint['floors'] = {'colour': .21}
+            torch.save(checkpoint, path)
+            assert detect.attr_classifier(path)(image, 'truck') == {}, 'loader enforces the same floor'
+        assert (namespace['run'] / 'attributes.yaml').read_bytes() == (root / 'attributes.yaml').read_bytes()
+        (root / 'attributes.yaml').unlink()
+        namespace['RUNS'] = root / 'without-yaml'
+        exec(saving, namespace)
+        assert namespace['out'].is_file() and not (namespace['run'] / 'attributes.yaml').exists(), \
+            'missing dataset YAML remains a silent skip'
+
+
+def champion_calibration_metadata():
+    import selfloop as sl
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        run = root / 'round2'; run.mkdir()
+        (run / 'attrs.pt').write_bytes(b'checkpoint')
+        rep = {'mean_acc': .9, 'per_head_acc': {'colour': .9}, 'floors': {'colour': .2},
+               'withheld': ['make'], 'calibration': {'colour': {'coverage': 1., 'precision': 1.}}}
+        for report in (rep, {'mean_acc': .9, 'per_head_acc': {'colour': .9}}):
+            state, client = {}, Mock()
+            with patch.object(sl, 'ATTRS_CHAMPION', root / 'attrs-champion.pt'), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                sl.crown_attrs(state, run, report, client, 'test-bucket')
+            published = client.put_object.call_args.kwargs
+            assert published['Bucket'] == 'test-bucket'
+            assert published['Key'] == f'{sl.MODELS}attrs-champion.json'
+            assert json.loads(published['Body']) == state['attrs_champion']
+            for key, default in (('floors', {}), ('withheld', []), ('calibration', {})):
+                assert state['attrs_champion'].get(key) == report.get(key, default), \
+                    f'champion must preserve {key}, including legacy defaults'
+            assert (root / 'attrs-champion.pt').read_bytes() == b'checkpoint'
+
+
+def champion_constraints_publication():
+    import selfloop as sl
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        run = root / 'round'; run.mkdir()
+        (run / 'attrs.pt').write_bytes(b'checkpoint')
+        rules = root / 'attributes.yaml'
+        rules.write_text('constraints: {truck: {colour: [blue]}}\n')
+        for exists in (True, False):
+            if not exists:
+                rules.unlink()
+            client = Mock()
+            with patch.object(sl, 'DATASET', root), patch.object(sl, 'ATTRS_CHAMPION', root / 'attrs-champion.pt'), contextlib.redirect_stdout(io.StringIO()):
+                sl.crown_attrs({}, run, {'mean_acc': .9, 'per_head_acc': {'type': .9}}, client, 'test-bucket')
+            yaml_calls = [c.args for c in client.upload_file.call_args_list if c.args[2] == f'{sl.MODELS}attributes.yaml']
+            assert yaml_calls == ([(str(rules), 'test-bucket', f'{sl.MODELS}attributes.yaml')] if exists else []), 'publish dataset constraints alongside deployed champion when present'
+
+
+def champion_constraints_download():
+    import detect
+    import selfloop as sl
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        run = root / 'round'; run.mkdir()
+        (run / 'attrs.pt').write_bytes(b'checkpoint')
+        rules = root / 'attributes.yaml'
+        deployed = root / 'deployed'; deployed.mkdir()
+        objects = {}
+        client = Mock()
+        client.upload_file.side_effect = lambda path, bucket, key: objects.update({key: Path(path).read_bytes()})
+        client.put_object.side_effect = lambda **kw: objects.update({kw['Key']: kw['Body']})
+        client.head_object.side_effect = lambda **kw: {'ContentLength': len(objects[kw['Key']])}
+        client.download_file.side_effect = lambda bucket, key, path: Path(path).write_bytes(objects[key])
+        for colour in ('blue', 'grey', 'orange'):
+            rules.write_text(f'constraints: {{truck: {{colour: [{colour}]}}}}\n')
+            with patch.object(sl, 'DATASET', root), patch.object(sl, 'ATTRS_CHAMPION', root / 'attrs-champion.pt'), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                sl.crown_attrs({}, run, {'mean_acc': .9, 'per_head_acc': {'type': .9}}, client, 'test-bucket')
+                got = dataset_sync.models(client, 'test-bucket', deployed)
+            assert (deployed / 'attrs-champion.pt').read_bytes() == b'checkpoint'
+            if colour == 'blue':
+                assert 'attributes.yaml' in got, 'fresh node downloads published constraints'
+                assert (deployed / 'attributes.yaml').read_bytes() == rules.read_bytes()
+            else:
+                assert 'attributes.yaml' not in got, 'existing live vocabulary must never be overwritten, regardless of size'
+                assert (deployed / 'attributes.yaml').read_bytes() == local_rules
+            assert detect.attr_constraints(deployed / 'attrs-champion.pt') == {'truck': {'colour': ['blue']}}, \
+                'deployed champion must read the preserved live constraints beside its weights'
+            local_rules = (deployed / 'attributes.yaml').read_bytes()
+        del objects[f'{sl.MODELS}attributes.yaml']
+        (deployed / 'attributes.yaml').unlink()
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            got = dataset_sync.models(client, 'test-bucket', deployed)
+        assert 'attributes.yaml' not in got and 'attributes.yaml' not in output.getvalue(), 'missing remote constraints skipped silently'
+        assert not (deployed / 'attributes.yaml').exists()
+
+
+def selection_floors():
+    import detect
+    select = detect.select_attr
+    assert select('colour', [4., 0.], ['white', 'blue'], None, {'colour': .9}, ['colour']) is None
+    assert select('colour', [0., 0.], ['white', 'blue'], None, {'colour': .9}, []) is None
+    assert select('colour', [4., 0.], ['white', 'blue'], None, {'colour': .9}, []) == 'white'
+    assert select('colour', [4., 0.], ['white', 'blue'], ['blue'], {'colour': .9}, []) is None
+    assert select('make', [0., 4.], ['Toyota', 'unknown'], None, {}, []) is None
+    assert select('colour', [0., 0.], ['white', 'blue'], None, None, None) == 'white'
+    assert select('make', [0., 4.], ['Toyota', 'unknown'], None, None, None) == 'unknown', 'legacy unchanged'
+    assert select('type', [0., 1.], ['van', 'bus'], None, {}, []) == 'bus'
+    assert select('colour', [0., 0.], ['white', 'blue'], None, {'colour': .5}, []) == 'white', 'floor inclusive'
+    assert select('colour', [1., 0.], ['white', 'blue'], [], {}, []) is None
+
+    # Exercise the real weights_only loader and its selection wiring, without downloads.
+    import torch
+    from torchvision.models import mobilenet_v3_small
+    with tempfile.TemporaryDirectory() as td:
+        heads = {'colour': ['white', 'blue'], 'make': ['Toyota', 'unknown'], 'type': ['van', 'bus']}
+        model = mobilenet_v3_small(weights=None)
+        fc = torch.nn.ModuleList([torch.nn.Linear(576, 2) for _ in heads])
+        with torch.no_grad():
+            for layer, bias in zip(fc, ([0., 0.], [0., 4.], [0., 1.])):
+                layer.weight.zero_()
+                layer.bias.copy_(torch.tensor(bias))
+        ck = {'state_dict': {**{f'features.{k}': v for k, v in model.features.state_dict().items()},
+                             **{f'fc.{k}': v for k, v in fc.state_dict().items()}},
+              'heads': heads, 'input': 32}
+        path = Path(td) / 'attrs.pt'
+        image = Image.new('RGB', (32, 32))
+        torch.save(ck, path)
+        assert detect.attr_classifier(path)(image) == {'colour': 'white', 'make': 'unknown', 'type': 'bus'}
+        ck.update(floors={'colour': .9}, withheld=[])
+        torch.save(ck, path)
+        assert detect.attr_classifier(path)(image) == {'type': 'bus'}, 'loader uses floors and suppresses unknown'
+        ck.update(floors={'colour': .5}, withheld=['colour'])
+        torch.save(ck, path)
+        assert detect.attr_classifier(path)(image) == {'type': 'bus'}, 'withheld overrides passing floor'
+
+
 def main():
     failures = []
-    for test in [review_archive_validation, review_cli_gate, review_validation, review_external_default, human_wins, stale_bbox, ai_only_and_last_line, archive_and_reference, external, counts_and_sync, run_file_order, training_mask_and_report]:
+    for test in [calibration_min_emit, suppressed_calibration, suppressed_selection, training_constraint_path, champion_constraints_publication, champion_constraints_download, champion_calibration_metadata, promotion_floors, calibration_floors, selection_floors, review_archive_validation, review_cli_gate, review_validation, review_external_default, human_wins, stale_bbox, ai_only_and_last_line, archive_and_reference, external, counts_and_sync, run_file_order, training_mask_and_report]:
         try:
             test()
             print(f'PASS {test.__name__}')

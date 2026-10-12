@@ -19,7 +19,7 @@ import time
 import uuid
 from collections import Counter
 from functools import lru_cache
-from math import hypot, isfinite
+from math import exp, hypot, isfinite
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from statistics import median
@@ -31,6 +31,8 @@ CLASS_IDS = {n: i for i, n in enumerate(CLASSES.values())}       # dataset ids, 
 COLORS = {}               # class -> RGB, filled by palette() when a model loads
 WEIGHTS = "yolov8n.pt"
 WHEEL = "wheel"          # a detector class, but never a vehicle: it feeds axle counting
+FLOORED_ATTR_HEADS = ("colour", "make")
+SUPPRESSED_ATTR_VALUES = {"unknown", "other"}
 CONF = 0.4
 IMGSZ = 1280      # sub-streams are 1280x720, so this is ~native; 640 missed distant trucks
 FPS = 5           # ffmpeg decimates to this — the loop then runs flat out
@@ -268,7 +270,8 @@ def attr_classifier(path, dev="cpu"):
         allowed = cons.get(cls) or {}
         a = {}
         for n in names:
-            v = constrained(scores[n], vocab[n], allowed.get(n))
+            v = select_attr(n, scores[n], vocab[n], allowed.get(n),
+                            ck.get("floors"), ck.get("withheld"))
             if v is not None:
                 a[n] = v
         # The config head reads the wheel grouping better than the axles head counts, so
@@ -385,6 +388,28 @@ def constrained(scores, values, allowed):
         return values[max(range(len(values)), key=lambda i: scores[i])]
     ok = [i for i, v in enumerate(values) if v in allowed]
     return values[max(ok, key=lambda i: scores[i])] if ok else None
+
+
+def softmax_scores(scores):
+    peak = max(scores)
+    weights = [exp(s - peak) for s in scores]
+    total = sum(weights)
+    return [w / total for w in weights]
+
+
+def select_attr(head, scores, values, allowed, floors=None, withheld=None):
+    """Legacy checkpoints keep their choices; calibrated heads may stay silent."""
+    if head in (withheld or []):
+        return None
+    value = constrained(scores, values, allowed)
+    if value is None:
+        return None
+    if (head in FLOORED_ATTR_HEADS and value in SUPPRESSED_ATTR_VALUES
+            and (floors is not None or withheld is not None)):
+        return None
+    if head in (floors or {}) and softmax_scores(scores)[values.index(value)] < floors[head]:
+        return None
+    return value
 
 
 def config_axles(value):

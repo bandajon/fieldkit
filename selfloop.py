@@ -23,8 +23,12 @@ the reference set, and promotes it to champion only if that score improved. The 
 pre-labels the next ingest pass — the loop closes there. Site boxes keep whatever weights
 they were given until someone deploys models/champion.pt: promoting the pre-labeller is
 cheap to be wrong about, promoting a toll gate's detector is not. The attribute classifier
-rides the same pass on the same curated set — trained after the detector, promoted on its
-own mean val accuracy, and used by the next ingest to pre-fill attribute suggestions.
+rides the same pass on the same curated set — trained after the detector and promoted
+on strictly better mean accuracy across shared non-floored heads, without losing any
+non-floored head measured by the champion. The next ingest uses it to pre-fill suggestions;
+colour/make do not affect promotion. Their floors require 100 labelled human val crops,
+50 emitted crops, and a 90% one-sided Wilson precision lower bound of at least .90;
+unknown/other stay silent.
 
 Classify is the other direction: the same champion, run over the mirrored recordings, is
 what turns a gate that only records into a gate that reports. Its events go to the bucket
@@ -252,14 +256,31 @@ def promote(candidate, champion):
 
 
 def promote_attrs(candidate, champion):
-    """The same rule for the attribute classifier, on the mean val accuracy across its
-    heads: a hand-trained champion with no report to compare against loses to anything,
-    otherwise a run has to be strictly better. Mean, not per-head — the heads share one
-    backbone, so they are promoted or not as one model."""
+    """Require improvement on shared non-floored heads without losing measurements."""
+    from detect import FLOORED_ATTR_HEADS
+
     if champion is None or champion.get("mean_acc") is None:
         return True
-    return bool(candidate) and candidate.get("mean_acc") is not None \
-        and candidate["mean_acc"] > champion["mean_acc"]
+    if not candidate:
+        return False
+    ca, ch = candidate.get("per_head_acc"), champion.get("per_head_acc")
+    if ch is None:     # legacy champion reports containing only the mean
+        measured = [acc for h, acc in (ca or {}).items()
+                    if h not in FLOORED_ATTR_HEADS and acc is not None]
+        mean = candidate.get("mean_acc") if ca is None else None
+        if measured:
+            mean = sum(measured) / len(measured)
+        return mean is not None and mean > champion["mean_acc"]
+    if ca is None or any(h not in FLOORED_ATTR_HEADS and acc is not None and ca.get(h) is None
+                         for h, acc in ch.items()):
+        return False
+    shared = [h for h, acc in ca.items()
+              if h not in FLOORED_ATTR_HEADS and acc is not None and ch.get(h) is not None]
+    if not shared:
+        return False
+    candidate_mean = sum(ca[h] for h in shared) / len(shared)
+    champion_mean = sum(ch[h] for h in shared) / len(shared)
+    return candidate_mean > champion_mean
 
 
 def local_path(key):
@@ -1947,9 +1968,14 @@ def crown_attrs(s, run, rep, cl, bucket):
     weights = run / "attrs.pt"
     shutil.copy2(weights, ATTRS_CHAMPION)
     s["attrs_champion"] = {"run": run.name, "at": now(), "mean_acc": rep and rep["mean_acc"],
-                           "per_head_acc": rep and rep["per_head_acc"]}
+                           "per_head_acc": rep and rep["per_head_acc"],
+                           "floors": (rep or {}).get("floors", {}),
+                           "withheld": (rep or {}).get("withheld", []),
+                           "calibration": (rep or {}).get("calibration", {})}
     for key in (f"{ATTR_MODELS}{run.name}/attrs.pt", f"{MODELS}attrs-champion.pt"):
         cl.upload_file(str(weights), bucket, key)
+    if (DATASET / "attributes.yaml").is_file():
+        cl.upload_file(str(DATASET / "attributes.yaml"), bucket, f"{MODELS}attributes.yaml")
     if (run / "report.json").is_file():
         cl.upload_file(str(run / "report.json"), bucket, f"{ATTR_MODELS}{run.name}/report.json")
     cl.put_object(Bucket=bucket, Key=f"{MODELS}attrs-champion.json",
@@ -3134,6 +3160,14 @@ def selfcheck():
     assert promote_attrs({"mean_acc": 0.88}, {"mean_acc": 0.87})
     assert not promote_attrs({"mean_acc": 0.87}, {"mean_acc": 0.87}), "a tie is not an improvement"
     assert not promote_attrs(None, {"mean_acc": 0.87}), "no report, no promotion"
+    attrs_champ = {"mean_acc": .90, "per_head_acc": {"type": .89, "axles": .91}}
+    assert promote_attrs({"mean_acc": .77, "per_head_acc": {"type": .90, "axles": .92, "make": .50}}, attrs_champ)
+    assert not promote_attrs({"mean_acc": .76, "per_head_acc": {"type": .885, "axles": .905, "make": .50}}, attrs_champ)
+    assert not promote_attrs({"mean_acc": .93, "per_head_acc": {"type": .884, "axles": .904, "make": .99}}, attrs_champ)
+    assert not promote_attrs({"mean_acc": .90, "per_head_acc": {"type": .89, "axles": .91, "make": None}}, attrs_champ)
+    assert not promote_attrs({"mean_acc": .99, "per_head_acc": {"make": .99}}, attrs_champ)
+    assert not promote_attrs({"mean_acc": .92, "per_head_acc": {"type": .92}}, attrs_champ), "do not lose a champion measurement"
+    assert not promote_attrs({"mean_acc": .90, "per_head_acc": {"type": .8, "make": 1.}}, {"mean_acc": .85}), "legacy comparison excludes floored heads"
     assert local_path("site1/cam3/20260827-100000.mkv").parent.name == "cam3", \
         "the camera must be the parent directory, or every camera samples as one"
     assert wanted_classes({"a": 5, "b": 300, "c": 299, "d": 0}, target=300) == ["a", "c", "d"]
@@ -3346,8 +3380,12 @@ def selfcheck():
     assert lag["cam"][2] == lag["cam"][0] and lag["other"][2] == lag["other"][0]   # oldest hole, not newest
     print("selfloop self-check ok: cameras found under any gate prefix, newest unsampled segments "
           "picked per camera, training triggers on the cumulative threshold, promotion needs a "
-          "strictly better reference score (detector) or mean val accuracy (attributes) unless "
-          "there is no comparable champion, unclassified segments drained oldest first "
+          "strictly better reference score (detector) or mean accuracy on shared non-floored heads "
+          "(attributes), without losing champion measurements, "
+          "unless there is no comparable champion. colour/make are emitted only at or above "
+          "floors with a 90% one-sided Wilson lower bound >= .90, 100 labelled human val crops "
+          "and 50 emissions; unknown/other stay silent; "
+          "unclassified segments drained oldest first "
           "under their gate's id")
 
 
