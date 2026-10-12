@@ -661,16 +661,19 @@ def selfcheck():
 def models(cl, bucket, root=DATASET):
     """The crowned weights (selfloop adopt publishes them under models/) into dataset/,
     where config.yaml's detect_weights / attr_weights point on a console. Same size and
-    name = same weights, like push/pull; metadata and attribute rules always refresh."""
+    name = same weights, like push/pull; metadata always refreshes. Attribute rules
+    bootstrap fresh nodes only; config pull updates the live vocabulary."""
     got = []
     for name in ("champion.pt", "champion.json", "attrs-champion.pt", "attrs-champion.json", "attributes.yaml"):
+        dest = root / name
+        if name == "attributes.yaml" and dest.exists():
+            continue
         key = "models/" + name
         try:
             size = cl.head_object(Bucket=bucket, Key=key)["ContentLength"]
         except Exception:
             continue                      # nothing crowned yet
-        dest = root / name
-        # Small metadata and attribute rules can change without changing size.
+        # Small metadata can change without changing size.
         if name.endswith(".pt") and dest.exists() and dest.stat().st_size == size:
             continue
         cl.download_file(bucket, key, str(dest))

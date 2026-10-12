@@ -305,6 +305,9 @@ def calibration_floors():
     floors, withheld, stats = ta.calibrate_floors({'colour': [[.6, .4]] * 100},
                                                 {'colour': [0] * 90 + [1] * 10}, {'colour': heads['colour']})
     assert not floors and withheld == ['colour'], 'point precision .90 has a Wilson lower bound below .90'
+    floors, withheld, stats = ta.calibrate_floors({'colour': [[.6, .4]] * 100},
+                                                {'colour': [0] * 92 + [1] * 8}, {'colour': heads['colour']})
+    assert not floors and withheld == ['colour'], '92/100 must be withheld by the 90% one-sided Wilson bound'
     floors, withheld, _ = ta.calibrate_floors({}, {}, heads)
     assert not floors and withheld == ['colour', 'make'], 'missing validation is withheld'
     floors, withheld, stats = ta.calibrate_floors({'make': [[.1, .9]] * 100},
@@ -474,17 +477,22 @@ def champion_constraints_download():
         client.put_object.side_effect = lambda **kw: objects.update({kw['Key']: kw['Body']})
         client.head_object.side_effect = lambda **kw: {'ContentLength': len(objects[kw['Key']])}
         client.download_file.side_effect = lambda bucket, key, path: Path(path).write_bytes(objects[key])
-        for colour in ('blue', 'grey'):
+        for colour in ('blue', 'grey', 'orange'):
             rules.write_text(f'constraints: {{truck: {{colour: [{colour}]}}}}\n')
             with patch.object(sl, 'DATASET', root), patch.object(sl, 'ATTRS_CHAMPION', root / 'attrs-champion.pt'), \
                  contextlib.redirect_stdout(io.StringIO()):
                 sl.crown_attrs({}, run, {'mean_acc': .9, 'per_head_acc': {'type': .9}}, client, 'test-bucket')
                 got = dataset_sync.models(client, 'test-bucket', deployed)
             assert (deployed / 'attrs-champion.pt').read_bytes() == b'checkpoint'
-            assert 'attributes.yaml' in got, 'download published constraints, including same-size updates'
-            assert (deployed / 'attributes.yaml').read_bytes() == rules.read_bytes()
-            assert detect.attr_constraints(deployed / 'attrs-champion.pt') == {'truck': {'colour': [colour]}}, \
-                'deployed champion must read the published constraints beside its weights'
+            if colour == 'blue':
+                assert 'attributes.yaml' in got, 'fresh node downloads published constraints'
+                assert (deployed / 'attributes.yaml').read_bytes() == rules.read_bytes()
+            else:
+                assert 'attributes.yaml' not in got, 'existing live vocabulary must never be overwritten, regardless of size'
+                assert (deployed / 'attributes.yaml').read_bytes() == local_rules
+            assert detect.attr_constraints(deployed / 'attrs-champion.pt') == {'truck': {'colour': ['blue']}}, \
+                'deployed champion must read the preserved live constraints beside its weights'
+            local_rules = (deployed / 'attributes.yaml').read_bytes()
         del objects[f'{sl.MODELS}attributes.yaml']
         (deployed / 'attributes.yaml').unlink()
         with contextlib.redirect_stdout(io.StringIO()) as output:
