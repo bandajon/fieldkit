@@ -9,7 +9,7 @@ curators approve ─► bucket ─► selfloop train (checked hourly)
         (waits while classify has a backlog, except 00:00–05:00 Lusaka when the gates are near-empty and the backlog is under NIGHT_LEFT segments)
         ≥ 1,000 new frames outside the reference set ─► train.py ─► score on the reference
         ─► better than the champion? ─► champion.pt (pre-labels the next ingest) + models/ in the bucket
-        then train_attrs.py on the same set ─► better mean val accuracy across the heads?
+        then train_attrs.py on the same set ─► better mean on shared measured heads (or ≤0.005 loss to add a measured head)?
         ─► attrs-champion.pt (suggests attributes on the next ingest) + models/attrs/ in the bucket
 bucket ─► selfloop classify (every 10 min)
         newest un-classified segments ─► the LIVE pipeline on footage time (champion +
@@ -23,9 +23,10 @@ bucket ─► selfloop classify (every 10 min)
 - `./run_training.sh` — train now regardless of the threshold; same lock, same promotion.
 - `python selfloop.py adopt <run>` — crown a run trained by hand; `adopt-attrs <run>` does
   the same for a `dataset/attr_runs/` run (the 2026-08-27 baseline was one).
-- The attribute classifier is promoted on the mean of its per-head val accuracies, written
-  by `train_attrs.py` to `report.json` next to `attrs.pt`. It is judged separately from the
-  detector: a run that fails to train the heads leaves the detector's promotion standing.
+- The attribute classifier is judged separately from the detector on shared measured heads
+  in `report.json`: its mean must improve, except adding a measured head allows a loss of
+  at most 0.005. colour/make are emitted only at or above their 90%-precision floors and
+  withheld below 100 human val crops; a failed attribute run leaves detector promotion standing.
 - Ingest pre-fills `pending/suggest/<stem>.json` with the attrs champion's guesses, so
   curators correct attributes instead of typing them. A suggestion is never a record — the
   Label tab drops it the moment the sample is saved.
