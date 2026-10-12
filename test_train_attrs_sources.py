@@ -413,12 +413,42 @@ def calibration_min_emit():
     for emitted in (1, 49, 50):
         floors, withheld, stats = ta.calibrate_floors(
             {'make': [[.99, .01]] * emitted + [[.01, .99]] * (100 - emitted)},
-            {'make': [0] * emitted + [1] * (100 - emitted)}, {'make': ['Toyota', 'unknown']})
+            {'make': [0] * emitted + [1] * (100 - emitted)}, {'make': ['Toyota', 'other']})
         if emitted < 50:
             assert not floors and withheld == ['make'], f'{emitted} emissions cannot qualify'
         else:
             assert floors == {'make': .99} and not withheld, '50 perfect emissions qualify'
             assert stats['make']['emitted'] == 50 and stats['make']['lower_bound'] >= .9
+
+
+def calibration_unknown_truth():
+    for head in ('colour', 'make'):
+        heads = {head: ['valid', 'unknown', 'other']}
+        floors, withheld, stats = ta.calibrate_floors(
+            {head: [[.9, .05, .05]] * 70 + [[.05, .9, .05]] * 30},
+            {head: [0] * 70 + [1] * 30}, heads)
+        assert not floors and withheld == [head], '70 known truths cannot meet MIN_VAL'
+        assert stats[head]['labelled_known'] == 70
+
+        floors, withheld, stats = ta.calibrate_floors(
+            {head: [[.9, .05, .05]] * 100 + [[.05, .9, .05]] * 30},
+            {head: [0] * 100 + [1] * 30}, heads)
+        assert floors == {head: .9} and not withheld
+        assert stats[head]['labelled_known'] == 100 and stats[head]['coverage'] == 1.
+
+        floors, withheld, stats = ta.calibrate_floors(
+            {head: [[.9, .05, .05]] * 100 + [[.05, .9, .05]]},
+            {head: [0] * 99 + [1, 0]}, heads)
+        assert floors == {head: .9} and not withheld
+        assert stats[head]['emitted'] == 100 and stats[head]['precision'] == .99, \
+            'emission on an unknown truth must count as wrong'
+        assert stats[head]['labelled_known'] == 100 and stats[head]['coverage'] == 1.
+
+        floors, withheld, stats = ta.calibrate_floors(
+            {head: [[.9, .05, .05]] * 70 + [[.05, .05, .9]] * 30},
+            {head: [0] * 70 + [2] * 30}, heads)
+        assert floors == {head: .9} and not withheld, 'other truths count toward MIN_VAL'
+        assert stats[head]['labelled_known'] == 100 and stats[head]['coverage'] == .7
 
 
 def suppressed_calibration():
@@ -626,7 +656,7 @@ def selection_floors():
 
 def main():
     failures = []
-    for test in [calibration_min_emit, suppressed_calibration, suppressed_selection, training_constraint_path, champion_constraints_publication, champion_constraints_download, champion_calibration_metadata, promotion_floors, promotion_floor_gain, promotion_floor_gain_history, promotion_floor_gain_null_metadata, calibration_floors, selection_floors, review_archive_validation, review_cli_gate, review_validation, review_external_default, human_wins, stale_bbox, ai_only_and_last_line, archive_and_reference, external, counts_and_sync, run_file_order, training_mask_and_report]:
+    for test in [calibration_unknown_truth, calibration_min_emit, suppressed_calibration, suppressed_selection, training_constraint_path, champion_constraints_publication, champion_constraints_download, champion_calibration_metadata, promotion_floors, promotion_floor_gain, promotion_floor_gain_history, promotion_floor_gain_null_metadata, calibration_floors, selection_floors, review_archive_validation, review_cli_gate, review_validation, review_external_default, human_wins, stale_bbox, ai_only_and_last_line, archive_and_reference, external, counts_and_sync, run_file_order, training_mask_and_report]:
         try:
             test()
             print(f'PASS {test.__name__}')
