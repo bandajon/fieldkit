@@ -48,6 +48,7 @@ ZONE_SHARE = 0.25    # a box is "in" a zone when this much of its area lies insi
 LEAD = 2.0           # s: an arrival may show up this long before its departure starts...
 LAG = 5.0            # ...or this long after it ends: at night cam3 locks on late (4.6 s measured)
 LAG_LATE = 12.0      # s: a late-locked chain (first seen past the zone) may start this long after the departure ends
+SLIVER_LEAD = 5.0    # s: fast vehicles can appear in the next camera before leaving the departure zone
 LATE_COS = 0.45      # a late-locked chain links only on a known appearance cosine at least this
 MU = 0.5             # s: typical departure -> arrival gap across the blind strip (0.2-2.2 measured)
 CLASS_PEN = 1.0      # s-equivalent cost of pairing two different classes
@@ -338,6 +339,14 @@ def _chains(tracklets, cameras):
             (x0, y0), (x1, y1) = _centre(first[0][1:]), _centre(first[-1][1:])
             if abs(complex(x1 - zc[0], y1 - zc[1])) - abs(complex(x0 - zc[0], y0 - zc[1])) >= MOVE:
                 ch["late"] = first[0][0]
+            elif ms[0]["hits"] < MIN_EDGE_HITS and abs(complex(x1 - x0, y1 - y0)) < MOVE:
+                # A still prefix supplies timing only to the restricted sliver swap.
+                for t in ms[1:]:
+                    (x0, y0), (x1, y1) = _centre(t["path"][0][1:]), _centre(t["path"][-1][1:])
+                    if (t["hits"] >= MIN_EDGE_HITS and
+                            abs(complex(x1 - zc[0], y1 - zc[1])) - abs(complex(x0 - zc[0], y0 - zc[1])) >= MOVE):
+                        ch["stub_late"] = path[0][0]
+                        break
             # Lost before the zone: use the last fragment's approach, not the whole chain's motion.
             last = max(ms, key=lambda t: t["t1"])["path"]
             (x0, y0), (x1, y1) = _centre(last[0][1:]), _centre(last[-1][1:])
@@ -480,7 +489,8 @@ def _links(chains, cameras, tz=None, shadows=None, absorbed=None):
     links += match(False, {id(c) for link in links for c in link}, early=True)
     links += _trucks(chains, links, pairs)
     used = {id(c) for link in links for c in link}
-    ta = lambda r: r["arr"] if r["arr"] is not None else r["late"]
+    ta = lambda r: r["arr"] if r["arr"] is not None else (
+        r["late"] if r.get("late") is not None else r["members"][0]["path"][0][0])
 
     def crosses(d, r, accepted):
         dep = d["dep"] if d["dep"] is not None else d["early"]
@@ -489,21 +499,48 @@ def _links(chains, cameras, tz=None, shadows=None, absorbed=None):
             for dd, aa in accepted if dd["class"] in HEAVY and aa["class"] in HEAVY
             and (dd["camera"], aa["camera"]) == (d["camera"], r["camera"]))
 
-    # Swap into unused late arrivals; only restricted weak-ghost recovery follows the shadow pass.
+    # Index only unused substantial late/stub arrivals; recheck ownership after each swap.
+    slivers = {}
+    chain_index = {id(c): i for i, c in enumerate(chains)}
+    for j, c in enumerate(chains):
+        arrival = c.get("late") if c.get("late") is not None else c.get("stub_late")
+        if (id(c) not in used and c["arr"] is None and arrival is not None
+                and sum(t["hits"] for t in c["members"]) >= MIN_EDGE_HITS):
+            slivers.setdefault(c["camera"], []).append((arrival, j))
+    for arrivals in slivers.values():
+        arrivals.sort()
+
+    # Preserve the original late swap; sliver recovery is an additional fallback.
     for k in range(ordinary_count):
         d, r = links[k]
         sim = _similar(d["app"], r["app"])
-        if (d["class"] == r["class"] or sim is None or sim >= LATE_COS
-                or any(t.get("counted") or t.get("direction") for t in r["members"])):
-            continue
         replacements = []
-        for c in candidates(True, used - {id(d)}):
-            L = chains[c[3]]
-            if chains[c[2]] is not d or L["class"] != d["class"]:
-                continue
-            if crosses(d, L, links):
-                continue
-            replacements.append(c)
+        if not (d["class"] == r["class"] or sim is None or sim >= LATE_COS
+                or any(t.get("counted") or t.get("direction") for t in r["members"])):
+            for c in candidates(True, used - {id(d)}):
+                L = chains[c[3]]
+                if chains[c[2]] is d and L["class"] == d["class"] and not crosses(d, L, links):
+                    replacements.append(c)
+        direction = next((t["direction"] for t in d["members"] if t.get("direction")), None)
+        weak = (sum(t["hits"] for t in r["members"]) < MIN_EDGE_HITS
+                and not any(t.get("counted") for t in r["members"])
+                and all(not t.get("direction") or t["direction"] == OPPOSITE.get(direction) for t in r["members"]))
+        if not replacements and weak and sim is not None:
+            # At 53 km/h the next camera sees the minibus before this zone loses it.
+            for cam, arrivals in slivers.items():
+                if cam == d["camera"] or frozenset((d["camera"], cam)) not in pairs:
+                    continue
+                lo = bisect_left(arrivals, d["dep"] - SLIVER_LEAD, key=lambda a: a[0])
+                hi = bisect_right(arrivals, d["z"][1] + LAG_LATE, key=lambda a: a[0])
+                for arrival, j in arrivals[lo:hi]:
+                    L = chains[j]
+                    if id(L) in used or L["class"] != d["class"]:
+                        continue
+                    look = _similar(d["app"], L["app"])
+                    if look is None or look < .8 or look - sim < .05 or crosses(d, L, links):
+                        continue
+                    t = abs(arrival - d["dep"] - MU)
+                    replacements.append((t, t + APP_PEN * (1 - look), chain_index[id(d)], j))
         if replacements:
             *_, i, j = min(replacements, key=lambda c: (c[1], c[2], c[3]))
             links[k] = (d, chains[j])
@@ -716,7 +753,9 @@ def _doc(chains, link, cfg, tz, events, absorbed=()):
         "crops": crops, "plates": plates,
         "members": members,
         "link": link and {"from": link[0]["camera"], "to": link[1]["camera"],
-                          "gap_s": round((link[1]["arr"] if link[1]["arr"] is not None else link[1]["late"]) - t, 2)},
+                          "gap_s": round((link[1]["arr"] if link[1]["arr"] is not None else (
+                              link[1]["late"] if link[1].get("late") is not None
+                              else link[1]["members"][0]["path"][0][0])) - t, 2)},
         "evidence": "handoff" if link else "line" if any(m["counted"] for m in ms) else "edge",
         "hits": sum(m["hits"] for m in ms),
         "dwell_s": round(max(m["t1"] for m in ms) - ms[0]["t0"], 1)}
@@ -1600,14 +1639,23 @@ def _selfcheck_late_priority(case):
                 "late": late, "z": (dep - 1, dep) if dep is not None else (arr, arr),
                 "members": [{"id": name, "hits": hits}]}
 
-    if case == "truck_swap_crossing":
+    if case in ("truck_swap_crossing", "weak_truck_swap_crossing"):
         chains = [chain("cam3", "A", "e-heavy", (1, 0, 0), 88, dep=36100),
                   chain("cam3", "B", "e-heavy", (0, 1, 0), 88, dep=36106),
-                  chain("cam4", "r", "b-light", (.3, 0, .91 ** .5), 88, arr=36100.5),
+                  chain("cam4", "r", "b-light", (.3, 0, .91 ** .5), 4 if case == "weak_truck_swap_crossing" else 88, arr=36100.5),
                   chain("cam4", "R2", "e-heavy", (0, 1, 0), 88, arr=36101),
                   chain("cam4", "U", "e-heavy", (1, 0, 0), 88, late=36108)]
         links = {(d["members"][0]["id"], r["members"][0]["id"]) for d, r in _links(chains, _CAMS)}
         assert links == {("A", "r"), ("B", "R2")}, ("truck swap crossing", links)
+        return
+
+    if case == "oct7_continuation":
+        chains = [chain("cam3", "06", "b-minibuses", (1, 0), 27, dep=100),
+                  chain("cam4", "07", "a-small", (.441, (1 - .441 ** 2) ** .5), 3, arr=100.4),
+                  chain("cam4", "08", "b-minibuses", (.777, (1 - .777 ** 2) ** .5), 27, late=104)]
+        chains[-1]["members"][0]["counted"] = True
+        links = {(d["members"][0]["id"], r["members"][0]["id"]) for d, r in _links(chains, _CAMS)}
+        assert links == {("06", "08")}, ("7 Oct 06:07:30 counted continuation replaces directionless sliver", links)
         return
 
     if case == "truck_swap_protection":
@@ -1707,7 +1755,123 @@ def _selfcheck_late_priority(case):
     assert links == expected, ("late priority", case, links, expected)
 
 
+def _selfcheck_duplicate_cards(case):
+    code = lambda cos: base64.b64encode(struct.pack("<32e", cos, (1 - cos * cos) ** .5, *[0.0] * 30)).decode()
+    look = {"app": code(1), "app_v": "m1", "hits": 27, "counted": True}
+    if case == "stub":
+        a = _t("cam4", "stub", "b-minibuses", [(100, _b(.27, .45, .02)), (101, _b(.27, .45, .02))], hits=4)
+        b = _t("cam4", "moving", "b-minibuses", [(101.2, _b(.28, .45, .02)), (103, _b(.5, .3, .02))],
+               hits=11, counted=True, direction="northbound", ghost_of=a["id"])
+        [ch] = _chains([a, b], _CAMS)
+        assert ch.get("late") is None and ch.get("stub_late") == 100, "stub timing must not widen general late matching"
+        d, _ = _north("stub-departure", 99.6, cls="b-minibuses", k3=look)
+        assert not _build([d, a, b], _CAMS)[2], "stub continuation never enters ordinary late pass"
+        for changes in ({"hits": MIN_EDGE_HITS}, {"path": [[100, *_b(.2, .5, .02)], [101, *_b(.27, .45, .02)]]}):
+            [guarded] = _chains([dict(a, **changes), b], _CAMS)
+            assert guarded.get("stub_late") is None, ("stub must be short and still", changes)
+        assert _chains([a, dict(b, hits=MIN_EDGE_HITS - 1)], _CAMS)[0].get("stub_late") is None
+        return
+    if case == "oct9_general_late":
+        # 9 Oct 14:05-14:10: #bc/#bd must not become a general late arrival for #b9.
+        tracks = [
+            _t('cam3', '000000b9', "a-small", [
+                (91.0, [0.067, 0.5464, 0.0881, 0.5809]),
+                (92.0, [0.0916, 0.5575, 0.1155, 0.5964]),
+                (93.0, [0.1262, 0.5764, 0.1493, 0.6119]),
+                (94.0, [0.1666, 0.5921, 0.1961, 0.634]),
+                (95.0, [0.2209, 0.6129, 0.2558, 0.6606]),
+                (96.0, [0.2957, 0.6391, 0.3381, 0.6941]),
+                (97.0, [0.3937, 0.6685, 0.4505, 0.737]),
+                (98.0, [0.5367, 0.7141, 0.6039, 0.792]),
+                (99.0, [0.7459, 0.7768, 0.8109, 0.8463]),
+                (100.0, [0.9565, 0.8084, 1.0, 0.872]),
+            ],
+               hits=46, counted=False, direction='northbound', app='o7gntJmxXLBZtm+lkLSvLlUxACZEr9wscjF7L/2y8KXArfkw8y6xrUexKaNoL4+oPjJAq8At0K7jJRYgDSssKQ==', app_v='d39e2864c3c7'),
+            _t('cam4', '000000bc', "a-small", [
+                (102.8, [0.369, 0.5286, 0.4171, 0.5796]),
+                (103.0, [0.3845, 0.5266, 0.428, 0.5727]),
+            ],
+               hits=2, counted=True, direction=None, app='8rE+tKO2JbI7t8Kqt7IaLZMzISfqrBqrmiwtrD20OK2AMEUpvjAWsn6z4yqQLtiuiDInr7MwYKkOrIyi/yrRMQ==', app_v='d39e2864c3c7'),
+            _t('cam4', '000000bd', "a-small", [
+                (103.6, [0.4222, 0.5116, 0.4643, 0.5588]),
+                (104.8, [0.4781, 0.4929, 0.5169, 0.5364]),
+                (105.8, [0.5126, 0.4828, 0.5459, 0.5201]),
+                (106.8, [0.5388, 0.4753, 0.5668, 0.5072]),
+                (107.8, [0.5569, 0.4697, 0.5826, 0.4995]),
+                (108.2, [0.5631, 0.4681, 0.5877, 0.4973]),
+            ],
+               hits=21, counted=False, direction='northbound', app='YLSrrnW0/abPuIKuSLQvLQMz9iHpq5Qqh602rNG1EbAVLHiolyx4sY6xaKmNMbGgKDFOqw0vYqpwrQmoUZM7MA==', app_v='d39e2864c3c7'),
+        ]
+        js, chains, links = _build(tracks, _CAMS)
+        assert len(chains) == 2 and len(js) == 2 and not links, "9 Oct still prefix preserves two journeys"
+        assert next(c for c in chains if c["camera"] == "cam4").get("late") is None
+        return
+    if case == "sliver":
+        a, _ = _north("minibus", 100, cls="b-minibuses", k3=look)
+        r = _t("cam4", "sliver", "a-small", [(100.4, _b(.03, .65, .02)), (102, _b(.05, .7, .02))],
+               hits=4, direction="southbound", app=code(.76), app_v="m1")
+        b = _t("cam4", "late", "b-minibuses", [(95.8, _b(.3, .5, .02)), (98.8, _b(.5, .3, .02))],
+               direction="northbound", **(look | {"app": code(.86)}))
+        tracks = [a, r, b]
+        js, _, links = _build(tracks, _CAMS)
+        assert len(links) == 1 and links[0][1]["members"][0]["id"] == b["id"], "opposite weak sliver yields to better late arrival"
+        assert len(js) == 1 and {m["id"] for m in js[0]["members"]} == {a["id"], b["id"]}, "released sliver has no counting evidence"
+        for changes in ({"hits": MIN_EDGE_HITS}, {"counted": True}, {"direction": "northbound"}):
+            assert _build([a, dict(r, **changes), b], _CAMS)[2][0][1]["members"][0]["id"] == r["id"], ("sliver evidence protects link", changes)
+        for cosine in (.70, .79, .80):
+            worse = dict(b, app=code(cosine))
+            assert _build([a, r, worse], _CAMS)[2][0][1]["members"][0]["id"] == r["id"], "replacement needs .8 cosine and .05 improvement"
+        assert not _build([a, b], _CAMS)[2], "sliver lead never widens ordinary late candidates"
+        for start, swap in ((95, True), (94.9, False), (112, True), (112.1, False)):
+            shifted = dict(b, t0=start, t1=start + 3, path=[[p[0] - b["t0"] + start, *p[1:]] for p in b["path"]])
+            target = b["id"] if swap else r["id"]
+            assert _build([a, r, shifted], _CAMS)[2][0][1]["members"][0]["id"] == target, ("sliver window", start)
+        prefix = _t("cam4", "still-prefix", "b-minibuses",
+                    [(95, _b(.29, .51, .02)), (95.5, _b(.29, .51, .02))], hits=4)
+        continuation = dict(b, ghost_of=prefix["id"])
+        repaired, chains, swapped = _build([a, r, prefix, continuation], _CAMS)
+        arrival = next(c for c in chains if b in c["members"] or continuation in c["members"])
+        assert arrival.get("late") is None and arrival.get("stub_late") == 95
+        assert len(repaired) == 1 and swapped == [(next(c for c in chains if a in c["members"]), arrival)]
+        assert repaired[0]["link"]["gap_s"] == -5, "stub-backed link retains first-sample arrival timing"
+        from selfloop import cleared
+        final = cleared(js, js, cutoff=1000)
+        assert final == js, "repaired minibus freezes"
+        claims = {(m["id"], m.get("piece")) for j in final for m in j["members"]}
+        assert build(tracks, _CAMS, frozen=claims) == [], "released sliver cannot count after freeze rebuild"
+        return
+
+
+def _selfcheck_weak_arrival_perf():
+    start = time.perf_counter()
+    tracks = [t for i in range(10_000) for t in _north(
+        i, 100.0 + 5 * i, k4={"hits": 4})]
+    tracks = [dict(t, direction=None) if t["camera"] == "cam4" else t for t in tracks]
+    assert len(build(tracks, _CAMS)) == 10_000
+    took = time.perf_counter() - start
+    assert took < 2, ("20k weak-arrival workload", took)
+    # Known similarities must also stay windowed when many unused late arrivals exist.
+    chains = []
+    for i in range(5_000):
+        dep = 100 + 30 * i
+        for cam, name, cls, cosine, hits, departure, arrival, late in (
+                ("cam3", "d", "b-minibuses", 1, 27, dep, None, None),
+                ("cam4", "r", "a-small", .76, 4, None, dep + .4, None),
+                ("cam4", "L", "b-minibuses", .79, 27, None, None, dep + 4)):
+            chains.append({"camera": cam, "class": cls, "app": ((cosine, (1 - cosine ** 2) ** .5), "m1"),
+                           "dep": departure, "arr": arrival, "late": late,
+                           "z": (dep - 1, dep) if departure is not None else (arrival, arrival),
+                           "members": [{"id": f"{name}-{i}", "hits": hits}]})
+    start = time.perf_counter()
+    assert len(_links(chains, _CAMS)) == 5_000
+    indexed_took = time.perf_counter() - start
+    assert indexed_took < 2, ("15k known-similarity weak/late workload", indexed_took)
+    return took, indexed_took
+
+
 def _selfcheck():
+    for case in ("stub", "sliver", "oct9_general_late"):
+        _selfcheck_duplicate_cards(case)
     for case in ("null", "number", "string", "null_entry", "number_entry", "string_entry",
                  "short", "long", "non_numeric", "nan", "inf", "outside", "reversed", "flat", "moving_prefix", "moved_onto"):
         _selfcheck_phantom_regressions(case)
@@ -1732,7 +1896,7 @@ def _selfcheck():
         _selfcheck_chain_guards(case)
     for case in ("yield", "same_class", "weak_late", "strong_ordinary", "shared_late", "shared_late_three",
                  "uncontested_replacement", "ordinary_count_protection", "truck_wider_window",
-                 "truck_swap_protection", "early_swap_protection", "truck_swap_crossing",
+                 "truck_swap_protection", "early_swap_protection", "truck_swap_crossing", "weak_truck_swap_crossing", "oct7_continuation",
                  "released_counted", "released_direction"):
         _selfcheck_late_priority(case)
     for case in ("frozen_unsplit", "speed", "events"):
@@ -2102,13 +2266,14 @@ def _selfcheck():
     assert len(build([t for i in range(10_000) for t in _north(
         i, 100.0 + 5 * i, cls="b-minibuses", k4={"class": "b-light"})], _CAMS)) == 10_000
     cross_took = time.perf_counter() - start
+    weak_took, indexed_took = _selfcheck_weak_arrival_perf()
     print("journeys self-check ok: handoff links front to rear, queues pair in order, long trucks "
           "link across the overlap, opposed fragments stay apart, parked vehicles never count, "
           "classes fuse by votes, weak ghosts do not veto continuations, opposite roots never bridge, "
           "refused joins leave slots free, eligible shadow swaps repair cross-class links without changing parent evidence, "
           "weak ghost prefixes recover unused handoffs and freeze together, calibrated phantoms trim relay heads and freeze stably, shared weak ghosts cannot poison roots, works skips shadows, glare blips drop, far fast fragments join, twins merge and anchor nothing, ids are stable, "
           "lone chains need a direction and honour lone_edge unless plant marks roadworks; "
-          f"10k passes (20k tracklets) in {took:.1f} s; cross-class in {cross_took:.1f} s")
+          f"10k passes (20k tracklets) in {took:.1f} s; cross-class in {cross_took:.1f} s; weak arrivals in {weak_took:.1f} s; known-similarity weak/late in {indexed_took:.1f} s")
 
 
 if __name__ == "__main__":
