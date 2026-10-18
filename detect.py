@@ -52,6 +52,7 @@ RECOUNT_GUARD = 45.0     # a counted vehicle's resting place is remembered this 
                          # that moved far while untracked still recounts; the honest fix
                          # there is higher effective fps, not longer memory.
 GUARD_IOU = 0.5
+GHOST_BIRTH_DIST = 0.5  # normalised frame distance: only a far-born track is a new vehicle
 DRAWN_IOU = 0.3          # looser than GUARD_IOU: a hand-drawn box is a curator's estimate
                          # of where a vehicle is, not a detector's box seen twice
 CENTRE = (0.25, 0.75)    # the middle half of each axis — "the centre of the frame"
@@ -125,6 +126,15 @@ def iou(a, b):
     inter = w * h
     union = (ax2 - ax1) * (ay2 - ay1) + (bx2 - bx1) * (by2 - by1) - inter
     return inter / union if union > 0 else 0.0
+
+
+def ghost_birth_distance(a, b, dim=(1, 1)):
+    """Centre distance in frame units; without image dimensions retain the guard's join."""
+    w, h = dim
+    if not w or not h:
+        return 0.0
+    return hypot((a[0] + a[2] - b[0] - b[2]) / (2 * w),
+                 (a[1] + a[3] - b[1] - b[3]) / (2 * h))
 
 
 def same_scene(a, b, iou_min=0.85):
@@ -1310,7 +1320,7 @@ class Detector:
                                     "first_seen": now, "counted_at": 0.0,
                                     "axles": 0, "best": (0.0, None), "attrs": {},
                                     "front": None, "rear": None,
-                                    "first_c": None, "c": None, "cross": {}, "dim": (0, 0),
+                                    "first_c": None, "first_box": box, "c": None, "cross": {}, "dim": (0, 0),
                                     "first_wall": wall, "path": [], "top": {},
                                     "first_ground": None, "last_ground": None}
                 t["votes"][cls] += 1
@@ -1368,7 +1378,8 @@ class Detector:
                         mem = self.recent.get(name, [])
                         mem[:] = [m for m in mem if m[2] > now]
                         ghost = next((m for m in mem
-                                      if m[0] == disp and iou(m[1], box) >= GUARD_IOU), None)
+                                      if m[0] == disp and iou(m[1], box) >= GUARD_IOU
+                                      and ghost_birth_distance(m[1], t["first_box"], t["dim"]) <= GHOST_BIRTH_DIST), None)
                         # A live twin: another id of the same class, counted moments ago,
                         # still on this very box — slow traffic splits one crawling vehicle
                         # into two ids before the first has even expired.
@@ -2029,6 +2040,22 @@ if __name__ == "__main__":
         swapped = [x for x in docs if x["hits"] == TRACKLET_CROP_HITS]
         assert len(swapped) == 2 and swapped[0]["id"] != swapped[1]["id"], docs
         assert all(x["crops"] for x in swapped), swapped
+        # Convoy trucks are born far from the remembered exit, then cross it.
+        d = fresh()
+        d.clock = d.wall = lambda: at[0]
+        for tid in range(1, 5):
+            run([FAR, BOX], tid=tid, d=d)
+            assert d.totals["truck"] == tid, "far-born convoy truck must count"
+            assert not d.tracks["c"][tid].get("ghost"), "convoy is not a stalled truck"
+            d.flush("c")
+        roots = {m[3] for m in d.recent["c"]}
+        run([BOX, BOX], tid=9, d=d)
+        assert d.totals["truck"] == 4 and d.tracks["c"][9].get("ghost"), "in-place return stays a ghost"
+        assert d.tracks["c"][9]["ghost_of"] in roots
+        d.flush("c")
+        nearby = tuple(v + (256 if i % 2 == 0 else 0) for i, v in enumerate(BOX))
+        run([nearby, BOX], tid=10, d=d)
+        assert d.totals["truck"] == 4 and d.tracks["c"][10].get("ghost"), "nearby disjoint return stays a ghost"
         # The same swap on the live clock is left alone.
         d = fresh()
         run([BOX] * 2 + [(400.0, 400.0, 500.0, 500.0)] * 2, d=d)
