@@ -1873,6 +1873,11 @@ def _selfcheck_sliver_guards(case):
         L["app"] = _app([dict(L["members"][0], app=code(.82))])
         assert .8 < _similar(A["app"], L["app"]) < _similar(A["app"], r["app"]) + .05
         expected = {("A", "r")}
+    elif case == "similarity":
+        r["app"] = _app([dict(r["members"][0], app=code(.70))])
+        L["app"] = _app([dict(L["members"][0], app=code(.79))])
+        assert _similar(A["app"], r["app"]) + .05 < _similar(A["app"], L["app"]) < .8
+        expected = {("A", "r")}
     elif case == "hits":
         L["members"][0]["hits"] = MIN_EDGE_HITS - 1
         expected = {("A", "r")}
@@ -1922,7 +1927,7 @@ def _selfcheck_weak_arrival_perf():
 
 
 def _selfcheck():
-    for case in ("ownership", "class", "margin", "hits", "timing", "stub_convoy"):
+    for case in ("ownership", "class", "margin", "similarity", "hits", "timing", "stub_convoy"):
         _selfcheck_sliver_guards(case)
     for case in ("stub", "sliver", "oct9_general_late"):
         _selfcheck_duplicate_cards(case)
