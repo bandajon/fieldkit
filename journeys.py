@@ -27,7 +27,8 @@ from math import isfinite
 from statistics import median
 from zoneinfo import ZoneInfo
 
-from detect import HEADINGS, OPPOSITE, bound_of, heading_of, iou, letter_of
+from detect import (GHOST_BIRTH_DIST, HEADINGS, OPPOSITE, bound_of, ghost_birth_distance,
+                    heading_of, iou, letter_of)
 
 STITCH_GAP = 3.0     # s: longest occlusion that still continues the same vehicle in one camera
 STITCH_IOU = 0.2     # the next fragment starts roughly where the last one ended
@@ -238,12 +239,76 @@ def _area(t):
     return max((p[3] - p[1]) * (p[4] - p[2]) for p in t["path"])
 
 
-def _chains(tracklets, cameras):
-    """One chain per vehicle per camera: ghosts join what they continue and twins (two ids
-    on one vehicle at once) join each other, then fragments that pick up where another left
-    off are stitched, cheapest first, one-to-one."""
-    by = {t["id"]: t for t in tracklets if t.get("path")}    # a node without images writes no path
+def _ghosts(tracklets, history=(), cameras=None):
+    """Classify raw births; only direction-compatible continuations advance root history."""
+    by = {t["id"]: t for t in [*history, *tracklets] if t.get("path")}    # a node without images writes no path
     up = {i: i for i in by}
+    cfg = {c["name"]: c for c in cameras or ()}
+    pieces = {i: _split(t, k, cfg.get(t["camera"], {})) if k is not None else [t]
+              for i, t in by.items() for k in [_reversal(t) if cameras is not None else None]}
+    leg_up = {p["id"]: p["id"] for ps in pieces.values() for p in ps}
+    directions = {p["id"]: {p["direction"]} if p.get("direction") and p["hits"] >= MIN_EDGE_HITS else set()
+                  for ps in pieces.values() for p in ps}
+
+    def find(i, parents=up):
+        while parents[i] != i:
+            parents[i] = parents[parents[i]]
+            i = parents[i]
+        return i
+
+    latest = {}
+
+    def join(a, b):
+        a, b = find(a), find(b)
+        if a != b:
+            up[b] = a
+            if b in latest and (a not in latest or (latest[b]["t1"], latest[b]["id"]) >
+                                (latest[a]["t1"], latest[a]["id"])):
+                latest[a] = latest[b]
+
+    joins = []
+    ended = iter(sorted(by.values(), key=lambda t: (t["t1"], t["id"])))
+    last = next(ended, None)
+    for t in sorted(by.values(), key=lambda t: (t["t0"], t["id"])):
+        while last is not None and last["t1"] <= t["t0"]:
+            latest[find(last["id"])] = last
+            last = next(ended, None)
+        root = by.get(t.get("ghost_of"))
+        if root is not None:
+            previous = latest.get(find(root["id"]))
+            # No completed endpoint means the old id is still alive: retain the original join.
+            if (previous is None or previous["camera"] == t["camera"] and
+                    ghost_birth_distance(previous["path"][-1][1:], t["path"][0][1:]) <= GHOST_BIRTH_DIST):
+                # Check the same resolved leg that _chains will join, but retain raw birth boxes.
+                ps = pieces[(previous or root)["id"]]
+                leg = max((p for p in ps if p["t1"] <= t["t0"]),
+                          key=lambda p: (p["t1"], p["id"]), default=ps[0])
+                a, b = find(leg["id"], leg_up), find(t["id"], leg_up)
+                if any(OPPOSITE.get(d) in directions[b] for d in directions[a]):
+                    continue
+                leg_up[b] = a
+                directions[a].update(directions[b])
+                join(root["id"], t["id"])
+                joins.append(((previous or root)["id"], t["id"]))
+            elif previous is not None:
+                # The recount guard suppressed a vehicle that drove in: restore its line evidence.
+                by[t["id"]] = dict(t, counted=True)
+
+    return by, joins
+
+
+def _chains(tracklets, cameras, ghost_joins=None):
+    """One chain per vehicle per camera: join classified ghosts and twins, then stitch
+    fragments that pick up where another left off, cheapest first, one-to-one."""
+    if ghost_joins is None:
+        by, ghost_joins = _ghosts(tracklets)
+    else:
+        by = {t["id"]: t for t in tracklets if t.get("path")}
+    up = {i: i for i in by}
+    owned = set()
+    legs = {i: {t["source"]["id"]: i} if t.get("source") else {} for i, t in by.items()}
+    directions = {i: {t["direction"]} if t.get("direction") and t["hits"] >= MIN_EDGE_HITS else set()
+                  for i, t in by.items()}
 
     def find(i):
         while up[i] != i:
@@ -251,23 +316,22 @@ def _chains(tracklets, cameras):
             i = up[i]
         return i
 
-    directions = {}
-    for t in by.values():
-        directions.setdefault(find(t["id"]), set()).update(
-            [t["direction"]] if t.get("direction") and t["hits"] >= MIN_EDGE_HITS else [])
-
     def join(a, b):
         a, b = find(a), find(b)
         if a != b:
             if any(OPPOSITE.get(d) in directions[b] for d in directions[a]):
-                return False    # a directionless member cannot bridge opposite ways
+                return False
+            if any(s in owned and legs[a][s] != legs[b][s] for s in legs[a].keys() & legs[b].keys()):
+                return False    # an accepted ghost owns one resolved leg, never its sibling
             up[b] = a
+            legs[a].update(legs[b])
             directions[a].update(directions[b])
         return True
 
-    for t in sorted(by.values(), key=lambda t: (t["t0"], t["id"])):
-        if t.get("ghost_of") in by:
-            join(t["ghost_of"], t["id"])
+    for a, b in ghost_joins:
+        if a in by and b in by:
+            if join(a, b) and by[a].get("source"):
+                owned.add(by[a]["source"]["id"])
 
     per = {}
     for t in by.values():
@@ -834,7 +898,7 @@ def _split(t, k, cam):
     return pieces
 
 
-def _build(tracklets, cameras, tz=None, events=None, with_dropped=False, plant=None, frozen=()):
+def _build(tracklets, cameras, tz=None, events=None, with_dropped=False, plant=None, frozen=(), history=()):
     if plant is None:
         plant = [(t["t0"], t["t1"], t["hits"]) for t in tracklets if t.get("class") == "e-plant"]
     cfg = {c["name"]: c for c in cameras}
@@ -867,8 +931,15 @@ def _build(tracklets, cameras, tz=None, events=None, with_dropped=False, plant=N
                  else dict(t, parked=True) if t["id"] in parked else t for t in tracklets
                  if not any(all(iou(p[1:], box) >= REPARK_IOU for p in t["path"])
                             for box in phantoms.get(t["id"], []))]
-    tracklets = [piece for t in tracklets for k in [_reversal(t)] for piece in
-                 (_split(t, k, cfg.get(t["camera"], {})) if k is not None else [t])]
+    ghosts, ghost_joins = _ghosts(tracklets, history, cameras)
+    tracklets = [ghosts.get(t["id"], t) for t in tracklets]
+    pieces = {t["id"]: _split(t, k, cfg.get(t["camera"], {})) if k is not None else [t]
+              for t in tracklets for k in [_reversal(t)]}
+    # Resolve before frozen pieces disappear; opposition is checked on the selected legs in _chains.
+    ghost_joins = [(max((p for p in pieces[a] if p["t1"] <= ghosts[b]["t0"]),
+                       key=lambda p: (p["t1"], p["id"]), default=pieces[a][0])["id"], b)
+                   for a, b in ghost_joins if a in pieces and b in pieces]
+    tracklets = [p for ps in pieces.values() for p in ps]
     claimed = {raw for raw, _ in frozen}
     tracklets = [t for t in tracklets if (
         (t["source"]["id"], None) not in frozen and (t["source"]["id"], t["id"]) not in frozen
@@ -883,7 +954,7 @@ def _build(tracklets, cameras, tz=None, events=None, with_dropped=False, plant=N
         t = min(m["t0"] for m in ms)
         near = [p for p in plant if p[0] - WORKS_WINDOW <= t <= p[1] + WORKS_WINDOW]
         return len(near) >= WORKS_PLANT_TRACKS or any(p[2] >= WORKS_PLANT_LONG for p in near)
-    chains = _chains(tracklets, cameras)
+    chains = _chains(tracklets, cameras, ghost_joins)
     shadows = _shadows(chains, lambda c: works(c, rescue=False))
     absorbed = {}
     links = _links(chains, cameras, tz, shadows, absorbed)
@@ -919,14 +990,15 @@ def _build(tracklets, cameras, tz=None, events=None, with_dropped=False, plant=N
     return [d for _, d in sorted(docs, key=lambda td: (td[0], td[1]["id"]))], chains, links
 
 
-def build(tracklets, cameras, tz=None, events=None, with_dropped=False, plant=None, frozen=()):
+def build(tracklets, cameras, tz=None, events=None, with_dropped=False, plant=None, frozen=(), history=()):
     """Tracklets (detect.py) of paired cameras -> counted journeys, sorted by ts then id. with_dropped
     also returns the lone chains the direction/lone_edge filter removed, flagged "dropped": True.
     plant: [(t0, t1, hits)] of e-plant tracklets for works mode, None = derive from tracklets (a caller
     that drops frozen tracklets passes the unfiltered list, or works mode flips off for open chains).
     frozen: (raw id, piece id) pairs to exclude after splitting; None claims the whole raw tracklet.
-    Any claimed leg also excludes a later unsplit copy of its raw tracklet."""
-    return _build(tracklets, cameras, tz, events, with_dropped, plant, frozen)[0]
+    Any claimed leg also excludes a later unsplit copy of its raw tracklet.
+    history: raw tracklets used only for ghost birth classification, including frozen roots."""
+    return _build(tracklets, cameras, tz, events, with_dropped, plant, frozen, history)[0]
 
 
 _CAMS = [{"name": "cam3", "heading": "south", "handoff": {"camera": "cam4", "zone": [0.80, 0.62, 0.20, 0.38]}},
@@ -1070,6 +1142,136 @@ def _selfcheck_phantom_regressions(case):
         assert build(tracks, cams) == [], ("invalid entries do not discard valid calibration", case)
 
 
+def _selfcheck_ghost_convoy():
+    from selfloop import cleared
+    from itertools import permutations
+
+    root = _t("cam3", "root", "e-heavy", [(100, _b(.9, .7, .03)), (110, _b(.03, .5, .02))],
+              hits=30, counted=True, direction="southbound")
+    trucks = [dict(root, id=f"convoy-{i}", counted=False, ghost_of=root["id"],
+                   t0=100 + 20 * i, t1=110 + 20 * i,
+                   path=[[t + 20 * i, *b] for t, *b in root["path"]]) for i in range(1, 4)]
+    tracks = [root, *trucks]
+    cams = [dict(c, lone_edge=False) for c in _CAMS]
+    assert len(_chains(tracks, cams)) == 4, "far-born convoy must not join its root"
+    expected = build(tracks, cams)
+    assert len(expected) == 4 and all(j["evidence"] == "line" for j in expected), "refused ghosts count as line evidence"
+    assert not any(t["counted"] for t in trucks), "rebuild must not mutate stored tracklets"
+    for shuffled in permutations(tracks):
+        assert build(shuffled, cams) == expected, "convoy input order"
+    final = cleared(expected, expected, cutoff=1000)
+    assert final == expected
+    claims = {(m["id"], m.get("piece")) for j in final for m in j["members"]}
+    assert build(tracks, cams, frozen=claims) == [], "convoy freeze -> rebuild"
+
+    convoy = [root, *[dict(root, id=f"convoy-{i}", counted=False, ghost_of=root["id"],
+                          t0=100 + 20 * i, t1=110 + 20 * i,
+                          path=[[t + 20 * i, *b] for t, *b in root["path"]]) for i in range(1, 31)]]
+    journeys = build(convoy, cams)
+    assert len(journeys) == 31, "long convoy counts every truck"
+    final = cleared(journeys, journeys, cutoff=800)
+    assert len(final) == 5, "partial convoy freeze includes the root"
+    claims = {(m["id"], m.get("piece")) for j in final for m in j["members"]}
+    remaining = build(convoy, cams, frozen=claims)
+    assert len(remaining) == 26, ("partial freeze must retain refused ghosts' line evidence", len(remaining))
+    assert remaining == [j for j in journeys if j not in final], "partial convoy freeze stable"
+    assert build(convoy[1:], cams) == [], "missing root alone does not restore counting evidence"
+    assert not any(t["counted"] for t in convoy[1:]), "classification never mutates stored tracklets"
+
+    turn = _t("cam3", "convoy-turn", "e-heavy",
+              [(120, _b(.97, .5, .02)), (125, _b(.8, .5, .02)),
+               (130, _b(.6, .5, .02)), (135, _b(.85, .5, .02))],
+              hits=30, direction="southbound", ghost_of=root["id"])
+    refused = build([root, turn], cams)
+    counted = build([root, dict(turn, counted=True, ghost_of=None)], cams)
+    assert len(refused) == len(counted) == 2, "refused reversal carries only one line count"
+    assert refused == counted, "refused ghost pieces behave like counted tracklet pieces"
+
+    # Root ids persist through ghosts: compare against the latest continuation's end.
+    stalled = dict(trucks[0], t0=120, t1=130,
+                   path=[[120, *_b(.03, .5, .02)], [130, *_b(.8, .5, .02)]])
+    again = dict(trucks[1], t0=140, t1=150,
+                 path=[[140, *_b(.8, .5, .02)], [150, *_b(.8, .5, .02)]])
+    [chain] = _chains([root, stalled, again], cams)
+    assert len(chain["members"]) == 3, "stalled ghosts follow the latest resting place"
+    nearby = dict(stalled, path=[[120, *_b(.43, .5, .02)], *stalled["path"][1:]])
+    assert len(_chains([root, nearby], cams)) == 1, "nearby disjoint return stays a ghost"
+    back = dict(again, path=[[140, *_b(.03, .5, .02)], [150, *_b(.03, .5, .02)]])
+    assert len(_chains([root, stalled, back], cams)) == 2, "old root box is no longer the resting place"
+
+
+def _selfcheck_ghost_reversal():
+    from datetime import datetime, timezone
+    from unittest.mock import patch
+    import selfloop
+
+    root = _t("cam3", "turn-root", "e-heavy",
+              [(100, _b(.05, .5, .02)), (105, _b(.9, .5, .02)),
+               (110, _b(.5, .5, .02)), (120, _b(.1, .5, .02))],
+              hits=100, counted=True, direction="northbound")
+    first = _t("cam3", "turn-first", "e-heavy",
+               [(108, _b(.9, .5, .02)), (109, _b(.9, .5, .02))],
+               hits=10, ghost_of=root["id"], direction="northbound")
+    last = _t("cam3", "turn-last", "e-heavy",
+              [(130, _b(.1, .5, .02)), (135, _b(.1, .5, .02))],
+              hits=10, ghost_of=root["id"])
+
+    def joined(tracks, ghost):
+        chains = _build(tracks, _CAMS)[1]
+        return {m["id"] for c in chains if any(m["id"] == ghost["id"] for m in c["members"])
+                for m in c["members"]}
+
+    assert joined([root, last], last) == {root["id"] + "~reverse", last["id"]}, \
+        "final-endpoint ghost must join the second reversal piece"
+    assert joined([root, first], first) == {root["id"], first["id"]}, \
+        "turn-endpoint ghost must join the first reversal piece"
+    slow_turn = dict(root, direction=None,
+                     path=[*root["path"][:2], [106, *_b(.899, .5, .02)], *root["path"][2:]])
+    assert len(_build([slow_turn], _CAMS)[1]) == 1, \
+        "ordinary slow-turn siblings keep their existing stitch behavior"
+    assert joined([slow_turn, last], last) == {root["id"] + "~reverse", last["id"]}, \
+        "slow turn must not stitch the selected reversal leg back to its sibling"
+    last = dict(last, direction="southbound", counted=True)
+    tracks = [root, first, last]
+    assert joined(tracks, last) == {root["id"] + "~reverse", last["id"]}, \
+        "the selected piece's direction must admit the final ghost"
+    opposed = dict(last, direction="northbound")
+    assert joined([root, opposed], opposed) == {opposed["id"]}, \
+        "the selected piece's direction must refuse an opposed ghost"
+
+    # Exercise the storage boundary: frozen piece claims must not reassign ghosts on rebuild.
+    base = datetime(2026, 8, 19, 10, tzinfo=timezone.utc).timestamp()
+    tracks = [dict(t, t0=t["t0"] + base, t1=t["t1"] + base,
+                   path=[[p[0] + base, *p[1:]] for p in t["path"]]) for t in tracks]
+    expected = build(tracks, _CAMS, timezone.utc)
+    assert len(expected) == 2, "each reversal leg has its own counted evidence"
+    objects = {"fieldkit-tracklets/G/20260819/a.jsonl": tracks}
+
+    class Bucket:
+        def put_object(self, Bucket, Key, Body, **kw):
+            objects[Key] = [json.loads(line) for line in Body.decode().splitlines()]
+
+    def docs(cl, bucket, prefix):
+        return [d for k, ds in objects.items() if k.startswith(prefix) for d in ds]
+
+    ownership = lambda js: {j["id"]: {(m["id"], m.get("piece")) for m in j["members"]} for j in js}
+    with patch.object(selfloop, "r2_jsonl", docs), patch.object(
+            selfloop, "bucket_keys", lambda cl, bucket, prefix: [k for k in objects if k.startswith(prefix)]):
+        for i, cutoff in enumerate((125, 1000, 1000)):
+            with patch.object(selfloop, "horizon", return_value=(
+                    {c: base + cutoff + selfloop.FINAL_MARGIN for c in ("cam3", "cam4")}, 0)):
+                n, opened, _ = selfloop.journeys_pass(Bucket(), "buck", {("G", "2026-08-19")},
+                                                    _CAMS, timezone.utc)
+            assert n == (2, 2, 0)[i] and bool(opened) == (i == 0), ("reversal ghost freeze pass", i, n, opened)
+            finals = [j for k, ds in objects.items() if "/final/" in k for j in ds]
+            assert len(finals) == (0 if i == 0 else 2) and all(
+                ownership(expected)[j["id"]] == ownership([j])[j["id"]] for j in finals), \
+                "reversal ghosts freeze once with stable piece ownership"
+            assert ownership(objects["fieldkit-journeys/G/20260819/journeys.jsonl"]) == ownership(expected), \
+                "open and frozen rebuilds retain both reversal legs' piece ownership"
+
+
+
 def _selfcheck_ghost_handoff():
     from selfloop import cleared
 
@@ -1085,13 +1287,29 @@ def _selfcheck_ghost_handoff():
                    hits=133, direction="southbound")
     tracks = [sliver, truck, departure]
     js, chains, links = _build(tracks, _CAMS)
-    assert len(js) == 1 and len(links) == 1, ("weak ghost prefix hides handoff", js)
-    assert {m["id"] for m in js[0]["members"]} == {t["id"] for t in tracks}, js
+    assert len(chains) == 3 and len(js) == 1 and len(links) == 1, ("far-born truck links independently", js)
+    assert {m["id"] for m in js[0]["members"]} == {truck["id"], departure["id"]}, js
+    assert build([sliver], _CAMS) == [], "counted 4-hit sliver without direction is no passage"
     assert js[0]["link"]["gap_s"] == 1.8, js
     final = cleared(js, js, cutoff=4000)
     assert final == js, ("ghost handoff freeze", final)
     claims = {(m["id"], m.get("piece")) for j in final for m in j["members"]}
     assert build(tracks, _CAMS, frozen=claims) == [], "ghost handoff rebuilt after freeze"
+
+    # Born in place across the zone boundary: the weak prefix still hides an arrival.
+    sliver = dict(sliver, path=[[2959.6, *_b(.78, .67, .02)], [2960.6, *_b(.78, .67, .02)]])
+    truck = dict(truck, path=[[2991.4, *_b(.805, .67, .02)], *truck["path"][1:]])
+    tracks = [sliver, truck, departure]
+    [chain] = _chains([sliver, truck], _CAMS)
+    assert chain["arr"] is None and chain["dep"] is None, "born-in-place prefix hides entry"
+    assert _chains([truck], _CAMS)[0]["arr"] == 2991.4, "tail has a real arrival"
+    js, _, links = _build(tracks, _CAMS)
+    assert len(js) == len(links) == 1 and js[0]["link"]["gap_s"] == 1.8, "reachable weak-prefix recovery"
+    assert {m["id"] for m in js[0]["members"]} == {t["id"] for t in tracks}
+    final = cleared(js, js, cutoff=4000)
+    assert final == js, "born-in-place handoff freeze"
+    claims = {(m["id"], m.get("piece")) for j in final for m in j["members"]}
+    assert build(tracks, _CAMS, frozen=claims) == [], "born-in-place handoff rebuild"
 
     for guard in ({"hits": MIN_EDGE_HITS}, {"direction": "southbound"}):
         assert not _build([dict(sliver, **guard), truck, departure], _CAMS)[2], (
@@ -1322,6 +1540,38 @@ def _selfcheck_shadow_competition(case):
     assert (len(js), len(links)) == (2, 1), (case, len(js), len(links))
     assert {m["id"] for c in links[0] for m in c["members"]} == {b["id"], arrival["id"]}, case
     assert next(c for c in chains if c["members"][0]["id"] == b["id"]).get("shadow"), case
+
+
+def _selfcheck_ghost_history():
+    from itertools import permutations
+
+    root = _t("cam3", "history-root", "e-heavy", [(100, _b(.2, .5, .02)), (110, _b(.1, .5, .02))],
+              hits=30, counted=True, direction="southbound")
+    opposed = _t("cam3", "history-opposed", "e-heavy", [(120, _b(.1, .5, .02)), (130, _b(.9, .5, .02))],
+                 hits=30, ghost_of=root["id"], direction="northbound")
+    again = _t("cam3", "history-again", "e-heavy", [(140, _b(.1, .5, .02)), (150, _b(.05, .5, .02))],
+               hits=30, ghost_of=root["id"], direction="southbound")
+    cams = [dict(c, lone_edge=False) for c in _CAMS]
+    expected = build([root, again], cams)
+    assert len(expected) == 1 and expected[0]["evidence"] == "line"
+    for shuffled in permutations([root, opposed, again]):
+        assert build(shuffled, cams) == expected, "opposed ghost must not advance continuation history"
+
+
+def _selfcheck_ghost_endpoint():
+    root = _t("cam3", "endpoint-root", "e-heavy", [(100, _b(.2, .5, .02)), (110, _b(.1, .5, .02))],
+              hits=30, counted=True, direction="southbound")
+    continued = _t("cam3", "endpoint-continued", "e-heavy", [(120, _b(.1, .5, .02)), (130, _b(.9, .5, .02))],
+                   hits=30, ghost_of=root["id"], direction="southbound")
+    moved = _t("cam3", "endpoint-moved", "e-heavy", [(140, _b(.9, .5, .02)), (150, _b(.85, .5, .02))],
+               hits=30, ghost_of=root["id"], direction="southbound")
+    cams = [dict(c, lone_edge=False) for c in _CAMS]
+    tracks = [root, continued, moved]
+    assert _ghosts(tracks)[1] == [(root["id"], continued["id"]), (continued["id"], moved["id"])], \
+        "ghost join must name the endpoint-bearing member"
+    [chain] = _build(tracks, cams, frozen={(root["id"], None)})[1]
+    assert {m["id"] for m in chain["members"]} == {continued["id"], moved["id"]}, \
+        "open ghosts must stay joined after the root freezes"
 
 
 def _selfcheck_ghost_permutations():
@@ -1937,6 +2187,8 @@ def _selfcheck():
     for case in ("relay", "unconfigured", "queue", "freeze"):
         _selfcheck_phantoms(case)
     _selfcheck_ghost_decoy()
+    _selfcheck_ghost_convoy()
+    _selfcheck_ghost_reversal()
     _selfcheck_ghost_handoff()
     _selfcheck_contradictory_swap()
     _selfcheck_twin_permutations()
@@ -1946,6 +2198,8 @@ def _selfcheck():
     for case in ("heavy", "contradicting_appearance"):
         _selfcheck_shadow_competition(case)
     _selfcheck_ghost_permutations()
+    _selfcheck_ghost_history()
+    _selfcheck_ghost_endpoint()
     for case in ("start", "class", "end", "counted", "weak_parent", "directionless_parent", "too_far", "eligible"):
         _selfcheck_shadow_rejections(case)
     _selfcheck_shadow_links()
@@ -2318,13 +2572,13 @@ def _selfcheck():
     pr = _north(1, 100.0)
     assert len(build([dict(pr[0], direction=None), pr[1]], _CAMS)) == 1
     # A whole day at a gate: 10k passes, 20k tracklets, in windowed time rather than all pairs.
-    start = time.perf_counter()
+    start = time.process_time()
     assert len(build([t for i in range(10_000) for t in _north(i, 100.0 + 5 * i)], _CAMS)) == 10_000
-    took = time.perf_counter() - start
-    start = time.perf_counter()
+    took = time.process_time() - start
+    start = time.process_time()
     assert len(build([t for i in range(10_000) for t in _north(
         i, 100.0 + 5 * i, cls="b-minibuses", k4={"class": "b-light"})], _CAMS)) == 10_000
-    cross_took = time.perf_counter() - start
+    cross_took = time.process_time() - start
     weak_took, indexed_took = _selfcheck_weak_arrival_perf()
     print("journeys self-check ok: handoff links front to rear, queues pair in order, long trucks "
           "link across the overlap, opposed fragments stay apart, parked vehicles never count, "

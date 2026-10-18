@@ -1284,7 +1284,8 @@ def journeys_pass(cl, bucket, touched, cameras, tz, keys=(), classified=(), sinc
             events.update({e["id"]: e for e in docs(EVENTS + next_w)})
             # with_dropped: lone chains the direction/lone_edge filter removed are not journeys, but
             # as open chains they still hold the freeze watermark back (they can yet link to a partner).
-            everything = journeys.build(tracklets, cameras, tz, events, with_dropped=True, plant=plant, frozen=fids)
+            everything = journeys.build(tracklets, cameras, tz, events, with_dropped=True, plant=plant, frozen=fids,
+                                        history=own_raw + prev_raw + next_raw)
             built = [j for j in everything if not j.get("dropped")]
             # A boundary tracklet can pull in a journey that really belongs to the neighbouring
             # day (it's rebuilt there too, from its own side of the same boundary) — keep only
@@ -2487,6 +2488,26 @@ def journeys_check():
     assert len(lone_built(wobjs)) == 1
     assert len(lone_built({**wobjs, "fieldkit-journeys/G/20260819/final/f.jsonl": frozen_plant})) == 1, "frozen plant still marks works"
     assert lone_built({day + "w.jsonl": lone}) == [], "no plant, no works"
+
+    # A frozen convoy root still supplies ghost context through the production caller.
+    import journeys
+    root = journeys._t("cam3", "convoy-root", "e-heavy",
+                       [(BASE + 100, journeys._b(.9, .7, .03)),
+                        (BASE + 110, journeys._b(.03, .5, .02))],
+                       hits=30, counted=True, direction="southbound")
+    convoy = [root, *[dict(root, id=f"convoy-{i}", counted=False, ghost_of=root["id"],
+                          t0=root["t0"] + 20 * i, t1=root["t1"] + 20 * i,
+                          path=[[t + 20 * i, *b] for t, *b in root["path"]]) for i in range(1, 31)]]
+    convoy_cams = [dict(c, lone_edge=False) for c in cams]
+    expected = journeys.build(convoy, convoy_cams, timezone.utc)
+    assert len(expected) == 31
+    cl = FakeS3({day + "convoy.jsonl": b"\n".join(json.dumps(t).encode() for t in convoy),
+                 "fieldkit-journeys/G/20260819/final/convoy.jsonl":
+                     b"\n".join(json.dumps(j).encode() for j in expected[:5])})
+    n, _, _ = journeys_pass(cl, "buck", {("G", "2026-08-19")}, convoy_cams, timezone.utc)
+    assert n == 26, ("frozen convoy root must retain 26 open journeys", n)
+    rebuilt = [json.loads(line) for line in cl.put["fieldkit-journeys/G/20260819/journeys.jsonl"].splitlines()]
+    assert len(rebuilt) == 31, "five frozen plus 26 remaining convoy journeys"
 
     # r2_jsonl: bodies cached by (key, ETag): re-read costs 0 downloads, a changed ETag exactly 1.
     import tempfile
