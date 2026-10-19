@@ -32,6 +32,7 @@ from detect import (GHOST_BIRTH_DIST, HEADINGS, OPPOSITE, bound_of, ghost_birth_
 
 STITCH_GAP = 3.0     # s: ordinary same-camera fragment continuation
 OCCLUDED_GAP = 6.0   # s: only with oncoming heavy cover at loss; 18 Oct tipper needs 4.4 s
+OVERTAKE_GAP = 15.0  # s: hard ceiling; measured same-direction cover must support the gap
 STITCH_IOU = 0.2     # the next fragment starts roughly where the last one ended
 TWIN_IOU = 0.5       # detect.GUARD_IOU: one vehicle, two ids, the same box at the same instant
 TWIN_COVER = 0.8     # a box this much inside another is the same vehicle seen in part (cab + whole truck)...
@@ -202,6 +203,52 @@ def _occluded(a, others):
     return False
 
 
+def _overtaken(a, others):
+    """{occluder id: last covered time} for uninterrupted overtaking cover after A's loss."""
+    last = a["path"][-1]
+    loss, box = last[0], last[1:]
+    va = _leaving(a["path"])
+    if not a.get("direction") or not va or abs(complex(*va)) < MOVE / 2:
+        return {}
+    x, y = _centre(box)
+    covers = {}
+    for truck in others:
+        if (truck["id"] == a["id"] or truck["camera"] != a["camera"]
+                or truck["class"] not in HEAVY or truck.get("direction") != a["direction"]):
+            continue
+        path = truck["path"]
+        cover = _at(path, loss)
+        if (not cover or iou(box, cover) <= 0
+                or (cover[2] - cover[0]) * (cover[3] - cover[1]) <= (box[2] - box[0]) * (box[3] - box[1])):
+            continue
+        i = bisect_right(path, loss, key=lambda p: p[0])
+        before = path[:i]
+        if not before or before[-1][0] < loss:
+            before = [*before, [loss, *cover]]
+        vb = _leaving(before)
+        if not vb or vb[0] * va[0] + vb[1] * va[1] <= va[0] ** 2 + va[1] ** 2:
+            continue    # the covering truck must gain on A along A's own motion
+        end = None
+        previous = loss
+        for t, *bounds in [[loss, *cover], *path[i:]]:
+            # A missing interval longer than _at can represent is not measured cover.
+            if t - previous > 2 * TWIN_SNAP:
+                break
+            px, py = x + va[0] * (t - loss), y + va[1] * (t - loss)
+            inside = bounds[0] <= px <= bounds[2] and bounds[1] <= py <= bounds[3]
+            if end is None:
+                if t - loss > STITCH_GAP:
+                    break
+            elif not inside:
+                break    # later re-covering must not bridge an uncovered interval
+            if inside:
+                end = t
+            previous = t
+        if end is not None:
+            covers[truck["id"]] = end
+    return covers
+
+
 def _twin(a, b):
     """B, starting while A is alive, is A under a second id: the boxes coincide where B starts
     and still where their overlap ends. Two cars in adjacent lanes touch briefly, then diverge."""
@@ -323,6 +370,10 @@ def _chains(tracklets, cameras, ghost_joins=None, history=()):
         by = {t["id"]: t for t in tracklets if t.get("path")}
     up = {i: i for i in by}
     owned = set()
+    excluded = {i: set() for i in by}
+    start = {i: t["t0"] for i, t in by.items()}
+    finish = {i: t["t1"] for i, t in by.items()}
+    windows = {i: [] for i in by}
     legs = {i: {t["source"]["id"]: i} if t.get("source") else {} for i, t in by.items()}
     directions = {i: {t["direction"]} if t.get("direction") and t["hits"] >= MIN_EDGE_HITS else set()
                   for i, t in by.items()}
@@ -336,12 +387,18 @@ def _chains(tracklets, cameras, ghost_joins=None, history=()):
     def join(a, b):
         a, b = find(a), find(b)
         if a != b:
+            if any(find(i) == b for i in excluded[a]) or any(find(i) == a for i in excluded[b]):
+                return False    # preserve an accepted overtake's distinct-vehicle exclusions
             if any(OPPOSITE.get(d) in directions[b] for d in directions[a]):
                 return False
             if any(s in owned and legs[a][s] != legs[b][s] for s in legs[a].keys() & legs[b].keys()):
                 return False    # an accepted ghost owns one resolved leg, never its sibling
             up[b] = a
+            start[a] = min(start[a], start[b])
+            finish[a] = max(finish[a], finish[b])
+            windows[a].extend(windows[b])
             legs[a].update(legs[b])
+            excluded[a].update(excluded[b])
             directions[a].update(directions[b])
         return True
 
@@ -371,8 +428,9 @@ def _chains(tracklets, cameras, ghost_joins=None, history=()):
         if t["class"] in HEAVY and t.get("direction"):
             evidence.setdefault(t["camera"], []).append(t)
     cands = []
+    overtake_edges = {}
     for camera, ts in per.items():
-        # Sweep heavy lifetimes at loss times: only concurrent oncoming tracks can occlude.
+        # Sweep heavy lifetimes at loss times; history supplies evidence, never candidates.
         heavy = sorted(evidence.get(camera, ()), key=lambda t: (t["t0"], t["id"]))
         born = iter(heavy)
         died = iter(sorted(heavy, key=lambda t: (t["t1"], t["id"])))
@@ -389,8 +447,20 @@ def _chains(tracklets, cameras, ghost_joins=None, history=()):
             if end[find(a["id"])] > a["t1"]:
                 continue    # its vehicle lived on under another id: a twin dying mid-frame left nowhere
             gap = OCCLUDED_GAP if _occluded(a, active.get(OPPOSITE.get(a.get("direction")), {}).values()) else STITCH_GAP
+            ordinary_gap = gap
+            overtaken = _overtaken(a, active.get(a.get("direction"), {}).values())
+            occluders = {find(i) for i in overtaken if i in up}
+            extended = []
+            emergence = max(loss, max(overtaken.values(), default=loss) - STITCH_GAP)
+            if overtaken:
+                gap = max(gap, min(OVERTAKE_GAP, max(overtaken.values()) + STITCH_GAP - a["t1"]))
             lo = bisect_left(ts, a["t1"], key=lambda t: t["t0"])
             for b in ts[lo:bisect_right(ts, a["t1"] + gap, key=lambda t: t["t0"])]:
+                if find(b["id"]) in occluders:
+                    continue    # the covering truck is a different vehicle
+                overtake_only = b["t0"] - a["t1"] > ordinary_gap
+                if overtake_only and start[find(b["id"])] < emergence:
+                    continue    # a vehicle already visible during cover is not A emerging
                 if b["t0"] - a["t1"] > STITCH_GAP:
                     (ax, ay), (bx, by_) = _centre(a["path"][-1][1:]), _centre(b["path"][0][1:])
                     vx, vy = _leaving(a["path"]) or (0.0, 0.0)
@@ -399,12 +469,36 @@ def _chains(tracklets, cameras, ghost_joins=None, history=()):
                         continue
                 if (b is not a and (iou(a["path"][-1][1:], b["path"][0][1:]) >= STITCH_IOU or _near(a, b))
                         and not _opposed(a, b)):
-                    cands.append((b["t0"] - a["t1"] + CLASS_PEN * (a["class"] != b["class"]),
-                                  a["id"], b["id"]))
+                    edge = (b["t0"] - a["t1"] + CLASS_PEN * (a["class"] != b["class"]), a["id"], b["id"])
+                    if overtake_only:
+                        extended.append(edge)
+                    else:
+                        cands.append(edge)
+            if len({find(b) for _, _, b in extended}) == 1:
+                cands.extend(extended)
+                for _, aid, bid in extended:
+                    overtake_edges[aid, bid] = emergence, tuple(i for i in overtaken if i in up)
     cands.sort()
     succ, pred = set(), set()
     for _, a, b in cands:
+        emergence, covers = overtake_edges.get((a, b), (None, ()))
+        if (emergence is not None and start[find(b)] < emergence
+                or any(find(i) in (find(a), find(b)) for i in covers)):
+            continue
+        ra, rb = find(a), find(b)
+        if ra != rb and (any(start[rb] < threshold
+                             and not (by[a]["t1"] <= loss and finish[rb] <= loss)
+                             for loss, threshold in windows[ra])
+                         or any(start[ra] < threshold
+                                and not (by[b]["t1"] <= loss and finish[ra] <= loss)
+                                for loss, threshold in windows[rb])):
+            continue    # only predecessors ending before loss may join the A side
         if a not in succ and b not in pred and join(a, b):
+            if (a, b) in overtake_edges:
+                windows[find(a)].append((by[a]["path"][-1][0], emergence))
+            for i in covers:
+                excluded[find(a)].add(i)
+                excluded[find(i)].add(a)
             succ.add(a)
             pred.add(b)
     groups = {}
@@ -2302,7 +2396,195 @@ def _selfcheck_occlusion(case):
         assert build(tracks, _CAMS, frozen=claims) == [], "occlusion freeze rebuild"
 
 
+
+def _selfcheck_overtake(case):
+    # 19 Oct 12:36: overlap at loss becomes centre cover three seconds later.
+    a = _t("cam3", "overtaken", "e-heavy", [
+        (22.2, [.2244, .5864, .3366, .6909]),
+        (23.2, [.2665, .6049, .3649, .6992]),
+        (24.2, [.2903, .6102, .3908, .7086]),
+        (24.4, [.2969, .6119, .3962, .7104])],
+        hits=60, counted=True, direction="northbound")
+    b = _t("cam3", "reacquired", "d-medium", [
+        (35.8, [.4622, .6498, .5883, .774]),
+        (36.8, [.4882, .6587, .613, .7813]),
+        (49.4, _b(.94, .80, .06))], hits=60, direction="northbound")
+    boxes = [(.1363, .5331, .2648, .6817), (.1556, .5325, .3036, .6959),
+             (.1776, .5376, .3447, .7131), (.2034, .551, .3879, .7315),
+             (.2276, .5566, .4381, .749), (.2531, .5639, .4913, .7694),
+             (.2859, .5736, .5497, .7899), (.3193, .5821, .6129, .8119),
+             (.3637, .5937, .6836, .8334), (.4086, .6083, .7526, .8522),
+             (.4565, .617, .8329, .8717), (.5181, .6315, .9045, .883),
+             (.5875, .651, .9711, .8914), (.6381, .6666, 1., .8943)]
+    truck = _t("cam3", "overtaker", "e-heavy",
+               [(23.4 + i, box) for i, box in enumerate(boxes)],
+               hits=64, counted=True, direction="northbound")
+    expected = case in ("road_train", "partial_freeze", "freeze", "order", "limit", "twin", "ghost", "early_vehicle", "later_visible_join",
+                        "early_twin_real", "early_ghost_real", "later_early_join")
+    if case == "follower":
+        b = dict(b, path=[[p[0], *_b(.14 + .02 * i, .70, .06)] for i, p in enumerate(b["path"])])
+    elif case == "ends_early":
+        truck = dict(truck, t1=28.4, path=truck["path"][:6])
+    elif case == "interrupted":
+        truck = dict(truck, path=[p if i != 7 else [p[0], *_b(.1, .2, .05)]
+                                 for i, p in enumerate(truck["path"])])
+    elif case == "missing_samples":
+        truck = dict(truck, path=truck["path"][:5] + truck["path"][9:])
+    elif case == "slower":
+        truck = dict(truck, path=[[23.4, *_b(.222, .614, .075)], *truck["path"][1:]])
+    elif case == "never_reaches":
+        truck = dict(truck, path=[p if i < 4 else [p[0], *_b(.1, .2, .05)]
+                                 for i, p in enumerate(truck["path"])])
+    elif case == "no_overlap":
+        truck = dict(truck, path=[p if i != 1 else [p[0], *_b(.15, .60, .07)]
+                                 for i, p in enumerate(truck["path"])])
+    elif case in ("limit", "too_long"):
+        born = a["t1"] + (15 if case == "limit" else 15.01)
+        b = dict(b, t0=born, path=[[born, *b["path"][0][1:]],
+                     [born + 1, *_b(.60, .73, .06)], b["path"][-1]])
+        truck = dict(truck, t1=39.4, path=[*truck["path"],
+                     [37.4, *_b(.70, .77, .20)], [38.4, *_b(.73, .78, .20)],
+                     [39.4, *_b(.76, .79, .20)]])
+    tracks = [a, b, truck]
+    if case in ("predecessor", "heavy_predecessor"):
+        from itertools import permutations
+
+        truck = dict(truck, t1=28.4, path=truck["path"][:6])
+        p = _t("cam3", "predecessor", "e-heavy" if case == "heavy_predecessor" else "d-medium",
+               [(18.2, _b(.18, .63, .05)), (19.2, _b(.205, .637, .05))],
+               hits=20, counted=True, direction="northbound")
+        b = _t("cam3", "reacquired", "e-heavy",
+               [(27.5, _b(.43, .69, .05)), (28.5, _b(.455, .697, .05)),
+                (40, _b(.94, .80, .06))], hits=60, counted=True, direction="northbound")
+        tracks = [p, a, b, truck]
+        expected_groups = {frozenset((p["id"], a["id"], b["id"])), frozenset((truck["id"],))}
+        baseline = None
+        for ordered in permutations(tracks):
+            js = build(list(ordered), _CAMS)
+            groups = {frozenset(m["id"] for m in j["members"]) for j in js}
+            assert groups == expected_groups, ("A-side predecessor", case, groups)
+            if baseline is None:
+                baseline = js
+            assert js == baseline, ("A-side predecessor input order", case)
+        return
+    if case in ("twin", "ghost"):
+        duplicate = _t("cam3", "duplicate", "e-heavy",
+                       [(p[0], p[1:]) for p in truck["path"] if p[0] >= 32.4],
+                       hits=20, direction="northbound")
+        if case == "ghost":
+            duplicate = dict(duplicate, ghost_of=truck["id"])
+        tracks.append(duplicate)
+    elif case in ("visible_twin", "visible_ghost"):
+        c = _t("cam3", "visible_c", "e-heavy",
+               [(22.4 + i, _b(.33 + .015 * i, .54, .07)) for i in range(17)],
+               hits=60, counted=True, direction="northbound")
+        duplicate = _t("cam3", "visible_d", "e-heavy",
+                       [(p[0], p[1:]) for p in c["path"] if p[0] >= 36.4],
+                       hits=20, counted=True, direction="northbound")
+        if case == "visible_ghost":
+            duplicate = dict(duplicate, ghost_of=c["id"])
+        tracks = [a, truck, c, duplicate]
+    elif case in ("early_twin", "early_ghost", "early_twin_real", "early_ghost_real"):
+        c = _t("cam3", "early_c", "e-heavy",
+               [(32.8 + i, _b(.54 + .05 * i, .59, .06)) for i in range(7)],
+               hits=60, counted=True, direction="northbound")
+        duplicate = _t("cam3", "early_d", "e-heavy",
+                       [(p[0], p[1:]) for p in c["path"] if p[0] >= 36.8],
+                       hits=20, counted=True, direction="northbound")
+        if "ghost" in case:
+            duplicate = dict(duplicate, ghost_of=c["id"])
+        tracks = [a, truck, c, duplicate] + ([b] if case.endswith("_real") else [])
+    elif case in ("later_visible_join", "later_early_join"):
+        b = dict(b, t1=39.4, path=[*b["path"][:2],
+                 [38.4, *_b(.94, .50, .06)], [39.4, *_b(.92, .52, .06)]])
+        duplicate = _t("cam3", "late_twin", "d-medium",
+                       [(p[0], p[1:]) for p in b["path"] if p[0] >= 38.4],
+                       hits=20, counted=True, direction="northbound")
+        c = _t("cam3", "earlier_vehicle", "e-heavy",
+               [(23, _b(.63, .27, .05)), (24, _b(.65, .30, .05))],
+               hits=20, counted=True, direction="northbound")
+        cover = _t("cam3", "earlier_cover", "e-heavy",
+                   [(t, _b(.60 + .025 * (t - 23), .30 + .03 * (t - 23), .18))
+                    for t in range(23, 40)], hits=60, counted=True, direction="northbound")
+        if case == "later_early_join":
+            c = dict(c, t0=c["t0"] + 9, t1=c["t1"] + 9,
+                     path=[[p[0] + 9, *p[1:]] for p in c["path"]])
+            cover = dict(cover, t0=32, path=[[p[0] + 9, *p[1:]] for p in cover["path"] if p[0] < 31])
+        tracks = [a, b, truck, c, cover, duplicate]
+        assert any({c["id"], duplicate["id"]} <= {t["id"] for t in ch["members"]}
+                   for ch in _chains([c, cover, duplicate], _CAMS)), "later join is otherwise admissible"
+    elif case == "joined_occluder":
+        duplicate = _t("cam3", "joined_cover", "e-heavy",
+                       [(37.4, truck["path"][-1][1:]), (38.4, _b(.87, .78, .15))],
+                       hits=20, counted=True, direction="northbound")
+        tracks = [a, truck, duplicate]
+    elif case in ("early_vehicle", "ambiguous"):
+        born = 32.8 if case == "early_vehicle" else 34.8
+        tracks.append(_t("cam3", "far_lane", "e-heavy",
+                      [(born + i, _b(x, .59, .06)) for i, x in enumerate((.54, .59, .64))],
+                      hits=20, counted=True, direction="northbound"))
+    elif case == "queue":
+        a = _t("cam3", "queued_a", "e-heavy", [(23, _b(.3500, .65, .05)),
+                (24, _b(.3501, .65, .05))], hits=20, counted=True, direction="northbound")
+        truck = _t("cam3", "queued_cover", "e-heavy",
+                   [(t, _b(.34 + .001 * (t - 23), .65, .10)) for t in range(23, 37)],
+                   hits=60, counted=True, direction="northbound")
+        b = _t("cam3", "queued_b", "e-heavy", [(34, _b(.39, .65, .05)),
+                (35, _b(.3901, .65, .05))], hits=20, counted=True, direction="northbound")
+        tracks = [a, b, truck]
+    chains = _chains(tracks, _CAMS)
+    members = next({t["id"] for t in c["members"]} for c in chains if a in c["members"])
+    assert (b["id"] in members) == expected, ("overtake stitch", case, members)
+    assert truck["id"] not in members, ("overtaker is never the continuation", case)
+    if case in ("twin", "ghost", "joined_occluder", "early_vehicle", "ambiguous", "queue",
+                "visible_twin", "visible_ghost", "later_visible_join",
+                "early_twin", "early_ghost", "early_twin_real", "early_ghost_real", "later_early_join"):
+        from itertools import permutations
+        for ordered in permutations(tracks):
+            js = build(list(ordered), _CAMS)
+            group = next({m["id"] for m in j["members"]} for j in js if any(m["id"] == a["id"] for m in j["members"]))
+            assert (b["id"] in group) == expected and truck["id"] not in group, (case, group)
+            allowed = {a["id"], b["id"]}
+            if case in ("later_visible_join", "later_early_join"):
+                allowed.add(duplicate["id"])
+            assert group <= allowed, ("distinct vehicle", case, group)
+            if case in ("visible_twin", "visible_ghost", "early_twin", "early_ghost",
+                        "early_twin_real", "early_ghost_real"):
+                assert group == ({a["id"], b["id"]} if expected else {a["id"]}) and len(js) == 3, (case, js)
+                assert any({c["id"], duplicate["id"]} <= {m["id"] for m in j["members"]}
+                           for j in js), ("resolved visible vehicle", case)
+    if case == "order":
+        from itertools import permutations
+        js = build(tracks, _CAMS)
+        for ordered in permutations(tracks):
+            assert build(list(ordered), _CAMS) == js, "overtake input order"
+    if case in ("freeze", "partial_freeze"):
+        from selfloop import cleared
+        if case == "partial_freeze":
+            b = dict(b, t1=3000, path=[*b["path"], [3000, *b["path"][-1][1:]]])
+            tracks = [a, b, truck]
+        js = build(tracks, _CAMS)
+        final = cleared(js, js, cutoff=1300)
+        claims = {(m["id"], m.get("piece")) for j in final for m in j["members"]}
+        if case == "freeze":
+            assert final == js and build(tracks, _CAMS, frozen=claims) == [], "overtake freeze"
+        else:
+            assert [{m["id"] for m in j["members"]} for j in final] == [{truck["id"]}]
+            original = json.dumps(tracks, sort_keys=True)
+            for opened in (tracks, [a, b]):
+                rebuilt = build(opened, _CAMS, frozen=claims, history=tracks)
+                assert len(rebuilt) == 1 and {m["id"] for m in rebuilt[0]["members"]} == {a["id"], b["id"]}, rebuilt
+            assert json.dumps(tracks, sort_keys=True) == original, "history is read-only"
+
+
 def _selfcheck():
+    for case in ("road_train", "follower", "ends_early", "slower", "never_reaches", "interrupted",
+                 "missing_samples", "no_overlap", "limit", "too_long", "partial_freeze", "order", "freeze",
+                 "twin", "ghost", "joined_occluder", "early_vehicle", "ambiguous", "queue",
+                 "visible_twin", "visible_ghost", "later_visible_join",
+                 "early_twin", "early_ghost", "early_twin_real", "early_ghost_real", "later_early_join",
+                 "predecessor", "heavy_predecessor"):
+        _selfcheck_overtake(case)
     for case in ("tipper", "absent", "same_direction", "opposed", "opposed_motion", "unknown_direction", "other_camera", "small",
                  "no_box", "no_overlap", "smaller_heavy", "limit", "too_long", "freeze", "convoy", "backward", "level", "partial_freeze"):
         _selfcheck_occlusion(case)
