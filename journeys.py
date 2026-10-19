@@ -30,7 +30,8 @@ from zoneinfo import ZoneInfo
 from detect import (GHOST_BIRTH_DIST, HEADINGS, OPPOSITE, bound_of, ghost_birth_distance,
                     heading_of, iou, letter_of)
 
-STITCH_GAP = 3.0     # s: longest occlusion that still continues the same vehicle in one camera
+STITCH_GAP = 3.0     # s: ordinary same-camera fragment continuation
+OCCLUDED_GAP = 6.0   # s: only with oncoming heavy cover at loss; 18 Oct tipper needs 4.4 s
 STITCH_IOU = 0.2     # the next fragment starts roughly where the last one ended
 TWIN_IOU = 0.5       # detect.GUARD_IOU: one vehicle, two ids, the same box at the same instant
 TWIN_COVER = 0.8     # a box this much inside another is the same vehicle seen in part (cab + whole truck)...
@@ -185,6 +186,22 @@ def _at(path, t):
     return p[1:] if abs(p[0] - t) <= TWIN_SNAP else None
 
 
+def _occluded(a, others):
+    """An oncoming heavy's larger box covers A when its last sample disappears."""
+    last = a["path"][-1]
+    box = last[1:]
+    x, y = _centre(box)
+    for b in others:
+        if (b is a or b["camera"] != a["camera"] or b["class"] not in HEAVY
+                or not a.get("direction") or b.get("direction") != OPPOSITE.get(a["direction"])):
+            continue
+        cover = _at(b["path"], last[0])
+        if (cover and (cover[2] - cover[0]) * (cover[3] - cover[1]) > (box[2] - box[0]) * (box[3] - box[1])
+                and (iou(box, cover) > 0 or cover[0] <= x <= cover[2] and cover[1] <= y <= cover[3])):
+            return True
+    return False
+
+
 def _twin(a, b):
     """B, starting while A is alive, is A under a second id: the boxes coincide where B starts
     and still where their overlap ends. Two cars in adjacent lanes touch briefly, then diverge."""
@@ -297,7 +314,7 @@ def _ghosts(tracklets, history=(), cameras=None):
     return by, joins
 
 
-def _chains(tracklets, cameras, ghost_joins=None):
+def _chains(tracklets, cameras, ghost_joins=None, history=()):
     """One chain per vehicle per camera: join classified ghosts and twins, then stitch
     fragments that pick up where another left off, cheapest first, one-to-one."""
     if ghost_joins is None:
@@ -349,14 +366,37 @@ def _chains(tracklets, cameras, ghost_joins=None):
     for t in by.values():
         r = find(t["id"])
         end[r] = max(end.get(r, t["t1"]), t["t1"])
+    evidence = {}
+    for t in {t["id"]: t for t in [*history, *by.values()] if t.get("path")}.values():
+        if t["class"] in HEAVY and t.get("direction"):
+            evidence.setdefault(t["camera"], []).append(t)
     cands = []
-    for ts in per.values():
-        # A whole day is ~20k tracklets a camera: only those starting within STITCH_GAP of a's end.
-        for a in ts:
+    for camera, ts in per.items():
+        # Sweep heavy lifetimes at loss times: only concurrent oncoming tracks can occlude.
+        heavy = sorted(evidence.get(camera, ()), key=lambda t: (t["t0"], t["id"]))
+        born = iter(heavy)
+        died = iter(sorted(heavy, key=lambda t: (t["t1"], t["id"])))
+        first, last = next(born, None), next(died, None)
+        active = {}
+        for a in sorted(ts, key=lambda t: (t["path"][-1][0], t["id"])):
+            loss = a["path"][-1][0]
+            while first is not None and first["t0"] <= loss:
+                active.setdefault(first["direction"], {})[first["id"]] = first
+                first = next(born, None)
+            while last is not None and last["t1"] < loss:
+                active[last["direction"]].pop(last["id"], None)
+                last = next(died, None)
             if end[find(a["id"])] > a["t1"]:
                 continue    # its vehicle lived on under another id: a twin dying mid-frame left nowhere
+            gap = OCCLUDED_GAP if _occluded(a, active.get(OPPOSITE.get(a.get("direction")), {}).values()) else STITCH_GAP
             lo = bisect_left(ts, a["t1"], key=lambda t: t["t0"])
-            for b in ts[lo:bisect_right(ts, a["t1"] + STITCH_GAP, key=lambda t: t["t0"])]:
+            for b in ts[lo:bisect_right(ts, a["t1"] + gap, key=lambda t: t["t0"])]:
+                if b["t0"] - a["t1"] > STITCH_GAP:
+                    (ax, ay), (bx, by_) = _centre(a["path"][-1][1:]), _centre(b["path"][0][1:])
+                    vx, vy = _leaving(a["path"]) or (0.0, 0.0)
+                    if (b.get("direction") != a.get("direction") or not _near(a, b)
+                            or (bx - ax) * vx + (by_ - ay) * vy <= 0):
+                        continue
                 if (b is not a and (iou(a["path"][-1][1:], b["path"][0][1:]) >= STITCH_IOU or _near(a, b))
                         and not _opposed(a, b)):
                     cands.append((b["t0"] - a["t1"] + CLASS_PEN * (a["class"] != b["class"]),
@@ -954,7 +994,7 @@ def _build(tracklets, cameras, tz=None, events=None, with_dropped=False, plant=N
         t = min(m["t0"] for m in ms)
         near = [p for p in plant if p[0] - WORKS_WINDOW <= t <= p[1] + WORKS_WINDOW]
         return len(near) >= WORKS_PLANT_TRACKS or any(p[2] >= WORKS_PLANT_LONG for p in near)
-    chains = _chains(tracklets, cameras, ghost_joins)
+    chains = _chains(tracklets, cameras, ghost_joins, history)
     shadows = _shadows(chains, lambda c: works(c, rescue=False))
     absorbed = {}
     links = _links(chains, cameras, tz, shadows, absorbed)
@@ -997,7 +1037,8 @@ def build(tracklets, cameras, tz=None, events=None, with_dropped=False, plant=No
     that drops frozen tracklets passes the unfiltered list, or works mode flips off for open chains).
     frozen: (raw id, piece id) pairs to exclude after splitting; None claims the whole raw tracklet.
     Any claimed leg also excludes a later unsplit copy of its raw tracklet.
-    history: raw tracklets used only for ghost birth classification, including frozen roots."""
+    history: raw tracklets used only for ghost birth classification and heavy occluder evidence,
+    including frozen tracks; never added to chain membership."""
     return _build(tracklets, cameras, tz, events, with_dropped, plant, frozen, history)[0]
 
 
@@ -2176,7 +2217,95 @@ def _selfcheck_weak_arrival_perf():
     return took, indexed_took
 
 
+def _selfcheck_occlusion(case):
+    # 18 Oct 08:14: the northbound tipper disappears behind a southbound truck for 4.4 s.
+    a = _t("cam3", "occluded", "e-heavy", [(881.8, _b(.066, .548, .025)),
+           (884.8, _b(.158, .588, .035)), (885.6, _b(.193, .600, .04))],
+           hits=20, counted=True, direction="northbound")
+    b = _t("cam3", "reacquired", "d-medium", [(890, _b(.545, .710, .07)),
+           (891, _b(.656, .735, .077)), (894.6, _b(.944, .773, .075))],
+           hits=24, direction="northbound")
+    truck = _t("cam3", "occluder", "e-heavy", [(879.6, _b(.87, .80, .12)),
+               (885.8, _b(.272, .642, .10)), (893.2, _b(.054, .549, .03))],
+               hits=64, direction="southbound")
+    others, expected = [truck], True
+    if case == "absent":
+        others, expected = [], False
+    elif case == "same_direction":
+        others, expected = [dict(truck, direction="northbound")], False
+    elif case == "opposed":
+        b, expected = dict(b, direction="southbound"), False
+    elif case == "opposed_motion":
+        b = dict(b, path=[b["path"][0], [891, *_b(.40, .70, .077)], [894.6, *_b(.30, .60, .075)]])
+        assert _opposed(a, b), "occlusion continuation reverses despite its direction label"
+        expected = False
+    elif case == "unknown_direction":
+        b, expected = dict(b, direction=None), False
+    elif case == "other_camera":
+        others, expected = [dict(truck, camera="cam4")], False
+    elif case == "small":
+        others, expected = [dict(truck, **{"class": "a-small"})], False
+    elif case == "no_box":
+        others, expected = [dict(truck, path=[truck["path"][0], truck["path"][-1]])], False
+    elif case == "no_overlap":
+        others, expected = [dict(truck, path=[[p[0], *_b(.8, .2, .1)] for p in truck["path"]])], False
+    elif case == "smaller_heavy":
+        others, expected = [dict(truck, path=[[p[0], *_b(.193, .600, .02)] for p in truck["path"]])], False
+    elif case in ("limit", "too_long"):
+        shift = 1.6 if case == "limit" else 1.7
+        b = dict(b, t0=b["t0"] + shift, t1=b["t1"] + shift,
+                 path=[[p[0] + shift, *p[1:]] for p in b["path"]])
+        expected = case == "limit"
+    elif case in ("convoy", "backward", "level"):
+        a = _t("cam3", "occluded", "e-heavy", [(98, _b(.20, .60, .05)),
+               (99, _b(.30, .60, .05)), (100, _b(.40, .60, .05))],
+               hits=15, counted=True, direction="northbound")
+        if case == "level":
+            a = dict(a, path=[[98, *_b(.38, .60, .05)], [99, *_b(.39, .60, .05)], a["path"][-1]])
+        x = .39 if case == "backward" else .40
+        b = _t("cam3", "reacquired", "e-heavy", [(105, _b(x, .60, .05)),
+               (106, _b(x + .10, .60, .05)), (107, _b(x + .20, .60, .05))],
+               hits=15, counted=True, direction="northbound")
+        others = [_t("cam3", "occluder", "e-heavy", [(99, _b(.50, .60, .15)),
+                  (100, _b(.40, .60, .15)), (101, _b(.30, .60, .15))],
+                  hits=15, counted=True, direction="southbound")]
+        assert _near(a, b) == (case == "level") and iou(a["path"][-1][1:], b["path"][0][1:]) >= STITCH_IOU
+        assert _occluded(a, others), "convoy fixture needs occlusion evidence"
+        expected = False
+    chains = _chains([a, b, *others], _CAMS)
+    together = any({a["id"], b["id"]} <= {t["id"] for t in c["members"]} for c in chains)
+    assert together == expected, ("occlusion stitch", case, together)
+    if case == "partial_freeze":
+        from selfloop import cleared
+        truck = dict(truck, counted=True)
+        b = dict(b, t1=3000, path=[*b["path"], [3000, *b["path"][-1][1:]]])
+        tracks = [a, b, truck]
+        js = build(tracks, _CAMS)
+        final = cleared(js, js, cutoff=1300)
+        assert [{m["id"] for m in j["members"]} for j in final] == [{truck["id"]}], "only occluder freezes"
+        claims = {(m["id"], m.get("piece")) for j in final for m in j["members"]}
+        for open_tracks in (tracks, [a, b]):
+            rebuilt = build(open_tracks, _CAMS, frozen=claims, history=tracks)
+            assert len(rebuilt) == 1 and {m["id"] for m in rebuilt[0]["members"]} == {a["id"], b["id"]}, (
+                "partial freeze preserves occlusion without reclaiming occluder", rebuilt)
+    if case == "freeze":
+        from selfloop import cleared
+        arrival = _north("tipper", 894.6, gap=1.6, cls="e-heavy", k4={"counted": True})[1]
+        tracks = [a, b, truck, arrival]
+        js = build(tracks, _CAMS)
+        tipper = next(j for j in js if any(m["id"] == a["id"] for m in j["members"]))
+        assert {m["id"] for m in tipper["members"]} == {a["id"], b["id"], arrival["id"]}
+        assert build(tracks[::-1], _CAMS) == js, "occlusion input order"
+        final = cleared(js, js, cutoff=2000)
+        assert final == js, "occlusion freezes"
+        claims = {(m["id"], m.get("piece")) for j in final for m in j["members"]}
+        assert build(tracks, _CAMS, frozen=claims) == [], "occlusion freeze rebuild"
+
+
 def _selfcheck():
+    for case in ("tipper", "absent", "same_direction", "opposed", "opposed_motion", "unknown_direction", "other_camera", "small",
+                 "no_box", "no_overlap", "smaller_heavy", "limit", "too_long", "freeze", "convoy", "backward", "level", "partial_freeze"):
+        _selfcheck_occlusion(case)
     for case in ("ownership", "class", "margin", "similarity", "hits", "timing", "stub_convoy"):
         _selfcheck_sliver_guards(case)
     for case in ("stub", "sliver", "oct9_general_late"):
