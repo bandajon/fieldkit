@@ -31,6 +31,7 @@ from detect import (GHOST_BIRTH_DIST, HEADINGS, OPPOSITE, bound_of, ghost_birth_
                     heading_of, iou, letter_of)
 
 STITCH_GAP = 3.0     # s: ordinary same-camera fragment continuation
+HEAVY_QUEUE_GAP = 12.0  # s: stopped heavy reacquisition needs strong box and appearance agreement
 OCCLUDED_GAP = 6.0   # s: only with oncoming heavy cover at loss; 18 Oct tipper needs 4.4 s
 OVERTAKE_GAP = 15.0  # s: hard ceiling; measured same-direction cover must support the gap
 STITCH_IOU = 0.2     # the next fragment starts roughly where the last one ended
@@ -206,13 +207,13 @@ def _opposed(a, b):
 
 
 def _near(a, b):
-    """B picks up where A was heading, for a far box too small to overlap its last one. Same
-    class or both heavy: every false merge by position on footage was a big vehicle occluding a small
-    one, a small-heavy jump (heavy classes flicker on one truck). Never behind A: that is the next vehicle in the queue."""
-    if a["class"] != b["class"] and not (a["class"] in HEAVY and b["class"] in HEAVY and abs(complex(*(_leaving(a["path"]) or (0, 0)))) >= MOVE / 2):
-        return False    # a stopped truck never swallows a different one queued behind it
-    last, first = a["path"][-1][1:], b["path"][0][1:]
+    """Motion continuation; compatible class flicker needs strong appearance agreement."""
+    same_class = a["class"] == b["class"]
     vx, vy = _leaving(a["path"]) or (0.0, 0.0)
+    if not same_class and not (a["class"] in HEAVY and b["class"] in HEAVY and abs(complex(vx, vy)) >= MOVE / 2):
+        if _clash(a["class"], b["class"]) or not (_similar(_app([a]), _app([b])) or 0) >= .80:
+            return False    # class flicker needs comparable appearance, never a small-heavy jump
+    last, first = a["path"][-1][1:], b["path"][0][1:]
     (ax, ay), (bx, by) = _centre(last), _centre(first)
     gap = b["t0"] - a["t1"]
     size = max(last[2] - last[0], last[3] - last[1], first[2] - first[0], first[3] - first[1])
@@ -507,8 +508,20 @@ def _chains(tracklets, cameras, ghost_joins=None, history=()):
     per = {}
     for t in by.values():
         per.setdefault(t["camera"], []).append(t)
+    queue_edges = []
     for ts in per.values():
         ts.sort(key=lambda t: (t["t0"], t["id"]))
+        for a in ts:
+            if a["class"] not in HEAVY or a.get("mixed"):
+                continue
+            for b in ts[bisect_right(ts, a["t1"] + STITCH_GAP, key=lambda t: t["t0"]):
+                        bisect_right(ts, a["t1"] + HEAVY_QUEUE_GAP, key=lambda t: t["t0"])]:
+                if (b["class"] in HEAVY and not b.get("mixed")
+                        and iou(a["path"][-1][1:], b["path"][0][1:]) >= .5
+                        and (_similar(_app([a]), _app([b])) or 0) >= .90
+                        and not _opposed(a, b)):
+                    queue_edges.append((a["id"], b["id"]))
+    for ts in per.values():
         for a in ts:
             # Forced like a ghost, any class (twins flicker), and no stitch slot used: detect's
             # recount guard only tags a twin once it crosses the count line.
@@ -577,6 +590,26 @@ def _chains(tracklets, cameras, ghost_joins=None, history=()):
                     overtake_edges[aid, bid] = emergence, tuple(i for i in overtaken if i in up)
     cands.sort()
     succ, pred = set(), set()
+    ordinary_succ = {find(a) for _, a, b in cands}
+    ordinary_pred = {find(b) for _, a, b in cands}
+    successors = Counter(a for a, b in queue_edges)
+    predecessors = Counter(b for a, b in queue_edges)
+    for a, b in sorted(queue_edges, key=lambda edge: (by[edge[0]]["t1"], *edge)):
+        if successors[a] == predecessors[b] == 1:
+            ra, rb = find(a), find(b)
+            # Queue recovery cannot steal an ordinary slot or an already-visible vehicle.
+            if (ra in ordinary_succ or rb in ordinary_pred or a in succ or b in pred
+                    or finish[ra] > by[a]["t1"] or start[rb] < by[a]["t1"]):
+                continue
+            if join(a, b):
+                if rb in ordinary_succ:
+                    ordinary_succ.add(find(a))
+                if rb in ordinary_pred:
+                    ordinary_pred.add(find(a))
+                succ.add(a)
+                pred.add(b)
+                if by[a].get("source"):
+                    owned.add(by[a]["source"]["id"])    # the continuation owns this resolved leg
     for _, a, b in cands:
         emergence, covers = overtake_edges.get((a, b), (None, ()))
         if (emergence is not None and start[find(b)] < emergence
@@ -3275,7 +3308,158 @@ def _selfcheck_reid_cases():
     assert abs(_reid_sim(_reids([scaled]),_reids(b["members"]))-1)<1e-9
 
 
+def _selfcheck_frag_stitch():
+    """Synthetic class-change boundaries avoid the IoU stitch bypass."""
+    from copy import deepcopy
+    from unittest.mock import patch
+
+    def look(cosine=1):
+        return {"app": base64.b64encode(struct.pack("<32e", cosine, (1 - cosine ** 2) ** .5,
+                                                     *([0.] * 30))).decode(), "app_v": "synthetic"}
+
+    def groups(ts):
+        return sorted(sorted(m["id"] for m in c["members"]) for c in _chains(ts, _CAMS, ghost_joins=[]))
+
+    rule = "classcos08"
+    a = _t("cam3", 801, "b-minibuses", [(100, _b(.48, .5)),
+                                       (101, _b(.5, .5))], hits=10, direction="northbound", **look())
+    b = _t("cam3", 802, "c-bus",
+           [(102, _b(.65, .5)), (103, _b(.66, .5))],
+           hits=10, direction="northbound", **look(.81))
+    assert iou(a["path"][-1][1:], b["path"][0][1:]) < STITCH_IOU
+    assert _near(a, b), (rule, "positive")
+    assert groups([a, b]) == [[a["id"], b["id"]]], (rule, "chain")
+    for change in (look(.79), {"app": None}, {"app_v": "other"}, {"mixed": True}):
+        assert not _near(a, dict(b, **change)), (rule, change)
+    # Exactly .80 must pass independently of float16 quantization.
+    with patch(__name__ + "._similar", return_value=.80):
+        assert _near(a, b), (rule, "inclusive cosine")
+    for cosine in (.79999, float("nan")):
+        with patch(__name__ + "._similar", return_value=cosine):
+            assert not _near(a, b), (rule, "cosine threshold", cosine)
+    assert not _near(dict(a, **{"class": "a-small"}), dict(b, **{"class": "e-heavy"})), (rule, "class clash")
+    for x in (.35, .95):
+        bb = deepcopy(b)
+        bb["path"][0][1:] = _b(x, .5)
+        assert not _near(a, bb), (rule, "motion geometry", x)
+    # Eligibility never overrides terminal motion or chain-root headings.
+    bb = deepcopy(b)
+    bb["path"][1][1:] = _b(.65 - .1, .5)
+    assert _opposed(a, bb) and len(groups([a, bb])) == 2, (rule, "opposed motion")
+    assert len(groups([a, dict(b, direction="southbound")])) == 2, (rule, "direction")
+    # Two eligible successors cannot consume one predecessor.
+    with patch(__name__ + "._twin", return_value=False):
+        rival = dict(b, id="obs-cam3-803")
+        assert len(groups([a, b, rival])) == 2, (rule, "one-to-one successor")
+        rival = dict(a, id="obs-cam3-803")
+        assert len(groups([a, rival, b])) == 2, (rule, "one-to-one predecessor")
+
+
+def _selfcheck_heavy_queue():
+    """Synthetic stopped-heavy reacquisition, including ambiguous queue neighbours."""
+    from copy import deepcopy
+    from unittest.mock import patch
+
+    def look(cosine=1):
+        return {"app": base64.b64encode(struct.pack("<32e", cosine, (1 - cosine ** 2) ** .5,
+                                                     *([0.] * 30))).decode(), "app_v": "synthetic"}
+
+    def groups(ts, ghosts=()):
+        # Isolate this rule from ordinary short-gap, twin and occlusion recovery.
+        with patch(__name__ + ".STITCH_IOU", 2), patch(__name__ + "._near", return_value=False), \
+                patch(__name__ + "._twin", return_value=False):
+            return _chains(ts, _CAMS, ghost_joins=list(ghosts))
+
+    def pair(a, b):
+        return len(groups([a, b])) == 1
+
+    a = _t("cam4", 901, "d-medium", [(100, _b(.5, .5)), (108, _b(.5, .5))],
+           hits=30, direction="southbound", **look())
+    b = _t("cam4", 902, "e-heavy", [(119.5, _b(.5, .5)), (127, _b(.5, .5))],
+           hits=15, **look(.95))
+    c = _t("cam4", 903, "f-abnormal", [(138, _b(.5, .5)), (143, _b(.5, .5))],
+           hits=25, **look(.94))
+    for ts in ([a, b, c], [c, b, a]):
+        chains = groups(ts)
+        assert len(chains) == 1, "heavy queue crane chain"
+        _, doc = _doc(chains, None, {c["name"]: c for c in _CAMS}, ZoneInfo("Africa/Lusaka"), None)
+        assert doc["direction"] == "southbound", "heavy queue crane direction"
+        assert {m["id"] for m in chains[0]["members"]} == {a["id"], b["id"], c["id"]}
+        assert len(_chains(ts, _CAMS, ghost_joins=[])) == 1, "heavy queue normal pipeline"
+    from itertools import permutations
+
+    queued = _t("cam4", "queue-owner", "e-heavy",
+                [(100, _b(.8, .5)), (108, _b(.8, .5)), (118, _b(.5, .5))],
+                hits=30, direction="southbound", **look())
+    expected = {frozenset([a["id"]]), frozenset([queued["id"], b["id"]])}
+    for ts in permutations([dict(a, counted=True, **{"class": "e-heavy", "votes": {"e-heavy": 30}}),
+                            dict(b, counted=True, **look()), dict(queued, counted=True)]):
+        actual = {frozenset(m["id"] for m in j["members"]) for j in build(ts, _CAMS)}
+        assert actual == expected, "ordinary predecessor owns the queue successor through build"
+
+    following = _t("cam4", "ordinary-successor", "d-medium",
+                   [(110, _b(.5, .5)), (118, _b(.8, .5))], hits=30,
+                   direction="southbound", **look())
+    expected = {frozenset([a["id"], following["id"]]), frozenset([b["id"]])}
+    for ts in permutations([dict(a, counted=True), dict(b, counted=True, direction="southbound"),
+                            dict(following, counted=True)]):
+        actual = {frozenset(m["id"] for m in j["members"]) for j in build(ts, _CAMS)}
+        assert actual == expected, "ordinary successor owns the queue predecessor through build"
+    # Ghost chains can have a different lifetime from the proposed queue endpoints.
+    alive = _t("cam3", "queue-alive", "d-medium",
+               [(105, _b(.8, .5)), (118, _b(.8, .5))], hits=30, **look())
+    assert len(groups([a, b, alive], [(a["id"], alive["id"])])) == 2, "queue predecessor chain lives on"
+    assert len(groups([a, b, alive], [(b["id"], alive["id"])])) == 2, "queue successor chain coexists"
+
+    for side in (0, 1):
+        for change in (look(.89), {"app": None}, {"app_v": "other"}, {"mixed": True},
+                       {"class": "b-light"}, {"camera": "cam3"}):
+            ts = [deepcopy(a), deepcopy(b)]
+            for t in ts:
+                t.update(look())
+            ts[side].update(change)
+            assert not pair(*ts), ("heavy queue member gate", side, change)
+    assert not pair(dict(a, **{"class": "b-light"}), dict(b, **{"class": "b-light"})), "light queue"
+    with patch(__name__ + "._similar", return_value=1):
+        assert not pair(dict(a, mixed=True), b), "heavy queue mixed predecessor"
+        assert not pair(a, dict(b, mixed=True)), "heavy queue mixed successor"
+    for gap, expected in ((-1, False), (0, False), (3, False), (3.00001, True),
+                          (12, True), (12.00001, False), (13, False)):
+        bb = deepcopy(b)
+        bb["t0"] = bb["path"][0][0] = a["t1"] + gap
+        bb["t1"] = bb["path"][-1][0] = bb["t0"] + 2
+        assert pair(a, bb) == expected, ("heavy queue gap", gap)
+    for cosine, expected in ((.90, True), (.89999, False), (float("nan"), False)):
+        with patch(__name__ + "._similar", return_value=cosine):
+            assert pair(a, b) == expected, ("heavy queue cosine", cosine)
+    for overlap, expected in ((.5, True), (.49999, False)):
+        with patch(__name__ + ".iou", return_value=overlap):
+            assert pair(a, b) == expected, ("heavy queue IoU", overlap)
+    bb = deepcopy(b)
+    bb["path"][0][1:] = bb["path"][-1][1:] = _b(.58, .5)
+    assert not pair(a, bb), "heavy queue separated boxes"
+    assert not pair(a, dict(b, direction="northbound")), "heavy queue opposite direction"
+    aa, bb = deepcopy(a), deepcopy(b)
+    aa["path"][0][1:] = _b(.3, .5)
+    bb["path"][-1][1:] = _b(.7, .5)
+    assert pair(aa, bb), "heavy queue endpoint boxes"
+    bb["path"][-1][1:] = _b(.3, .5)
+    assert _opposed(aa, bb) and not pair(aa, bb), "heavy queue opposed motion"
+    for ts in ([a, b, dict(b, id="obs-cam4-904")], [a, dict(a, id="obs-cam4-904"), b]):
+        assert len(groups(ts)) == 3, "heavy queue ambiguous predecessor/successor"
+    # Pairwise directionless evidence cannot override an already-owned root heading.
+    north = dict(b, id="obs-cam3-905", camera="cam3", direction="northbound")
+    assert len(groups([a, b, north], [(b["id"], north["id"])])) == 2, "heavy queue root heading"
+    aa, bb = dict(a, source={"id": "synthetic-source"}), dict(b, source={"id": "synthetic-source"})
+    owner = dict(a, id="obs-cam4-906", camera="cam3")
+    assert len(groups([aa, bb, owner], [(aa["id"], owner["id"])])) == 2, "heavy queue ghost ownership"
+    sibling = dict(c, source={"id": "synthetic-source"})
+    assert len(groups([aa, b, sibling])) == 2, "heavy queue continuation owns its resolved leg"
+
+
 def _selfcheck():
+    _selfcheck_heavy_queue()
+    _selfcheck_frag_stitch()
     _selfcheck_reid()
     _selfcheck_pair_tie()
     for case in ("ride_letter", "absorption_class", "ride_birth", "ride_end", "ride_direction", "ride_rows", "ride_movement", "ride_slip", "ride_behind", "ride_lane",
