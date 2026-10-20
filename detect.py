@@ -347,6 +347,47 @@ def appearance_code(pil, embed, pca):
         return None
 
 
+def reid_model(weights, dev):
+    """Optional TorchScript identity tower; bad/missing weights never stop detection."""
+    if not weights:
+        return None
+    try:
+        import torch
+        model = torch.jit.load(str(weights), map_location=dev).eval()
+        if not isinstance(model.version, str) or not model.version:
+            raise ValueError("missing re-ID version")
+        return model
+    except Exception as e:
+        print(f"  ! re-ID weights: {e} — re-ID off")
+        return None
+
+
+def reid_code(model, pil):
+    """Reference CLIP resize/centre crop, then base64 little-endian float16 256-d."""
+    try:
+        import base64
+        import numpy as np
+        import torch
+        from PIL import Image
+        w, h = pil.size
+        if min(w, h) != 224:
+            pil = pil.resize((224, int(224*h/w)) if w <= h else (int(224*w/h), 224),
+                             Image.Resampling.BICUBIC)
+        w, h = pil.size
+        left, top = int(round((w-224)/2)), int(round((h-224)/2))
+        im = pil.crop((left, top, left+224, top+224)).convert("RGB")
+        x = torch.from_numpy(np.array(im, dtype=np.uint8, copy=True)).permute(2, 0, 1).float()/255.
+        x = (x-torch.tensor((.48145466,.4578275,.40821073))[:,None,None]) / torch.tensor(
+            (.26862954,.26130258,.27577711))[:,None,None]
+        with torch.inference_mode():
+            z = model(x.unsqueeze(0).to(model.preprocess_mean.device))[0].cpu().numpy()
+        if z.shape != (256,) or not np.isfinite(z).all() or not np.linalg.norm(z) > 0:
+            return None
+        return base64.b64encode(z.astype("<f2").tobytes()).decode()
+    except Exception:
+        return None
+
+
 def _best_plate_box(xyxy, confs):
     """Index of the surest plate-shaped box (w/h >= PLATE_ASPECT), or None."""
     ok = [i for i, (x0, y0, x1, y1) in enumerate(xyxy) if (x1 - x0) >= PLATE_ASPECT * (y1 - y0)]
@@ -946,6 +987,8 @@ class Detector:
         self.weights = str(cfg.get("detect_weights", "") or "").strip()
         # Stage 2: attributes off the counted vehicle's best crop (type/axles/cargo).
         self.attr_weights = str(cfg.get("attr_weights", "") or "").strip()
+        self.reid_weights = str(cfg.get("reid_weights", "") or "").strip()
+        self.reid = None
         self.attrs = None
         self.app = None                      # (mu, P, champion tag) when appearance is on
         # Plate evidence on each tracklet's best crops, for linking a vehicle across cameras.
@@ -1174,6 +1217,7 @@ class Detector:
         if self.attr_weights:
             self.attrs = attr_classifier(self.attr_weights, dev)   # worker thread only
             self.app = appearance_pca(self.attr_weights, self.attrs.tag)
+        self.reid = reid_model(self.reid_weights, dev)   # worker thread only
         if self.plate_weights:
             self.plates = plate_reader(self.plate_weights, dev)
 
@@ -1522,6 +1566,14 @@ class Detector:
                "path": path, "crops": {tag: rel[tag] for tag in shots},
                "attrs": t["attrs"] or (self._classify(t, k) if shots and self.attrs else {}),
                "plate": plate and {"conf": round(plate[0], 3), "crop": rel["plate"]}}
+        if self.reid is not None and t["best"][1]:
+            try:
+                from PIL import Image
+                code = reid_code(self.reid, Image.open(io.BytesIO(t["best"][1])).convert("RGB"))
+                if code:
+                    doc.update(reid=code, reid_v=self.reid.version)
+            except Exception:
+                pass                      # a bad crop costs the code, never the tracklet
         if self.app and self.attrs and t["best"][1]:
             try:
                 from PIL import Image
@@ -2925,6 +2977,50 @@ if __name__ == "__main__":
             rendered_files = {str(p.relative_to(events)): p.read_bytes() for p in events.rglob("*") if p.is_file()}
             plain_files = {str(p.relative_to(plain)): p.read_bytes() for p in plain.rglob("*") if p.is_file()}
             assert rendered_files == plain_files, "stalled rendering changed event/tracklet/crop bytes"
+
+    # Synthetic TorchScript: optional re-ID writes only valid, versioned 256-d codes.
+    import torch
+    import base64
+    import numpy as np
+    class FakeReid(torch.nn.Module):
+        version: str
+        def __init__(self):
+            super().__init__()
+            self.version = "synthetic-v1"
+            self.register_buffer("preprocess_mean", torch.zeros(3))
+        def forward(self, x):
+            return torch.nn.functional.normalize(torch.ones((x.size(0), 256), device=x.device), dim=1)
+    with tempfile.TemporaryDirectory() as td:
+        weights = Path(td) / "synthetic.pt"
+        torch.jit.script(FakeReid()).save(str(weights))
+        model = reid_model(str(weights), "cpu")
+        assert model is not None and model.version == "synthetic-v1"
+        from types import SimpleNamespace
+        import sys
+        n = Detector([], nosnap, {"reid_weights": str(weights)})
+        with patch.dict(sys.modules, {"ultralytics": SimpleNamespace(YOLO=None)}), \
+             patch("torch.backends.mps.is_available", return_value=False):
+            n._load()
+        assert n.reid is not None and n.reid.version == "synthetic-v1", "worker loader uses reid_weights"
+        assert reid_model("", "cpu") is None
+        assert reid_model(str(weights)+".missing", "cpu") is None
+        broken = Path(td)/"broken.pt"; broken.write_bytes(b"synthetic invalid weights")
+        assert reid_model(str(broken), "cpu") is None
+        for configured in (True, False):
+            d = fresh(events_dir=Path(td)/str(configured))
+            d.clock = d.wall = lambda: at[0]
+            d.reid = model if configured else None
+            for i in range(TRACKLET_CROP_HITS):
+                d._track("c", [("truck", .9, VEH, 1)], pic)
+                at[0] += .4
+            d.flush("c")
+            row=json.loads(next((d.events_dir/"tracklets").glob("*.jsonl")).read_text().splitlines()[-1])
+            if configured:
+                vector=np.frombuffer(base64.b64decode(row["reid"]),dtype="<f2")
+                assert vector.shape==(256,) and abs(np.linalg.norm(vector)-1)<.001
+                assert row["reid_v"]==model.version
+            else:
+                assert "reid" not in row and "reid_v" not in row
 
     # Appearance code: a unit 32-d float16 vector; a stale PCA (other champion) is off.
     import base64

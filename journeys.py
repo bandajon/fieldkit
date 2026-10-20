@@ -151,6 +151,30 @@ def _similar(a, b):
     return sum(x * y for x, y in zip(a[0], b[0]))
 
 
+REID_MISSED_HEAVY_COS = .5365007054807878
+
+
+def _reids(ms):
+    """All clean, valid member codes, normalized after float16 storage."""
+    out = []
+    for t in ms:
+        if t.get("mixed") or not t.get("reid") or not t.get("reid_v"):
+            continue
+        try:
+            v = struct.unpack("<256e", base64.b64decode(t["reid"], validate=True))
+            n = sum(x*x for x in v)**.5
+            if n > 0 and isfinite(n):
+                out.append((t["camera"], tuple(x/n for x in v), t["reid_v"]))
+        except (TypeError, ValueError, struct.error):
+            pass
+    return out
+
+
+def _reid_sim(a, b):
+    return max((sum(x*y for x,y in zip(va,vb)) for ca,va,version in a for cb,vb,vb_version in b
+                if version == vb_version and ca != cb), default=None)
+
+
 def _vel(p, q):
     """Centre velocity per second from path sample p to a later one q."""
     dt = q[0] - p[0]
@@ -975,6 +999,7 @@ def _pairs(lone, cameras, accepted=()):
     dirs = {id(c): next((t["direction"] for t in c["members"] if t.get("direction")), None) for c in lone}
     heavy = lambda c: c["class"] in (*HEAVY, "c-bus")
     family = lambda c: "heavy" if c["class"] in HEAVY else "bus" if c["class"] == "c-bus" else "light"
+    codes = {id(c): _reids(c["members"]) if heavy(c) else [] for c in lone}
     arrival = lambda c: c["arr"] if c["arr"] is not None else (
         c["late"] if c.get("late") is not None else c.get("stub_late"))
     times = {}
@@ -1008,8 +1033,12 @@ def _pairs(lone, cameras, accepted=()):
             cos = _similar(a["app"], b["app"])
             threshold = PAIR_HEAVY_COS if heavy(a) else max(PAIR_COS, PAIR_SMALL_COS if
                 a["class"] in ("a-small", "a-motorcycle") or b["class"] in ("a-small", "a-motorcycle") else PAIR_COS)
-            if cos is None or cos < threshold:
+            reid = _reid_sim(codes[id(a)], codes[id(b)])
+            scores = ([cos] if cos is not None and cos >= threshold else []) + (
+                [reid] if reid is not None and reid >= REID_MISSED_HEAVY_COS else [])
+            if not scores:
                 continue
+            cos = max(scores)   # only qualifying evidence competes for mutual best
             if heavy(a) and _crosses(d, r, accepted, (*HEAVY, "c-bus")):
                 continue
             for c, other in ((a, b), (b, a)):
@@ -3125,7 +3154,104 @@ def _selfcheck_pair_tie():
     _selfcheck_l2_freeze(tracks, expected)
 
 
+def _selfcheck_reid():
+    from copy import deepcopy
+    from itertools import permutations
+
+    def chain(cam, name, start=100, cls="e-heavy", score=1.):
+        v = [score, (1-score*score)**.5] + [0.] * 254
+        t = _t(cam, name, cls, [(start, _b(.6,.4)), (start+1, _b(.5,.4)),
+                               (start+2, _b(.4,.4))], counted=True, hits=30,
+               direction="southbound", reid_v="synthetic-v1",
+               reid=base64.b64encode(struct.pack("<256e", *v)).decode())
+        return dict(camera=cam, members=[t], **{"class":cls}, app=None,
+                    votes=t["votes"], conf=t["conf"], z=(start,start+2),
+                    dep=start+2 if cam=="cam4" else None,
+                    arr=start if cam=="cam3" else None, early=None, late=None)
+
+    a,b = chain("cam4","a"),chain("cam3","b",104)
+    assert _pairs([a,b], _CAMS) == [(a,b)], "re-ID rescues missed handoff without app"
+    # Raw tracklets must carry re-ID through build, not just hand-built _pairs cards.
+    for app in (False, True):
+        tracks = deepcopy([a["members"][0], b["members"][0]])
+        if app:
+            for t, score in zip(tracks, (1., 0.)):
+                t.update(app=base64.b64encode(struct.pack(
+                    "<32e", score, 1-score, *[0.] * 30)).decode(), app_v="synthetic-app")
+            assert _similar(*[_app([t]) for t in tracks]) < PAIR_HEAVY_COS
+        without = [{k:v for k,v in t.items() if k not in ("reid", "reid_v")} for t in tracks]
+        assert len(build(without, _CAMS)) == 2, "missed handoff control must require re-ID"
+        expected = build(tracks, _CAMS)
+        assert len(expected) == 1, "build lost re-ID missed heavy handoff"
+        assert expected[0]["evidence"] == "handoff" and expected[0]["link"]["gap_s"] == 2
+        assert {m["id"] for m in expected[0]["members"]} == {t["id"] for t in tracks}
+        for ordered in permutations(tracks):
+            assert build(list(ordered), _CAMS) == expected, "re-ID handoff input order"
+        _selfcheck_l2_freeze(tracks, expected)
+
+    convoy = [chain(cam, name, start)["members"][0]
+              for cam, name, start in (("cam4", "convoy-a", 100), ("cam4", "convoy-b", 101),
+                                       ("cam3", "convoy-c", 104), ("cam3", "convoy-d", 105))]
+    expected = build(convoy, _CAMS)
+    assert len(expected) == 4 and all(len(j["members"]) == 1 and not j["link"] for j in expected), \
+        "identical re-ID codes must not collapse four ambiguous convoy trucks"
+    assert {m["id"] for j in expected for m in j["members"]} == {t["id"] for t in convoy}
+    for ordered in permutations(convoy):
+        assert build(list(ordered), _CAMS) == expected, "re-ID convoy input order"
+
+    for cls, threshold in (("e-heavy", .5365007054807878), ("c-bus", .5365007054807878)):
+        for delta, want in ((-.002, False), (.002, True)):
+            x,y = chain("cam4","x",cls=cls),chain("cam3","y",104,cls,threshold+delta)
+            assert bool(_pairs([x,y], _CAMS)) == want, (cls,delta)
+    for field,value in (("reid_v","other"),("reid_v",None),("reid","bad"),("mixed",True)):
+        x,y=deepcopy(a),deepcopy(b)
+        y["members"][0][field]=value
+        assert not _pairs([x,y],_CAMS), field
+    x,y=deepcopy(a),deepcopy(b)
+    x["members"].append(dict(x["members"][0], id="lower-hit", hits=1))
+    x["members"][0]["reid"] = chain("cam4","orthogonal",score=0)["members"][0]["reid"]
+    assert _pairs([x,y],_CAMS), "MAX includes lower-hit members"
+    for change in ("family","direction","window","config","heading"):
+        x,y=deepcopy(a),deepcopy(b); cams=deepcopy(_CAMS)
+        if change=="family": y["class"]="c-bus"
+        if change=="direction":
+            y["members"][0]["direction"]="northbound"
+            y["dep"],y["arr"]=y["arr"],None
+        if change=="window": y["arr"]=1000
+        if change=="config": cams=[{k:v for k,v in c.items() if k!="handoff"} for c in cams]
+        if change=="heading": cams[0]["heading"]="unknown"
+        assert not _pairs([x,y],cams), change
+    c=chain("cam3","competitor",105,score=.98)
+    assert not _pairs([a,b,c],_CAMS), "strict margin rejects near ties"
+    c=chain("cam4","competitor",101,score=.9)
+    assert _pairs([a,b,c],_CAMS)==[(a,b)], "mutual best keeps strongest"
+    # A below-threshold app score must not inflate a qualifying re-ID candidate.
+    x=chain("cam4","score-parent")
+    y=chain("cam3","weaker",104,score=.55)
+    z=chain("cam3","stronger",105,score=.62)
+    x["app"]=((1.,0.),"app")
+    y["app"]=((.69,(1-.69**2)**.5),"app")
+    z["app"]=((0.,1.),"app")
+    assert _pairs([x,y,z],_CAMS)==[(x,z)], "only qualifying scores determine mutual-best margin"
+    c,d=chain("cam4","c",101),chain("cam3","d",103)
+    assert not _pairs([a,b],_CAMS,[(c,d)]), "accepted convoy order survives re-ID"
+
+    for cls in ("a-small", "a-motorcycle", "b-light"):
+        x,y=chain("cam4","x",cls=cls),chain("cam3","y",104,cls)
+        assert not _pairs([x,y],_CAMS), "re-ID only rescues heavy/bus handoffs"
+    codes=_reids(a["members"])
+    assert _reid_sim(codes,codes) is None, "same-camera codes cannot support a handoff"
+    bad=dict(a["members"][0],reid=base64.b64encode(struct.pack("<256e", *([float("nan")]*256))).decode())
+    assert not _reids([bad]), "nonfinite vectors abstain"
+    bad["reid"]=base64.b64encode(bytes(512)).decode()
+    assert not _reids([bad]), "zero vectors abstain"
+    # Similarity is cosine even when half-precision storage changes the norm.
+    scaled=dict(a["members"][0],reid=base64.b64encode(struct.pack("<256e", *([2.]+[0.]*255))).decode())
+    assert abs(_reid_sim(_reids([scaled]),_reids(b["members"]))-1)<1e-9
+
+
 def _selfcheck():
+    _selfcheck_reid()
     _selfcheck_pair_tie()
     for case in ("ride_letter", "absorption_class", "ride_birth", "ride_end", "ride_direction", "ride_rows", "ride_movement", "ride_slip", "ride_behind", "ride_lane",
                  "pair_config", "pair_heading", "pair_same_heading", "pair_family", "pair_stub", "pair_dropped", "pair_cos_order", "pair_bus_crossing", "links_bus", "pair_parked_perf"):
