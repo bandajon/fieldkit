@@ -86,12 +86,12 @@ RIDE_END_S = 2.0     # s: a towed part disappears with its tractor
 RIDE_GAP = 0.25      # smaller-box heights: a towed part touches its tractor at every common instant
 RIDE_SLIP = 0.25     # of the tractor's displacement: it moves with it
 RIDE_LANE = 0.5      # tractor widths: in line behind it, not in the next lane
-PAIR_COS = 0.85      # general leftovers outside the small-car family
+PAIR_COS = 0.85      # labelled general leftovers: 41/45 correct (91.1%)
 PAIR_SMALL_COS = 0.88  # similar small cars need stronger appearance evidence
-PAIR_HEAVY_COS = 0.75  # labelled heavy/bus handoffs meet the owner's accepted .80 precision bar
+PAIR_HEAVY_COS = 0.75  # labelled heavy/bus handoffs after window filtering: 74/78 correct (94.9%)
 PAIR_MARGIN = 0.05  # a near-equal second candidate is too ambiguous to pair
 PAIR_WINDOW = (-8.0, 12.0)  # s: real departure-end to arrival-start window for general leftovers
-PAIR_HEAVY_WINDOW = (-15.0, 20.0)  # labelled zone gaps: 125/136 precision (91.9%), 125/132 recall (94.7%)
+PAIR_HEAVY_WINDOW = (-15.0, 20.0)  # s: heavy/bus zone departure to arrival
 
 
 def _centre(b):
@@ -664,8 +664,8 @@ def _shadows(chains, works):
     return owners
 
 
-def _crosses(d, r, accepted):
-    heavy = lambda c: c["class"] in (*HEAVY, "c-bus")
+def _crosses(d, r, accepted, classes=HEAVY):
+    heavy = lambda c: c["class"] in classes
     dep = lambda c: c["dep"] if c["dep"] is not None else c.get("early")
     arr = lambda c: c["arr"] if c["arr"] is not None else (
         c["late"] if c.get("late") is not None else c.get("stub_late", c["members"][0]["path"][0][0]))
@@ -961,45 +961,60 @@ def _trucks(chains, links, pairs):
     return out
 
 
-def _pairs(lone, accepted=()):
+def _pairs(lone, cameras, accepted=()):
     """Mutual, unambiguous appearance matches among final lone cam3/cam4 cards."""
+    cfg = {c["name"]: c for c in cameras}
+    handoffs = {frozenset((c["name"], c["handoff"]["camera"])) for c in cameras if c.get("handoff")}
+    if frozenset(("cam3", "cam4")) not in handoffs:
+        return []
+    headings = {cam: HEADINGS.get(heading_of(cfg.get(cam, {}))) for cam in ("cam3", "cam4")}
+    if headings["cam3"] is None or headings["cam4"] != OPPOSITE[headings["cam3"]]:
+        return []
     starts = {id(c): min(t["t0"] for t in c["members"]) for c in lone}
     ends = {id(c): max(t["t1"] for t in c["members"]) for c in lone}
     dirs = {id(c): next((t["direction"] for t in c["members"] if t.get("direction")), None) for c in lone}
     heavy = lambda c: c["class"] in (*HEAVY, "c-bus")
     family = lambda c: "heavy" if c["class"] in HEAVY else "bus" if c["class"] == "c-bus" else "light"
-    rows = sorted((starts[id(c)], i, c) for i, c in enumerate(lone) if c["camera"] == "cam3")
-    duration = max((ends[id(c)] - starts[id(c)] for _, _, c in rows), default=0)
+    arrival = lambda c: c["arr"] if c["arr"] is not None else (
+        c["late"] if c.get("late") is not None else c.get("stub_late"))
+    times = {}
+    rows = {}
+    for i, c in enumerate(lone):
+        direction = dirs[id(c)]
+        if c["camera"] not in headings or direction not in headings.values():
+            continue
+        departure = direction == OPPOSITE[headings[c["camera"]]]
+        t = (c["dep"] if c["dep"] is not None else c.get("early")) if departure else arrival(c)
+        times[id(c)] = t if heavy(c) else ends[id(c)] if departure else starts[id(c)]
+        if c["camera"] == "cam3" and times[id(c)] is not None:
+            rows.setdefault((direction, family(c)), []).append((times[id(c)], i, c))
+    for index in rows.values():
+        index.sort()
     choices = {}
     for a in lone:
-        if a["camera"] != "cam4":
+        if a["camera"] != "cam4" or times.get(id(a)) is None:
             continue
-        # Both direction orders must fit within the widest departure/arrival window.
-        lo = bisect_left(rows, starts[id(a)] - PAIR_HEAVY_WINDOW[1] - duration, key=lambda row: row[0])
-        hi = bisect_right(rows, ends[id(a)] + PAIR_HEAVY_WINDOW[1], key=lambda row: row[0])
-        for _, _, b in rows[lo:hi]:
-            da, db = dirs[id(a)], dirs[id(b)]
-            if da not in ("northbound", "southbound") or db != da or _clash(a["class"], b["class"]):
+        direction = dirs[id(a)]
+        index = rows.get((direction, family(a)), [])
+        departure = direction == OPPOSITE[headings["cam4"]]
+        low, high = PAIR_HEAVY_WINDOW if heavy(a) else PAIR_WINDOW
+        t = times[id(a)]
+        # Cam3 is indexed by arrival start or departure end, never by lifetime span.
+        lo, hi = (t + low, t + high) if departure else (t - high, t - low)
+        for _, _, b in index[bisect_left(index, lo, key=lambda row: row[0]):
+                             bisect_right(index, hi, key=lambda row: row[0])]:
+            d, r = (a, b) if departure else (b, a)
+            gap = times[id(r)] - times[id(d)]
+            if not low <= gap <= high:
                 continue
-            d, r = (a, b) if da == "southbound" else (b, a)
-            both_heavy = heavy(a) and heavy(b)
-            dep, arr = ends[id(d)], starts[id(r)]
-            if both_heavy:
-                dep = d["dep"] if d["dep"] is not None else d.get("early")
-                arr = r["arr"] if r["arr"] is not None else r.get("late")
-                if dep is None or arr is None:
-                    continue
-            gap = arr - dep
             cos = _similar(a["app"], b["app"])
-            if cos is None or not (
-                    both_heavy and cos >= PAIR_HEAVY_COS and PAIR_HEAVY_WINDOW[0] <= gap <= PAIR_HEAVY_WINDOW[1]
-                    or not both_heavy and family(a) == family(b) and cos >= max(PAIR_COS, PAIR_SMALL_COS if
-                        a["class"] in ("a-small", "a-motorcycle") or b["class"] in ("a-small", "a-motorcycle") else PAIR_COS)
-                    and PAIR_WINDOW[0] <= gap <= PAIR_WINDOW[1]):
+            threshold = PAIR_HEAVY_COS if heavy(a) else max(PAIR_COS, PAIR_SMALL_COS if
+                a["class"] in ("a-small", "a-motorcycle") or b["class"] in ("a-small", "a-motorcycle") else PAIR_COS)
+            if cos is None or cos < threshold:
                 continue
-            if both_heavy and _crosses(d, r, accepted):
+            if heavy(a) and _crosses(d, r, accepted, (*HEAVY, "c-bus")):
                 continue
-            for c, other in ((a,b), (b,a)):
+            for c, other in ((a, b), (b, a)):
                 choices.setdefault(id(c), []).append((cos, abs(gap), id(other), d, r))
     best = {}
     for key, candidates in choices.items():
@@ -1007,17 +1022,14 @@ def _pairs(lone, accepted=()):
         if len(candidates) == 1 or candidates[0][0] - candidates[1][0] > PAIR_MARGIN:
             best[key] = candidates[0]
     pairs = []
-    for key, (_, _, other, d, r) in best.items():
+    for key, (_, _, other, d, r) in sorted(best.items(), key=lambda item: (
+            -item[1][0], item[1][1], min(t["id"] for t in item[1][3]["members"]),
+            min(t["id"] for t in item[1][4]["members"]))):
         if key == id(d) and other in best and best[other][2] == key:
-            if _crosses(d, r, pairs):
+            if _crosses(d, r, pairs, (*HEAVY, "c-bus")):
                 continue
-            # Preserve zone timing for heavy handoffs; general leftovers use chain endpoints.
-            if heavy(d) and heavy(r):
-                d["dep"] = d["dep"] if d["dep"] is not None else d["early"]
-                r["arr"] = r["arr"] if r["arr"] is not None else r["late"]
-            else:
-                d["dep"], r["arr"] = ends[id(d)], starts[id(r)]
-            pairs.append((d,r))
+            d["dep"], r["arr"] = times[id(d)], times[id(r)]
+            pairs.append((d, r))
     return pairs
 
 
@@ -1253,7 +1265,7 @@ def _build(tracklets, cameras, tz=None, events=None, with_dropped=False, plant=N
     dropped = [c for c in lone if not accepted(c)]
     lone = [c for c in lone if accepted(c)]
     # Only existing lone cards may become leftover handoffs; dropped chains remain dropped.
-    links.extend(_pairs(lone, links))
+    links.extend(_pairs(lone, cameras, links))
     linked.update(id(c) for pair in links for c in pair)
     # Index member ends so rider checks stay local even on a full cached day.
     ends = {}
@@ -2892,9 +2904,9 @@ def _selfcheck_l2e(case):
     with patch(__name__ + "._similar", return_value=.95):
         if case == "heavy_zone_window":
             b["arr"] = 121
-            assert not _pairs([a,b]), "heavy window used endpoints instead of 21 s zone gap"
+            assert not _pairs([a,b], _CAMS), "heavy window used endpoints instead of 21 s zone gap"
         else:
-            assert not _pairs([a,b], [(d,r)]), "heavy leftover jumped over accepted truck"
+            assert not _pairs([a,b], _CAMS, [(d,r)]), "heavy leftover jumped over accepted truck"
 
 
 def _selfcheck_l2_freeze(tracks, js):
@@ -2966,24 +2978,149 @@ def _selfcheck_l2f(case):
     elif case == "pair_mutual":
         c = chain("cam4",3,101)
         a["app"],c["app"] = ((.99,(1-.99**2)**.5),"m1"),((.8,.6),"m1")
-        pairs = _pairs([a,c,b])
+        pairs = _pairs([a,c,b], _CAMS)
         assert pairs == [(a,b)], "only the arrival's best departure may pair"
     elif case == "pair_crossing":
         c,d = chain("cam4",3,101),chain("cam3",4,103)
         c["app"] = d["app"] = ((0.,1.),"m1")
-        pairs = _pairs([a,b,c,d])
+        pairs = _pairs([a,b,c,d], _CAMS)
         assert len(pairs) == 1, "new leftover handoffs must not cross"
     elif case == "heavy_lower":
         b["arr"] = a["dep"] - 16
-        assert not _pairs([a,b]), "heavy zone gap below -15 s must be rejected"
+        assert not _pairs([a,b], _CAMS), "heavy zone gap below -15 s must be rejected"
     elif case == "cheap_before_crossing":
         b["app"] = ((0.,1.),"m1")
         with patch(__name__ + "._crosses", return_value=False) as crossing:
-            assert not _pairs([a,b], [(a,b)])
+            assert not _pairs([a,b], _CAMS, [(a,b)])
             assert crossing.call_count == 0, "ineligible appearance must reject before crossing scan"
 
 
+def _selfcheck_l2g(case):
+    from unittest.mock import patch
+    if case.startswith("ride_"):
+        # A broad whole-truck box covers a smaller attached part, moving to the right.
+        def member(name, born=0, end=4, off=-.08, lane=0, speed=.1, size=.04):
+            return _t("cam4", name, "e-heavy",
+                      [(t, _b(.3 + speed*t + off, .5 + lane, size)) for t in range(born,end+1)],
+                      direction="southbound")
+        y = member("tractor", off=0, size=.2)
+        x = member("part", born=1)
+        assert _rides({"members":[x]}, {"members":[y]}), "rider control"
+        if case == "ride_letter":
+            x["class"] = "b-light"
+        elif case == "ride_birth":
+            y = member("tractor", born=1, off=0, size=.2)
+            x = member("part")
+            x["path"][0][1:] = x["path"][1][1:]
+        elif case == "ride_end":
+            # A same-lane follower stays attached during overlap but outlives the tractor by 5 s.
+            x = member("follower", born=1, end=9)
+        elif case == "ride_direction":
+            x["direction"] = "northbound"
+        elif case == "ride_rows":
+            y["path"], x["path"] = y["path"][2::2], x["path"][1::2]
+            y["t0"] = x["t0"] = 2
+        elif case == "ride_movement":
+            y, x = member("tractor", off=0, size=.2, speed=.02), member("part", born=1, speed=.02)
+        elif case == "ride_slip":
+            x = member("part", born=1, speed=.07)
+        elif case == "ride_behind":
+            x = member("ahead", born=1, off=.08)
+        elif case == "ride_lane":
+            # Covered completely by a broad truck box, but in the adjacent lane.
+            y["path"] = [[t,x1+.1,y1,x2-.1,y2] for t,x1,y1,x2,y2 in y["path"]]
+            x = member("adjacent", born=1, lane=.15)
+        assert not _rides({"members":[x]}, {"members":[y]}), case
+        return
+
+    def chain(cam, name, start, cls="e-heavy", cos=1, axis=0):
+        vector = [0., 0., 0., 0.]
+        vector[axis], vector[axis+1] = cos, (1-cos*cos)**.5
+        t = _t(cam,name,cls,[(start,_b(.6,.4)),(start+1,_b(.5,.4)),(start+2,_b(.4,.4))],
+               counted=True,hits=30,direction="southbound")
+        return dict(camera=cam,members=[t],**{"class":cls},app=(tuple(vector),"m1"),
+                    votes=t["votes"],conf=t["conf"],z=(start,start+2),
+                    dep=start+2 if cam=="cam4" else None,arr=start if cam=="cam3" else None,
+                    early=None,late=None)
+
+    def pairs(cards, cameras=_CAMS, accepted=()):
+        # Exercise the production caller as well: config and dropped-chain filtering live there.
+        with patch(__name__ + "._chains", return_value=cards), patch(__name__ + "._links", return_value=list(accepted)), patch(__name__ + "._shadows", return_value={}):
+            return _build([], cameras)[2]
+
+    a,b = chain("cam4","a",100),chain("cam3","b",104)
+    if case == "absorption_class":
+        c = chain("cam4", "plant", 100, "e-plant")
+        c["members"][0]["counted"] = False
+        with patch(__name__ + "._rides", return_value=True) as riding:
+            pairs([a,b,c], accepted=[(a,b)])
+        assert not riding.called, "non-rider classes must not reach geometry checks"
+    elif case == "pair_config":
+        for cameras in ([dict(c, handoff=None) for c in _CAMS],
+                        [dict(c,handoff={"camera":"cam5"}) for c in _CAMS]):
+            assert not pairs([a,b],cameras), "leftover pair requires configured cam3/cam4 handoff"
+    elif case == "pair_heading":
+        cameras = [dict(c,heading="north" if c["name"]=="cam3" else "south") for c in _CAMS]
+        a,b = chain("cam3","a",100,"b-light"),chain("cam4","b",104,"b-light")
+        a["dep"],a["arr"],b["dep"],b["arr"] = 102,None,None,104
+        assert pairs([a,b],cameras)==[(a,b)], "direction order must follow headings"
+    elif case == "pair_family":
+        b["class"] = b["members"][0]["class"] = "c-bus"
+        b["votes"] = b["members"][0]["votes"] = {"c-bus":30}
+        assert not pairs([a,b]), "truck and bus are separate families"
+    elif case == "pair_stub":
+        b["arr"],b["stub_late"] = None,104
+        assert pairs([a,b])==[(a,b)] and b["arr"]==104, "heavy stub arrival timing"
+    elif case == "pair_dropped":
+        b["members"][0]["counted"] = False
+        cameras = [dict(c,lone_edge=False) for c in _CAMS]
+        assert not pairs([a,b],cameras), "dropped chain must never pair"
+    elif case == "pair_cos_order":
+        a["app"] = ((.9,(1-.9**2)**.5,0.,0.),"m1")
+        c,d = chain("cam4","c",101,axis=2),chain("cam3","d",103,axis=2)
+        assert pairs([a,b,c,d])==[(c,d)], "higher cosine wins crossing new pairs"
+    elif case == "links_bus":
+        for c in (a,b): c["class"] = "c-bus"
+        c,d = chain("cam4","c",101,"c-bus"),chain("cam3","d",103,"c-bus")
+        assert not _crosses(a,b,[(c,d)]), "ordinary links retain HEAVY-only crossing behaviour"
+    elif case == "pair_parked_perf":
+        # Counting cosines is deterministic and catches wide scans without a slow timing threshold.
+        cards = [chain(cam,f"{cam}-{i}",i*40,"b-light") for cam in ("cam3","cam4") for i in range(1200)]
+        parked = chain("cam3","parked",0,"b-light")
+        parked["members"][0]["t1"] = 6*3600
+        cards.append(parked)
+        start = time.process_time()
+        with patch(__name__ + "._similar", wraps=_similar) as cosine:
+            pairs(cards)
+        assert cosine.call_count < 5000, ("long parked card widened pairing scan",cosine.call_count)
+        assert time.process_time()-start < 3, "long parked workload must stay fast"
+
+
+def _selfcheck_pair_tie():
+    def track(cam, name, start, axis):
+        vector = [0.] * 32
+        vector[axis] = 1.
+        return _t(cam, name, "e-heavy", [(start+i, _b(.6-.1*i, .4)) for i in range(3)],
+                  counted=True, hits=30, direction="southbound", app_v="m1",
+                  app=base64.b64encode(struct.pack("<32e", *vector)).decode())
+
+    # Orthogonal vehicles: each pair has cosine 1 and |gap| 4, but their handoffs cross.
+    tracks = [track("cam4", "A", 98, 0), track("cam3", "A", 104, 0),
+              track("cam4", "B", 100, 1), track("cam3", "B", 98, 1)]
+    expected = build(tracks, _CAMS)
+    assert len(expected) == 3 and any(
+        {m["id"] for m in j["members"]} == {tracks[0]["id"], tracks[1]["id"]}
+        for j in expected), "equal-score crossing pairs prefer stable departure/arrival member ids"
+    for _ in range(100):
+        assert build(tracks, _CAMS) == expected, "identical builds must retain identical cards"
+    _selfcheck_l2_freeze(tracks, expected)
+
+
 def _selfcheck():
+    _selfcheck_pair_tie()
+    for case in ("ride_letter", "absorption_class", "ride_birth", "ride_end", "ride_direction", "ride_rows", "ride_movement", "ride_slip", "ride_behind", "ride_lane",
+                 "pair_config", "pair_heading", "pair_family", "pair_stub", "pair_dropped", "pair_cos_order", "links_bus", "pair_parked_perf"):
+        _selfcheck_l2g(case)
     for case in ("tail_cos", "tail_birth", "tail_end", "tail_hits", "rider_gap", "rider_continuity",
                  "works_directionless", "pair_mutual", "pair_crossing", "heavy_lower", "cheap_before_crossing"):
         _selfcheck_l2f(case)
