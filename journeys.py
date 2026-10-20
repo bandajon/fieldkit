@@ -1005,8 +1005,6 @@ def _pairs(lone, cameras, accepted=()):
                              bisect_right(index, hi, key=lambda row: row[0])]:
             d, r = (a, b) if departure else (b, a)
             gap = times[id(r)] - times[id(d)]
-            if not low <= gap <= high:
-                continue
             cos = _similar(a["app"], b["app"])
             threshold = PAIR_HEAVY_COS if heavy(a) else max(PAIR_COS, PAIR_SMALL_COS if
                 a["class"] in ("a-small", "a-motorcycle") or b["class"] in ("a-small", "a-motorcycle") else PAIR_COS)
@@ -3064,6 +3062,10 @@ def _selfcheck_l2g(case):
         a,b = chain("cam3","a",100,"b-light"),chain("cam4","b",104,"b-light")
         a["dep"],a["arr"],b["dep"],b["arr"] = 102,None,None,104
         assert pairs([a,b],cameras)==[(a,b)], "direction order must follow headings"
+    elif case == "pair_same_heading":
+        cameras = [dict(c,heading="south") for c in _CAMS]
+        a,b = chain("cam4","a",100,"b-light"),chain("cam3","b",104,"b-light")
+        assert not pairs([a,b],cameras), "configured handoff requires opposite headings"
     elif case == "pair_family":
         b["class"] = b["members"][0]["class"] = "c-bus"
         b["votes"] = b["members"][0]["votes"] = {"c-bus":30}
@@ -3077,8 +3079,13 @@ def _selfcheck_l2g(case):
         assert not pairs([a,b],cameras), "dropped chain must never pair"
     elif case == "pair_cos_order":
         a["app"] = ((.9,(1-.9**2)**.5,0.,0.),"m1")
-        c,d = chain("cam4","c",101,axis=2),chain("cam3","d",103,axis=2)
+        c,d = chain("cam4","c",101,axis=2),chain("cam3","d",95,axis=2)
         assert pairs([a,b,c,d])==[(c,d)], "higher cosine wins crossing new pairs"
+    elif case == "pair_bus_crossing":
+        a,b = chain("cam4","a",100,"c-bus"),chain("cam3","b",104,"c-bus")
+        c,d = chain("cam4","c",101,"c-bus"),chain("cam3","d",103,"c-bus")
+        assert pairs([a,b])==[(a,b)], "bus leftover control"
+        assert pairs([a,b,c,d],accepted=[(c,d)])==[(c,d)], "bus leftover must not cross accepted bus link"
     elif case == "links_bus":
         for c in (a,b): c["class"] = "c-bus"
         c,d = chain("cam4","c",101,"c-bus"),chain("cam3","d",103,"c-bus")
@@ -3097,6 +3104,8 @@ def _selfcheck_l2g(case):
 
 
 def _selfcheck_pair_tie():
+    from itertools import permutations
+
     def track(cam, name, start, axis):
         vector = [0.] * 32
         vector[axis] = 1.
@@ -3105,21 +3114,21 @@ def _selfcheck_pair_tie():
                   app=base64.b64encode(struct.pack("<32e", *vector)).decode())
 
     # Orthogonal vehicles: each pair has cosine 1 and |gap| 4, but their handoffs cross.
-    tracks = [track("cam4", "A", 98, 0), track("cam3", "A", 104, 0),
-              track("cam4", "B", 100, 1), track("cam3", "B", 98, 1)]
+    tracks = [track("cam4", "A", 100, 0), track("cam3", "A", 98, 0),
+              track("cam4", "B", 98, 1), track("cam3", "B", 104, 1)]
     expected = build(tracks, _CAMS)
     assert len(expected) == 3 and any(
         {m["id"] for m in j["members"]} == {tracks[0]["id"], tracks[1]["id"]}
         for j in expected), "equal-score crossing pairs prefer stable departure/arrival member ids"
-    for _ in range(100):
-        assert build(tracks, _CAMS) == expected, "identical builds must retain identical cards"
+    for shuffled in permutations(tracks):
+        assert build(list(shuffled), _CAMS) == expected, "input order must not change equal-score crossing pairs"
     _selfcheck_l2_freeze(tracks, expected)
 
 
 def _selfcheck():
     _selfcheck_pair_tie()
     for case in ("ride_letter", "absorption_class", "ride_birth", "ride_end", "ride_direction", "ride_rows", "ride_movement", "ride_slip", "ride_behind", "ride_lane",
-                 "pair_config", "pair_heading", "pair_family", "pair_stub", "pair_dropped", "pair_cos_order", "links_bus", "pair_parked_perf"):
+                 "pair_config", "pair_heading", "pair_same_heading", "pair_family", "pair_stub", "pair_dropped", "pair_cos_order", "pair_bus_crossing", "links_bus", "pair_parked_perf"):
         _selfcheck_l2g(case)
     for case in ("tail_cos", "tail_birth", "tail_end", "tail_hits", "rider_gap", "rider_continuity",
                  "works_directionless", "pair_mutual", "pair_crossing", "heavy_lower", "cheap_before_crossing"):
