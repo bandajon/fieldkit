@@ -347,6 +347,50 @@ def appearance_code(pil, embed, pca):
         return None
 
 
+def reid_model(weights, dev, on_error=None):
+    """Optional TorchScript identity tower; bad/missing weights never stop detection."""
+    if not weights:
+        return None
+    try:
+        import torch
+        model = torch.jit.load(str(weights), map_location=dev).eval()
+        if not isinstance(model.version, str) or not model.version:
+            raise ValueError("missing re-ID version")
+        for name in ("preprocess_mean", "preprocess_std"):
+            value = getattr(model, name)
+            if not isinstance(value, torch.Tensor) or value.shape != (3,) or not torch.isfinite(value).all():
+                raise ValueError(f"invalid re-ID buffer: {name}")
+        return model
+    except Exception as e:
+        if on_error:
+            on_error(e)
+        print(f"  ! re-ID weights: {e} — re-ID off")
+        return None
+
+
+def reid_code(model, pil):
+    """Reference CLIP resize/centre crop, then base64 little-endian float16 256-d."""
+    import base64
+    import numpy as np
+    import torch
+    from PIL import Image
+    w, h = pil.size
+    if min(w, h) != 224:
+        pil = pil.resize((224, int(224*h/w)) if w <= h else (int(224*w/h), 224),
+                         Image.Resampling.BICUBIC)
+    w, h = pil.size
+    left, top = int(round((w-224)/2)), int(round((h-224)/2))
+    im = pil.crop((left, top, left+224, top+224)).convert("RGB")
+    x = torch.from_numpy(np.array(im, dtype=np.uint8, copy=True)).permute(2, 0, 1).float()/255.
+    x = (x-torch.tensor((.48145466,.4578275,.40821073))[:,None,None]) / torch.tensor(
+        (.26862954,.26130258,.27577711))[:,None,None]
+    with torch.inference_mode():
+        z = model(x.unsqueeze(0).to(model.preprocess_mean.device))[0].cpu().numpy()
+    if z.shape != (256,) or not np.isfinite(z).all() or not np.linalg.norm(z) > 0:
+        raise ValueError("invalid re-ID output (expected finite, nonzero 256-d vector)")
+    return base64.b64encode(z.astype("<f2").tobytes()).decode()
+
+
 def _best_plate_box(xyxy, confs):
     """Index of the surest plate-shaped box (w/h >= PLATE_ASPECT), or None."""
     ok = [i for i, (x0, y0, x1, y1) in enumerate(xyxy) if (x1 - x0) >= PLATE_ASPECT * (y1 - y0)]
@@ -946,6 +990,9 @@ class Detector:
         self.weights = str(cfg.get("detect_weights", "") or "").strip()
         # Stage 2: attributes off the counted vehicle's best crop (type/axles/cargo).
         self.attr_weights = str(cfg.get("attr_weights", "") or "").strip()
+        self.reid_weights = str(cfg.get("reid_weights", "") or "").strip()
+        self.reid = None
+        self.reid_error = ""
         self.attrs = None
         self.app = None                      # (mu, P, champion tag) when appearance is on
         # Plate evidence on each tracklet's best crops, for linking a vehicle across cameras.
@@ -1174,6 +1221,8 @@ class Detector:
         if self.attr_weights:
             self.attrs = attr_classifier(self.attr_weights, dev)   # worker thread only
             self.app = appearance_pca(self.attr_weights, self.attrs.tag)
+        self.reid_error = ""
+        self.reid = reid_model(self.reid_weights, dev, self._reid_failed)   # worker thread only
         if self.plate_weights:
             self.plates = plate_reader(self.plate_weights, dev)
 
@@ -1212,7 +1261,7 @@ class Detector:
         except Exception as e:
             self._set("error", str(e))
             return
-        self._set("running", "")
+        self._set("running", self.reid_error)
         self._dataset_init()      # may re-key totals from classes.txt, so restore after it
         self._restore()
         self._prune_events()
@@ -1241,7 +1290,7 @@ class Detector:
                 with self.lock:
                     if self._known(name):
                         self.frames[name] = (shot, time.time())
-                    self.error = ""       # a one-off bad frame must not look permanent
+                    self.error = self.reid_error  # keep optional-model failures visible
                 self._capture(name, jpeg, shown, img.width, img.height)
             if self.dirty and time.monotonic() - saved >= SAVE_EVERY:
                 saved = time.monotonic()
@@ -1490,6 +1539,11 @@ class Detector:
             self.events_dir = None
             self.error = f"events off: {e}"
 
+    def _reid_failed(self, error):
+        if not self.reid_error:
+            self.reid_error = f"re-ID: {error}"
+            self.error = self.reid_error
+
     def _tracklet(self, name, t):
         """One line per track that was ever a vehicle (COUNT_AT_HITS sightings), counted,
         ghost or neither: its path through the frame and its surest looks. The journey
@@ -1522,6 +1576,15 @@ class Detector:
                "path": path, "crops": {tag: rel[tag] for tag in shots},
                "attrs": t["attrs"] or (self._classify(t, k) if shots and self.attrs else {}),
                "plate": plate and {"conf": round(plate[0], 3), "crop": rel["plate"]}}
+        # Only heavy/bus codes are consumed by the linker; skip other inference costs.
+        if k in ("d-medium", "e-heavy", "f-abnormal", "c-bus") and self.reid is not None and t["best"][1]:
+            try:
+                from PIL import Image
+                code = reid_code(self.reid, Image.open(io.BytesIO(t["best"][1])).convert("RGB"))
+                if code:
+                    doc.update(reid=code, reid_v=self.reid.version)
+            except Exception as e:
+                self._reid_failed(e)       # a bad crop costs the code, never the tracklet
         if self.app and self.attrs and t["best"][1]:
             try:
                 from PIL import Image
@@ -2925,6 +2988,116 @@ if __name__ == "__main__":
             rendered_files = {str(p.relative_to(events)): p.read_bytes() for p in events.rglob("*") if p.is_file()}
             plain_files = {str(p.relative_to(plain)): p.read_bytes() for p in plain.rglob("*") if p.is_file()}
             assert rendered_files == plain_files, "stalled rendering changed event/tracklet/crop bytes"
+
+    # Synthetic TorchScript samples all three channels, so preprocessing affects the code.
+    import torch
+    import base64
+    import numpy as np
+    class FakeReid(torch.nn.Module):
+        version: str
+        def __init__(self, mode="normal"):
+            super().__init__()
+            self.version = "synthetic-v1"
+            self.mode = mode
+            self.register_buffer("preprocess_mean", torch.zeros(3))
+            self.register_buffer("preprocess_std", torch.ones(3))
+        def forward(self, x):
+            if self.mode == "fail":
+                raise RuntimeError("synthetic inference failure")
+            if self.mode == "zero":
+                return torch.zeros((x.size(0), 256), device=x.device)
+            return torch.nn.functional.normalize(x.flatten(1)[:, ::587][:, :256], dim=1)
+    with tempfile.TemporaryDirectory() as td:
+        weights = Path(td) / "synthetic.pt"
+        torch.jit.script(FakeReid()).save(str(weights))
+        model = reid_model(str(weights), "cpu")
+        assert model is not None and model.version == "synthetic-v1"
+        y,x = np.indices((189,317))
+        gradient = Image.fromarray(np.stack(((x*7+y*3)%256, (x*2+y*11)%256,
+                                             (x*13+y*5)%256), axis=2).astype("uint8"))
+        # Computed once with external reid_ref.preprocess + the fake forward; no runtime oracle.
+        expected = (
+            "XCvNIrOtUqkUpwejhyg1KjIubq5wrZao0qWEoA4puyqPLgOuH63qp5Ck/5uvKXcrXCyzrc+s3qacoqIoTyoMLDmucK2MrJyl"
+            "GKAoKdYqTyxurhKtO6xapFKaySmRK58spa3BrNarnKIfFGoqGSzwLGKtfqxmpVqfDx7wKlwsMy0SrS6sWqSlmIshkSutLJEt"
+            "tKy7qzGieRekIycs/SzhLXGsNatan+YeSSVqLEStX61WKAesMKy1KsqpHap8LGAsRae5LZAtfqHoLnIv+R9AHkquvCZNJqys"
+            "vClqKRWrTKvkK7ao7agTLeosHqVDLicuvJjEKKMuXSRvI3utcig6KCKs0CqZKuapOKp8LA6ns6edLRCh7KHaLrEuHR8Frkqu"
+            "hCYWJrqshSlOKTCr/yutK9KoCan4LOakVaU1LiWRdZo6JfAt3SNErXutVigUrDCstSpiKh2qy6MapDssOywnq4MmgyaML8uj"
+            "Y6M7LEgsJ6u3JoMmmS9jo2OjVSxILA2r7Ca3JksvY6P6olUsVSzzquwm7CbVLqYv+qJiLGIs86ogJyAnfy9yL5KibyxiLNmq"
+            "ICdUJ7Mv1S4pom8sbyzZqlQnVCezLz4vKaJ8LG8sv6q/qognFy+zL8GhfCyJLKWqpaq9J7Mvsy/BoYksiSyLqouqvSezL+8u"
+            "WKFYoZYscKo="
+        )
+        assert reid_code(model, gradient) == expected, "reference preprocessing/float16 encoding"
+        try:
+            reid_code(torch.jit.script(FakeReid("zero")), gradient)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("zero-norm output must fail")
+        from types import SimpleNamespace
+        import sys
+        n = Detector([], nosnap, {"reid_weights": str(weights)})
+        def load_worker(detector):
+            with patch.dict(sys.modules, {"ultralytics": SimpleNamespace(YOLO=None)}), \
+                 patch("torch.backends.mps.is_available", return_value=False):
+                detector._load()
+        load_worker(n)
+        assert n.reid is not None and n.reid.version == "synthetic-v1", "worker loader uses reid_weights"
+        assert reid_model("", "cpu") is None
+        assert reid_model(str(weights)+".missing", "cpu") is None
+        broken = Path(td)/"broken.pt"; broken.write_bytes(b"synthetic invalid weights")
+        assert reid_model(str(broken), "cpu") is None
+        for missing in ("version", "preprocess_mean", "preprocess_std"):
+            invalid = FakeReid()
+            delattr(invalid, missing)
+            bad_weights = Path(td)/(missing+".pt")
+            torch.jit.script(invalid).save(str(bad_weights))
+            n = Detector([], nosnap, {"reid_weights": str(bad_weights)})
+            load_worker(n)
+            assert n.reid is None and "re-ID:" in n.error, missing
+        invalid = FakeReid(); invalid.version = ""
+        torch.jit.script(invalid).save(str(bad_weights))
+        n = Detector([], nosnap, {"reid_weights": str(bad_weights)})
+        load_worker(n)
+        assert n.reid is None and "missing re-ID version" in n.error
+        def check_running_error():
+            assert n.state == "running" and "missing re-ID version" in n.info()["error"]
+            n.stopping.set()
+        with patch.object(n, "_load"), patch.object(n, "_dataset_init"), \
+             patch.object(n, "_restore"), patch.object(n, "_prune_events"), \
+             patch.object(n, "_sync_readers", side_effect=check_running_error):
+            n._run()
+        for cls in ("d-medium", "e-heavy", "f-abnormal", "c-bus", "a-small", "b-minibuses", "a-motorcycle"):
+            for mode in ("normal", "off", "fail", "zero"):
+                d = fresh(events_dir=Path(td)/cls/mode)
+                d.display["truck"] = cls
+                d.totals[cls] = 0
+                d.clock = d.wall = lambda: at[0]
+                d.reid = None if mode == "off" else torch.jit.script(FakeReid(mode))
+                with patch(__name__+".reid_code", wraps=reid_code) as inference:
+                    for tid in (1,2):
+                        for i in range(TRACKLET_CROP_HITS):
+                            d._track("c", [("truck", .9, VEH, tid)], pic)
+                            at[0] += .4
+                        d.flush("c")
+                        first_error = d.error if tid == 1 else first_error
+                    heavy = cls in ("d-medium", "e-heavy", "f-abnormal", "c-bus")
+                    assert inference.call_count == (2 if heavy and mode != "off" else 0), (cls,mode)
+                rows=[json.loads(line) for f in (d.events_dir/"tracklets").glob("*.jsonl")
+                      for line in f.read_text().splitlines()]
+                assert len(rows) == 2, "optional inference failure must not lose tracklets"
+                for row in rows:
+                    if heavy and mode == "normal":
+                        vector=np.frombuffer(base64.b64decode(row["reid"]),dtype="<f2")
+                        assert vector.shape==(256,) and abs(np.linalg.norm(vector)-1)<.001
+                        assert row["reid_v"]==model.version
+                    else:
+                        assert "reid" not in row and "reid_v" not in row
+                if heavy and mode in ("fail", "zero"):
+                    assert "re-ID:" in first_error and d.error == first_error
+                    d._reid_failed("later failure")
+                    assert d.error == first_error, "report the first inference failure"
+                else:
+                    assert not d.error, (cls,mode,d.error)
 
     # Appearance code: a unit 32-d float16 vector; a stale PCA (other champion) is off.
     import base64
