@@ -151,7 +151,7 @@ def _similar(a, b):
     return sum(x * y for x, y in zip(a[0], b[0]))
 
 
-REID_MISSED_HEAVY_COS = .5365007054807878
+REID_MISSED_HEAVY_COS = {"reid-v1-clip-b32-laion2b-head-r1": .5365007054807878}
 
 
 def _reids(ms):
@@ -170,9 +170,11 @@ def _reids(ms):
     return out
 
 
-def _reid_sim(a, b):
-    return max((sum(x*y for x,y in zip(va,vb)) for ca,va,version in a for cb,vb,vb_version in b
-                if version == vb_version and ca != cb), default=None)
+def _reid_sim(a, b, *, passing=False):
+    return max((score for ca,va,version in a for cb,vb,vb_version in b
+                if version == vb_version and ca != cb and version in REID_MISSED_HEAVY_COS
+                for score in [sum(x*y for x,y in zip(va,vb))]
+                if not passing or score >= REID_MISSED_HEAVY_COS[version]), default=None)
 
 
 def _vel(p, q):
@@ -1033,9 +1035,9 @@ def _pairs(lone, cameras, accepted=()):
             cos = _similar(a["app"], b["app"])
             threshold = PAIR_HEAVY_COS if heavy(a) else max(PAIR_COS, PAIR_SMALL_COS if
                 a["class"] in ("a-small", "a-motorcycle") or b["class"] in ("a-small", "a-motorcycle") else PAIR_COS)
-            reid = _reid_sim(codes[id(a)], codes[id(b)])
+            reid = _reid_sim(codes[id(a)], codes[id(b)], passing=True)
             scores = ([cos] if cos is not None and cos >= threshold else []) + (
-                [reid] if reid is not None and reid >= REID_MISSED_HEAVY_COS else [])
+                [reid] if reid is not None else [])
             if not scores:
                 continue
             cos = max(scores)   # only qualifying evidence competes for mutual best
@@ -3155,6 +3157,13 @@ def _selfcheck_pair_tie():
 
 
 def _selfcheck_reid():
+    from unittest.mock import patch
+    with patch.dict(REID_MISSED_HEAVY_COS, {"synthetic-v1": .5365007054807878}):
+        _selfcheck_reid_cases()
+
+
+def _selfcheck_reid_cases():
+    from unittest.mock import patch
     from copy import deepcopy
     from itertools import permutations
 
@@ -3203,10 +3212,23 @@ def _selfcheck_reid():
         for delta, want in ((-.002, False), (.002, True)):
             x,y = chain("cam4","x",cls=cls),chain("cam3","y",104,cls,threshold+delta)
             assert bool(_pairs([x,y], _CAMS)) == want, (cls,delta)
+            for c in (x,y):
+                c["members"][0]["reid_v"] = "reid-v1-clip-b32-laion2b-head-r1"
+            assert bool(_pairs([x,y], _CAMS)) == want, ("current version",cls,delta)
     for field,value in (("reid_v","other"),("reid_v",None),("reid","bad"),("mixed",True)):
         x,y=deepcopy(a),deepcopy(b)
         y["members"][0][field]=value
         assert not _pairs([x,y],_CAMS), field
+    for version in (None, "", "uncalibrated"):
+        x,y=deepcopy(a),deepcopy(b)
+        for c in (x,y): c["members"][0]["reid_v"]=version
+        assert not _pairs([x,y],_CAMS), "both codes must have a calibrated version"
+        if not version:
+            assert not _reids(x["members"]), "missing/empty version must not decode"
+    with patch.dict(REID_MISSED_HEAVY_COS, {"synthetic-v1": 1.}):
+        assert _pairs([a,b],_CAMS), "exact threshold equality must pair"
+    with patch.dict(REID_MISSED_HEAVY_COS, {"synthetic-v1": 1.000001}):
+        assert not _pairs([a,b],_CAMS), "use the version's threshold"
     x,y=deepcopy(a),deepcopy(b)
     x["members"].append(dict(x["members"][0], id="lower-hit", hits=1))
     x["members"][0]["reid"] = chain("cam4","orthogonal",score=0)["members"][0]["reid"]
@@ -3241,6 +3263,9 @@ def _selfcheck_reid():
         assert not _pairs([x,y],_CAMS), "re-ID only rescues heavy/bus handoffs"
     codes=_reids(a["members"])
     assert _reid_sim(codes,codes) is None, "same-camera codes cannot support a handoff"
+    weaker = _reids(chain("cam4", "weaker-member", score=.6)["members"])
+    for members in (codes + weaker, weaker + codes):
+        assert _reid_sim(members, _reids(b["members"])) == 1., "MAX over every compatible member"
     bad=dict(a["members"][0],reid=base64.b64encode(struct.pack("<256e", *([float("nan")]*256))).decode())
     assert not _reids([bad]), "nonfinite vectors abstain"
     bad["reid"]=base64.b64encode(bytes(512)).decode()
