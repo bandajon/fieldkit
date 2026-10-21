@@ -347,6 +347,10 @@ def appearance_code(pil, embed, pca):
         return None
 
 
+REID_MEAN = (.48145466, .4578275, .40821073)
+REID_STD = (.26862954, .26130258, .27577711)
+
+
 def reid_model(weights, dev, on_error=None):
     """Optional TorchScript identity tower; bad/missing weights never stop detection."""
     if not weights:
@@ -356,10 +360,13 @@ def reid_model(weights, dev, on_error=None):
         model = torch.jit.load(str(weights), map_location=dev).eval()
         if not isinstance(model.version, str) or not model.version:
             raise ValueError("missing re-ID version")
-        for name in ("preprocess_mean", "preprocess_std"):
+        for name, expected in (("preprocess_mean", REID_MEAN), ("preprocess_std", REID_STD)):
             value = getattr(model, name)
-            if not isinstance(value, torch.Tensor) or value.shape != (3,) or not torch.isfinite(value).all():
+            if (not isinstance(value, torch.Tensor) or value.shape != (3,)
+                    or not value.is_floating_point() or not torch.isfinite(value).all()):
                 raise ValueError(f"invalid re-ID buffer: {name}")
+            if not torch.allclose(value, torch.tensor(expected, dtype=value.dtype, device=value.device)):
+                raise ValueError(f"re-ID buffer {name} does not match CLIP normalisation")
         return model
     except Exception as e:
         if on_error:
@@ -382,8 +389,8 @@ def reid_code(model, pil):
     left, top = int(round((w-224)/2)), int(round((h-224)/2))
     im = pil.crop((left, top, left+224, top+224)).convert("RGB")
     x = torch.from_numpy(np.array(im, dtype=np.uint8, copy=True)).permute(2, 0, 1).float()/255.
-    x = (x-torch.tensor((.48145466,.4578275,.40821073))[:,None,None]) / torch.tensor(
-        (.26862954,.26130258,.27577711))[:,None,None]
+    x = (x-torch.tensor(REID_MEAN)[:,None,None]) / torch.tensor(
+        REID_STD)[:,None,None]
     with torch.inference_mode():
         z = model(x.unsqueeze(0).to(model.preprocess_mean.device))[0].cpu().numpy()
     if z.shape != (256,) or not np.isfinite(z).all() or not np.linalg.norm(z) > 0:
@@ -2999,8 +3006,8 @@ if __name__ == "__main__":
             super().__init__()
             self.version = "synthetic-v1"
             self.mode = mode
-            self.register_buffer("preprocess_mean", torch.zeros(3))
-            self.register_buffer("preprocess_std", torch.ones(3))
+            self.register_buffer("preprocess_mean", torch.tensor(REID_MEAN))
+            self.register_buffer("preprocess_std", torch.tensor(REID_STD))
         def forward(self, x):
             if self.mode == "fail":
                 raise RuntimeError("synthetic inference failure")
