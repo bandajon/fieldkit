@@ -1,6 +1,8 @@
-from contextlib import nullcontext
+from concurrent.futures import Future
+from contextlib import contextmanager, nullcontext
 import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -24,6 +26,23 @@ class Client:
         Path(dest).write_bytes(b"video")
 
 
+class InlinePool:
+    """Completed futures keep orchestration tests deterministic; spawn has its own self-check."""
+    def submit(self, fn, *args, **kwargs):
+        future = Future()
+        try:
+            future.set_result(fn(*args, **kwargs))
+        except BaseException as e:
+            future.set_exception(e)
+        return future
+
+
+@contextmanager
+def inline_resources():
+    pool = InlinePool()
+    yield pool.submit, lambda: pool, threading.Event()
+
+
 class ClassifyPassTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -37,27 +56,42 @@ class ClassifyPassTest(unittest.TestCase):
     def run_pass(self, keys, journeys, budget=3600, monotonic=None, live=None, save=None,
                  per_pass=1, state=None):
         cl = self.cl = Client()
-        detect = SimpleNamespace(classify_segment=lambda *a, **kw: ("2026-09-27", 0, False))
+        def classify(video, cam, cfg, tz, out, **kwargs):
+            day = Path(video).stem[:8]
+            day = f"{day[:4]}-{day[4:6]}-{day[6:8]}"
+            (out / "tracklets").mkdir()
+            (out / "tracklets" / f"{day}.jsonl").write_text("{}\n")
+            return day, 0, False
+        detect = SimpleNamespace(classify_segment=classify, TRACKER_CFG=self.root / "tracker.yaml",
+                                 TRACKER_YAML="synthetic tracker")
         ingest = SimpleNamespace(config=lambda: {"cameras": []},
                                  cam_and_start=lambda path: ("cam", 1790500000))
         state = state or {"classified": [], "open_days": []}
+        clock = monotonic or _Tick()
+        def publish(*args):
+            clock.advance()
+            return 1
         with patch.multiple(selfloop, STATE=self.state, CHAMPION=self.champion,
                             VIDEOS=self.root / "videos", CLASSIFY_PER_PASS=per_pass,
-                            CLASSIFY_BUDGET=budget, JOURNEYS_EVERY_S=0), \
+                            CLASSIFY_BUDGET=budget, CLASSIFY_WORKERS=1, JOURNEYS_EVERY_S=1,
+                            _stop_classify_pool=lambda pool: None, appearance_stale=lambda: None,
+                            prune_annotated=lambda *a: None,
+                            audit_summary=lambda gate: {"status": "synthetic"}), \
              patch.object(selfloop, "Lock", nullcontext), \
+             patch.object(selfloop, "_classify_resources", inline_resources), \
              patch.object(selfloop, "load_state", return_value=state), \
              patch.object(selfloop, "save_state", side_effect=save or (lambda s: None)), \
              patch.object(selfloop, "r2", return_value=(None, cl, "bucket")), \
              patch.object(selfloop, "recording_keys", return_value=keys), \
              patch.object(selfloop, "published_manifests", return_value=set()), \
              patch.object(selfloop, "live_lane", side_effect=live or (lambda *a: [])), \
-             patch.object(selfloop, "publish", return_value=1), \
+             patch.object(selfloop, "publish", side_effect=publish), \
              patch.object(selfloop, "journeys_pass", side_effect=journeys), \
              patch.object(selfloop, "prune_open_days", side_effect=lambda c, o, d: set()), \
              patch.object(selfloop, "coverage_manifests", return_value={}), \
              patch.dict("sys.modules", {"detect": detect, "ingest_video": ingest}), \
              patch.object(selfloop, "classify_since", return_value="20260927-000000"), \
-             patch("time.monotonic", side_effect=monotonic or _Tick()), \
+             patch("time.monotonic", side_effect=clock), \
              patch("time.time", return_value=1790500000):
             selfloop.classify_pass()
         return state
@@ -100,14 +134,15 @@ class ClassifyPassTest(unittest.TestCase):
         cams = [{"name": "cam1", "handoff": {"camera": "cam2"}}]
         day = ("G", "2026-09-27")
         client = FakeS3()
-        with patch.object(selfloop, "bucket_keys", side_effect=OSError("mock read failure")):
+        with patch.object(selfloop, "r2_jsonl", side_effect=OSError("mock read failure")) as read:
             early = selfloop.journeys_pass(client, "bucket", {day}, cams, None)
+        read.assert_called_once()
         self.assertEqual(early, (0, {day}, set()))
 
         with patch.object(selfloop, "bucket_keys", return_value=[]), \
              patch.object(selfloop, "horizon", return_value=({}, 0)), \
              patch.object(selfloop, "cleared", return_value=[]), \
-             patch.dict("sys.modules", {"journeys": SimpleNamespace(build=lambda *a: [])}):
+             patch.dict("sys.modules", {"journeys": SimpleNamespace(build=lambda *a, **kw: [])}):
             late = selfloop.journeys_pass(client, "bucket", {day}, cams, None)
         self.assertEqual(late, (0, {day}, {day}))
 
@@ -166,7 +201,8 @@ class ClassifyPassTest(unittest.TestCase):
         self.assertEqual(selfloop.ALERTS, [])
         doc = json.loads(self.cl.puts["fieldkit-health/RDA-TG-KTB.json"])
         self.assertEqual(set(doc), {"gate", "updated", "backlog", "backlog_scope", "last_classify", "lag_s",
-                                    "oldest_unclassified_s", "newest", "alerts"})
+                                    "oldest_unclassified_s", "newest", "alerts", "duplicate_audit"})
+        self.assertEqual(doc["duplicate_audit"], {"status": "synthetic"})
         self.assertEqual(doc["backlog_scope"], "loop")
         self.assertEqual(doc["oldest_unclassified_s"], {"cam": None})
         self.assertEqual([a["kind"] for a in doc["alerts"]], ["lost_counts"])
@@ -179,16 +215,15 @@ class _Tick:
         self.value = 0
 
     def __call__(self):
-        self.value += 1
         return self.value
 
+    def advance(self):
+        self.value += 1
 
-class _BudgetClock:
-    def __init__(self):
-        self.values = iter([0, 0, 0, 0, 2, 2, 2, 2, 2, 2, 2, 2])
 
-    def __call__(self):
-        return next(self.values, 2)
+class _BudgetClock(_Tick):
+    def advance(self):
+        self.value += 2   # the first publication exhausts the one-second budget
 
 
 if __name__ == "__main__":
