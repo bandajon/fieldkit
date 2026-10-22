@@ -749,7 +749,11 @@ def _links(chains, cameras, tz=None, shadows=None, absorbed=None):
                             continue
                         t = abs(z0(j) - dep - MU) + CLASS_PEN * (d["class"] != r["class"])
                         cands.append((t, t + APP_PEN * (1 - (APP_TYPICAL if sim is None else sim)), i, j))
-        return cands
+        # A mixed bus arrival can start on the truck ahead; its timing then favours that truck.
+        mixed_bus = {j for _, _, i, j in cands
+                     if chains[i]["class"] == chains[j]["class"] == "c-bus"
+                     and any(t.get("mixed") for t in chains[j]["members"])}
+        return [c for c in cands if not (c[3] in mixed_bus and chains[c[2]]["class"] in HEAVY)]
 
     def match(late, used, early=False):
         """Match unused chains per component, preferring appearance when it preserves the link count."""
@@ -3275,7 +3279,72 @@ def _selfcheck_reid_cases():
     assert abs(_reid_sim(_reids([scaled]),_reids(b["members"]))-1)<1e-9
 
 
+def _selfcheck_mixed_bus_arrival():
+    from copy import deepcopy
+    from itertools import permutations
+
+    code = base64.b64encode(struct.pack("<32e", 1, *[0.] * 31)).decode()
+    kw = dict(hits=40, direction="northbound", app=code, app_v="m1")
+    # Synthetic truck -> coach switch: the arrival starts before either departure,
+    # but stays in the zone long enough for both. Truck timing is cheaper.
+    bus = _t("cam3", "coach", "c-bus", [
+        (43307, _b(.5, .4)), (43319.6, _b(.85, .8)), (43321.2, _b(.95, .8))], counted=True, **kw)
+    truck = _t("cam3", "truck", "e-heavy", [
+        (43301.2, _b(.5, .4)), (43311.8, _b(.85, .8)), (43314.6, _b(.95, .8))], **kw)
+    switched = _t("cam4", "switched", "c-bus", [
+        (43310.2, _b(.1, .7)), (43323, _b(.15, .7)), (43343.2, _b(.55, .3))],
+        mixed=True, counted=True, **kw)
+    rear = _t("cam4", "truck", "e-heavy", [
+        (43323.2, _b(.35, .5)), (43326, _b(.55, .3))], **dict(kw, direction=None, hits=15))
+
+    def members(j):
+        return {m["id"] for m in j["members"]}
+
+    tracks = [bus, truck, switched, rear]
+    original = deepcopy(tracks)
+    for order in permutations(tracks):
+        js, chains, links = _build(order, _CAMS)
+        assert len(chains) == 4 and len(links) == 2, "ordinary bus + late truck handoffs"
+        assert {(j["class"], frozenset(members(j))) for j in js} == {
+            ("c-bus", frozenset((bus["id"], switched["id"]))),
+            ("e-heavy", frozenset((truck["id"], rear["id"])))}, "mixed arrival must leave one bus and one heavy card"
+        coach = next(j for j in js if j["class"] == "c-bus")
+        assert coach["link"]["gap_s"] == -11.0 and "rear" not in coach["crops"]
+    assert tracks == original, "matching must not rewrite switched-track evidence"
+
+    # Mixed belongs to the whole chain, even when its first member is clean.
+    chains = _build(tracks, _CAMS)[1]
+    arrival = next(c for c in chains if c["arr"] is not None)
+    arrival["members"].insert(0, dict(switched, id="obs-cam4-clean", mixed=False, app=None))
+    assert any(d["class"] == r["class"] == "c-bus" for d, r in _links(chains, _CAMS))
+    # A geometrically eligible bus still must pass the daylight appearance veto.
+    arrival["app"] = ((1., 0.), "m1")
+    next(c for c in chains if c["class"] == "c-bus" and c["dep"] is not None)["app"] = ((0., 1.), "m1")
+    assert any(d["class"] == "e-heavy" and r is arrival for d, r in _links(chains, _CAMS))
+
+    # Each negative would catch a broader class preference or blanket mixed veto.
+    for case in ("clean", "no_bus", "ineligible_bus", "truck_arrival"):
+        arrival = dict(switched, mixed=False) if case == "clean" else switched
+        if case == "truck_arrival":
+            arrival = dict(switched, **{"class": "e-heavy", "votes": {"e-heavy": 40}})
+        departure = bus
+        if case == "ineligible_bus":
+            departure = _t("cam3", "coach", "c-bus", [
+                (43350, _b(.5, .4)), (43351, _b(.85, .8)), (43352, _b(.95, .8))], counted=True, **kw)
+        ts = [truck, arrival] + ([] if case == "no_bus" else [departure])
+        js = build(ts, _CAMS)
+        assert any(members(j) == {truck["id"], arrival["id"]} for j in js), case
+        assert not any(bus["id"] in members(j) and arrival["id"] in members(j) for j in js), case
+
+    # All three heavy classes compete, not just the incident's e-heavy truck.
+    for cls in HEAVY:
+        heavy = dict(truck, **{"class": cls, "votes": {cls: 40}})
+        js = build([bus, heavy, switched], _CAMS)
+        assert any(members(j) == {bus["id"], switched["id"]} for j in js), cls
+
+
 def _selfcheck():
+    _selfcheck_mixed_bus_arrival()
     _selfcheck_reid()
     _selfcheck_pair_tie()
     for case in ("ride_letter", "absorption_class", "ride_birth", "ride_end", "ride_direction", "ride_rows", "ride_movement", "ride_slip", "ride_behind", "ride_lane",
