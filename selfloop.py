@@ -530,7 +530,39 @@ GAP_S = 660               # a gap this long between a camera's consecutive segme
                           # a real outage, not jitter — segments target 600s but aren't aligned.
 
 
-def horizon(keys, classified, gate, day, since, cam_cfg, now=None):
+def declared_outages():
+    """Read operator-confirmed missing footage once per journeys pass."""
+    path = ROOT / "outages.json"
+    try:
+        entries = json.loads(path.read_text())
+        if not isinstance(entries, list):
+            raise ValueError("expected a JSON list")
+    except FileNotFoundError:
+        return []
+    except (OSError, ValueError) as e:
+        print(f"WARNING {path.name}: {e}; ignoring file", flush=True)
+        return []
+    valid = []
+    for i, entry in enumerate(entries):
+        try:
+            if not isinstance(entry, dict) or not all(
+                isinstance(entry.get(k), str) for k in ("gate", "cam", "from", "to", "note")
+            ) or not entry["gate"] or not entry["cam"]:
+                raise ValueError("expected gate, cam, from, to and note strings")
+            for k in ("from", "to"):
+                if not re.fullmatch(r"\d{8}-\d{6}", entry[k]):
+                    raise ValueError("timestamps must be YYYYmmdd-HHMMSS")
+                datetime.strptime(entry[k], "%Y%m%d-%H%M%S")
+            if entry["from"] > entry["to"]:
+                raise ValueError("from must be <= to")
+        except ValueError as e:
+            print(f"WARNING {path.name} entry {i}: {e}; ignoring entry", flush=True)
+            continue
+        valid.append(entry)
+    return valid
+
+
+def horizon(keys, classified, gate, day, since, cam_cfg, now=None, *, outages=None):
     """{cam: epoch} for every camera in `cam_cfg` with a `handoff` entry — the moment past
     which that camera can no longer place a tracklet inside `day`'s handoff window, so a
     journey whose latest member is safely behind every camera's horizon will never gain a
@@ -556,7 +588,8 @@ def horizon(keys, classified, gate, day, since, cam_cfg, now=None):
     SEGMENT BEFORE THE GAP — a reconnect can cut that segment short, so the missing footage
     may begin well before its nominal end) if the segment after it is itself less than
     DEAD_AFTER_S old as of `now` (a late upload may yet fill an older gap, which is a real
-    outage instead and doesn't block). If nothing blocks, horizon
+    outage instead and doesn't block). A gap overlapping an operator-declared outage for
+    this gate and camera also doesn't block. If nothing blocks, horizon
     is the start of that camera's single latest recorded segment (any day) — its true end is
     unknown, so nothing can be assumed settled past where it begins. A segment older than
     `since` is abandoned: it will never be classified, and is ignored rather than pinning the
@@ -597,9 +630,19 @@ def horizon(keys, classified, gate, day, since, cam_cfg, now=None):
         # Segments before since are abandoned and do not block freezing.
         live = [k for k in relevant if k not in done and Path(k).stem >= since]
         abandoned += sum(1 for k in relevant if k not in done and k not in live)
-        gap = min((starts[a] for a, b in zip(relevant, relevant[1:])
-                   if starts[b] - starts[a] > GAP_S and now - starts[b] < DEAD_AFTER_S),
-                  default=None)
+        gaps = []
+        for a, b in zip(relevant, relevant[1:]):
+            if starts[b] - starts[a] <= GAP_S or now - starts[b] >= DEAD_AFTER_S:
+                continue
+            window = next((w for w in (outages or [])
+                           if w["gate"] == gate and w["cam"] == cam
+                           and w["from"] <= Path(b).stem and w["to"] >= Path(a).stem), None)
+            if window is not None:
+                print(f"  declared outage unblocks gap: {gate}/{cam} "
+                      f"{window['from']}..{window['to']}", flush=True)
+                continue
+            gaps.append(starts[a])
+        gap = min(gaps, default=None)
         candidates = [starts[k] for k in live] + ([gap] if gap is not None else [])
         out[cam] = min(candidates) if candidates else max(starts[k] for k in segs)
     return out, abandoned
@@ -1240,6 +1283,7 @@ def journeys_pass(cl, bucket, touched, cameras, tz, keys=(), classified=(), sinc
     from datetime import timedelta
     import journeys
 
+    outages = declared_outages()
     _cache = {}          # a day's docs read once per journeys_pass call, not once per (day
                           # it's touched) x (day it's a neighbour of) — same day, same body.
 
@@ -1312,7 +1356,7 @@ def journeys_pass(cl, bucket, touched, cameras, tz, keys=(), classified=(), sinc
                               f"classified behind {gate}/{yyyymmdd}'s latest frozen journey ts")
 
             checked_days.add((gate, day))
-            h, abandoned = horizon(keys, classified, gate, yyyymmdd, since, cameras)
+            h, abandoned = horizon(keys, classified, gate, yyyymmdd, since, cameras, outages=outages)
             # min(h.values()): a journey freezes only once EVERY camera the gate owns is past it
             # by FINAL_MARGIN — an uncaught-up partner could still hand a lone chain a new link.
             # An empty h (no cameras at all) or any -inf (a camera not yet known caught up) both
@@ -3358,6 +3402,43 @@ def selfcheck():
     h6, _ = horizon(gapped, classified=gapped, gate="RDA-TG-KTB", day="20260827",
                     since="20260101-000000", cam_cfg=hcams)   # now defaults to the real clock
     assert h6["cam3"] == epoch("20260827-102500"), "an old gap doesn't block: latest recorded wins"
+    outage = {"gate": "RDA-TG-KTB", "cam": "cam3", "from": "20260827-100500",
+              "to": "20260827-102000", "note": "Synthetic recorder outage"}
+    for declared, expected in [
+        (outage, h6["cam3"]),
+        ({**outage, "cam": "cam4"}, h5["cam3"]),
+        ({**outage, "gate": "synthetic-other-gate"}, h5["cam3"]),
+        ({**outage, "from": "20260827-102501", "to": "20260827-103000"}, h5["cam3"]),
+        ({**outage, "from": "20260827-090000", "to": "20260827-095959"}, h5["cam3"]),
+        ({**outage, "from": "20260827-102500", "to": "20260827-102500"}, h6["cam3"]),
+        ({**outage, "from": "20260827-100000", "to": "20260827-100000"}, h6["cam3"]),
+    ]:
+        hd, _ = horizon(gapped, classified=gapped, gate="RDA-TG-KTB", day="20260827",
+                        since="20260101-000000", cam_cfg=hcams,
+                        now=epoch("20260827-102500") + 60, outages=[declared])
+        assert hd["cam3"] == expected, (declared, hd)
+
+    from unittest.mock import patch
+    import io
+    with tempfile.TemporaryDirectory(prefix="selfloop-outages-") as tmp, \
+            patch(__name__ + ".ROOT", Path(tmp)):
+        path = Path(tmp) / "outages.json"
+        assert declared_outages() == [], "missing outages file means none"
+        for body in ("{", "{}", '[{"gate": "synthetic-gate"}]',
+                     json.dumps([{**outage, "from": "20260832-100000"}]),
+                     json.dumps([{**outage, "to": "20260827-090000"}]),
+                     json.dumps([{**outage, "from": "20260827-10050"}]),
+                     json.dumps([None])):
+            path.write_text(body)
+            with contextlib.redirect_stdout(io.StringIO()) as warnings:
+                assert declared_outages() == [], body
+            assert warnings.getvalue().count("WARNING") == 1, warnings.getvalue()
+        path.write_text(json.dumps([None, outage]))
+        with contextlib.redirect_stdout(io.StringIO()) as warnings:
+            assert declared_outages() == [outage], "bad entries do not discard valid windows"
+        assert warnings.getvalue().count("WARNING") == 1
+        path.write_text("[]")
+        assert declared_outages() == [], "outages file is reread each pass"
 
     # c/d/r: c is a lone chain that would clear the cutoff on its own; d is still open
     # (its own max t1 hasn't cleared the cutoff yet) and started before c did. Freezing c
