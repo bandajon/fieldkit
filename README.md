@@ -495,6 +495,52 @@ defaults to 8080.
 
 ---
 
+## External recorder watchdog (Linux, optional)
+
+Copy `recorder_watchdog.py` into the node's app directory. It uses only the
+Python standard library and runs as the same unprivileged user as the system
+unit `fieldkit`; no sudo is needed. The unit must already use `Restart=always`,
+`RestartSec=3` and `KillSignal=SIGINT` so signalling its main PID resumes saved
+sessions.
+
+```sh
+cd <dir>
+python3 recorder_watchdog.py --selfcheck
+python3 recorder_watchdog.py --cam <name>=<address> --dry-run
+crontab -e
+```
+
+Add this line to that service user's crontab (replace `<dir>` with the absolute
+app directory and add `--cam <name>=<address>` for each camera):
+
+```cron
+* * * * * python3 <dir>/recorder_watchdog.py --cam <name>=<address> >> <dir>/watchdog.log 2>&1
+```
+
+The watchdog reads desired sessions from `record_state.json`; it does not read
+`config.yaml`. Supply a required `--cam <name>=<address>` argument for each
+monitored camera. A desired camera without an address logs `no address configured`
+once and is skipped without restarting the app. `--root` defaults to the script's
+directory. Recordings are watched under `--record-dir` (default `<root>/recordings`)
+/ `--site` (default `site1`); relative recording paths resolve against `--root`.
+Set these arguments to match FieldKit's recording directory and site. Healthy
+runs are silent (exit 0); errors exit 1.
+
+A segment older than 180 seconds (or a missing segment directory) is stale
+once app uptime exceeds the 300-second grace period. Only a camera answering
+TCP port 554 can trigger SIGINT. Restarts are limited to one per 600 seconds
+across all cameras and cron runs. Tune with `--stale`, `--grace` and
+`--min-interval`. Operator-stopped and expired sessions are ignored.
+
+Read actions, `camera unreachable`, `suppressed`, `recovered` and errors with
+`tail -n 50 <dir>/watchdog.log`; timestamps are UTC. Events print once to stdout,
+which cron redirects to that log. The JSON cooldown/transition state and flock
+are `watchdog_state.json` and `watchdog_state.lock`; `--state <path>`
+changes that base path. Keep these files writable by the service user and
+preserve the JSON between runs. `--dry-run` logs proposed actions without
+signalling or changing watchdog JSON. To disable, remove or comment out the
+cron line using `crontab -e`; recordings continue normally.
+
 ## Testing
 
 ```
