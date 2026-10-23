@@ -495,6 +495,76 @@ defaults to 8080.
 
 ---
 
+## External recorder watchdog (Linux, optional)
+
+Copy `recorder_watchdog.py` into the node's app directory. It uses only the
+Python standard library and runs as the same unprivileged user as the system
+unit `fieldkit`; no sudo is needed. The unit must already use `Restart=always`,
+`RestartSec=3` and `KillSignal=SIGINT` so signalling its main PID resumes saved
+sessions.
+
+```sh
+cd <dir>
+python3 recorder_watchdog.py --selfcheck
+python3 recorder_watchdog.py --cam <name>=<address> --dry-run  # must print nothing on a healthy node
+crontab -e
+```
+
+Add this line to that service user's crontab (replace `<dir>` with the absolute
+app directory and add `--cam <name>=<address>` for each camera):
+
+```cron
+* * * * * python3 <dir>/recorder_watchdog.py --cam <name>=<address> >> <dir>/watchdog.log 2>&1
+```
+
+The watchdog reads desired sessions from `record_state.json`; it does not read
+`config.yaml`. Supply a required `--cam <name>=<address>` argument for each
+monitored camera. A desired camera without an address logs `no address configured`
+once and is skipped without restarting the app. `--root` defaults to the script's
+directory. Recordings are watched under `--record-dir` (default `<root>/recordings`)
+/ `--site` (default `site1`); relative recording paths resolve against `--root`.
+Set these arguments to match FieldKit's recording directory and site. Healthy
+runs are silent (exit 0); errors exit 1.
+
+A segment older than 180 seconds (or an existing directory with no segments)
+is stale once app uptime exceeds the 300-second grace period. A missing camera
+directory is a configuration error, logged once per transition, and never triggers
+a restart. Check `--record-dir`, `--site` and the camera name. Segment timestamps
+are fresh when any `.mkv` file is within ±`--stale` seconds of now, even if
+an older segment has a far-future timestamp after a clock correction. If none
+is in that window, footage is stale or stale-unknown. A future saved restart time is treated as expired.
+
+Only a camera answering TCP port 554 can trigger SIGINT. The watchdog checks
+`http://127.0.0.1:8080/api/record/status` (set `--port` for a different app port)
+with a five-second timeout. `RECONNECTING`, or changed restart counts/recorded byte totals,
+means the supervisor is active: `supervisor active, not restarting`. The first
+observation establishes a fingerprint without restarting. An unchanged fingerprint
+on a subsequent run, with state `RECORDING` and stale segments, indicates a dead
+supervisor; changing ffmpeg stderr alone does not count as supervisor activity.
+If status bytes grow while the watched directory stays stale, it logs
+`configuration error: path mismatch: check --record-dir/--site` and does not restart.
+The fingerprint stores restart counts and bytes as plain JSON. An unavailable
+status API also permits recovery by restart; an unknown camera status does not. A stopped unit (`MainPID=0`) logs
+`no app main process (unit stopped)` once per transition, exits 1, and is left stopped.
+
+One shared app restart cooldown applies across all cameras and cron runs.
+Repeated restarts while any desired camera remains stale double the cooldown:
+600, 1200, 2400 seconds, up to four hours. The cooldown resets only when no
+desired camera is stale; one camera recovering does not reset it. While waiting it logs `backing off until <time>`. Tune the initial
+interval with `--min-interval`, and thresholds with `--stale` and `--grace`.
+Operator-stopped and expired sessions are ignored, including a stop or expiry
+during the camera probe.
+
+Read actions, `camera unreachable`, `backing off until <time>`, `recovered` and errors with
+`tail -n 50 <dir>/watchdog.log`; timestamps are UTC. Repeated identical decisions
+print only on change to stdout, which cron redirects to that log. The JSON cooldown/transition state and flock
+are `watchdog_state.json` and `watchdog_state.lock`; `--state <path>`
+changes that base path. Keep these files writable by the service user and
+preserve the JSON between runs. Corrupt watchdog JSON resets to defaults with
+one log line; invalid desired-session JSON remains an error. `--dry-run` logs
+proposed actions without signalling or changing watchdog JSON. To disable, remove or comment out the
+cron line using `crontab -e`; recordings continue normally.
+
 ## Testing
 
 ```
