@@ -142,6 +142,14 @@ Switching it is a prefix change there, once the counts are compared — but the 
 rebuilt every pass (ids are deterministic, so unchanged journeys keep theirs), and crops are
 cited by full bucket key rather than `crops/<name>`.
 
+Declare an outage only when the footage is confirmed never recorded. Place `outages.json`
+beside `selfloop.py`: a JSON list such as `[{"gate":"synthetic-gate","cam":"cam3","from":"20260827-100500","to":"20260827-102000","note":"Confirmed recorder outage"}]`,
+with recorder-local (Africa/Lusaka) timestamps. It is read each journeys pass; a missing
+file means none, and malformed files or entries are warned about and ignored. A matching
+window overlapping a recording gap stops that gap blocking finalization, allowing the
+other camera's journeys to become final for that window once the usual checks clear;
+no cross-camera links are possible there.
+
 ### Duplicate audit
 
 `selfloop.py audit [YYYYMMDD]` (daily agent `loop-audit`, default yesterday in Lusaka) reads a
